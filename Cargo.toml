@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/frances"]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+authors = ["Frances Contributors"]
+license = "MIT"
+repository = "https://github.com/jono/frances"
+
+[workspace.dependencies]
+anyhow = "1"
+bincode = { version = "2", features = ["serde"] }
+libc = "0.2"
+serde = { version = "1", features = ["derive"] }
+clap = { version = "4", features = ["derive"] }

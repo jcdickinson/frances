@@ -1,0 +1,17 @@
+# 2026-05-07 16:20 UTC
+input: 47443 words
+token-count distribution in kept set: {1: 4391, 2: 3801}
+# 2026-05-07 16:23 UTC
+input: 87335 words (from top 100000, len>=4, alpha)
+prefix-collision drops: 6007
+token-count distribution in kept set: {1: 2669, 2: 5523}
+# 2026-05-07 16:28 UTC
+input: 87335 words (from top 100000, len>=4, alpha)
+target dict size: 2060 (12 padding + 2048 data, 11 bits/word)
+prefix-collision drops: 736
+token-count distribution in kept set: {1: 2060}
+# 2026-05-07 16:30 UTC
+input: 87335 words (from top 100000, len>=4, alpha)
+target dict size: 2058 (10 padding + 2048 data, 11 bits/word)
+prefix-collision drops: 731
+token-count distribution in kept set: {1: 2058}

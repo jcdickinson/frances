@@ -1,0 +1,17 @@
+[package]
+name = "frances"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "frances"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+bincode.workspace = true
+libc.workspace = true
+serde.workspace = true
+clap.workspace = true
