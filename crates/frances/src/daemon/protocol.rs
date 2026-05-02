@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use crate::context::InvocationContext;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ControlRequest {
     Ping,
@@ -19,10 +21,7 @@ pub enum ControlResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientRequest {
-    Attach {
-        tty_key: Option<String>,
-        cwd: Option<PathBuf>,
-    },
+    Attach { context: InvocationContext },
     Detach,
 }
 

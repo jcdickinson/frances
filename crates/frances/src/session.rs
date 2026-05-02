@@ -126,7 +126,11 @@ impl Paths {
         })
     }
 
-    pub fn resolve_or_create_for_tty(&self, tty_key: &str, cwd: Option<PathBuf>) -> Result<Session> {
+    pub fn resolve_or_create_for_tty(
+        &self,
+        tty_key: &str,
+        cwd: Option<PathBuf>,
+    ) -> Result<Session> {
         if let Some(session) = self.resolve_tty_link(tty_key)? {
             return Ok(session);
         }
@@ -145,7 +149,9 @@ impl Paths {
         let target = match fs::read_link(&link_path) {
             Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error).with_context(|| format!("failed reading tty link {tty_key}")),
+            Err(error) => {
+                return Err(error).with_context(|| format!("failed reading tty link {tty_key}"));
+            }
         };
 
         if !target.exists() {
@@ -220,7 +226,8 @@ fn current_uid() -> u32 {
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create directory {}", path.display()))?;
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create directory {}", path.display()))?;
     let permissions = fs::Permissions::from_mode(SESSION_DIR_MODE);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("failed to set permissions on {}", path.display()))?;
@@ -229,12 +236,14 @@ fn create_private_dir(path: &Path) -> Result<()> {
 
 fn write_metadata(path: &Path, meta: &SessionMeta) -> Result<()> {
     let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())?;
-    fs::write(path, bytes).with_context(|| format!("failed writing metadata {}", path.display()))?;
+    fs::write(path, bytes)
+        .with_context(|| format!("failed writing metadata {}", path.display()))?;
     Ok(())
 }
 
 fn read_metadata(path: &Path) -> Result<SessionMeta> {
-    let bytes = fs::read(path).with_context(|| format!("failed reading metadata {}", path.display()))?;
+    let bytes =
+        fs::read(path).with_context(|| format!("failed reading metadata {}", path.display()))?;
     let (meta, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
     Ok(meta)
 }
@@ -271,7 +280,10 @@ mod tests {
         let loaded = paths.load_session(&session.id).expect("load session");
         assert_eq!(loaded.meta.id, session.id);
         assert_eq!(loaded.meta.cwd, Some(PathBuf::from("/tmp/work")));
-        assert_eq!(fs::metadata(&loaded.dir).expect("metadata").mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(&loaded.dir).expect("metadata").mode() & 0o777,
+            0o700
+        );
 
         let _ = fs::remove_dir_all(root);
     }

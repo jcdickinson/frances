@@ -1,11 +1,20 @@
+mod context;
 mod daemon;
+mod history;
+mod llm;
 mod session;
+mod store;
 mod tty;
+mod ui;
 
 use anyhow::{Result, anyhow};
 use clap::Parser;
 use daemon::{client, protocol, server, spawn};
-use session::{Paths, Session};
+use tracing::debug;
+
+use crate::context::InvocationContext;
+use crate::session::{Paths, Session};
+use crate::ui::App;
 
 #[derive(Debug, Parser)]
 #[command(name = "frances")]
@@ -20,19 +29,22 @@ struct Cli {
     stop: bool,
 }
 
-fn main() {
-    if let Err(error) = real_main() {
+#[tokio::main]
+async fn main() {
+    if let Err(error) = real_main().await {
         eprintln!("frances: {error:#}");
         std::process::exit(1);
     }
 }
 
-fn real_main() -> Result<()> {
+async fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(session_id) = cli.daemon {
         let paths = Paths::discover()?;
         let session = paths.load_session(&session_id)?;
+        server::install_logging(&session)?;
+        let _store = store::Store::open(&paths).await?;
         return server::run(session);
     }
 
@@ -42,12 +54,7 @@ fn real_main() -> Result<()> {
     if cli.status {
         let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
         let status = client::status(&session)?;
-        println!("session_id: {}", status.session_id);
-        println!("client_attached: {}", status.client_attached);
-        println!("daemon_pid: {}", status.daemon_pid);
-        println!("control_socket: {}", status.control_socket_path.display());
-        println!("client_socket: {}", status.client_socket_path.display());
-        println!("protocol_version: {}", status.protocol_version);
+        App { status: &status }.run()?;
         return Ok(());
     }
 
@@ -58,15 +65,17 @@ fn real_main() -> Result<()> {
         return Ok(());
     }
 
-    let cwd = std::env::current_dir().ok();
-    let session = paths.resolve_or_create_for_tty(&tty_key, cwd)?;
+    let invocation = InvocationContext::capture(Some(tty_key.clone()));
+    let session = paths.resolve_or_create_for_tty(&tty_key, invocation.process.cwd.clone())?;
 
     spawn::ensure_daemon(&session)?;
 
-    match client::attach(&session, Some(tty_key), std::env::current_dir().ok())? {
-        protocol::ClientResponse::Attached { session_id } => {
+    debug!(session_id = %session.id, "attaching client to daemon");
+    match client::attach(&session, invocation)? {
+        protocol::ClientResponse::Attached { session_id: _ } => {
+            let status = client::status(&session)?;
             let _ = client::detach(&session);
-            println!("frances session ready: {session_id}");
+            App { status: &status }.run()?;
         }
         protocol::ClientResponse::Busy => {
             println!("frances session busy: {}", session.id);
@@ -83,6 +92,7 @@ fn real_main() -> Result<()> {
 }
 
 fn resolve_existing_session_for_tty(paths: &Paths, tty_key: &str) -> Result<Session> {
-    paths.resolve_tty_link(tty_key)?
+    paths
+        .resolve_tty_link(tty_key)?
         .ok_or_else(|| anyhow!("no frances session is linked to the current TTY"))
 }

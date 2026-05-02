@@ -6,8 +6,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Serialize, de::DeserializeOwned};
+use tracing::trace;
 
-use crate::daemon::protocol::{ClientRequest, ClientResponse, ControlRequest, ControlResponse, DaemonStatus};
+use crate::context::InvocationContext;
+use crate::daemon::protocol::{
+    ClientRequest, ClientResponse, ControlRequest, ControlResponse, DaemonStatus,
+};
 use crate::session::Session;
 
 pub fn ping(session: &Session) -> Result<()> {
@@ -34,8 +38,9 @@ pub fn stop(session: &Session, delete_state: bool) -> Result<()> {
     }
 }
 
-pub fn attach(session: &Session, tty_key: Option<String>, cwd: Option<std::path::PathBuf>) -> Result<ClientResponse> {
-    send_client(session, ClientRequest::Attach { tty_key, cwd })
+pub fn attach(session: &Session, context: InvocationContext) -> Result<ClientResponse> {
+    trace!(session_id = %session.id, "sending attach request");
+    send_client(session, ClientRequest::Attach { context })
 }
 
 pub fn detach(session: &Session) -> Result<()> {
@@ -72,7 +77,9 @@ pub fn remove_socket_if_present(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error).with_context(|| format!("failed removing socket {}", path.display())),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed removing socket {}", path.display()))
+        }
     }
 }
 

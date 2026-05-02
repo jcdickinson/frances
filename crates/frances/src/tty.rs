@@ -28,7 +28,8 @@ pub fn controlling_tty_identity() -> Result<TtyIdentity> {
         return Err(anyhow!("no controlling TTY available"));
     }
 
-    let tty_path = fs::read_link("/proc/self/fd/0").context("failed to resolve controlling tty path")?;
+    let tty_path =
+        fs::read_link("/proc/self/fd/0").context("failed to resolve controlling tty path")?;
     let metadata = fs::metadata("/proc/self/fd/0").context("failed to stat controlling tty")?;
     let (session_leader, tty_nr) = read_proc_self_stat()?;
 
