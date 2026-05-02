@@ -44,8 +44,8 @@ async fn real_main() -> Result<()> {
         let paths = Paths::discover()?;
         let session = paths.load_session(&session_id)?;
         server::install_logging(&session)?;
-        let _store = store::Store::open(&paths).await?;
-        return server::run(session);
+        let db = store::Database::open(&session).await?;
+        return server::run(session, db).await;
     }
 
     let tty_key = tty::controlling_tty_key()?;
@@ -53,14 +53,18 @@ async fn real_main() -> Result<()> {
 
     if cli.status {
         let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-        let status = client::status(&session)?;
-        App { status: &status }.run()?;
+        let status = client::status(&session).await?;
+        App {
+            session: &session,
+            status: &status,
+        }
+        .run()?;
         return Ok(());
     }
 
     if cli.stop {
         let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-        client::stop(&session, false)?;
+        client::stop(&session, false).await?;
         println!("frances session stopping: {}", session.id);
         return Ok(());
     }
@@ -68,23 +72,21 @@ async fn real_main() -> Result<()> {
     let invocation = InvocationContext::capture(Some(tty_key.clone()));
     let session = paths.resolve_or_create_for_tty(&tty_key, invocation.process.cwd.clone())?;
 
-    spawn::ensure_daemon(&session)?;
+    spawn::ensure_daemon(&session).await?;
 
     debug!(session_id = %session.id, "attaching client to daemon");
-    match client::attach(&session, invocation)? {
-        protocol::ClientResponse::Attached { session_id: _ } => {
-            let status = client::status(&session)?;
-            let _ = client::detach(&session);
-            App { status: &status }.run()?;
+    match client::attach(&session, invocation).await? {
+        protocol::AttachResponse::Attached { session_id: _ } => {
+            let status = client::status(&session).await?;
+            let _ = client::detach(&session).await;
+            App {
+                session: &session,
+                status: &status,
+            }
+            .run()?;
         }
-        protocol::ClientResponse::Busy => {
+        protocol::AttachResponse::Busy => {
             println!("frances session busy: {}", session.id);
-        }
-        protocol::ClientResponse::Detached => {
-            println!("frances session detached: {}", session.id);
-        }
-        protocol::ClientResponse::Error(message) => {
-            return Err(anyhow!(message));
         }
     }
 

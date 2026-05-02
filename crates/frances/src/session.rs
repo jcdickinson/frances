@@ -197,12 +197,20 @@ impl Session {
         self.runtime_dir.join("client.sock")
     }
 
+    pub fn events_socket_path(&self) -> PathBuf {
+        self.runtime_dir.join("events.sock")
+    }
+
     pub fn pid_path(&self) -> PathBuf {
         self.runtime_dir.join("daemon.pid")
     }
 
     pub fn metadata_path(&self) -> PathBuf {
         self.dir.join(METADATA_FILE)
+    }
+
+    pub fn database_path(&self) -> PathBuf {
+        self.dir.join("frances.db")
     }
 }
 

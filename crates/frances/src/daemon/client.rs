@@ -1,102 +1,137 @@
-use std::fs;
-use std::io::{Read, Write};
-use std::os::unix::net::UnixStream;
 use std::path::Path;
-use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
-use serde::{Serialize, de::DeserializeOwned};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use tarpc::client::RpcError;
+use tarpc::context;
+use tarpc::tokio_serde::formats::Bincode;
+use thiserror::Error;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::UnixStream;
 use tracing::trace;
 
 use crate::context::InvocationContext;
 use crate::daemon::protocol::{
-    ClientRequest, ClientResponse, ControlRequest, ControlResponse, DaemonStatus,
+    AttachResponse, ClientClient, ControlClient, DaemonStatus, PromptId, StreamFrame,
 };
 use crate::session::Session;
 
-pub fn ping(session: &Session) -> Result<()> {
-    match send_control(session, ControlRequest::Ping)? {
-        ControlResponse::Pong => Ok(()),
-        ControlResponse::Error(message) => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected ping response: {other:?}")),
-    }
+#[derive(Debug, Error)]
+pub enum ClientError {
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("rpc error: {0}")]
+    Rpc(#[from] RpcError),
+    #[error("encode error: {0}")]
+    Encode(#[from] bincode::error::EncodeError),
+    #[error("decode error: {0}")]
+    Decode(#[from] bincode::error::DecodeError),
+    #[error("message too large for protocol framing")]
+    MessageTooLarge,
+    #[error("daemon: {0}")]
+    Server(String),
 }
 
-pub fn status(session: &Session) -> Result<DaemonStatus> {
-    match send_control(session, ControlRequest::Status)? {
-        ControlResponse::Status(status) => Ok(status),
-        ControlResponse::Error(message) => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected status response: {other:?}")),
-    }
+async fn connect_control(session: &Session) -> Result<ControlClient, ClientError> {
+    let path = session.control_socket_path();
+    trace!(session_id = %session.id, path = %path.display(), "connecting control");
+    let transport = tarpc::serde_transport::unix::connect(&path, Bincode::default).await?;
+    Ok(ControlClient::new(tarpc::client::Config::default(), transport).spawn())
 }
 
-pub fn stop(session: &Session, delete_state: bool) -> Result<()> {
-    match send_control(session, ControlRequest::Stop { delete_state })? {
-        ControlResponse::Stopping => Ok(()),
-        ControlResponse::Error(message) => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected stop response: {other:?}")),
-    }
+async fn connect_client(session: &Session) -> Result<ClientClient, ClientError> {
+    let path = session.client_socket_path();
+    trace!(session_id = %session.id, path = %path.display(), "connecting client");
+    let transport = tarpc::serde_transport::unix::connect(&path, Bincode::default).await?;
+    Ok(ClientClient::new(tarpc::client::Config::default(), transport).spawn())
 }
 
-pub fn attach(session: &Session, context: InvocationContext) -> Result<ClientResponse> {
+pub async fn ping(session: &Session) -> Result<(), ClientError> {
+    let client = connect_control(session).await?;
+    client.ping(context::current()).await?;
+    Ok(())
+}
+
+pub async fn status(session: &Session) -> Result<DaemonStatus, ClientError> {
+    let client = connect_control(session).await?;
+    Ok(client.status(context::current()).await?)
+}
+
+pub async fn stop(session: &Session, delete_state: bool) -> Result<(), ClientError> {
+    let client = connect_control(session).await?;
+    client.stop(context::current(), delete_state).await?;
+    Ok(())
+}
+
+pub async fn attach(
+    session: &Session,
+    invocation: InvocationContext,
+) -> Result<AttachResponse, ClientError> {
     trace!(session_id = %session.id, "sending attach request");
-    send_client(session, ClientRequest::Attach { context })
+    let client = connect_client(session).await?;
+    Ok(client.attach(context::current(), invocation).await?)
 }
 
-pub fn detach(session: &Session) -> Result<()> {
-    match send_client(session, ClientRequest::Detach)? {
-        ClientResponse::Detached => Ok(()),
-        ClientResponse::Error(message) => Err(anyhow!(message)),
-        other => Err(anyhow!("unexpected detach response: {other:?}")),
-    }
+pub async fn detach(session: &Session) -> Result<(), ClientError> {
+    let client = connect_client(session).await?;
+    client.detach(context::current()).await?;
+    Ok(())
 }
 
-pub fn send_control(session: &Session, request: ControlRequest) -> Result<ControlResponse> {
-    let mut stream = connect(&session.control_socket_path())
-        .with_context(|| format!("failed to connect control socket for {}", session.id))?;
-    write_message(&mut stream, &request)?;
-    read_message(&mut stream)
-}
+pub async fn prompt_stream<F>(
+    session: &Session,
+    prompt_id: PromptId,
+    text: String,
+    mut on_frame: F,
+) -> Result<(), ClientError>
+where
+    F: FnMut(StreamFrame),
+{
+    trace!(session_id = %session.id, prompt_id, "opening events socket");
+    let mut events = UnixStream::connect(session.events_socket_path()).await?;
+    write_message(&mut events, &prompt_id).await?;
 
-pub fn send_client(session: &Session, request: ClientRequest) -> Result<ClientResponse> {
-    let mut stream = connect(&session.client_socket_path())
-        .with_context(|| format!("failed to connect client socket for {}", session.id))?;
-    write_message(&mut stream, &request)?;
-    read_message(&mut stream)
-}
+    let client = connect_client(session).await?;
+    client
+        .prompt(context::current(), prompt_id, text)
+        .await?
+        .map_err(ClientError::Server)?;
 
-fn connect(path: &Path) -> Result<UnixStream> {
-    let stream = UnixStream::connect(path)
-        .with_context(|| format!("failed to connect to {}", path.display()))?;
-    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
-    Ok(stream)
-}
-
-pub fn remove_socket_if_present(path: &Path) -> Result<()> {
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => {
-            Err(error).with_context(|| format!("failed removing socket {}", path.display()))
+    loop {
+        let frame: StreamFrame = read_message(&mut events).await?;
+        let stop = matches!(frame, StreamFrame::Done | StreamFrame::Error(_));
+        on_frame(frame);
+        if stop {
+            return Ok(());
         }
     }
 }
 
-pub fn write_message<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+pub async fn write_message<T: Serialize>(
+    stream: &mut UnixStream,
+    value: &T,
+) -> Result<(), ClientError> {
     let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
-    let len = u32::try_from(bytes.len()).context("message too large for protocol framing")?;
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(&bytes)?;
+    let len = u32::try_from(bytes.len()).map_err(|_| ClientError::MessageTooLarge)?;
+    stream.write_all(&len.to_be_bytes()).await?;
+    stream.write_all(&bytes).await?;
     Ok(())
 }
 
-pub fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+pub async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T, ClientError> {
     let mut len_bytes = [0_u8; 4];
-    stream.read_exact(&mut len_bytes)?;
+    stream.read_exact(&mut len_bytes).await?;
     let len = u32::from_be_bytes(len_bytes) as usize;
     let mut payload = vec![0_u8; len];
-    stream.read_exact(&mut payload)?;
+    stream.read_exact(&mut payload).await?;
     let (message, _) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())?;
     Ok(message)
+}
+
+pub fn remove_socket_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }

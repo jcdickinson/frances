@@ -1,6 +1,5 @@
 use std::fs;
 use std::process::{Command, Stdio};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -11,8 +10,8 @@ use crate::session::Session;
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub fn ensure_daemon(session: &Session) -> Result<()> {
-    if client::ping(session).is_ok() {
+pub async fn ensure_daemon(session: &Session) -> Result<()> {
+    if client::ping(session).await.is_ok() {
         return Ok(());
     }
 
@@ -28,16 +27,16 @@ pub fn ensure_daemon(session: &Session) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn daemon for session {}", session.id))?;
 
-    wait_for_ready(session, READINESS_TIMEOUT)
+    wait_for_ready(session, READINESS_TIMEOUT).await
 }
 
-pub fn wait_for_ready(session: &Session, timeout: Duration) -> Result<()> {
+pub async fn wait_for_ready(session: &Session, timeout: Duration) -> Result<()> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if client::ping(session).is_ok() {
+        if client::ping(session).await.is_ok() {
             return Ok(());
         }
-        thread::sleep(READINESS_POLL_INTERVAL);
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
 
     Err(anyhow!(
@@ -59,6 +58,7 @@ pub fn cleanup_stale_runtime(session: &Session) -> Result<()> {
 
     client::remove_socket_if_present(&session.control_socket_path())?;
     client::remove_socket_if_present(&session.client_socket_path())?;
+    client::remove_socket_if_present(&session.events_socket_path())?;
 
     match fs::remove_file(session.pid_path()) {
         Ok(()) => {}

@@ -1,30 +1,174 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use tracing::{debug, error, info, trace};
+use futures::StreamExt;
+use tarpc::context;
+use tarpc::server::Channel;
+use tarpc::tokio_serde::formats::Bincode;
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::{Notify, oneshot};
+use tracing::{debug, info, trace, warn};
 
 use crate::context::InvocationContext;
 use crate::daemon::client::{read_message, remove_socket_if_present, write_message};
 use crate::daemon::protocol::{
-    ClientRequest, ClientResponse, ControlRequest, ControlResponse, DaemonStatus,
+    AttachResponse, Client, Control, DaemonStatus, PromptId, StreamFrame,
 };
+use crate::history::{Block, BlockType, HistoryStore, Role};
+use crate::llm::{InceptionClient, StreamEvent};
 use crate::session::Session;
+use crate::store::Database;
 
-#[derive(Debug)]
+const EVENTS_PAIRING_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
 struct ServerState {
     session: Session,
-    client_attached: std::sync::Mutex<bool>,
-    last_context: std::sync::Mutex<Option<InvocationContext>>,
-    shutdown: AtomicBool,
+    client_attached: StdMutex<bool>,
+    last_context: StdMutex<Option<InvocationContext>>,
     daemon_pid: u32,
+    history: HistoryStore,
+    events: EventsRouter,
+    shutdown: Notify,
+}
+
+#[derive(Default)]
+struct EventsRouter {
+    inner: StdMutex<HashMap<PromptId, EventsSlot>>,
+}
+
+enum EventsSlot {
+    HasStream(UnixStream),
+    Waiting(oneshot::Sender<UnixStream>),
+}
+
+impl EventsRouter {
+    fn register(&self, id: PromptId, stream: UnixStream) {
+        let mut inner = self.inner.lock().expect("events router poisoned");
+        match inner.remove(&id) {
+            Some(EventsSlot::Waiting(tx)) => {
+                let _ = tx.send(stream);
+            }
+            Some(EventsSlot::HasStream(_)) | None => {
+                inner.insert(id, EventsSlot::HasStream(stream));
+            }
+        }
+    }
+
+    async fn take(&self, id: PromptId) -> Option<UnixStream> {
+        let rx = {
+            let mut inner = self.inner.lock().expect("events router poisoned");
+            match inner.remove(&id) {
+                Some(EventsSlot::HasStream(s)) => return Some(s),
+                Some(EventsSlot::Waiting(_)) => return None,
+                None => {
+                    let (tx, rx) = oneshot::channel();
+                    inner.insert(id, EventsSlot::Waiting(tx));
+                    rx
+                }
+            }
+        };
+        match tokio::time::timeout(EVENTS_PAIRING_TIMEOUT, rx).await {
+            Ok(Ok(stream)) => Some(stream),
+            _ => {
+                self.inner
+                    .lock()
+                    .expect("events router poisoned")
+                    .remove(&id);
+                None
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ControlServer {
+    state: Arc<ServerState>,
+}
+
+impl Control for ControlServer {
+    async fn ping(self, _: context::Context) {}
+
+    async fn status(self, _: context::Context) -> DaemonStatus {
+        daemon_status(&self.state)
+    }
+
+    async fn stop(self, _: context::Context, _delete_state: bool) {
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(SHUTDOWN_GRACE).await;
+            state.shutdown.notify_waiters();
+        });
+    }
+}
+
+#[derive(Clone)]
+struct ClientServer {
+    state: Arc<ServerState>,
+}
+
+impl Client for ClientServer {
+    async fn attach(self, _: context::Context, ctx: InvocationContext) -> AttachResponse {
+        trace!(
+            session_id = %self.state.session.id,
+            env_vars = ctx.process.env.len(),
+            has_cwd = ctx.process.cwd.is_some(),
+            "received attach context"
+        );
+        let mut attached = self
+            .state
+            .client_attached
+            .lock()
+            .expect("client_attached poisoned");
+        if *attached {
+            AttachResponse::Busy
+        } else {
+            *self
+                .state
+                .last_context
+                .lock()
+                .expect("last_context poisoned") = Some(ctx);
+            *attached = true;
+            AttachResponse::Attached {
+                session_id: self.state.session.id.clone(),
+            }
+        }
+    }
+
+    async fn detach(self, _: context::Context) {
+        let mut attached = self
+            .state
+            .client_attached
+            .lock()
+            .expect("client_attached poisoned");
+        *attached = false;
+    }
+
+    async fn prompt(
+        self,
+        _: context::Context,
+        prompt_id: PromptId,
+        text: String,
+    ) -> Result<(), String> {
+        let stream = self
+            .state
+            .events
+            .take(prompt_id)
+            .await
+            .ok_or_else(|| format!("no events socket registered for prompt {prompt_id}"))?;
+
+        let state = self.state.clone();
+        tokio::spawn(async move {
+            run_prompt(state, stream, text).await;
+        });
+        Ok(())
+    }
 }
 
 pub fn install_logging(session: &Session) -> Result<()> {
@@ -57,7 +201,7 @@ pub fn install_logging(session: &Session) -> Result<()> {
     Ok(())
 }
 
-pub fn run(session: Session) -> Result<()> {
+pub async fn run(session: Session, db: Database) -> Result<()> {
     debug!(session_id = %session.id, "starting daemon server");
 
     fs::create_dir_all(&session.runtime_dir).with_context(|| {
@@ -69,122 +213,227 @@ pub fn run(session: Session) -> Result<()> {
 
     remove_socket_if_present(&session.control_socket_path())?;
     remove_socket_if_present(&session.client_socket_path())?;
-
-    let control_listener = bind_listener(&session.control_socket_path())?;
-    let client_listener = bind_listener(&session.client_socket_path())?;
+    remove_socket_if_present(&session.events_socket_path())?;
 
     fs::write(session.pid_path(), std::process::id().to_string())
         .with_context(|| format!("failed writing pid file for {}", session.id))?;
 
     let state = Arc::new(ServerState {
         session: session.clone(),
-        client_attached: std::sync::Mutex::new(false),
-        last_context: std::sync::Mutex::new(None),
-        shutdown: AtomicBool::new(false),
+        client_attached: StdMutex::new(false),
+        last_context: StdMutex::new(None),
         daemon_pid: std::process::id(),
+        history: HistoryStore::new(db),
+        events: EventsRouter::default(),
+        shutdown: Notify::new(),
     });
 
-    control_listener.set_nonblocking(true)?;
-    client_listener.set_nonblocking(true)?;
+    let events_listener = UnixListener::bind(session.events_socket_path()).with_context(|| {
+        format!(
+            "failed to bind events socket {}",
+            session.events_socket_path().display()
+        )
+    })?;
+    let events_state = state.clone();
+    tokio::spawn(async move {
+        accept_events(events_listener, events_state).await;
+    });
 
-    while !state.shutdown.load(Ordering::SeqCst) {
-        accept_control(&control_listener, &state)?;
-        accept_client(&client_listener, &state)?;
-        thread::sleep(Duration::from_millis(25));
-    }
+    let control_state = state.clone();
+    let control_path = session.control_socket_path();
+    tokio::spawn(async move {
+        if let Err(error) = serve_control(control_path, control_state).await {
+            warn!(%error, "control listener exited");
+        }
+    });
+
+    let client_state = state.clone();
+    let client_path = session.client_socket_path();
+    tokio::spawn(async move {
+        if let Err(error) = serve_client(client_path, client_state).await {
+            warn!(%error, "client listener exited");
+        }
+    });
+
+    info!(
+        session_id = %session.id,
+        control = %session.control_socket_path().display(),
+        client = %session.client_socket_path().display(),
+        events = %session.events_socket_path().display(),
+        "daemon listening"
+    );
+
+    state.shutdown.notified().await;
+    info!("shutdown signaled");
 
     let _ = fs::remove_file(session.pid_path());
     let _ = fs::remove_file(session.control_socket_path());
     let _ = fs::remove_file(session.client_socket_path());
+    let _ = fs::remove_file(session.events_socket_path());
 
     Ok(())
 }
 
-fn bind_listener(path: &Path) -> Result<UnixListener> {
-    UnixListener::bind(path).with_context(|| format!("failed to bind {}", path.display()))
-}
-
-fn accept_control(listener: &UnixListener, state: &Arc<ServerState>) -> Result<()> {
-    match listener.accept() {
-        Ok((stream, _)) => {
-            let state = Arc::clone(state);
-            thread::spawn(move || {
-                if let Err(error) = handle_control(stream, &state) {
-                    error!(error = %error, "frances control handler error");
-                }
-            });
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-        Err(error) => Err(error).context("control accept failed"),
+async fn serve_control(path: std::path::PathBuf, state: Arc<ServerState>) -> Result<()> {
+    let mut listener = tarpc::serde_transport::unix::listen(&path, Bincode::default).await?;
+    listener.config_mut().max_frame_length(usize::MAX);
+    while let Some(transport) = listener.next().await {
+        let transport = match transport {
+            Ok(t) => t,
+            Err(error) => {
+                warn!(%error, "control accept error");
+                continue;
+            }
+        };
+        let server = ControlServer {
+            state: state.clone(),
+        };
+        let channel = tarpc::server::BaseChannel::with_defaults(transport);
+        tokio::spawn(
+            channel
+                .execute(server.serve())
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                }),
+        );
     }
+    Ok(())
 }
 
-fn accept_client(listener: &UnixListener, state: &Arc<ServerState>) -> Result<()> {
-    match listener.accept() {
-        Ok((stream, _)) => {
-            let state = Arc::clone(state);
-            thread::spawn(move || {
-                if let Err(error) = handle_client(stream, &state) {
-                    error!(error = %error, "frances client handler error");
-                }
-            });
-            Ok(())
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(()),
-        Err(error) => Err(error).context("client accept failed"),
+async fn serve_client(path: std::path::PathBuf, state: Arc<ServerState>) -> Result<()> {
+    let mut listener = tarpc::serde_transport::unix::listen(&path, Bincode::default).await?;
+    listener.config_mut().max_frame_length(usize::MAX);
+    while let Some(transport) = listener.next().await {
+        let transport = match transport {
+            Ok(t) => t,
+            Err(error) => {
+                warn!(%error, "client accept error");
+                continue;
+            }
+        };
+        let server = ClientServer {
+            state: state.clone(),
+        };
+        let channel = tarpc::server::BaseChannel::with_defaults(transport);
+        tokio::spawn(
+            channel
+                .execute(server.serve())
+                .for_each(|response| async move {
+                    tokio::spawn(response);
+                }),
+        );
     }
+    Ok(())
 }
 
-fn handle_control(mut stream: UnixStream, state: &Arc<ServerState>) -> Result<()> {
-    let request: ControlRequest = read_message(&mut stream)?;
-    let response = match request {
-        ControlRequest::Ping => ControlResponse::Pong,
-        ControlRequest::Status => ControlResponse::Status(daemon_status(state)),
-        ControlRequest::Stop { .. } => {
-            state.shutdown.store(true, Ordering::SeqCst);
-            ControlResponse::Stopping
-        }
-    };
-    write_message(&mut stream, &response)
-}
-
-fn handle_client(mut stream: UnixStream, state: &Arc<ServerState>) -> Result<()> {
-    let request: ClientRequest = read_message(&mut stream)?;
-    let response = match request {
-        ClientRequest::Attach { context } => {
-            trace!(
-                session_id = %state.session.id,
-                env_vars = context.process.env.len(),
-                has_cwd = context.process.cwd.is_some(),
-                "received attach context"
-            );
-
-            let mut attached = state
-                .client_attached
-                .lock()
-                .expect("client_attached poisoned");
-            if *attached {
-                ClientResponse::Busy
-            } else {
-                *state.last_context.lock().expect("last_context poisoned") = Some(context);
-                *attached = true;
-                ClientResponse::Attached {
-                    session_id: state.session.id.clone(),
-                }
+async fn accept_events(listener: UnixListener, state: Arc<ServerState>) {
+    loop {
+        match listener.accept().await {
+            Ok((mut stream, _)) => {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    let id: PromptId = match read_message(&mut stream).await {
+                        Ok(id) => id,
+                        Err(error) => {
+                            warn!(%error, "events handshake failed");
+                            return;
+                        }
+                    };
+                    trace!(prompt_id = id, "events socket registered");
+                    state.events.register(id, stream);
+                });
+            }
+            Err(error) => {
+                warn!(%error, "events accept error");
+                return;
             }
         }
-        ClientRequest::Detach => {
-            let mut attached = state
-                .client_attached
-                .lock()
-                .expect("client_attached poisoned");
-            *attached = false;
-            ClientResponse::Detached
-        }
-    };
+    }
+}
 
-    write_message(&mut stream, &response)
+async fn run_prompt(state: Arc<ServerState>, mut stream: UnixStream, text: String) {
+    if let Err(error) = stream_prompt(&state, &mut stream, text).await {
+        warn!(%error, "prompt handler failed");
+        match write_message(&mut stream, &StreamFrame::Error(format!("{error:#}"))).await {
+            Ok(()) => trace!("wrote error frame"),
+            Err(e) => warn!(error = %e, "failed to write error frame"),
+        }
+    }
+    match write_message(&mut stream, &StreamFrame::Done).await {
+        Ok(()) => trace!("wrote done frame"),
+        Err(e) => warn!(error = %e, "failed to write done frame"),
+    }
+}
+
+async fn stream_prompt(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    text: String,
+) -> Result<()> {
+    let env = state
+        .last_context
+        .lock()
+        .expect("last_context poisoned")
+        .as_ref()
+        .map(|ctx| ctx.process.env.clone())
+        .ok_or_else(|| anyhow::anyhow!("no client context — attach first"))?;
+
+    let llm = InceptionClient::from_env(&env, state.session.id.clone())?;
+
+    let user_block = Block {
+        kind: BlockType::Text,
+        text: text.clone(),
+        data: None,
+    };
+    state.history.append(Role::User, vec![user_block]).await?;
+
+    let messages = state.history.messages().await?;
+
+    let mut accumulated = String::new();
+    let mut send_error: Option<anyhow::Error> = None;
+    let mut pending: Vec<StreamFrame> = Vec::new();
+
+    let stream_result = llm
+        .stream(&messages, |event| {
+            let frame = match event {
+                StreamEvent::Text(chunk) => {
+                    accumulated.push_str(chunk);
+                    StreamFrame::Text(chunk.to_string())
+                }
+                StreamEvent::Usage(usage) => StreamFrame::Usage(usage),
+            };
+            pending.push(frame);
+            Ok(())
+        })
+        .await;
+
+    for frame in pending {
+        if send_error.is_some() {
+            break;
+        }
+        if let Err(error) = write_message(stream, &frame).await {
+            send_error = Some(anyhow::Error::new(error));
+        }
+    }
+
+    if let Some(error) = send_error {
+        return Err(error);
+    }
+    stream_result?;
+
+    if !accumulated.is_empty() {
+        let assistant_block = Block {
+            kind: BlockType::Text,
+            text: accumulated,
+            data: None,
+        };
+        state
+            .history
+            .append(Role::Assistant, vec![assistant_block])
+            .await?;
+    }
+
+    Ok(())
 }
 
 fn daemon_status(state: &ServerState) -> DaemonStatus {
@@ -197,6 +446,7 @@ fn daemon_status(state: &ServerState) -> DaemonStatus {
         daemon_pid: state.daemon_pid,
         control_socket_path: state.session.control_socket_path(),
         client_socket_path: state.session.client_socket_path(),
+        events_socket_path: state.session.events_socket_path(),
         protocol_version: 1,
     }
 }

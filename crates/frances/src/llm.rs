@@ -1,181 +1,210 @@
+use std::ffi::OsString;
+use std::time::Duration;
+
 use anyhow::{Context, Result, anyhow};
 use futures_util::StreamExt;
-use llm::backends::openai::OpenAI;
-use llm::chat::{ChatMessage, ChatProvider, ChatRole, StreamChunk};
+use serde::{Deserialize, Serialize};
 use tracing::{debug, trace};
 
-use crate::history::{Block, BlockType, Message, Role};
+use crate::history::{BlockType, Message, Role};
 
-pub const DEFAULT_OPENAI_MODEL: &str = "gpt-4.1-nano";
+const INCEPTION_URL: &str = "https://api.inceptionlabs.ai/v1/chat/completions";
+const INCEPTION_MODEL: &str = "mercury-2";
+const INCEPTION_MAX_TOKENS: u32 = 1000;
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[derive(Debug, Clone)]
-pub enum StreamEvent {
-    Text(String),
-    Thinking(String),
+pub struct InceptionClient {
+    http: reqwest::Client,
+    api_key: String,
+    session_affinity: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct OpenAiConfig {
-    pub api_key: String,
-    pub base_url: Option<String>,
-    pub model: String,
-    pub system_prompt: Option<String>,
-}
+impl InceptionClient {
+    pub fn from_env(env: &[(OsString, OsString)], session_affinity: String) -> Result<Self> {
+        let api_key = env
+            .iter()
+            .find(|(k, _)| k == "INCEPTION_API_KEY")
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("INCEPTION_API_KEY not set in client environment"))?;
 
-impl OpenAiConfig {
-    pub fn from_env() -> Result<Self> {
-        let api_key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
-        let base_url = std::env::var("OPENAI_BASE_URL").ok();
-        let model =
-            std::env::var("OPENAI_MODEL").unwrap_or_else(|_| DEFAULT_OPENAI_MODEL.to_string());
-        let system_prompt = std::env::var("FRANCES_SYSTEM_PROMPT").ok();
+        let http = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .context("build reqwest client")?;
 
         Ok(Self {
+            http,
             api_key,
-            base_url,
-            model,
-            system_prompt,
-        })
-    }
-}
-
-pub struct OpenAiProvider {
-    client: OpenAI,
-    system_prompt: Option<String>,
-}
-
-impl std::fmt::Debug for OpenAiProvider {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpenAiProvider")
-            .field("system_prompt", &self.system_prompt)
-            .finish_non_exhaustive()
-    }
-}
-
-impl OpenAiProvider {
-    pub fn new(config: OpenAiConfig) -> Result<Self> {
-        debug!(model = %config.model, has_base_url = config.base_url.is_some(), "constructing openai provider");
-
-        let client = OpenAI::new(
-            config.api_key,
-            config.base_url,
-            Some(config.model),
-            None,
-            None,
-            None,
-            config.system_prompt.clone(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|error| anyhow!(error.to_string()))?;
-
-        Ok(Self {
-            client,
-            system_prompt: config.system_prompt,
+            session_affinity,
         })
     }
 
-    pub fn prepend_system<'a>(
-        &self,
-        messages: impl IntoIterator<Item = &'a Message>,
-    ) -> Vec<ChatMessage> {
-        let mut out = Vec::new();
+    pub async fn stream<F>(&self, messages: &[Message], mut on_event: F) -> Result<()>
+    where
+        F: FnMut(StreamEvent<'_>) -> Result<()>,
+    {
+        let body = ChatRequest {
+            model: INCEPTION_MODEL,
+            messages: messages.iter().filter_map(to_chat_message).collect(),
+            max_tokens: INCEPTION_MAX_TOKENS,
+            stream: true,
+            stream_options: StreamOptions {
+                include_usage: true,
+            },
+        };
 
-        if let Some(prompt) = &self.system_prompt {
-            out.push(ChatMessage::assistant().content(prompt.clone()).build());
+        debug!(
+            messages = body.messages.len(),
+            "calling inception chat completions"
+        );
+
+        let response = self
+            .http
+            .post(INCEPTION_URL)
+            .bearer_auth(&self.api_key)
+            .header("x-session-affinity", &self.session_affinity)
+            .json(&body)
+            .send()
+            .await
+            .context("inception request failed")?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(anyhow!("inception returned {status}: {text}"));
         }
 
-        out.extend(messages.into_iter().map(to_chat_message));
-        out
-    }
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
 
-    pub async fn stream<'a>(
-        &self,
-        messages: impl IntoIterator<Item = &'a Message>,
-    ) -> Result<Vec<StreamEvent>> {
-        let request = self.prepend_system(messages);
-        debug!(messages = request.len(), "starting llm stream");
-
-        let mut stream = self
-            .client
-            .chat_stream_with_tools(&request, None)
-            .await
-            .map_err(|error| anyhow!(error.to_string()))?;
-
-        let mut events = Vec::new();
         while let Some(chunk) = stream.next().await {
-            match chunk.map_err(|error| anyhow!(error.to_string()))? {
-                StreamChunk::Text(text) => {
-                    trace!(bytes = text.len(), "received llm text chunk");
-                    events.push(StreamEvent::Text(text));
-                }
-                StreamChunk::Done { stop_reason } => {
-                    trace!(%stop_reason, "llm stream completed");
-                }
-                StreamChunk::ToolUseStart { name, .. } => {
-                    trace!(tool = %name, "ignoring llm tool call start");
-                }
-                StreamChunk::ToolUseInputDelta { .. } | StreamChunk::ToolUseComplete { .. } => {
-                    trace!("ignoring llm tool call chunk");
+            let chunk = chunk.context("inception stream chunk")?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+            while let Some(idx) = buffer.find("\n\n") {
+                let event: String = buffer.drain(..idx + 2).collect();
+                for line in event.lines() {
+                    let Some(payload) = line.strip_prefix("data:") else {
+                        continue;
+                    };
+                    let payload = payload.trim();
+                    if payload.is_empty() || payload == "[DONE]" {
+                        continue;
+                    }
+
+                    let parsed: ChatStreamEvent = match serde_json::from_str(payload) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            trace!(%error, payload, "skipping unparsable sse payload");
+                            continue;
+                        }
+                    };
+
+                    for choice in parsed.choices {
+                        if let Some(content) = choice.delta.content {
+                            if !content.is_empty() {
+                                on_event(StreamEvent::Text(&content))?;
+                            }
+                        }
+                    }
+
+                    if let Some(usage) = parsed.usage {
+                        on_event(StreamEvent::Usage(usage))?;
+                    }
                 }
             }
         }
 
-        Ok(events)
+        Ok(())
     }
 }
 
-fn to_chat_message(message: &Message) -> ChatMessage {
+#[derive(Debug, Clone)]
+pub enum StreamEvent<'a> {
+    Text(&'a str),
+    Usage(Usage),
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u32,
+    #[serde(default)]
+    pub completion_tokens: u32,
+    #[serde(default)]
+    pub total_tokens: u32,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: u32,
+}
+
+fn to_chat_message(message: &Message) -> Option<ChatMessage> {
     let role = match message.role {
-        Role::System | Role::User | Role::Tool => ChatRole::User,
-        Role::Assistant => ChatRole::Assistant,
+        Role::User | Role::System | Role::Tool => "user",
+        Role::Assistant => "assistant",
     };
 
     let content = message
         .blocks
         .iter()
         .filter_map(|block| match block.kind {
-            BlockType::Text | BlockType::Thinking => Some(block.text.as_str()),
-            BlockType::Image | BlockType::ToolUse | BlockType::ToolResult => None,
+            BlockType::Text => Some(block.text.as_str()),
+            BlockType::Thinking | BlockType::Image | BlockType::ToolUse | BlockType::ToolResult => {
+                None
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
 
-    ChatMessage::new(role).content(content).build()
-}
-
-trait ChatMessageExt {
-    fn new(role: ChatRole) -> llm::chat::ChatMessageBuilder;
-}
-
-impl ChatMessageExt for ChatMessage {
-    fn new(role: ChatRole) -> llm::chat::ChatMessageBuilder {
-        match role {
-            ChatRole::User => ChatMessage::user(),
-            ChatRole::Assistant => ChatMessage::assistant(),
-        }
+    if content.is_empty() {
+        return None;
     }
+
+    Some(ChatMessage { role, content })
 }
 
-#[allow(dead_code)]
-fn _block_to_text(block: &Block) -> Option<&str> {
-    match block.kind {
-        BlockType::Text | BlockType::Thinking => Some(block.text.as_str()),
-        BlockType::Image | BlockType::ToolUse | BlockType::ToolResult => None,
-    }
+#[derive(Serialize)]
+struct ChatRequest<'a> {
+    model: &'a str,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+    stream: bool,
+    stream_options: StreamOptions,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+#[derive(Serialize)]
+struct ChatMessage {
+    role: &'static str,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ChatStreamEvent {
+    #[serde(default)]
+    choices: Vec<ChatStreamChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
+}
+
+#[derive(Deserialize)]
+struct ChatStreamChoice {
+    #[serde(default)]
+    delta: ChatStreamDelta,
+}
+
+#[derive(Default, Deserialize)]
+struct ChatStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
 }

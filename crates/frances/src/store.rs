@@ -1,50 +1,48 @@
+use std::ops::Deref;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tracing::trace;
-use turso::{Builder, Connection, Database};
+use turso::{Builder, Connection};
 
-use crate::session::Paths;
+use crate::session::Session;
 
 #[derive(Clone)]
-pub struct Store {
-    database: Database,
-    path: PathBuf,
+pub struct Database {
+    conn: Connection,
+    path: Arc<PathBuf>,
 }
 
-impl std::fmt::Debug for Store {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Store").field("path", &self.path).finish()
+pub struct ActiveDatabase(Connection);
+
+impl Deref for ActiveDatabase {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.0
     }
 }
 
-impl Store {
-    pub async fn open(paths: &Paths) -> Result<Self> {
-        let path = paths.state_root.join("frances.db");
-        trace!(path = %path.display(), "opening turso store");
+impl Drop for ActiveDatabase {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.cacheflush() {
+            tracing::warn!(%error, "cacheflush failed");
+        }
+    }
+}
+
+impl Database {
+    pub async fn open(session: &Session) -> Result<Self> {
+        let path = session.database_path();
+        trace!(path = %path.display(), "opening turso database");
 
         let database = Builder::new_local(&path.to_string_lossy())
             .build()
             .await
             .context("build turso database")?;
+        let conn = database.connect().context("connect turso database")?;
 
-        let store = Self { database, path };
-        store.initialize().await?;
-        Ok(store)
-    }
-
-    pub fn connect(&self) -> Result<Connection> {
-        trace!(path = %self.path.display(), "opening turso connection");
-        self.database.connect().context("connect turso database")
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
-    async fn initialize(&self) -> Result<()> {
-        let conn = self.connect()?;
-        trace!(path = %self.path.display(), "initializing turso schema");
+        trace!(path = %path.display(), "initializing turso schema");
         conn.execute_batch(
             r#"
             CREATE TABLE IF NOT EXISTS messages (
@@ -68,6 +66,22 @@ impl Store {
         )
         .await
         .context("initialize turso schema")?;
-        Ok(())
+
+        Ok(Self {
+            conn,
+            path: Arc::new(path),
+        })
+    }
+
+    pub fn connect(&self) -> ActiveDatabase {
+        ActiveDatabase(self.conn.clone())
+    }
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &*self.path)
+            .finish()
     }
 }

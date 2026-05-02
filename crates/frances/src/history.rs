@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
-use crate::store::Store;
+use crate::store::Database;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
@@ -82,12 +82,12 @@ pub struct Message {
 
 #[derive(Debug, Clone)]
 pub struct HistoryStore {
-    store: Store,
+    db: Database,
 }
 
 impl HistoryStore {
-    pub fn new(store: Store) -> Self {
-        Self { store }
+    pub fn new(db: Database) -> Self {
+        Self { db }
     }
 
     pub async fn append(&self, role: Role, blocks: Vec<Block>) -> Result<Message> {
@@ -97,7 +97,7 @@ impl HistoryStore {
             "appending history message"
         );
 
-        let conn = self.store.connect()?;
+        let conn = self.db.connect();
         let seq = next_seq(&conn).await?;
 
         conn.execute(
@@ -135,7 +135,7 @@ impl HistoryStore {
     pub async fn messages(&self) -> Result<Vec<Message>> {
         trace!("loading history messages");
 
-        let conn = self.store.connect()?;
+        let conn = self.db.connect();
         let mut rows = conn
             .query(
                 "
@@ -205,7 +205,7 @@ impl HistoryStore {
     pub async fn clear(&self) -> Result<()> {
         trace!("clearing history tables");
 
-        let conn = self.store.connect()?;
+        let conn = self.db.connect();
         conn.execute("DELETE FROM blocks", ())
             .await
             .context("clear blocks")?;
