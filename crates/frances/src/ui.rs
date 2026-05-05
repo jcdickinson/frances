@@ -11,7 +11,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Text;
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 use tokio::runtime::Handle;
 use tui_textarea::TextArea;
@@ -95,14 +95,7 @@ impl App<'_> {
 
                     match run_streaming(terminal, self.session, prompt)? {
                         StreamOutcome::Quit => return Ok(()),
-                        StreamOutcome::Done { response, usage } => {
-                            if !response.is_empty() {
-                                let lines: Vec<String> = response
-                                    .lines()
-                                    .map(|line| format!("frances: {line}"))
-                                    .collect();
-                                emit_lines(terminal, &lines)?;
-                            }
+                        StreamOutcome::Done { usage } => {
                             if let Some(usage) = usage {
                                 emit_lines(terminal, &[format_usage(&usage)])?;
                             }
@@ -132,23 +125,15 @@ impl App<'_> {
 }
 
 enum StreamOutcome {
-    Done {
-        response: String,
-        usage: Option<Usage>,
-    },
+    Done { usage: Option<Usage> },
     Error(String),
     Quit,
 }
 
 fn format_usage(usage: &Usage) -> String {
-    let cached = usage
-        .prompt_tokens_details
-        .as_ref()
-        .map(|d| d.cached_tokens)
-        .unwrap_or(0);
     format!(
         "  ↳ tokens: prompt={} (cached={}) completion={} total={}",
-        usage.prompt_tokens, cached, usage.completion_tokens, usage.total_tokens
+        usage.prompt_tokens, usage.cached_input_tokens, usage.completion_tokens, usage.total_tokens
     )
 }
 
@@ -177,7 +162,8 @@ fn run_streaming(
         }
     });
 
-    let mut accumulated = String::new();
+    let mut line_buffer = String::new();
+    let mut first_line = true;
     let mut error: Option<String> = None;
     let mut usage: Option<Usage> = None;
 
@@ -188,14 +174,7 @@ fn run_streaming(
                 .borders(Borders::ALL)
                 .title("frances")
                 .title_style(Style::default().add_modifier(Modifier::BOLD));
-            let body = if accumulated.is_empty() {
-                "thinking…".to_string()
-            } else {
-                accumulated.clone()
-            };
-            let para = Paragraph::new(Text::raw(body))
-                .block(block)
-                .wrap(Wrap { trim: false });
+            let para = Paragraph::new(Text::raw("thinking…")).block(block);
             frame.render_widget(para, area);
         })?;
 
@@ -210,17 +189,18 @@ fn run_streaming(
 
         loop {
             match rx.try_recv() {
-                Ok(StreamFrame::Text(text)) => accumulated.push_str(&text),
+                Ok(StreamFrame::Text(text)) => {
+                    line_buffer.push_str(&text);
+                    flush_complete_lines(terminal, &mut line_buffer, &mut first_line)?;
+                }
                 Ok(StreamFrame::Usage(received)) => {
                     usage = Some(received);
                 }
                 Ok(StreamFrame::Done) => {
+                    flush_remaining(terminal, &mut line_buffer, &mut first_line)?;
                     return Ok(match error {
                         Some(message) => StreamOutcome::Error(message),
-                        None => StreamOutcome::Done {
-                            response: accumulated,
-                            usage,
-                        },
+                        None => StreamOutcome::Done { usage },
                     });
                 }
                 Ok(StreamFrame::Error(message)) => {
@@ -228,6 +208,7 @@ fn run_streaming(
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
+                    flush_remaining(terminal, &mut line_buffer, &mut first_line)?;
                     return Ok(match error {
                         Some(message) => StreamOutcome::Error(message),
                         None => StreamOutcome::Error("stream ended without response".to_string()),
@@ -236,6 +217,36 @@ fn run_streaming(
             }
         }
     }
+}
+
+fn flush_complete_lines(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    line_buffer: &mut String,
+    first_line: &mut bool,
+) -> io::Result<()> {
+    while let Some(idx) = line_buffer.find('\n') {
+        let raw: String = line_buffer.drain(..=idx).collect();
+        let line = raw.trim_end_matches('\n');
+        let prefix = if *first_line { "frances: " } else { "         " };
+        *first_line = false;
+        emit_lines(terminal, &[format!("{prefix}{line}")])?;
+    }
+    Ok(())
+}
+
+fn flush_remaining(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    line_buffer: &mut String,
+    first_line: &mut bool,
+) -> io::Result<()> {
+    flush_complete_lines(terminal, line_buffer, first_line)?;
+    if !line_buffer.is_empty() {
+        let prefix = if *first_line { "frances: " } else { "         " };
+        *first_line = false;
+        emit_lines(terminal, &[format!("{prefix}{line_buffer}")])?;
+        line_buffer.clear();
+    }
+    Ok(())
 }
 
 fn classify_key(key: &KeyEvent) -> KeyAction {

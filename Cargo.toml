@@ -21,7 +21,6 @@ tracing-subscriber = "0.3"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 serde_json = "1"
-bytes = "1"
 turso = { version = "0.6.0-pre.26", default-features = false }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 crossterm = "0.29"

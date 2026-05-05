@@ -21,7 +21,6 @@ tracing-subscriber.workspace = true
 futures-util.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
-bytes.workspace = true
 turso.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true

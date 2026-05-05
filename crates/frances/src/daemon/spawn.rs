@@ -47,13 +47,11 @@ pub async fn wait_for_ready(session: &Session, timeout: Duration) -> Result<()> 
 }
 
 pub fn cleanup_stale_runtime(session: &Session) -> Result<()> {
-    if let Ok(contents) = fs::read_to_string(session.pid_path()) {
-        if let Ok(pid) = contents.trim().parse::<u32>() {
-            let proc_path = std::path::PathBuf::from(format!("/proc/{pid}"));
-            if proc_path.exists() {
-                return Ok(());
-            }
-        }
+    if let Ok(contents) = fs::read_to_string(session.pid_path())
+        && let Ok(pid) = contents.trim().parse::<u32>()
+        && std::path::PathBuf::from(format!("/proc/{pid}")).exists()
+    {
+        return Ok(());
     }
 
     client::remove_socket_if_present(&session.control_socket_path())?;

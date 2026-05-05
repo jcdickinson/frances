@@ -21,7 +21,7 @@ use crate::daemon::protocol::{
     AttachResponse, Client, Control, DaemonStatus, PromptId, StreamFrame,
 };
 use crate::history::{Block, BlockType, HistoryStore, Role};
-use crate::llm::{InceptionClient, StreamEvent};
+use crate::llm::{self, InceptionClient};
 use crate::session::Session;
 use crate::store::Database;
 
@@ -378,44 +378,56 @@ async fn stream_prompt(
         .map(|ctx| ctx.process.env.clone())
         .ok_or_else(|| anyhow::anyhow!("no client context — attach first"))?;
 
-    let llm = InceptionClient::from_env(&env, state.session.id.clone())?;
+    let llm = InceptionClient::from_env(&env)?;
 
     let user_block = Block {
         kind: BlockType::Text,
         text: text.clone(),
         data: None,
     };
-    state.history.append(Role::User, vec![user_block]).await?;
+    let user_payload = serde_json::json!({ "role": "user", "content": text });
+    state
+        .history
+        .append(Role::User, vec![user_block], user_payload)
+        .await?;
 
-    let messages = state.history.messages().await?;
+    let payloads = state.history.openai_payloads().await?;
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let llm_task = tokio::spawn(async move {
+        llm.stream(&payloads, move |chunk| {
+            let _ = tx.send(chunk.clone());
+            Ok(())
+        })
+        .await
+    });
 
     let mut accumulated = String::new();
     let mut send_error: Option<anyhow::Error> = None;
-    let mut pending: Vec<StreamFrame> = Vec::new();
+    let mut chunks: Vec<serde_json::Value> = Vec::new();
 
-    let stream_result = llm
-        .stream(&messages, |event| {
-            let frame = match event {
-                StreamEvent::Text(chunk) => {
-                    accumulated.push_str(chunk);
-                    StreamFrame::Text(chunk.to_string())
+    while let Some(chunk) = rx.recv().await {
+        for delta in llm::chunk_text_deltas(&chunk) {
+            accumulated.push_str(delta);
+            if send_error.is_none() {
+                if let Err(error) =
+                    write_message(stream, &StreamFrame::Text(delta.to_string())).await
+                {
+                    send_error = Some(anyhow::Error::new(error));
                 }
-                StreamEvent::Usage(usage) => StreamFrame::Usage(usage),
-            };
-            pending.push(frame);
-            Ok(())
-        })
-        .await;
-
-    for frame in pending {
-        if send_error.is_some() {
-            break;
+            }
         }
-        if let Err(error) = write_message(stream, &frame).await {
-            send_error = Some(anyhow::Error::new(error));
+        if let Some(usage) = llm::chunk_usage(&chunk) {
+            if send_error.is_none() {
+                if let Err(error) = write_message(stream, &StreamFrame::Usage(usage)).await {
+                    send_error = Some(anyhow::Error::new(error));
+                }
+            }
         }
+        chunks.push(chunk);
     }
 
+    let stream_result = llm_task.await.context("llm task panicked")?;
     if let Some(error) = send_error {
         return Err(error);
     }
@@ -424,12 +436,17 @@ async fn stream_prompt(
     if !accumulated.is_empty() {
         let assistant_block = Block {
             kind: BlockType::Text,
-            text: accumulated,
+            text: accumulated.clone(),
             data: None,
         };
+        let assistant_payload = serde_json::json!({ "role": "assistant", "content": accumulated });
+        let assistant_msg = state
+            .history
+            .append(Role::Assistant, vec![assistant_block], assistant_payload)
+            .await?;
         state
             .history
-            .append(Role::Assistant, vec![assistant_block])
+            .append_response_chunks(assistant_msg.id, &chunks)
             .await?;
     }
 

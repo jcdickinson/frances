@@ -789,7 +789,6 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bincode 2.0.1",
- "bytes",
  "clap",
  "crossterm",
  "futures",

@@ -69,7 +69,7 @@ impl BlockType {
 pub struct Block {
     pub kind: BlockType,
     pub text: String,
-    pub data: Option<Vec<u8>>,
+    pub data: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -90,7 +90,12 @@ impl HistoryStore {
         Self { db }
     }
 
-    pub async fn append(&self, role: Role, blocks: Vec<Block>) -> Result<Message> {
+    pub async fn append(
+        &self,
+        role: Role,
+        blocks: Vec<Block>,
+        openai_payload: serde_json::Value,
+    ) -> Result<Message> {
         trace!(
             role = role.as_str(),
             blocks = blocks.len(),
@@ -124,12 +129,83 @@ impl HistoryStore {
             .with_context(|| format!("insert block {index}"))?;
         }
 
+        let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
+        conn.execute(
+            "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
+            (message_id, payload_text),
+        )
+        .await
+        .context("insert openai payload")?;
+
         Ok(Message {
             id: message_id,
             seq,
             role,
             blocks,
         })
+    }
+
+    pub async fn openai_payloads(&self) -> Result<Vec<serde_json::Value>> {
+        trace!("loading openai payloads");
+
+        let conn = self.db.connect();
+        let mut rows = conn
+            .query(
+                "
+                SELECT json(om.payload)
+                FROM messages m
+                JOIN openai_messages om ON om.message_id = m.id
+                ORDER BY m.seq
+                ",
+                (),
+            )
+            .await
+            .context("query openai payloads")?;
+
+        let mut payloads = Vec::new();
+        while let Some(row) = rows.next().await.context("iterate openai payloads")? {
+            let text = match row.get_value(0).context("payload column")? {
+                turso::Value::Text(value) => value,
+                other => return Err(anyhow!("unexpected payload value: {other:?}")),
+            };
+            let value: serde_json::Value = serde_json::from_str(&text).context("decode payload")?;
+            payloads.push(value);
+        }
+
+        Ok(payloads)
+    }
+
+    pub async fn append_response_chunks(
+        &self,
+        message_id: i64,
+        chunks: &[serde_json::Value],
+    ) -> Result<()> {
+        if chunks.is_empty() {
+            return Ok(());
+        }
+
+        trace!(
+            message_id,
+            chunks = chunks.len(),
+            "persisting response chunks"
+        );
+
+        let conn = self.db.connect();
+        for (index, chunk) in chunks.iter().enumerate() {
+            let chunk_text = serde_json::to_string(chunk).context("encode chunk")?;
+            conn.execute(
+                "INSERT INTO openai_response_chunks (message_id, seq, chunk) VALUES (?1, ?2, jsonb(?3))",
+                (
+                    message_id,
+                    i64::try_from(index).context("chunk index overflow")?,
+                    chunk_text,
+                ),
+            )
+            .await
+            .with_context(|| format!("insert response chunk {index}"))?;
+        }
+
+        Ok(())
     }
 
     pub async fn messages(&self) -> Result<Vec<Message>> {
@@ -192,7 +268,7 @@ impl HistoryStore {
 
             let data = match row.get_value(5).context("block data")? {
                 turso::Value::Null => None,
-                turso::Value::Blob(bytes) => Some(bytes),
+                turso::Value::Text(value) => Some(value),
                 other => return Err(anyhow!("unexpected block data value: {other:?}")),
             };
 

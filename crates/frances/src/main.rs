@@ -8,7 +8,7 @@ mod tty;
 mod ui;
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use daemon::{client, protocol, server, spawn};
 use tracing::debug;
 
@@ -22,11 +22,28 @@ struct Cli {
     #[arg(long, hide = true)]
     daemon: Option<String>,
 
-    #[arg(long, conflicts_with = "stop")]
-    status: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-    #[arg(long, conflicts_with = "status")]
-    stop: bool,
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Manage the daemon for the current TTY.
+    Daemon {
+        #[command(subcommand)]
+        action: DaemonAction,
+    },
+    /// Stop the daemon for the current TTY and unlink its session, so the
+    /// next invocation starts a fresh session.
+    New,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonAction {
+    /// Show daemon status for the current TTY.
+    Status,
+    /// Stop the daemon for the current TTY.
+    Stop,
 }
 
 #[tokio::main]
@@ -51,22 +68,36 @@ async fn real_main() -> Result<()> {
     let tty_key = tty::controlling_tty_key()?;
     let paths = Paths::discover()?;
 
-    if cli.status {
-        let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-        let status = client::status(&session).await?;
-        App {
-            session: &session,
-            status: &status,
+    match cli.command {
+        Some(Command::Daemon {
+            action: DaemonAction::Status,
+        }) => {
+            let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
+            let status = client::status(&session).await?;
+            App {
+                session: &session,
+                status: &status,
+            }
+            .run()?;
+            return Ok(());
         }
-        .run()?;
-        return Ok(());
-    }
-
-    if cli.stop {
-        let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-        client::stop(&session, false).await?;
-        println!("frances session stopping: {}", session.id);
-        return Ok(());
+        Some(Command::Daemon {
+            action: DaemonAction::Stop,
+        }) => {
+            let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
+            client::stop(&session, false).await?;
+            println!("frances session stopping: {}", session.id);
+            return Ok(());
+        }
+        Some(Command::New) => {
+            if let Some(session) = paths.resolve_tty_link(&tty_key)? {
+                if let Err(error) = client::stop(&session, false).await {
+                    debug!(%error, "stop request failed during `new`; continuing to unlink");
+                }
+                paths.unlink_tty(&tty_key)?;
+            }
+        }
+        None => {}
     }
 
     let invocation = InvocationContext::capture(Some(tty_key.clone()));

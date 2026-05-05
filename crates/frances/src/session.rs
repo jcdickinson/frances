@@ -183,6 +183,15 @@ impl Paths {
         Ok(())
     }
 
+    pub fn unlink_tty(&self, tty_key: &str) -> Result<bool> {
+        let link_path = self.tty_link_path(tty_key);
+        match fs::remove_file(&link_path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error).with_context(|| format!("failed removing tty link {tty_key}")),
+        }
+    }
+
     pub fn tty_link_path(&self, tty_key: &str) -> PathBuf {
         self.tty_links_root().join(tty_key)
     }

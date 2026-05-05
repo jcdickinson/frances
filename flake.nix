@@ -51,6 +51,8 @@
           packages = [
             rustToolchain
             pkgs.rust-analyzer
+            pkgs.jq
+            pkgs.python3
           ];
         };
       });
