@@ -18,7 +18,7 @@ use tracing::{debug, info, trace, warn};
 use crate::context::InvocationContext;
 use crate::daemon::client::{read_message, remove_socket_if_present, write_message};
 use crate::daemon::protocol::{
-    AttachResponse, Client, Control, DaemonStatus, PromptId, StreamFrame,
+    AttachResponse, BlockKind, Client, DaemonStatus, PROTOCOL_VERSION, PromptId, StreamFrame,
 };
 use crate::history::{Block, BlockType, HistoryStore, Role};
 use crate::llm::{self, InceptionClient};
@@ -84,27 +84,6 @@ impl EventsRouter {
                 None
             }
         }
-    }
-}
-
-#[derive(Clone)]
-struct ControlServer {
-    state: Arc<ServerState>,
-}
-
-impl Control for ControlServer {
-    async fn ping(self, _: context::Context) {}
-
-    async fn status(self, _: context::Context) -> DaemonStatus {
-        daemon_status(&self.state)
-    }
-
-    async fn stop(self, _: context::Context, _delete_state: bool) {
-        let state = self.state.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(SHUTDOWN_GRACE).await;
-            state.shutdown.notify_waiters();
-        });
     }
 }
 
@@ -274,29 +253,94 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     Ok(())
 }
 
+// The control socket speaks a deliberately tiny newline-delimited TEXT protocol,
+// not tarpc/bincode. Rationale: control is for management — "what version are
+// you?" and "please shut down" — and it has to keep working *across binary
+// versions* so a client built against a new schema can still ask an old daemon
+// to step aside. Any binary serialization format (bincode, protobuf, etc.)
+// breaks the moment a single field shape changes, which is exactly the
+// situation the version-mismatch flow exists to handle. Plain text with
+// `key=value` lines and an explicit terminator is forward-compatible by
+// convention: unknown commands → `err`; unknown keys → ignored.
+//
+// On every accepted connection the server's first action is to write the
+// current build's PROTOCOL_VERSION as a hex banner line. The client reads
+// that line first and can decide to bail without sending any command.
+//
+// Wire shape:
+//   server → client: "<protocol_version_hex>\n"
+//   client → server: "<command>[ <args>]\n"
+//   server → client: "ok\n" or "err <msg>\n"
+//                    optional "key=value\n" lines
+//                    "\n"  (blank line ends response)
 async fn serve_control(path: std::path::PathBuf, state: Arc<ServerState>) -> Result<()> {
-    let mut listener = tarpc::serde_transport::unix::listen(&path, Bincode::default).await?;
-    listener.config_mut().max_frame_length(usize::MAX);
-    while let Some(transport) = listener.next().await {
-        let transport = match transport {
-            Ok(t) => t,
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("bind control socket {}", path.display()))?;
+    loop {
+        let (mut stream, _) = match listener.accept().await {
+            Ok(pair) => pair,
             Err(error) => {
                 warn!(%error, "control accept error");
                 continue;
             }
         };
-        let server = ControlServer {
-            state: state.clone(),
-        };
-        let channel = tarpc::server::BaseChannel::with_defaults(transport);
-        tokio::spawn(
-            channel
-                .execute(server.serve())
-                .for_each(|response| async move {
-                    tokio::spawn(response);
-                }),
-        );
+        let state = state.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_control_conn(&mut stream, state).await {
+                trace!(%error, "control handler exited");
+            }
+        });
     }
+}
+
+async fn handle_control_conn(stream: &mut UnixStream, state: Arc<ServerState>) -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut write_half) = stream.split();
+
+    // Greet with our build's protocol id so the client can decide compatibility
+    // before issuing any command.
+    write_half
+        .write_all(format!("{PROTOCOL_VERSION:016x}\n").as_bytes())
+        .await?;
+    write_half.flush().await?;
+
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    if reader.read_line(&mut line).await? == 0 {
+        return Ok(());
+    }
+    let request = line.trim();
+    let mut parts = request.splitn(2, char::is_whitespace);
+    let cmd = parts.next().unwrap_or("");
+    let args = parts.next().unwrap_or("").trim();
+
+    let response = match cmd {
+        "ping" => "ok\n\n".to_string(),
+        "status" => {
+            let s = daemon_status(&state);
+            let mut out = String::from("ok\n");
+            out.push_str(&format!("session_id={}\n", s.session_id));
+            out.push_str(&format!("client_attached={}\n", s.client_attached));
+            out.push_str(&format!("daemon_pid={}\n", s.daemon_pid));
+            out.push_str(&format!("protocol_version={:016x}\n", s.protocol_version));
+            out.push('\n');
+            out
+        }
+        "stop" => {
+            let _delete_state = args.split_whitespace().any(|tok| tok == "delete=1");
+            let state = state.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(SHUTDOWN_GRACE).await;
+                state.shutdown.notify_waiters();
+            });
+            "ok\n\n".to_string()
+        }
+        other => format!("err unknown command: {other}\n\n"),
+    };
+
+    write_half.write_all(response.as_bytes()).await?;
+    write_half.flush().await?;
     Ok(())
 }
 
@@ -386,12 +430,49 @@ async fn stream_prompt(
         data: None,
     };
     let user_payload = serde_json::json!({ "role": "user", "content": text });
-    state
+    let user_msg = state
         .history
         .append(Role::User, vec![user_block], user_payload)
         .await?;
 
+    let mut send_error: Option<anyhow::Error> = None;
+    let user_id = user_msg.id as u64;
+    for frame in [
+        StreamFrame::BlockStart {
+            id: user_id,
+            kind: BlockKind::UserText,
+        },
+        StreamFrame::BlockDelta {
+            id: user_id,
+            text: text.clone(),
+        },
+        StreamFrame::BlockStop { id: user_id },
+    ] {
+        if send_error.is_some() {
+            break;
+        }
+        if let Err(error) = write_message(stream, &frame).await {
+            send_error = Some(anyhow::Error::new(error));
+        }
+    }
+
+    let assistant_id_i64 = state.history.start_assistant().await?;
+    let assistant_id = assistant_id_i64 as u64;
     let payloads = state.history.openai_payloads().await?;
+
+    if send_error.is_none() {
+        if let Err(error) = write_message(
+            stream,
+            &StreamFrame::BlockStart {
+                id: assistant_id,
+                kind: BlockKind::AssistantText,
+            },
+        )
+        .await
+        {
+            send_error = Some(anyhow::Error::new(error));
+        }
+    }
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let llm_task = tokio::spawn(async move {
@@ -403,15 +484,20 @@ async fn stream_prompt(
     });
 
     let mut accumulated = String::new();
-    let mut send_error: Option<anyhow::Error> = None;
     let mut chunks: Vec<serde_json::Value> = Vec::new();
 
     while let Some(chunk) = rx.recv().await {
         for delta in llm::chunk_text_deltas(&chunk) {
             accumulated.push_str(delta);
             if send_error.is_none() {
-                if let Err(error) =
-                    write_message(stream, &StreamFrame::Text(delta.to_string())).await
+                if let Err(error) = write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: assistant_id,
+                        text: delta.to_string(),
+                    },
+                )
+                .await
                 {
                     send_error = Some(anyhow::Error::new(error));
                 }
@@ -427,6 +513,14 @@ async fn stream_prompt(
         chunks.push(chunk);
     }
 
+    if send_error.is_none() {
+        if let Err(error) =
+            write_message(stream, &StreamFrame::BlockStop { id: assistant_id }).await
+        {
+            send_error = Some(anyhow::Error::new(error));
+        }
+    }
+
     let stream_result = llm_task.await.context("llm task panicked")?;
     if let Some(error) = send_error {
         return Err(error);
@@ -440,13 +534,13 @@ async fn stream_prompt(
             data: None,
         };
         let assistant_payload = serde_json::json!({ "role": "assistant", "content": accumulated });
-        let assistant_msg = state
+        state
             .history
-            .append(Role::Assistant, vec![assistant_block], assistant_payload)
+            .finish_assistant(assistant_id_i64, vec![assistant_block], assistant_payload)
             .await?;
         state
             .history
-            .append_response_chunks(assistant_msg.id, &chunks)
+            .append_response_chunks(assistant_id_i64, &chunks)
             .await?;
     }
 
@@ -464,6 +558,6 @@ fn daemon_status(state: &ServerState) -> DaemonStatus {
         control_socket_path: state.session.control_socket_path(),
         client_socket_path: state.session.client_socket_path(),
         events_socket_path: state.session.events_socket_path(),
-        protocol_version: 1,
+        protocol_version: PROTOCOL_VERSION,
     }
 }

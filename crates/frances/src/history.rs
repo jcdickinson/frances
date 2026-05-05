@@ -145,6 +145,62 @@ impl HistoryStore {
         })
     }
 
+    pub async fn start_assistant(&self) -> Result<i64> {
+        trace!("starting empty assistant message");
+
+        let conn = self.db.connect();
+        let seq = next_seq(&conn).await?;
+
+        conn.execute(
+            "INSERT INTO messages (seq, role) VALUES (?1, ?2)",
+            (seq, Role::Assistant.as_str()),
+        )
+        .await
+        .context("insert assistant placeholder")?;
+
+        last_insert_rowid(&conn).await
+    }
+
+    pub async fn finish_assistant(
+        &self,
+        message_id: i64,
+        blocks: Vec<Block>,
+        openai_payload: serde_json::Value,
+    ) -> Result<()> {
+        trace!(
+            message_id,
+            blocks = blocks.len(),
+            "finishing assistant message"
+        );
+
+        let conn = self.db.connect();
+
+        for (index, block) in blocks.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO blocks (message_id, seq, type, text, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                (
+                    message_id,
+                    i64::try_from(index).context("block index overflow")?,
+                    block.kind.as_str(),
+                    block.text.as_str(),
+                    block.data.clone(),
+                ),
+            )
+            .await
+            .with_context(|| format!("insert block {index}"))?;
+        }
+
+        let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
+        conn.execute(
+            "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
+            (message_id, payload_text),
+        )
+        .await
+        .context("insert openai payload")?;
+
+        Ok(())
+    }
+
     pub async fn openai_payloads(&self) -> Result<Vec<serde_json::Value>> {
         trace!("loading openai payloads");
 

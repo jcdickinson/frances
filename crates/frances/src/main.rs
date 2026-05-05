@@ -5,6 +5,7 @@ mod llm;
 mod session;
 mod store;
 mod tty;
+mod tui;
 mod ui;
 
 use anyhow::{Result, anyhow};
@@ -78,7 +79,8 @@ async fn real_main() -> Result<()> {
                 session: &session,
                 status: &status,
             }
-            .run()?;
+            .run()
+            .await?;
             return Ok(());
         }
         Some(Command::Daemon {
@@ -114,7 +116,8 @@ async fn real_main() -> Result<()> {
                 session: &session,
                 status: &status,
             }
-            .run()?;
+            .run()
+            .await?;
         }
         protocol::AttachResponse::Busy => {
             println!("frances session busy: {}", session.id);

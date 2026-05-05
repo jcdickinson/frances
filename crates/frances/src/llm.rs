@@ -53,7 +53,10 @@ impl InceptionClient {
             },
         };
 
-        debug!(messages = messages.len(), "calling openrouter chat completions");
+        debug!(
+            messages = messages.len(),
+            "calling openrouter chat completions"
+        );
 
         let response = self
             .http

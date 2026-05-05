@@ -9,6 +9,9 @@ authors.workspace = true
 name = "frances"
 path = "src/main.rs"
 
+[build-dependencies]
+sha2 = "0.10"
+
 [dependencies]
 anyhow.workspace = true
 bincode.workspace = true
@@ -22,9 +25,8 @@ futures-util.workspace = true
 reqwest.workspace = true
 serde_json.workspace = true
 turso.workspace = true
-ratatui.workspace = true
 crossterm.workspace = true
-tui-textarea.workspace = true
+unicode-width.workspace = true
 tarpc.workspace = true
 futures.workspace = true
 thiserror.workspace = true

@@ -3,16 +3,29 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+use tracing::info;
 
 use crate::daemon::client;
+use crate::daemon::protocol::PROTOCOL_VERSION;
 use crate::session::Session;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub async fn ensure_daemon(session: &Session) -> Result<()> {
-    if client::ping(session).await.is_ok() {
-        return Ok(());
+    // First strike: a daemon is already listening, but its build differs.
+    // Stop it and let the spawn path take over.
+    if let Ok(version) = client::daemon_version(session).await {
+        if version == PROTOCOL_VERSION {
+            return Ok(());
+        }
+        info!(
+            daemon = format!("{version:016x}"),
+            client = format!("{:016x}", PROTOCOL_VERSION),
+            "protocol version mismatch — restarting daemon"
+        );
+        let _ = client::stop(session, false).await;
+        wait_for_down(session, READINESS_TIMEOUT).await?;
     }
 
     cleanup_stale_runtime(session)?;
@@ -27,20 +40,44 @@ pub async fn ensure_daemon(session: &Session) -> Result<()> {
         .spawn()
         .with_context(|| format!("failed to spawn daemon for session {}", session.id))?;
 
-    wait_for_ready(session, READINESS_TIMEOUT).await
+    // Second strike: a freshly-spawned daemon should match our build. If it
+    // doesn't, something on disk is out of sync (e.g. a different binary got
+    // exec'd). Don't loop — bail loudly.
+    let version = wait_for_ready_and_check(session, READINESS_TIMEOUT).await?;
+    if version != PROTOCOL_VERSION {
+        return Err(anyhow!(
+            "freshly-spawned daemon reports {version:016x} but client is {client:016x} — client binary out of sync with disk",
+            client = PROTOCOL_VERSION,
+        ));
+    }
+    Ok(())
 }
 
-pub async fn wait_for_ready(session: &Session, timeout: Duration) -> Result<()> {
+async fn wait_for_ready_and_check(session: &Session, timeout: Duration) -> Result<u64> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if client::ping(session).await.is_ok() {
+        if let Ok(version) = client::daemon_version(session).await {
+            return Ok(version);
+        }
+        tokio::time::sleep(READINESS_POLL_INTERVAL).await;
+    }
+    Err(anyhow!(
+        "daemon for session {} did not become ready within {:?}",
+        session.id,
+        timeout
+    ))
+}
+
+async fn wait_for_down(session: &Session, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if client::daemon_version(session).await.is_err() {
             return Ok(());
         }
         tokio::time::sleep(READINESS_POLL_INTERVAL).await;
     }
-
     Err(anyhow!(
-        "daemon for session {} did not become ready within {:?}",
+        "daemon for session {} did not shut down within {:?}",
         session.id,
         timeout
     ))
