@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances"]
+members = ["crates/frances", "crates/frances-anchors"]
 resolver = "2"
 
 [workspace.package]
@@ -27,3 +27,4 @@ unicode-width = "0.2"
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "serde-transport-bincode", "unix"] }
 futures = "0.3"
 thiserror = "2"
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }

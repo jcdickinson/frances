@@ -759,6 +759,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "frances-anchors"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "twox-hash",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
