@@ -11,7 +11,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::daemon::client;
-use crate::daemon::protocol::{BlockKind, DaemonStatus, PromptId, StreamFrame};
+use crate::daemon::protocol::{BlockId, BlockKind, DaemonStatus, PromptId, StreamFrame};
 use crate::llm::Usage;
 use crate::session::Session;
 use crate::tui::region::Region;
@@ -22,7 +22,7 @@ use crate::tui::{BlockView, Screen, Textarea, scrollback};
 static NEXT_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_prompt_id() -> PromptId {
-    NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed)
+    PromptId(NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 pub struct App<'a> {
@@ -36,11 +36,97 @@ enum KeyAction {
     Edit,
 }
 
-struct Active {
-    id: u64,
+struct ActiveBlock {
+    id: BlockId,
     kind: BlockKind,
     text: String,
     committed_lines: u16,
+}
+
+/// Local state machine for the in-progress streamed block. Replaces the
+/// previous `Option<Active>` shape so out-of-order frames (delta with no
+/// active block, stop for a mismatched id) become explicit errors instead
+/// of silent drops.
+enum BlockState {
+    Idle,
+    Active(ActiveBlock),
+}
+
+impl BlockState {
+    fn new() -> Self {
+        Self::Idle
+    }
+
+    /// Begin a new block. Returns the previously-active block if any so the
+    /// caller can commit it.
+    fn start(&mut self, id: BlockId, kind: BlockKind) -> Option<ActiveBlock> {
+        let prev = match std::mem::replace(self, Self::Idle) {
+            Self::Active(active) => Some(active),
+            Self::Idle => None,
+        };
+        *self = Self::Active(ActiveBlock {
+            id,
+            kind,
+            text: String::new(),
+            committed_lines: 0,
+        });
+        prev
+    }
+
+    fn delta(&mut self, id: BlockId, text: &str) -> Result<()> {
+        match self {
+            Self::Idle => Err(anyhow::anyhow!(
+                "BlockDelta {id} arrived with no active block"
+            )),
+            Self::Active(active) => {
+                if active.id != id {
+                    return Err(anyhow::anyhow!(
+                        "BlockDelta {id} does not match active block {}",
+                        active.id
+                    ));
+                }
+                active.text.push_str(text);
+                Ok(())
+            }
+        }
+    }
+
+    fn stop(&mut self, id: BlockId) -> Result<ActiveBlock> {
+        match self {
+            Self::Idle => Err(anyhow::anyhow!(
+                "BlockStop {id} arrived with no active block"
+            )),
+            Self::Active(active) => {
+                if active.id != id {
+                    return Err(anyhow::anyhow!(
+                        "BlockStop {id} does not match active block {}",
+                        active.id
+                    ));
+                }
+                let active = match std::mem::replace(self, Self::Idle) {
+                    Self::Active(a) => a,
+                    Self::Idle => unreachable!(),
+                };
+                Ok(active)
+            }
+        }
+    }
+
+    /// Take the active block (if any) and reset to Idle. Used at terminal
+    /// `Done` / `Error` frames to flush whatever's in flight.
+    fn take(&mut self) -> Option<ActiveBlock> {
+        match std::mem::replace(self, Self::Idle) {
+            Self::Active(a) => Some(a),
+            Self::Idle => None,
+        }
+    }
+
+    fn as_active_mut(&mut self) -> Option<&mut ActiveBlock> {
+        match self {
+            Self::Active(a) => Some(a),
+            Self::Idle => None,
+        }
+    }
 }
 
 impl App<'_> {
@@ -57,12 +143,12 @@ impl App<'_> {
         scrollback::emit_text(screen, &self.banner_lines())?;
 
         let mut textarea = Textarea::new("type a message…");
-        let mut active: Option<Active> = None;
+        let mut state = BlockState::new();
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
         let mut events = EventStream::new();
 
         loop {
-            redraw(screen, &textarea, &mut active)?;
+            redraw(screen, &textarea, &mut state)?;
 
             tokio::select! {
                 Some(event) = events.next() => {
@@ -88,7 +174,7 @@ impl App<'_> {
                     }
                 }
                 Some(frame) = frame_rx.recv() => {
-                    handle_frame(screen, &mut active, frame)?;
+                    handle_frame(screen, &mut state, frame)?;
                 }
             }
         }
@@ -106,12 +192,12 @@ impl App<'_> {
     }
 }
 
-fn redraw(screen: &mut Screen, textarea: &Textarea, active: &mut Option<Active>) -> Result<()> {
+fn redraw(screen: &mut Screen, textarea: &Textarea, state: &mut BlockState) -> Result<()> {
     let width = screen.width();
     let max_block_rows = screen.height().saturating_sub(INPUT_HEIGHT);
 
-    let visible_lines: Vec<String> = if let Some(a) = active.as_mut() {
-        let wrapped = BlockView::new(a.kind, &a.text).wrapped_lines(width);
+    let visible_lines: Vec<String> = if let Some(a) = state.as_active_mut() {
+        let wrapped = BlockView::new(&a.kind, &a.text).wrapped_lines(width);
         let total = wrapped.len() as u16;
         let uncommitted = total.saturating_sub(a.committed_lines);
         let overflow = uncommitted.saturating_sub(max_block_rows);
@@ -149,48 +235,30 @@ fn redraw(screen: &mut Screen, textarea: &Textarea, active: &mut Option<Active>)
     Ok(())
 }
 
-fn handle_frame(
-    screen: &mut Screen,
-    active: &mut Option<Active>,
-    frame: StreamFrame,
-) -> Result<()> {
+fn handle_frame(screen: &mut Screen, state: &mut BlockState, frame: StreamFrame) -> Result<()> {
     match frame {
         StreamFrame::BlockStart { id, kind } => {
-            if let Some(prev) = active.take() {
+            if let Some(prev) = state.start(id, kind) {
                 commit_remaining(screen, &prev)?;
             }
-            *active = Some(Active {
-                id,
-                kind,
-                text: String::new(),
-                committed_lines: 0,
-            });
         }
         StreamFrame::BlockDelta { id, text } => {
-            if let Some(a) = active.as_mut() {
-                if a.id == id {
-                    a.text.push_str(&text);
-                }
-            }
+            state.delta(id, &text)?;
         }
         StreamFrame::BlockStop { id } => {
-            if let Some(a) = active.as_ref() {
-                if a.id == id {
-                    let prev = active.take().expect("checked above");
-                    commit_remaining(screen, &prev)?;
-                }
-            }
+            let prev = state.stop(id)?;
+            commit_remaining(screen, &prev)?;
         }
         StreamFrame::Usage(usage) => {
             scrollback::emit_text(screen, &[format_usage(&usage)])?;
         }
         StreamFrame::Done => {
-            if let Some(prev) = active.take() {
+            if let Some(prev) = state.take() {
                 commit_remaining(screen, &prev)?;
             }
         }
         StreamFrame::Error(message) => {
-            if let Some(prev) = active.take() {
+            if let Some(prev) = state.take() {
                 commit_remaining(screen, &prev)?;
             }
             scrollback::emit_text(screen, &[format!("frances: error: {message}")])?;
@@ -199,14 +267,14 @@ fn handle_frame(
     Ok(())
 }
 
-fn commit_remaining(screen: &mut Screen, active: &Active) -> io::Result<()> {
+fn commit_remaining(screen: &mut Screen, active: &ActiveBlock) -> io::Result<()> {
     // The visible portion of the active block is already painted into the top
     // of the viewport by the most recent redraw. To finalise it into scrollback
     // we just shrink the viewport by that many rows — the bytes stay where
     // they are on screen but stop being repainted. Doing it this way avoids
     // `emit_above`'s scroll-and-rewrite, which would otherwise displace the
     // textarea borders into the rows we're about to drop into scrollback.
-    let wrapped = BlockView::new(active.kind, &active.text).wrapped_lines(screen.width());
+    let wrapped = BlockView::new(&active.kind, &active.text).wrapped_lines(screen.width());
     let uncommitted = (wrapped.len() as u16).saturating_sub(active.committed_lines);
     if uncommitted > 0 {
         let new_height = screen.viewport_height().saturating_sub(uncommitted);

@@ -1,9 +1,12 @@
+mod anchor_store;
 mod context;
 mod daemon;
+mod edit_session;
 mod history;
 mod llm;
 mod session;
 mod store;
+mod tools;
 mod tty;
 mod tui;
 mod ui;
@@ -127,7 +130,7 @@ async fn real_main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_existing_session_for_tty(paths: &Paths, tty_key: &str) -> Result<Session> {
+fn resolve_existing_session_for_tty(paths: &Paths, tty_key: &tty::TtyKey) -> Result<Session> {
     paths
         .resolve_tty_link(tty_key)?
         .ok_or_else(|| anyhow!("no frances session is linked to the current TTY"))

@@ -5,19 +5,63 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone)]
-pub struct TtyIdentity {
-    pub key: String,
-    pub tty_path: PathBuf,
-    pub session_leader: i32,
-    pub tty_nr: i64,
-    pub dev: u64,
-    pub inode: u64,
-    pub rdev: u64,
+/// Hashed identifier for the invoking process's controlling TTY. Used as a
+/// session-link filename. Distinct from arbitrary strings to prevent
+/// confusion with session ids, paths, etc.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TtyKey(pub String);
+
+impl TtyKey {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
-pub fn controlling_tty_key() -> Result<String> {
+impl std::fmt::Display for TtyKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl AsRef<str> for TtyKey {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Pid(pub i32);
+
+/// `tty_nr` from `/proc/self/stat` — kernel-encoded device number with a
+/// non-standard bit layout, distinct from the file's `rdev` value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TtyDeviceNr(pub i64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct DeviceId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Inode(pub u64);
+
+/// Identifies the invoking process's controlling terminal. Only `key` is
+/// read externally (used as a session-link filename); the other fields are
+/// retained as forensic context — anything that contributes to `key` should
+/// stay reachable so we can debug a stale link.
+#[derive(Debug, Clone)]
+pub struct TtyIdentity {
+    pub key: TtyKey,
+    pub tty_path: PathBuf,
+    pub session_leader: Pid,
+    pub tty_nr: TtyDeviceNr,
+    pub dev: DeviceId,
+    pub inode: Inode,
+    pub rdev: DeviceId,
+}
+
+pub fn controlling_tty_key() -> Result<TtyKey> {
     Ok(controlling_tty_identity()?.key)
 }
 
@@ -35,25 +79,25 @@ pub fn controlling_tty_identity() -> Result<TtyIdentity> {
 
     let mut hasher = DefaultHasher::new();
     tty_path.hash(&mut hasher);
-    session_leader.hash(&mut hasher);
-    tty_nr.hash(&mut hasher);
+    session_leader.0.hash(&mut hasher);
+    tty_nr.0.hash(&mut hasher);
     metadata.dev().hash(&mut hasher);
     metadata.ino().hash(&mut hasher);
     metadata.rdev().hash(&mut hasher);
-    let key = format!("{:016x}", hasher.finish());
+    let key = TtyKey(format!("{:016x}", hasher.finish()));
 
     Ok(TtyIdentity {
         key,
         tty_path,
         session_leader,
         tty_nr,
-        dev: metadata.dev(),
-        inode: metadata.ino(),
-        rdev: metadata.rdev(),
+        dev: DeviceId(metadata.dev()),
+        inode: Inode(metadata.ino()),
+        rdev: DeviceId(metadata.rdev()),
     })
 }
 
-fn read_proc_self_stat() -> Result<(i32, i64)> {
+fn read_proc_self_stat() -> Result<(Pid, TtyDeviceNr)> {
     let stat = fs::read_to_string("/proc/self/stat").context("failed to read /proc/self/stat")?;
     let rparen = stat
         .rfind(')')
@@ -73,5 +117,5 @@ fn read_proc_self_stat() -> Result<(i32, i64)> {
         .parse::<i64>()
         .context("failed to parse tty_nr from /proc/self/stat")?;
 
-    Ok((session_leader, tty_nr))
+    Ok((Pid(session_leader), TtyDeviceNr(tty_nr)))
 }

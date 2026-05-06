@@ -15,25 +15,31 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, oneshot};
 use tracing::{debug, info, trace, warn};
 
+use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
 use crate::daemon::client::{read_message, remove_socket_if_present, write_message};
 use crate::daemon::protocol::{
-    AttachResponse, BlockKind, Client, DaemonStatus, PROTOCOL_VERSION, PromptId, StreamFrame,
+    AttachResponse, BlockId, BlockKind, Client, DaemonPid, DaemonStatus, PROTOCOL_VERSION,
+    PromptId, SessionId, StreamFrame,
 };
-use crate::history::{Block, BlockType, HistoryStore, Role};
-use crate::llm::{self, InceptionClient};
+use crate::edit_session::EditSession;
+use crate::history::{Block, HistoryStore, Role};
+use crate::llm::{self, InceptionClient, ToolCallAccumulator};
 use crate::session::Session;
 use crate::store::Database;
+use crate::tools;
+use frances_edit::EditEngine;
 
 const EVENTS_PAIRING_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
 
-struct ServerState {
+pub(crate) struct ServerState {
     session: Session,
     client_attached: StdMutex<bool>,
     last_context: StdMutex<Option<InvocationContext>>,
     daemon_pid: u32,
     history: HistoryStore,
+    edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
     events: EventsRouter,
     shutdown: Notify,
 }
@@ -115,7 +121,7 @@ impl Client for ClientServer {
                 .expect("last_context poisoned") = Some(ctx);
             *attached = true;
             AttachResponse::Attached {
-                session_id: self.state.session.id.clone(),
+                session_id: SessionId(self.state.session.id.clone()),
             }
         }
     }
@@ -197,12 +203,14 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     fs::write(session.pid_path(), std::process::id().to_string())
         .with_context(|| format!("failed writing pid file for {}", session.id))?;
 
+    let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
     let state = Arc::new(ServerState {
         session: session.clone(),
         client_attached: StdMutex::new(false),
         last_context: StdMutex::new(None),
         daemon_pid: std::process::id(),
         history: HistoryStore::new(db),
+        edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
     });
@@ -383,7 +391,7 @@ async fn accept_events(listener: UnixListener, state: Arc<ServerState>) {
                             return;
                         }
                     };
-                    trace!(prompt_id = id, "events socket registered");
+                    trace!(prompt_id = %id, "events socket registered");
                     state.events.register(id, stream);
                 });
             }
@@ -414,29 +422,41 @@ async fn stream_prompt(
     stream: &mut UnixStream,
     text: String,
 ) -> Result<()> {
-    let env = state
-        .last_context
-        .lock()
-        .expect("last_context poisoned")
-        .as_ref()
-        .map(|ctx| ctx.process.env.clone())
-        .ok_or_else(|| anyhow::anyhow!("no client context — attach first"))?;
+    let result = run_turn(state, stream, text).await;
+    if let Err(error) = state.edit_session.lock().await.end_turn().await {
+        warn!(%error, "edit_session::end_turn failed");
+    }
+    result
+}
+
+async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: String) -> Result<()> {
+    let (env, cwd) = {
+        let guard = state.last_context.lock().expect("last_context poisoned");
+        let ctx = guard
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no client context — attach first"))?;
+        (ctx.process.env.clone(), ctx.process.cwd.clone())
+    };
 
     let llm = InceptionClient::from_env(&env)?;
 
-    let user_block = Block {
-        kind: BlockType::Text,
-        text: text.clone(),
-        data: None,
+    let mut next_block: u64 = 1;
+    let mut alloc_block = || {
+        let id = BlockId(next_block);
+        next_block += 1;
+        id
     };
+
+    let mut send_error: Option<anyhow::Error> = None;
+
+    let user_block = Block::Text { text: text.clone() };
     let user_payload = serde_json::json!({ "role": "user", "content": text });
-    let user_msg = state
+    state
         .history
         .append(Role::User, vec![user_block], user_payload)
         .await?;
 
-    let mut send_error: Option<anyhow::Error> = None;
-    let user_id = user_msg.id as u64;
+    let user_id = alloc_block();
     for frame in [
         StreamFrame::BlockStart {
             id: user_id,
@@ -448,113 +468,265 @@ async fn stream_prompt(
         },
         StreamFrame::BlockStop { id: user_id },
     ] {
-        if send_error.is_some() {
+        try_write(stream, &frame, &mut send_error).await;
+    }
+
+    let mut iterations: u32 = 0;
+    loop {
+        iterations += 1;
+        if iterations.is_multiple_of(25) {
+            warn!(iterations, "agent loop running long");
+        }
+
+        let made_tool_calls = run_llm_step(
+            state,
+            stream,
+            &llm,
+            &mut alloc_block,
+            &mut send_error,
+            cwd.as_deref(),
+        )
+        .await?;
+
+        if !made_tool_calls {
             break;
         }
-        if let Err(error) = write_message(stream, &frame).await {
-            send_error = Some(anyhow::Error::new(error));
-        }
     }
 
-    let assistant_id_i64 = state.history.start_assistant().await?;
-    let assistant_id = assistant_id_i64 as u64;
+    if let Some(error) = send_error {
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Runs one LLM call, streams the result, persists the assistant message,
+/// and dispatches any tool calls (also persisting their results). Returns
+/// `true` if the model emitted tool calls (caller should loop), `false` if
+/// the model's response was terminal.
+async fn run_llm_step(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    llm: &InceptionClient,
+    alloc_block: &mut impl FnMut() -> BlockId,
+    send_error: &mut Option<anyhow::Error>,
+    cwd: Option<&std::path::Path>,
+) -> Result<bool> {
+    let assistant_message_id = state.history.start_assistant().await?;
     let payloads = state.history.openai_payloads().await?;
 
-    if send_error.is_none() {
-        if let Err(error) = write_message(
-            stream,
-            &StreamFrame::BlockStart {
-                id: assistant_id,
-                kind: BlockKind::AssistantText,
-            },
-        )
-        .await
-        {
-            send_error = Some(anyhow::Error::new(error));
-        }
-    }
+    let assistant_id = alloc_block();
+    let mut wire_active: Option<BlockId> = Some(assistant_id);
+    try_write(
+        stream,
+        &StreamFrame::BlockStart {
+            id: assistant_id,
+            kind: BlockKind::AssistantText,
+        },
+        send_error,
+    )
+    .await;
 
+    let llm_owned: InceptionClient = (*llm).clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let llm_task = tokio::spawn(async move {
-        llm.stream(&payloads, move |chunk| {
-            let _ = tx.send(chunk.clone());
-            Ok(())
-        })
-        .await
+        llm_owned
+            .stream(
+                &payloads,
+                tools::definitions(),
+                None,
+                move |chunk: &serde_json::Value| {
+                    let _ = tx.send(chunk.clone());
+                    Ok(())
+                },
+            )
+            .await
     });
 
-    let mut accumulated = String::new();
+    let mut accumulated_text = String::new();
     let mut chunks: Vec<serde_json::Value> = Vec::new();
+    let mut accumulator = ToolCallAccumulator::new();
+    // streaming-index → wire BlockId for the most recently started tool block.
+    // The TUI is single-active-block: a fresh BlockStart auto-closes the
+    // previous block on the wire, so we never explicitly Stop them — the only
+    // explicit Stop is for whichever block is `wire_active` when the stream ends.
+    let mut tool_block_for_index: HashMap<u32, BlockId> = HashMap::new();
 
     while let Some(chunk) = rx.recv().await {
         for delta in llm::chunk_text_deltas(&chunk) {
-            accumulated.push_str(delta);
-            if send_error.is_none() {
-                if let Err(error) = write_message(
+            accumulated_text.push_str(delta);
+            // Text deltas only make sense if the assistant block is still the
+            // active one. Once a tool call has started, we drop further text
+            // deltas on the wire (they'd address a closed block) — the model
+            // rarely emits text after tool_calls in OpenAI's stream anyway.
+            if wire_active == Some(assistant_id) {
+                try_write(
                     stream,
                     &StreamFrame::BlockDelta {
                         id: assistant_id,
                         text: delta.to_string(),
                     },
+                    send_error,
                 )
-                .await
-                {
-                    send_error = Some(anyhow::Error::new(error));
-                }
+                .await;
             }
         }
-        if let Some(usage) = llm::chunk_usage(&chunk) {
-            if send_error.is_none() {
-                if let Err(error) = write_message(stream, &StreamFrame::Usage(usage)).await {
-                    send_error = Some(anyhow::Error::new(error));
+        for tool_delta in llm::chunk_tool_call_deltas(&chunk) {
+            match &tool_delta.event {
+                llm::ToolCallEvent::Start { name, .. } => {
+                    let block_id = alloc_block();
+                    tool_block_for_index.insert(tool_delta.index, block_id);
+                    wire_active = Some(block_id);
+                    try_write(
+                        stream,
+                        &StreamFrame::BlockStart {
+                            id: block_id,
+                            kind: BlockKind::ToolUse {
+                                name: (*name).to_string(),
+                            },
+                        },
+                        send_error,
+                    )
+                    .await;
+                }
+                llm::ToolCallEvent::Append(fragment) => {
+                    if let Some(&block_id) = tool_block_for_index.get(&tool_delta.index) {
+                        if wire_active == Some(block_id) {
+                            try_write(
+                                stream,
+                                &StreamFrame::BlockDelta {
+                                    id: block_id,
+                                    text: (*fragment).to_string(),
+                                },
+                                send_error,
+                            )
+                            .await;
+                        }
+                    }
                 }
             }
+            accumulator.push(tool_delta)?;
+        }
+        if let Some(usage) = llm::chunk_usage(&chunk) {
+            try_write(stream, &StreamFrame::Usage(usage), send_error).await;
         }
         chunks.push(chunk);
     }
 
-    if send_error.is_none() {
-        if let Err(error) =
-            write_message(stream, &StreamFrame::BlockStop { id: assistant_id }).await
-        {
-            send_error = Some(anyhow::Error::new(error));
-        }
+    if let Some(id) = wire_active.take() {
+        try_write(stream, &StreamFrame::BlockStop { id }, send_error).await;
     }
 
     let stream_result = llm_task.await.context("llm task panicked")?;
-    if let Some(error) = send_error {
-        return Err(error);
-    }
     stream_result?;
 
-    if !accumulated.is_empty() {
-        let assistant_block = Block {
-            kind: BlockType::Text,
-            text: accumulated.clone(),
-            data: None,
+    let tool_calls = accumulator.finalize()?;
+
+    let mut assistant_blocks: Vec<Block> = Vec::new();
+    if !accumulated_text.is_empty() {
+        assistant_blocks.push(Block::Text {
+            text: accumulated_text.clone(),
+        });
+    }
+    for call in &tool_calls {
+        assistant_blocks.push(Block::ToolUse {
+            id: call.id.clone(),
+            name: call.name.clone(),
+            input: call.arguments.clone(),
+        });
+    }
+    let assistant_payload = tools::assistant_payload(&accumulated_text, &tool_calls);
+    state
+        .history
+        .finish_assistant(assistant_message_id, assistant_blocks, assistant_payload)
+        .await?;
+    state
+        .history
+        .append_response_chunks(assistant_message_id, &chunks)
+        .await?;
+
+    if tool_calls.is_empty() {
+        return Ok(false);
+    }
+
+    for call in &tool_calls {
+        let outcome = tools::dispatch(
+            call,
+            tools::ToolContext {
+                edit_session: &state.edit_session,
+                cwd,
+            },
+        )
+        .await;
+
+        let result_id = alloc_block();
+        try_write(
+            stream,
+            &StreamFrame::BlockStart {
+                id: result_id,
+                kind: BlockKind::ToolResult {
+                    tool_use_id: call.id.clone(),
+                    is_error: outcome.is_error,
+                },
+            },
+            send_error,
+        )
+        .await;
+        try_write(
+            stream,
+            &StreamFrame::BlockDelta {
+                id: result_id,
+                text: outcome.content.clone(),
+            },
+            send_error,
+        )
+        .await;
+        try_write(
+            stream,
+            &StreamFrame::BlockStop { id: result_id },
+            send_error,
+        )
+        .await;
+
+        let result_block = Block::ToolResult {
+            tool_use_id: call.id.clone(),
+            content: outcome.content.clone(),
+            is_error: outcome.is_error,
         };
-        let assistant_payload = serde_json::json!({ "role": "assistant", "content": accumulated });
+        let result_payload = tools::tool_result_payload(&call.id, &outcome.content);
         state
             .history
-            .finish_assistant(assistant_id_i64, vec![assistant_block], assistant_payload)
-            .await?;
-        state
-            .history
-            .append_response_chunks(assistant_id_i64, &chunks)
+            .append(Role::Tool, vec![result_block], result_payload)
             .await?;
     }
 
-    Ok(())
+    Ok(true)
+}
+
+/// Best-effort frame write that records the first send error and silently
+/// no-ops afterward. Once the client socket is gone, further frames would
+/// just fail; we keep consuming the LLM stream and persisting history so
+/// the next attach can replay it.
+async fn try_write(
+    stream: &mut UnixStream,
+    frame: &StreamFrame,
+    send_error: &mut Option<anyhow::Error>,
+) {
+    if send_error.is_some() {
+        return;
+    }
+    if let Err(error) = write_message(stream, frame).await {
+        *send_error = Some(anyhow::Error::new(error));
+    }
 }
 
 fn daemon_status(state: &ServerState) -> DaemonStatus {
     DaemonStatus {
-        session_id: state.session.id.clone(),
+        session_id: SessionId(state.session.id.clone()),
         client_attached: *state
             .client_attached
             .lock()
             .expect("client_attached poisoned"),
-        daemon_pid: state.daemon_pid,
+        daemon_pid: DaemonPid(state.daemon_pid),
         control_socket_path: state.session.control_socket_path(),
         client_socket_path: state.session.client_socket_path(),
         events_socket_path: state.session.events_socket_path(),

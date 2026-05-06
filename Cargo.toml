@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors"]
+members = ["crates/frances", "crates/frances-anchors", "crates/frances-edit"]
 resolver = "2"
 
 [workspace.package]
@@ -28,3 +28,9 @@ tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "
 futures = "0.3"
 thiserror = "2"
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
+similar = { version = "3.1", default-features = false }
+async-trait = "0.1"
+frances-anchors = { path = "crates/frances-anchors" }
+frances-edit = { path = "crates/frances-edit" }
+tempfile = "3"
+smallvec = "1"

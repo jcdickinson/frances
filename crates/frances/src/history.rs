@@ -4,6 +4,26 @@ use tracing::trace;
 
 use crate::store::Database;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageId(pub i64);
+
+impl std::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MessageSeq(pub i64);
+
+impl std::fmt::Display for MessageSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Role {
     System,
@@ -33,49 +53,38 @@ impl Role {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockType {
-    Text,
-    Thinking,
-    Image,
-    ToolUse,
-    ToolResult,
+/// Discriminated union of block payloads. The variant *is* the schema —
+/// you can't construct a `Text` block with image data, or a `ToolUse` with
+/// no name. Persisted as a single JSONB column (`blocks.payload`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Block {
+    Text {
+        text: String,
+    },
+    Thinking {
+        text: String,
+    },
+    Image {
+        description: String,
+        data: serde_json::Value,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
-impl BlockType {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Thinking => "thinking",
-            Self::Image => "image",
-            Self::ToolUse => "tool_use",
-            Self::ToolResult => "tool_result",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "text" => Ok(Self::Text),
-            "thinking" => Ok(Self::Thinking),
-            "image" => Ok(Self::Image),
-            "tool_use" => Ok(Self::ToolUse),
-            "tool_result" => Ok(Self::ToolResult),
-            _ => Err(anyhow!("unknown block type {value:?}")),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Block {
-    pub kind: BlockType,
-    pub text: String,
-    pub data: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Message {
-    pub id: i64,
-    pub seq: i64,
+    pub id: MessageId,
+    pub seq: MessageSeq,
     pub role: Role,
     pub blocks: Vec<Block>,
 }
@@ -107,7 +116,7 @@ impl HistoryStore {
 
         conn.execute(
             "INSERT INTO messages (seq, role) VALUES (?1, ?2)",
-            (seq, role.as_str()),
+            (seq.0, role.as_str()),
         )
         .await
         .context("insert message")?;
@@ -115,14 +124,13 @@ impl HistoryStore {
         let message_id = last_insert_rowid(&conn).await?;
 
         for (index, block) in blocks.iter().enumerate() {
+            let payload = serde_json::to_string(block).context("encode block")?;
             conn.execute(
-                "INSERT INTO blocks (message_id, seq, type, text, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO blocks (message_id, seq, payload) VALUES (?1, ?2, jsonb(?3))",
                 (
-                    message_id,
+                    message_id.0,
                     i64::try_from(index).context("block index overflow")?,
-                    block.kind.as_str(),
-                    block.text.as_str(),
-                    block.data.clone(),
+                    payload,
                 ),
             )
             .await
@@ -132,7 +140,7 @@ impl HistoryStore {
         let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
         conn.execute(
             "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
-            (message_id, payload_text),
+            (message_id.0, payload_text),
         )
         .await
         .context("insert openai payload")?;
@@ -145,7 +153,7 @@ impl HistoryStore {
         })
     }
 
-    pub async fn start_assistant(&self) -> Result<i64> {
+    pub async fn start_assistant(&self) -> Result<MessageId> {
         trace!("starting empty assistant message");
 
         let conn = self.db.connect();
@@ -153,7 +161,7 @@ impl HistoryStore {
 
         conn.execute(
             "INSERT INTO messages (seq, role) VALUES (?1, ?2)",
-            (seq, Role::Assistant.as_str()),
+            (seq.0, Role::Assistant.as_str()),
         )
         .await
         .context("insert assistant placeholder")?;
@@ -163,12 +171,12 @@ impl HistoryStore {
 
     pub async fn finish_assistant(
         &self,
-        message_id: i64,
+        message_id: MessageId,
         blocks: Vec<Block>,
         openai_payload: serde_json::Value,
     ) -> Result<()> {
         trace!(
-            message_id,
+            %message_id,
             blocks = blocks.len(),
             "finishing assistant message"
         );
@@ -176,14 +184,13 @@ impl HistoryStore {
         let conn = self.db.connect();
 
         for (index, block) in blocks.iter().enumerate() {
+            let payload = serde_json::to_string(block).context("encode block")?;
             conn.execute(
-                "INSERT INTO blocks (message_id, seq, type, text, data) VALUES (?1, ?2, ?3, ?4, ?5)",
+                "INSERT INTO blocks (message_id, seq, payload) VALUES (?1, ?2, jsonb(?3))",
                 (
-                    message_id,
+                    message_id.0,
                     i64::try_from(index).context("block index overflow")?,
-                    block.kind.as_str(),
-                    block.text.as_str(),
-                    block.data.clone(),
+                    payload,
                 ),
             )
             .await
@@ -193,7 +200,7 @@ impl HistoryStore {
         let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
         conn.execute(
             "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
-            (message_id, payload_text),
+            (message_id.0, payload_text),
         )
         .await
         .context("insert openai payload")?;
@@ -233,7 +240,7 @@ impl HistoryStore {
 
     pub async fn append_response_chunks(
         &self,
-        message_id: i64,
+        message_id: MessageId,
         chunks: &[serde_json::Value],
     ) -> Result<()> {
         if chunks.is_empty() {
@@ -241,7 +248,7 @@ impl HistoryStore {
         }
 
         trace!(
-            message_id,
+            %message_id,
             chunks = chunks.len(),
             "persisting response chunks"
         );
@@ -252,7 +259,7 @@ impl HistoryStore {
             conn.execute(
                 "INSERT INTO openai_response_chunks (message_id, seq, chunk) VALUES (?1, ?2, jsonb(?3))",
                 (
-                    message_id,
+                    message_id.0,
                     i64::try_from(index).context("chunk index overflow")?,
                     chunk_text,
                 ),
@@ -271,7 +278,7 @@ impl HistoryStore {
         let mut rows = conn
             .query(
                 "
-                SELECT m.id, m.seq, m.role, b.type, b.text, b.data
+                SELECT m.id, m.seq, m.role, json(b.payload)
                 FROM messages m
                 LEFT JOIN blocks b ON b.message_id = m.id
                 ORDER BY m.seq, b.seq
@@ -281,16 +288,16 @@ impl HistoryStore {
             .await
             .context("query messages")?;
 
-        let mut messages = Vec::new();
+        let mut messages: Vec<Message> = Vec::new();
 
         while let Some(row) = rows.next().await.context("iterate messages")? {
-            let message_id = row.get::<i64>(0).context("message id")?;
-            let message_seq = row.get::<i64>(1).context("message seq")?;
+            let message_id = MessageId(row.get::<i64>(0).context("message id")?);
+            let message_seq = MessageSeq(row.get::<i64>(1).context("message seq")?);
             let message_role = Role::parse(&row.get::<String>(2).context("message role")?)?;
 
             let needs_new = messages
                 .last()
-                .map(|message: &Message| message.id != message_id)
+                .map(|message| message.id != message_id)
                 .unwrap_or(true);
 
             if needs_new {
@@ -306,29 +313,18 @@ impl HistoryStore {
                 continue;
             };
 
-            let kind_value = row.get_value(3).context("block type")?;
-            if let turso::Value::Null = kind_value {
+            let payload_value = row.get_value(3).context("block payload")?;
+            if let turso::Value::Null = payload_value {
                 continue;
             }
 
-            let kind = match kind_value {
-                turso::Value::Text(value) => BlockType::parse(&value)?,
-                other => return Err(anyhow!("unexpected block type value: {other:?}")),
-            };
-
-            let text = match row.get_value(4).context("block text")? {
+            let payload_text = match payload_value {
                 turso::Value::Text(value) => value,
-                turso::Value::Null => String::new(),
-                other => return Err(anyhow!("unexpected block text value: {other:?}")),
+                other => return Err(anyhow!("unexpected block payload value: {other:?}")),
             };
-
-            let data = match row.get_value(5).context("block data")? {
-                turso::Value::Null => None,
-                turso::Value::Text(value) => Some(value),
-                other => return Err(anyhow!("unexpected block data value: {other:?}")),
-            };
-
-            message.blocks.push(Block { kind, text, data });
+            let block: Block =
+                serde_json::from_str(&payload_text).context("decode block payload")?;
+            message.blocks.push(block);
         }
 
         Ok(messages)
@@ -348,7 +344,7 @@ impl HistoryStore {
     }
 }
 
-async fn next_seq(conn: &turso::Connection) -> Result<i64> {
+async fn next_seq(conn: &turso::Connection) -> Result<MessageSeq> {
     let mut rows = conn
         .query("SELECT COALESCE(MAX(seq), -1) + 1 FROM messages", ())
         .await
@@ -358,10 +354,10 @@ async fn next_seq(conn: &turso::Connection) -> Result<i64> {
         .await
         .context("read next seq row")?
         .ok_or_else(|| anyhow!("next seq query returned no rows"))?;
-    row.get::<i64>(0).context("decode next seq")
+    Ok(MessageSeq(row.get::<i64>(0).context("decode next seq")?))
 }
 
-async fn last_insert_rowid(conn: &turso::Connection) -> Result<i64> {
+async fn last_insert_rowid(conn: &turso::Connection) -> Result<MessageId> {
     let mut rows = conn
         .query("SELECT last_insert_rowid()", ())
         .await
@@ -371,5 +367,7 @@ async fn last_insert_rowid(conn: &turso::Connection) -> Result<i64> {
         .await
         .context("read last_insert_rowid row")?
         .ok_or_else(|| anyhow!("last_insert_rowid query returned no rows"))?;
-    row.get::<i64>(0).context("decode last_insert_rowid")
+    Ok(MessageId(
+        row.get::<i64>(0).context("decode last_insert_rowid")?,
+    ))
 }

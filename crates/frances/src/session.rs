@@ -1,11 +1,15 @@
 use std::env;
 use std::fs;
-use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+#[cfg(test)]
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+
+use crate::tty::TtyKey;
 
 const METADATA_FILE: &str = "metadata.bin";
 const SESSION_DIR_MODE: u32 = 0o700;
@@ -128,7 +132,7 @@ impl Paths {
 
     pub fn resolve_or_create_for_tty(
         &self,
-        tty_key: &str,
+        tty_key: &TtyKey,
         cwd: Option<PathBuf>,
     ) -> Result<Session> {
         if let Some(session) = self.resolve_tty_link(tty_key)? {
@@ -140,7 +144,7 @@ impl Paths {
         Ok(session)
     }
 
-    pub fn resolve_tty_link(&self, tty_key: &str) -> Result<Option<Session>> {
+    pub fn resolve_tty_link(&self, tty_key: &TtyKey) -> Result<Option<Session>> {
         let link_path = self.tty_link_path(tty_key);
         if !link_path.exists() {
             return Ok(None);
@@ -173,7 +177,7 @@ impl Paths {
         }
     }
 
-    pub fn link_tty(&self, tty_key: &str, session: &Session) -> Result<()> {
+    pub fn link_tty(&self, tty_key: &TtyKey, session: &Session) -> Result<()> {
         let link_path = self.tty_link_path(tty_key);
         if link_path.exists() {
             let _ = fs::remove_file(&link_path);
@@ -183,7 +187,7 @@ impl Paths {
         Ok(())
     }
 
-    pub fn unlink_tty(&self, tty_key: &str) -> Result<bool> {
+    pub fn unlink_tty(&self, tty_key: &TtyKey) -> Result<bool> {
         let link_path = self.tty_link_path(tty_key);
         match fs::remove_file(&link_path) {
             Ok(()) => Ok(true),
@@ -192,8 +196,8 @@ impl Paths {
         }
     }
 
-    pub fn tty_link_path(&self, tty_key: &str) -> PathBuf {
-        self.tty_links_root().join(tty_key)
+    pub fn tty_link_path(&self, tty_key: &TtyKey) -> PathBuf {
+        self.tty_links_root().join(tty_key.as_str())
     }
 }
 
@@ -315,11 +319,12 @@ mod tests {
         paths.ensure_layout().expect("layout");
 
         let missing_target = paths.sessions_root().join("missing-session");
-        symlink(&missing_target, paths.tty_link_path("tty-key")).expect("create link");
+        let tty_key = TtyKey("tty-key".into());
+        symlink(&missing_target, paths.tty_link_path(&tty_key)).expect("create link");
 
-        let resolved = paths.resolve_tty_link("tty-key").expect("resolve tty");
+        let resolved = paths.resolve_tty_link(&tty_key).expect("resolve tty");
         assert!(resolved.is_none());
-        assert!(!paths.tty_link_path("tty-key").exists());
+        assert!(!paths.tty_link_path(&tty_key).exists());
 
         let _ = fs::remove_dir_all(root);
     }

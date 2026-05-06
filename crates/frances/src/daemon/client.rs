@@ -11,7 +11,9 @@ use tokio::net::UnixStream;
 use tracing::trace;
 
 use crate::context::InvocationContext;
-use crate::daemon::protocol::{AttachResponse, ClientClient, DaemonStatus, PromptId, StreamFrame};
+use crate::daemon::protocol::{
+    AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId, SessionId, StreamFrame,
+};
 use crate::session::Session;
 
 #[derive(Debug, Error)]
@@ -92,9 +94,9 @@ pub async fn status(session: &Session) -> Result<DaemonStatus, ClientError> {
         }
     }
     Ok(DaemonStatus {
-        session_id,
+        session_id: SessionId(session_id),
         client_attached,
-        daemon_pid,
+        daemon_pid: DaemonPid(daemon_pid),
         control_socket_path: session.control_socket_path(),
         client_socket_path: session.client_socket_path(),
         events_socket_path: session.events_socket_path(),
@@ -185,7 +187,7 @@ pub async fn prompt_stream<F>(
 where
     F: FnMut(StreamFrame),
 {
-    trace!(session_id = %session.id, prompt_id, "opening events socket");
+    trace!(session_id = %session.id, prompt_id = %prompt_id, "opening events socket");
     let mut events = UnixStream::connect(session.events_socket_path()).await?;
     write_message(&mut events, &prompt_id).await?;
 

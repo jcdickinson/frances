@@ -11,19 +11,27 @@ use super::widget::{RenderCtx, Widget};
 use crate::daemon::protocol::BlockKind;
 
 pub struct BlockView<'a> {
-    pub kind: BlockKind,
+    pub kind: &'a BlockKind,
     pub text: &'a str,
 }
 
 impl<'a> BlockView<'a> {
-    pub fn new(kind: BlockKind, text: &'a str) -> Self {
+    pub fn new(kind: &'a BlockKind, text: &'a str) -> Self {
         Self { kind, text }
     }
 
-    fn prefix(&self) -> &'static str {
+    fn prefix(&self) -> String {
         match self.kind {
-            BlockKind::UserText => "you: ",
-            BlockKind::AssistantText => "frances: ",
+            BlockKind::UserText => "you: ".to_string(),
+            BlockKind::AssistantText => "frances: ".to_string(),
+            BlockKind::ToolUse { name } => format!("→ {name}("),
+            BlockKind::ToolResult { is_error, .. } => {
+                if *is_error {
+                    "[err] ".to_string()
+                } else {
+                    "[ok] ".to_string()
+                }
+            }
         }
     }
 
@@ -34,11 +42,15 @@ impl<'a> BlockView<'a> {
 
         let mut out = Vec::new();
         for (i, source_line) in self.text.split('\n').enumerate() {
-            let lead = if i == 0 { prefix } else { indent.as_str() };
+            let lead = if i == 0 {
+                prefix.as_str()
+            } else {
+                indent.as_str()
+            };
             wrap_into(lead, source_line, max, &mut out);
         }
         if out.is_empty() {
-            out.push(prefix.to_string());
+            out.push(prefix);
         }
         out
     }

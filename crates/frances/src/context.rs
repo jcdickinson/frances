@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use tracing::trace;
 
+use crate::tty::TtyKey;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessContext {
     pub cwd: Option<PathBuf>,
@@ -13,12 +15,12 @@ pub struct ProcessContext {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvocationContext {
-    pub tty_key: Option<String>,
+    pub tty_key: Option<TtyKey>,
     pub process: ProcessContext,
 }
 
 impl InvocationContext {
-    pub fn capture(tty_key: Option<String>) -> Self {
+    pub fn capture(tty_key: Option<TtyKey>) -> Self {
         let context = Self {
             tty_key,
             process: ProcessContext {
