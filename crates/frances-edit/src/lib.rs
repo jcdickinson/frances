@@ -1,7 +1,6 @@
 mod anchor;
 mod edit;
 mod engine;
-mod patch;
 mod pool;
 mod reconcile;
 mod render;
@@ -12,7 +11,6 @@ mod truncated;
 pub use anchor::{Anchor, AnchorParseError};
 pub use edit::{EditOp, apply_ops};
 pub use engine::{EditEngine, WorkingFile};
-pub use patch::{ParsedPatch, PatchParseError, parse_patch};
 pub use pool::Pool;
 pub use reconcile::{EditHints, ReconcileOutcome, reconcile};
 pub use render::{render_diff_block, render_file};

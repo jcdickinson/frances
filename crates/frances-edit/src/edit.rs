@@ -5,6 +5,9 @@ pub enum EditOp {
     /// Insert `lines` immediately after the line anchored at `pin` in the
     /// pre-turn line array.
     InsertAfter { pin: Anchor, lines: Vec<String> },
+    /// Insert `lines` immediately before the line anchored at `pin` in the
+    /// pre-turn line array.
+    InsertBefore { pin: Anchor, lines: Vec<String> },
     /// Replace the contiguous run of pre-turn lines from anchor `from` to
     /// anchor `to` (inclusive) with `lines`. Empty `lines` = pure deletion.
     Replace {
@@ -41,6 +44,19 @@ pub fn apply_ops(
                 let n = lines.len();
                 splice_in(&mut out, draft_idx, lines);
                 shift_after(&mut offsets, orig, n as i64);
+            }
+            EditOp::InsertBefore { pin, lines } => {
+                let orig = original_state
+                    .find_anchor(pin)
+                    .expect("apply_ops: anchor not found (parser should have caught this)")
+                    as usize;
+                let draft_idx = (orig as i64 + offsets[orig]) as usize;
+                let n = lines.len();
+                splice_in(&mut out, draft_idx, lines);
+                // pin itself shifts because the new lines land at its index.
+                for offset in offsets.iter_mut().skip(orig) {
+                    *offset += n as i64;
+                }
             }
             EditOp::Replace { from, to, lines } => {
                 let from_orig = original_state
@@ -151,6 +167,45 @@ mod tests {
         let ops = vec![
             EditOp::InsertAfter {
                 pin: anchors[0].clone(),
+                lines: vec!["X".into()],
+            },
+            EditOp::InsertAfter {
+                pin: anchors[1].clone(),
+                lines: vec!["Y".into()],
+            },
+        ];
+        let out = apply_ops(&state, &lines, &ops);
+        assert_eq!(out, vec!["a", "X", "b", "Y", "c"]);
+    }
+
+    #[test]
+    fn insert_before_basic() {
+        let (state, lines, anchors) = fresh_state(&["a", "b", "c"]);
+        let ops = vec![EditOp::InsertBefore {
+            pin: anchors[1].clone(),
+            lines: vec!["X".into()],
+        }];
+        let out = apply_ops(&state, &lines, &ops);
+        assert_eq!(out, vec!["a", "X", "b", "c"]);
+    }
+
+    #[test]
+    fn insert_before_at_first_line() {
+        let (state, lines, anchors) = fresh_state(&["a", "b"]);
+        let ops = vec![EditOp::InsertBefore {
+            pin: anchors[0].clone(),
+            lines: vec!["X".into(), "Y".into()],
+        }];
+        let out = apply_ops(&state, &lines, &ops);
+        assert_eq!(out, vec!["X", "Y", "a", "b"]);
+    }
+
+    #[test]
+    fn insert_before_then_insert_after_same_anchor() {
+        let (state, lines, anchors) = fresh_state(&["a", "b", "c"]);
+        let ops = vec![
+            EditOp::InsertBefore {
+                pin: anchors[1].clone(),
                 lines: vec!["X".into()],
             },
             EditOp::InsertAfter {

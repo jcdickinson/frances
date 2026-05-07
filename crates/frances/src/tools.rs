@@ -15,7 +15,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::anchor_store::AnchorStoreImpl;
-use crate::edit_session::{EditInput, EditSession, format_error};
+use crate::edit_session::{EditError, EditInput, EditSession};
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 pub struct ToolContext<'a> {
@@ -55,9 +55,24 @@ pub fn definitions() -> &'static [ToolDef] {
                                 "type": "object",
                                 "properties": {
                                     "path": { "type": "string" },
-                                    "patch": { "type": "string" }
+                                    "edits": {
+                                        "type": "array",
+                                        "items": {
+                                            "type": "object",
+                                            "properties": {
+                                                "edit_type": {
+                                                    "type": "string",
+                                                    "enum": ["replace", "insert_after", "insert_before"]
+                                                },
+                                                "anchor": { "type": "string" },
+                                                "end_anchor": { "type": "string" },
+                                                "text": { "type": "string" }
+                                            },
+                                            "required": ["edit_type", "anchor", "text"]
+                                        }
+                                    }
                                 },
-                                "required": ["path", "patch"]
+                                "required": ["path", "edits"]
                             }
                         }
                     },
@@ -69,38 +84,42 @@ pub fn definitions() -> &'static [ToolDef] {
 }
 
 const READ_FILE_DESC: &str = "\
-Read a file from disk and render it with line anchors. Each line is rendered as ` Anchor§<content>` — a leading space, then a stable per-line anchor word (e.g. `Apple`, `BananaCarrot`), then `§`, then the line's content. Blank lines render as ` Anchor§` with empty content. The leading space is intentional: each line is already in the shape of a patch context line, so you can copy lines verbatim into an `edit` patch as context, or change the leading space to `-` to delete one. Anchors survive external edits and formatter runs. Always call `read_file` for a path before calling `edit` on it — the edit tool requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
+Read a file from disk and render it with line anchors. Each line is rendered as `Word§content` — a stable per-line anchor word (e.g. `Apple`, `BananaCarrot`), then `§`, then the line's content. Blank lines render as `Word§` with empty content. Anchors survive external edits and formatter runs. The rendered string of each line is exactly what you pass back as the `anchor` (and `end_anchor`) field of an `edit` call. Always call `read_file` for a path before calling `edit` on it — edit requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
 
 const EDIT_DESC: &str = "\
-Apply patches to one or more files. The patch format is strict and unforgiving — read this carefully.
+Edit one or more files by replacing, inserting after, or inserting before specific anchored lines. You must call `read_file` on each file first this turn so its anchors are cached.
 
-EVERY line of `patch` MUST start with EXACTLY ONE sigil byte at column 0: a literal space (0x20), a `-`, or a `+`. NO padding, NO indentation before the sigil. The sigil is followed immediately by the anchor word (or empty, for inserts), then `§`, then content.
+Each entry in `files` has `path` and `edits`. Each edit has these fields:
+  edit_type:  one of \"replace\", \"insert_after\", \"insert_before\"
+  anchor:     full anchor line as `read_file` rendered it — `Word§content`
+  end_anchor: only for replace; the rendered anchor line of the LAST line in the inclusive range to replace
+  text:       the new content. Use `\\n` for newlines. Multi-line is fine; do not include any anchors in `text`.
 
-Line shapes (the leading character shown is the sigil itself):
-` ANCHOR§content`   context — keeps this line. You MUST repeat the line's exact content as `read_file` rendered it. The parser does a trimmed equality check and rejects the patch if content is missing or wrong.
-`-ANCHOR§content`   delete this line. Same content requirement as context — the content is checked against the file.
-`+§content`         insert a new line. Anchor is empty: literally `+`, `§`, then content.
+The anchor word must match a line in the latest `read_file` output for that path. The content after `§` must match the line's content (trimmed comparison). On mismatch, re-read the file and use the latest anchors.
 
-A patch is a sequence of hunks separated by completely blank lines. Each hunk must contain at least one context (` `) or delete (`-`) line to pin where the inserts go.
+Behaviour:
+  replace:        replaces all lines from `anchor` through `end_anchor` (inclusive) with `text`.
+  insert_after:   inserts `text` immediately after `anchor`.
+  insert_before:  inserts `text` immediately before `anchor`.
 
-Concrete example. Suppose `read_file` returned this rendering — note every line starts with a single leading space (the context sigil), so you can copy lines straight into a patch:
+Edits within a single call must not touch overlapping line ranges in the same file. If they do the call is rejected — split overlapping work into separate calls.
 
- Apple§def hello():
- Banana§    print(\"hi\")
- Cherry§
- Daisy§def goodbye():
+Example. Suppose `read_file` returned:
+  Apple§def hello():
+  Banana§    print(\"hi\")
+  Cherry§
+  Daisy§def goodbye():
 
-To replace the print with two prints, the patch is:
+To replace the print with two prints:
+  { \"edit_type\": \"replace\",
+    \"anchor\":    \"Banana§    print(\\\"hi\\\")\",
+    \"end_anchor\": \"Banana§    print(\\\"hi\\\")\",
+    \"text\":      \"    print(\\\"hi there\\\")\\n    print(\\\"welcome\\\")\" }
 
- Apple§def hello():
--Banana§    print(\"hi\")
-+§    print(\"hi there\")
-+§    print(\"welcome\")
- Cherry§
-
-Note how three patch lines (` Apple§`, ` Cherry§`, and the deleted line's anchor+content) come straight from `read_file`'s output — only the deleted line's leading space was changed to `-`. The leading space IS the sigil, not indentation: do not add extra spaces before it. ` Apple§` is correct, `  Apple§` is malformed (the second space becomes part of the anchor and parsing fails).
-
-Everything after `+§` is the new line's content verbatim, including any leading whitespace. Include the indentation you want (e.g. `+§    print(\"hi\")`).
+To add a docstring before goodbye:
+  { \"edit_type\": \"insert_before\",
+    \"anchor\":    \"Daisy§def goodbye():\",
+    \"text\":      \"# Says goodbye.\" }
 
 Returns one diff block per file with the new anchors for inserted lines.";
 
@@ -150,7 +169,7 @@ async fn run_edit(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
         .into_iter()
         .map(|entry| crate::edit_session::EditFileEntry {
             path: resolve_path(ctx.cwd, &entry.path),
-            patch: entry.patch,
+            edits: entry.edits,
         })
         .collect::<Vec<_>>();
     let input = EditInput {
@@ -163,8 +182,11 @@ async fn run_edit(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
     match outcome {
         Ok(diff) => Ok(diff),
         Err(error) => {
-            if let Some(parse_error) = error.downcast_ref::<frances_edit::PatchParseError>() {
-                return Err(anyhow!(format_error(parse_error)));
+            // Surface validator errors via their bespoke Display so the model
+            // sees the same wording the type designed for it ("anchor not
+            // found", "content mismatch", etc.) rather than anyhow's chain.
+            if let Some(edit_error) = error.downcast_ref::<EditError>() {
+                return Err(anyhow!(edit_error.to_string()));
             }
             Err(error)
         }
@@ -354,7 +376,7 @@ mod tests {
                 .into_iter()
                 .map(|f| EditFileEntry {
                     path: resolve_path(cwd, &f.path),
-                    patch: f.patch,
+                    edits: f.edits,
                 })
                 .collect(),
         };
@@ -365,9 +387,9 @@ mod tests {
                 is_error: false,
             },
             Err(error) => {
-                if let Some(parse_error) = error.downcast_ref::<frances_edit::PatchParseError>() {
+                if let Some(edit_error) = error.downcast_ref::<EditError>() {
                     ToolOutcome {
-                        content: format_error(parse_error),
+                        content: edit_error.to_string(),
                         is_error: true,
                     }
                 } else {
@@ -392,10 +414,7 @@ mod tests {
         let lines: Vec<&str> = outcome.content.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(
-                line.starts_with(' ') && line.contains('§'),
-                "line missing context-sigil or anchor: {line:?}"
-            );
+            assert!(line.contains('§'), "line missing anchor: {line:?}");
         }
     }
 
@@ -409,8 +428,15 @@ mod tests {
         assert!(outcome.content.contains("does-not-exist"));
     }
 
+    /// Pulls the rendered anchor line for `idx` straight out of read_file
+    /// output. This is exactly what the model gets and exactly what it must
+    /// pass back as `anchor` / `end_anchor`.
+    fn anchor_line(read_output: &str, idx: usize) -> String {
+        read_output.lines().nth(idx).unwrap().to_string()
+    }
+
     #[tokio::test]
-    async fn edit_happy_path_deletes_a_line() {
+    async fn edit_replace_happy_path() {
         let (session, dir) = fresh_ctx();
         let path = dir.path().join("file.txt");
         fs::write(&path, "a\nb\nc\n").unwrap();
@@ -418,18 +444,20 @@ mod tests {
         let read = dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() }))
             .await
             .content;
-        let anchor_b = read.lines().nth(1).unwrap();
-        // Each rendered line is " Anchor§content" — strip the leading sigil.
-        let anchor_b = anchor_b.split('§').next().unwrap().trim_start();
+        let line_b = anchor_line(&read, 1);
 
-        let patch = format!("-{anchor_b}§b\n");
         let outcome = dispatch_edit(
             &session,
             None,
             json!({
                 "files": [{
                     "path": path.to_str().unwrap(),
-                    "patch": patch,
+                    "edits": [{
+                        "edit_type": "replace",
+                        "anchor": line_b,
+                        "end_anchor": line_b,
+                        "text": "B2"
+                    }]
                 }]
             }),
         )
@@ -437,17 +465,17 @@ mod tests {
         assert!(!outcome.is_error, "unexpected error: {}", outcome.content);
 
         let on_disk = fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, "a\nc\n");
-        assert!(outcome.content.contains(&format!("-{anchor_b}§b")));
+        assert_eq!(on_disk, "a\nB2\nc\n");
+        assert!(outcome.content.contains("§B2"));
     }
 
     #[tokio::test]
-    async fn edit_patch_parse_error_uses_format_error() {
+    async fn edit_anchor_not_found_is_error() {
         let (session, dir) = fresh_ctx();
         let path = dir.path().join("file.txt");
         fs::write(&path, "a\nb\n").unwrap();
 
-        let _ = dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() })).await;
+        dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() })).await;
 
         let outcome = dispatch_edit(
             &session,
@@ -455,13 +483,51 @@ mod tests {
             json!({
                 "files": [{
                     "path": path.to_str().unwrap(),
-                    "patch": "+§unpinned\n",
+                    "edits": [{
+                        "edit_type": "insert_after",
+                        "anchor": "Nonsense§a",
+                        "text": "X"
+                    }]
                 }]
             }),
         )
         .await;
         assert!(outcome.is_error);
-        assert!(outcome.content.contains("patch error"));
+        assert!(outcome.content.contains("not found"));
+    }
+
+    #[tokio::test]
+    async fn edit_content_mismatch_is_error() {
+        let (session, dir) = fresh_ctx();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "a\nb\n").unwrap();
+
+        let read = dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() }))
+            .await
+            .content;
+        // Pull the real anchor word, then attach the wrong content to it.
+        let real_b = anchor_line(&read, 1);
+        let word_b = real_b.split('§').next().unwrap();
+        let wrong = format!("{word_b}§not the real content");
+
+        let outcome = dispatch_edit(
+            &session,
+            None,
+            json!({
+                "files": [{
+                    "path": path.to_str().unwrap(),
+                    "edits": [{
+                        "edit_type": "replace",
+                        "anchor": wrong,
+                        "end_anchor": wrong,
+                        "text": "x"
+                    }]
+                }]
+            }),
+        )
+        .await;
+        assert!(outcome.is_error);
+        assert!(outcome.content.contains("content mismatch"));
     }
 
     #[test]

@@ -589,18 +589,18 @@ async fn run_llm_step(
                     .await;
                 }
                 llm::ToolCallEvent::Append(fragment) => {
-                    if let Some(&block_id) = tool_block_for_index.get(&tool_delta.index) {
-                        if wire_active == Some(block_id) {
-                            try_write(
-                                stream,
-                                &StreamFrame::BlockDelta {
-                                    id: block_id,
-                                    text: (*fragment).to_string(),
-                                },
-                                send_error,
-                            )
-                            .await;
-                        }
+                    if let Some(&block_id) = tool_block_for_index.get(&tool_delta.index)
+                        && wire_active == Some(block_id)
+                    {
+                        try_write(
+                            stream,
+                            &StreamFrame::BlockDelta {
+                                id: block_id,
+                                text: (*fragment).to_string(),
+                            },
+                            send_error,
+                        )
+                        .await;
                     }
                 }
             }
