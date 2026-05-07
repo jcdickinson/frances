@@ -7,10 +7,19 @@ use crate::state::FileAnchorState;
 
 pub const ANCHOR_SEP: char = '§';
 
+/// Renders the file with one line per source line, in unified-diff context
+/// shape: each line starts with a literal space (the patch sigil for an
+/// unchanged context line), then `anchor§content`. The model can copy any
+/// line verbatim into a patch as context, or flip the leading space to `-`
+/// to delete it — no reformatting required.
 pub fn render_file(state: &FileAnchorState, lines: &[String]) -> String {
     let mut out = String::with_capacity(lines.len() * 16);
     for (le, line) in state.lines.iter().zip(lines) {
-        write!(out, "{}{ANCHOR_SEP}{line}", le.anchor).expect("write to String");
+        // Leading space is the patch context sigil. Emitting it here means
+        // `read_file` output is byte-identical to a valid patch context line,
+        // so the model can copy lines verbatim instead of having to remember
+        // to prepend the sigil itself (which it routinely forgets or doubles).
+        write!(out, " {}{ANCHOR_SEP}{line}", le.anchor).expect("write to String");
         out.push('\n');
     }
     out

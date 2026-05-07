@@ -69,7 +69,7 @@ pub fn definitions() -> &'static [ToolDef] {
 }
 
 const READ_FILE_DESC: &str = "\
-Read a file from disk and render it with line anchors. Each line is shown as `Anchor§<content>` where the anchor is a stable per-line word (e.g. `Apple`, `BananaCarrot`) you reference in subsequent edits. Anchors survive external edits and formatter runs. Always call `read_file` for a path before calling `edit` on it — the edit tool requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
+Read a file from disk and render it with line anchors. Each line is rendered as ` Anchor§<content>` — a leading space, then a stable per-line anchor word (e.g. `Apple`, `BananaCarrot`), then `§`, then the line's content. Blank lines render as ` Anchor§` with empty content. The leading space is intentional: each line is already in the shape of a patch context line, so you can copy lines verbatim into an `edit` patch as context, or change the leading space to `-` to delete one. Anchors survive external edits and formatter runs. Always call `read_file` for a path before calling `edit` on it — the edit tool requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
 
 const EDIT_DESC: &str = "\
 Apply patches to one or more files. The patch format is strict and unforgiving — read this carefully.
@@ -83,14 +83,14 @@ Line shapes (the leading character shown is the sigil itself):
 
 A patch is a sequence of hunks separated by completely blank lines. Each hunk must contain at least one context (` `) or delete (`-`) line to pin where the inserts go.
 
-Concrete example. Suppose `read_file` returned this rendering (each line starts at column 0):
+Concrete example. Suppose `read_file` returned this rendering — note every line starts with a single leading space (the context sigil), so you can copy lines straight into a patch:
 
-Apple§def hello():
-Banana§    print(\"hi\")
-Cherry§
-Daisy§def goodbye():
+ Apple§def hello():
+ Banana§    print(\"hi\")
+ Cherry§
+ Daisy§def goodbye():
 
-To replace the print with two prints, the patch is exactly (note column 0 starts each line):
+To replace the print with two prints, the patch is:
 
  Apple§def hello():
 -Banana§    print(\"hi\")
@@ -98,7 +98,7 @@ To replace the print with two prints, the patch is exactly (note column 0 starts
 +§    print(\"welcome\")
  Cherry§
 
-The leading space on the context lines IS the sigil — it is a single 0x20 byte at column 0, NOT indentation. Do not put extra spaces before the sigil; ` Apple§` is correct, `  Apple§` is malformed (the second space becomes part of the anchor and parsing fails).
+Note how three patch lines (` Apple§`, ` Cherry§`, and the deleted line's anchor+content) come straight from `read_file`'s output — only the deleted line's leading space was changed to `-`. The leading space IS the sigil, not indentation: do not add extra spaces before it. ` Apple§` is correct, `  Apple§` is malformed (the second space becomes part of the anchor and parsing fails).
 
 Everything after `+§` is the new line's content verbatim, including any leading whitespace. Include the indentation you want (e.g. `+§    print(\"hi\")`).
 
@@ -392,7 +392,10 @@ mod tests {
         let lines: Vec<&str> = outcome.content.lines().collect();
         assert_eq!(lines.len(), 3);
         for line in &lines {
-            assert!(line.contains('§'), "line missing anchor: {line}");
+            assert!(
+                line.starts_with(' ') && line.contains('§'),
+                "line missing context-sigil or anchor: {line:?}"
+            );
         }
     }
 
@@ -416,7 +419,8 @@ mod tests {
             .await
             .content;
         let anchor_b = read.lines().nth(1).unwrap();
-        let anchor_b = anchor_b.split('§').next().unwrap();
+        // Each rendered line is " Anchor§content" — strip the leading sigil.
+        let anchor_b = anchor_b.split('§').next().unwrap().trim_start();
 
         let patch = format!("-{anchor_b}§b\n");
         let outcome = dispatch_edit(
