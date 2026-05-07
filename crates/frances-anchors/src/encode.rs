@@ -124,18 +124,44 @@ mod tests {
     fn hash_sized_payload() {
         let hash_bytes = [0xDE, 0xAD, 0xBE, 0xEF, 0x12, 0x34, 0x56, 0x78];
         let encoded = encode(&hash_bytes);
-        assert_eq!(encoded.len(), 6);
-        assert!(is_padding_marker(*encoded.last().unwrap()));
+        let total_bits = (hash_bytes.len() as u32) * 8;
+        let n_data = total_bits.div_ceil(BITS_PER_WORD) as usize;
+        let has_padding = !total_bits.is_multiple_of(BITS_PER_WORD);
+        assert_eq!(encoded.len(), n_data + has_padding as usize);
+        assert_eq!(is_padding_marker(*encoded.last().unwrap()), has_padding);
         round_trip(&hash_bytes);
     }
 
+    /// `BITS_PER_WORD` bytes encode to exactly 8 data words with zero residual
+    /// bits in the last word — so no padding marker is appended.
     #[test]
-    fn thirteen_bytes_no_padding_marker() {
-        let bytes: Vec<u8> = (0..13).collect();
+    fn payload_aligned_to_word_boundary_has_no_padding() {
+        let bytes: Vec<u8> = (0..BITS_PER_WORD as u8).collect();
         let encoded = encode(&bytes);
         assert_eq!(encoded.len(), 8);
         assert!(!is_padding_marker(*encoded.last().unwrap()));
         round_trip(&bytes);
+    }
+
+    /// Every padding marker (indices 0..N_PADDING_WORDS) must be reachable by
+    /// the encoder. If the dictionary shrinks below the number of distinct
+    /// residual-bit counts, decoding would silently break for some lengths.
+    #[test]
+    fn every_padding_marker_is_emitted() {
+        use std::collections::HashSet;
+        // Byte lengths 1..=BITS_PER_WORD walk every residual modulo BITS_PER_WORD
+        // (since gcd(8, BITS_PER_WORD) = 1 for any odd BITS_PER_WORD), which is
+        // every non-zero pad-bit count from 1 to BITS_PER_WORD-1.
+        let mut seen: HashSet<u16> = HashSet::new();
+        for len in 1..=BITS_PER_WORD as usize {
+            let bytes: Vec<u8> = (0..len as u8).collect();
+            let last = *encode(&bytes).last().unwrap();
+            if is_padding_marker(last) {
+                seen.insert(last);
+            }
+        }
+        let expected: HashSet<u16> = (0..N_PADDING_WORDS as u16).collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]

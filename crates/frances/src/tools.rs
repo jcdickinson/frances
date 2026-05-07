@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use std::time::SystemTime;
 
 use anyhow::{Context, Result, anyhow};
+use frances_core::JsonRepair;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -89,37 +90,66 @@ Read a file from disk and render it with line anchors. Each line is rendered as 
 const EDIT_DESC: &str = "\
 Edit one or more files by replacing, inserting after, or inserting before specific anchored lines. You must call `read_file` on each file first this turn so its anchors are cached.
 
-Each entry in `files` has `path` and `edits`. Each edit has these fields:
-  edit_type:  one of \"replace\", \"insert_after\", \"insert_before\"
-  anchor:     full anchor line as `read_file` rendered it — `Word§content`
-  end_anchor: only for replace; the rendered anchor line of the LAST line in the inclusive range to replace
-  text:       the new content. Use `\\n` for newlines. Multi-line is fine; do not include any anchors in `text`.
+Top-level shape — `files` is an ARRAY of file objects, NOT a string. Each file has an `edits` ARRAY:
 
-The anchor word must match a line in the latest `read_file` output for that path. The content after `§` must match the line's content (trimmed comparison). On mismatch, re-read the file and use the latest anchors.
+{
+  \"files\": [
+    {
+      \"path\": \"src/example.rs\",
+      \"edits\": [
+        { \"edit_type\": \"replace\", \"anchor\": \"...\", \"end_anchor\": \"...\", \"text\": \"...\" },
+        { \"edit_type\": \"insert_after\", \"anchor\": \"...\", \"text\": \"...\" }
+      ]
+    }
+  ]
+}
+
+Do NOT JSON-encode `files` or `edits` as a string. They are inline JSON arrays.
+
+Per-edit fields:
+  edit_type:  one of \"replace\", \"insert_after\", \"insert_before\"
+  anchor:     full anchor line as `read_file` rendered it — \"Word§content\"
+  end_anchor: only for replace; the rendered anchor line of the LAST line in the inclusive range
+  text:       the new content. Use \\n for newlines. Multi-line is fine; do NOT include any anchors in text.
+
+The anchor word must match a line in the latest `read_file` output for that path. The content after § must match the line's content (trimmed comparison). On mismatch, re-read the file and use the latest anchors.
 
 Behaviour:
-  replace:        replaces all lines from `anchor` through `end_anchor` (inclusive) with `text`.
-  insert_after:   inserts `text` immediately after `anchor`.
-  insert_before:  inserts `text` immediately before `anchor`.
+  replace        — replaces all lines from `anchor` through `end_anchor` (inclusive) with `text`.
+  insert_after   — inserts `text` immediately after `anchor`.
+  insert_before  — inserts `text` immediately before `anchor`.
 
 Edits within a single call must not touch overlapping line ranges in the same file. If they do the call is rejected — split overlapping work into separate calls.
 
-Example. Suppose `read_file` returned:
+WORKED EXAMPLE. Suppose read_file on src/greet.py returned:
+
   Apple§def hello():
   Banana§    print(\"hi\")
   Cherry§
   Daisy§def goodbye():
 
-To replace the print with two prints:
-  { \"edit_type\": \"replace\",
-    \"anchor\":    \"Banana§    print(\\\"hi\\\")\",
-    \"end_anchor\": \"Banana§    print(\\\"hi\\\")\",
-    \"text\":      \"    print(\\\"hi there\\\")\\n    print(\\\"welcome\\\")\" }
+To replace the print with two prints AND add a docstring before goodbye, the WHOLE tool call body is:
 
-To add a docstring before goodbye:
-  { \"edit_type\": \"insert_before\",
-    \"anchor\":    \"Daisy§def goodbye():\",
-    \"text\":      \"# Says goodbye.\" }
+{
+  \"files\": [
+    {
+      \"path\": \"src/greet.py\",
+      \"edits\": [
+        {
+          \"edit_type\": \"replace\",
+          \"anchor\":     \"Banana§    print(\\\"hi\\\")\",
+          \"end_anchor\": \"Banana§    print(\\\"hi\\\")\",
+          \"text\":       \"    print(\\\"hi there\\\")\\n    print(\\\"welcome\\\")\"
+        },
+        {
+          \"edit_type\": \"insert_before\",
+          \"anchor\": \"Daisy§def goodbye():\",
+          \"text\":   \"# Says goodbye.\"
+        }
+      ]
+    }
+  ]
+}
 
 Returns one diff block per file with the new anchors for inserted lines.";
 
@@ -162,7 +192,12 @@ async fn run_read_file(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
 }
 
 async fn run_edit(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
-    let raw: EditInput = serde_json::from_value(args.clone()).context("parse edit args")?;
+    // `JsonRepair` absorbs the qwen3-coder family quirk where array fields
+    // (`files`, per-entry `edits`) arrive as JSON-encoded strings. On a clean
+    // input the strict path runs and we're a passthrough.
+    let raw = JsonRepair::<EditInput>::from_value(args.clone())
+        .context("parse edit args")?
+        .into_inner();
 
     let resolved_files = raw
         .files
@@ -361,8 +396,8 @@ mod tests {
         cwd: Option<&Path>,
         args: Value,
     ) -> ToolOutcome {
-        let raw: EditInput = match serde_json::from_value(args) {
-            Ok(i) => i,
+        let raw = match JsonRepair::<EditInput>::from_value(args) {
+            Ok(i) => i.into_inner(),
             Err(e) => {
                 return ToolOutcome {
                     content: format!("{e:#}"),
@@ -485,7 +520,7 @@ mod tests {
                     "path": path.to_str().unwrap(),
                     "edits": [{
                         "edit_type": "insert_after",
-                        "anchor": "Nonsense§a",
+                        "anchor": "Wizard§a",
                         "text": "X"
                     }]
                 }]
@@ -494,6 +529,40 @@ mod tests {
         .await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("not found"));
+    }
+
+    /// Exercises the qwen3-coder family quirk: the model emits `files` (and
+    /// each entry's `edits`) as a JSON-encoded string instead of an inline
+    /// array. `JsonRepair` in `run_edit` should unwrap both layers and the
+    /// edit should apply normally.
+    #[tokio::test]
+    async fn edit_with_stringified_files_and_edits_succeeds() {
+        let (session, dir) = fresh_ctx();
+        let path = dir.path().join("file.txt");
+        fs::write(&path, "a\nb\nc\n").unwrap();
+
+        let read = dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() }))
+            .await
+            .content;
+        let line_b = anchor_line(&read, 1);
+
+        let edits_str = serde_json::to_string(&json!([{
+            "edit_type": "replace",
+            "anchor": line_b,
+            "end_anchor": line_b,
+            "text": "B2"
+        }]))
+        .unwrap();
+        let files_str = serde_json::to_string(&json!([{
+            "path": path.to_str().unwrap(),
+            "edits": edits_str
+        }]))
+        .unwrap();
+
+        let outcome = dispatch_edit(&session, None, json!({ "files": files_str })).await;
+        assert!(!outcome.is_error, "unexpected error: {}", outcome.content);
+
+        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nB2\nc\n");
     }
 
     #[tokio::test]

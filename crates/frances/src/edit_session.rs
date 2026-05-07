@@ -483,11 +483,12 @@ mod tests {
             .await
             .unwrap();
 
+        let unused = unused_dict_word(&session, &path);
         let input = EditInput {
             files: vec![EditFileEntry {
                 path: path.clone(),
                 edits: vec![LlmEdit::InsertAfter {
-                    anchor: "Nonsense§a".into(),
+                    anchor: format!("{unused}§a"),
                     text: "X".into(),
                 }],
             }],
@@ -495,6 +496,27 @@ mod tests {
         let err = session.edit(input, no_format).await.unwrap_err();
         let downcast = err.downcast_ref::<EditError>().expect("EditError downcast");
         assert!(matches!(downcast, EditError::AnchorNotFound { .. }));
+    }
+
+    /// Returns a real dict word that isn't currently used as an anchor in
+    /// `path`. Robust to dict regeneration; lets the "anchor word valid but
+    /// not in this file" tests run without hardcoding a specific entry.
+    fn unused_dict_word<S: AnchorStore>(session: &EditSession<S>, path: &Path) -> &'static str {
+        let used: std::collections::HashSet<String> = session
+            .open_files
+            .get(path)
+            .expect("file is cached")
+            .state
+            .lines
+            .iter()
+            .map(|l| l.anchor.to_string())
+            .collect();
+        frances_anchors::WORDS
+            .iter()
+            .copied()
+            .skip(frances_anchors::N_PADDING_WORDS)
+            .find(|w| !used.contains(*w))
+            .expect("dict has more data entries than the file uses")
     }
 
     #[tokio::test]

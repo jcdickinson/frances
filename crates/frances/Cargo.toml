@@ -30,9 +30,11 @@ unicode-width.workspace = true
 tarpc.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+frances-core.workspace = true
 frances-edit.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]
+frances-anchors.workspace = true
 frances-edit = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true

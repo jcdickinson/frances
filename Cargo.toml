@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors", "crates/frances-edit"]
+members = ["crates/frances", "crates/frances-anchors", "crates/frances-core", "crates/frances-edit"]
 resolver = "2"
 
 [workspace.package]
@@ -31,6 +31,7 @@ twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_
 similar = { version = "3.1", default-features = false }
 async-trait = "0.1"
 frances-anchors = { path = "crates/frances-anchors" }
+frances-core = { path = "crates/frances-core" }
 frances-edit = { path = "crates/frances-edit" }
 tempfile = "3"
 smallvec = "1"

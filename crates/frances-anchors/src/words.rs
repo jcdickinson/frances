@@ -3,8 +3,10 @@ use std::sync::LazyLock;
 
 static WORDS_TXT: &str = include_str!("../words.txt");
 
-pub const BITS_PER_WORD: u32 = 13;
-pub const N_PADDING_WORDS: usize = 12;
+pub const BITS_PER_WORD: u32 = 11;
+/// One padding marker per possible residual bit count (1..BITS_PER_WORD)
+/// in the last data word. Keep this in lock-step with BITS_PER_WORD.
+pub const N_PADDING_WORDS: usize = (BITS_PER_WORD - 1) as usize;
 pub const N_DATA_WORDS: usize = 1 << BITS_PER_WORD;
 pub const DICT_SIZE: usize = N_PADDING_WORDS + N_DATA_WORDS;
 
@@ -45,7 +47,7 @@ mod tests {
     #[test]
     fn dictionary_size() {
         assert_eq!(WORDS.len(), DICT_SIZE);
-        assert_eq!(WORDS.len(), 8204);
+        assert_eq!(WORDS.len(), 2058);
     }
 
     #[test]

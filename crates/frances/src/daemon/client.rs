@@ -68,6 +68,7 @@ pub async fn daemon_version(session: &Session) -> Result<u64, ClientError> {
     read_banner(&mut reader).await
 }
 
+#[expect(dead_code, reason = "control-protocol client API; not all verbs are wired into the binary yet")]
 pub async fn ping(session: &Session) -> Result<(), ClientError> {
     request_control(session, "ping").await?;
     Ok(())

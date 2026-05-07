@@ -51,6 +51,7 @@ pub struct Inode(pub u64);
 /// retained as forensic context — anything that contributes to `key` should
 /// stay reachable so we can debug a stale link.
 #[derive(Debug, Clone)]
+#[expect(dead_code, reason = "forensic context for debugging stale TTY session links; see struct doc")]
 pub struct TtyIdentity {
     pub key: TtyKey,
     pub tty_path: PathBuf,

@@ -35,6 +35,7 @@ impl std::fmt::Display for BlockId {
 pub struct SessionId(pub String);
 
 impl SessionId {
+    #[expect(dead_code, reason = "newtype accessor; callers currently go through Display")]
     pub fn as_str(&self) -> &str {
         &self.0
     }

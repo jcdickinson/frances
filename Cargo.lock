@@ -754,6 +754,8 @@ dependencies = [
  "bincode 2.0.1",
  "clap",
  "crossterm",
+ "frances-anchors",
+ "frances-core",
  "frances-edit",
  "futures",
  "futures-util",
@@ -778,6 +780,14 @@ version = "0.1.0"
 dependencies = [
  "thiserror",
  "twox-hash",
+]
+
+[[package]]
+name = "frances-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

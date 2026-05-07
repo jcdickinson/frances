@@ -192,6 +192,7 @@ pub fn chunk_tool_call_deltas(chunk: &Value) -> Vec<ToolCallDelta<'_>> {
     out
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "stream chunk inspector; exercised by tests, not yet by the runtime"))]
 pub fn chunk_finish_reason(chunk: &Value) -> Option<&str> {
     chunk
         .get("choices")
@@ -255,6 +256,7 @@ pub struct ToolFunction {
 /// `{"type":"function","function":{"name":"..."}}`. This enum serializes to
 /// whichever shape is appropriate.
 #[derive(Clone, Debug)]
+#[cfg_attr(not(test), expect(dead_code, reason = "tool_choice variants kept for caller flexibility; default `auto` is implicit when omitted"))]
 pub enum ToolChoice {
     Auto,
     None,
@@ -336,6 +338,7 @@ impl ToolCallAccumulator {
         Ok(())
     }
 
+    #[expect(dead_code, reason = "accumulator introspection; useful for debugging mid-stream state")]
     pub fn is_empty(&self) -> bool {
         self.in_progress.is_empty()
     }
@@ -653,7 +656,7 @@ mod tests {
 
     #[test]
     fn toolchoice_function_serializes_to_object() {
-        let v = serde_json::to_value(&ToolChoice::Function("edit".into())).unwrap();
+        let v = serde_json::to_value(ToolChoice::Function("edit".into())).unwrap();
         assert_eq!(v["type"], "function");
         assert_eq!(v["function"]["name"], "edit");
     }
