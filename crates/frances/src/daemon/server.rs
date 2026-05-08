@@ -24,11 +24,14 @@ use crate::daemon::protocol::{
 };
 use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
-use crate::llm::{self, LlmConfig, OpenAiClient, ToolCallAccumulator};
+use crate::llm::{
+    self, ChatClient, ModelsConfig, ProviderConfig, ResponsesModelExtras, SessionConfigProvider,
+    ToolCallAccumulator,
+};
 use crate::session::Session;
 use crate::store::Database;
 use crate::tools;
-use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider};
+use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
 use frances_shell::Shell;
 
@@ -49,7 +52,9 @@ pub(crate) struct ServerState {
     /// daemon's lifetime. Bindings are refreshed via this handle's registry.
     #[expect(dead_code, reason = "held for processor task lifetime")]
     config: ConfigHandle,
-    llm_config: ConfigBinding<LlmConfig>,
+    providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+    models: ConfigBinding<ModelsConfig>,
+    responses_extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
 }
 
 #[derive(Default)]
@@ -213,12 +218,19 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
 
     let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
 
-    let providers: Vec<Arc<dyn ConfigProvider>> =
-        vec![Arc::new(EnvProvider::with_prefix("FRANCES"))];
-    let config = ConfigHandle::build(providers)
+    let config_providers = build_config_providers(db.clone());
+    let config = ConfigHandle::build(config_providers)
         .await
         .context("build config handle")?;
-    let llm_config = config.bind::<LlmConfig>("llm").context("bind llm config")?;
+    let providers = config
+        .bind::<HashMap<String, ProviderConfig>>("model_providers")
+        .context("bind model_providers")?;
+    let models = config
+        .bind::<ModelsConfig>("models")
+        .context("bind models")?;
+    let responses_extras = config
+        .bind::<HashMap<String, ResponsesModelExtras>>("responses_models")
+        .context("bind responses_models")?;
 
     let state = Arc::new(ServerState {
         session: session.clone(),
@@ -231,7 +243,9 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         config,
-        llm_config,
+        providers,
+        models,
+        responses_extras,
     });
 
     let events_listener = UnixListener::bind(session.events_socket_path()).with_context(|| {
@@ -457,7 +471,12 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         (ctx.process.env.clone(), ctx.process.cwd.clone())
     };
 
-    let llm = OpenAiClient::new(&env, state.llm_config.clone())?;
+    let llm = ChatClient::new(
+        env,
+        state.providers.clone(),
+        state.models.clone(),
+        state.responses_extras.clone(),
+    )?;
 
     let mut next_block: u64 = 1;
     let mut alloc_block = || {
@@ -525,7 +544,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 async fn run_llm_step(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    llm: &OpenAiClient,
+    llm: &ChatClient,
     alloc_block: &mut impl FnMut() -> BlockId,
     send_error: &mut Option<anyhow::Error>,
     cwd: Option<&std::path::Path>,
@@ -545,7 +564,7 @@ async fn run_llm_step(
     )
     .await;
 
-    let llm_owned: OpenAiClient = (*llm).clone();
+    let llm_owned: ChatClient = (*llm).clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let llm_task = tokio::spawn(async move {
         llm_owned
@@ -752,4 +771,39 @@ fn daemon_status(state: &ServerState) -> DaemonStatus {
         events_socket_path: state.session.events_socket_path(),
         protocol_version: PROTOCOL_VERSION,
     }
+}
+
+/// Builds the layered config provider stack for the daemon. Order is
+/// low → high priority — `ConfigHandle::build` applies them in sequence,
+/// so later providers override earlier ones.
+///
+///   1. XDG system config dirs (`XDG_CONFIG_DIRS`, default `/etc/xdg`).
+///      Spec orders these most-preferred first; we push in reverse so
+///      the most-preferred ends up last among the system layers.
+///   2. XDG user config dir (`XDG_CONFIG_HOME`, default `~/.config`).
+///   3. `FRANCES__*` env vars.
+///   4. Per-session DB rows.
+///
+/// Each TOML file is `.optional()` — running with no config files
+/// present is a supported configuration.
+fn build_config_providers(db: Database) -> Vec<Arc<dyn ConfigProvider>> {
+    let xdg_dirs = xdg::BaseDirectories::with_prefix("frances");
+
+    let mut providers: Vec<Arc<dyn ConfigProvider>> = Vec::new();
+
+    for dir in xdg_dirs.get_config_dirs().iter().rev() {
+        let path = dir.join("config.toml");
+        providers.push(Arc::new(TomlProvider::new(path).optional()));
+    }
+
+    if let Some(home) = xdg_dirs.get_config_home() {
+        providers.push(Arc::new(
+            TomlProvider::new(home.join("config.toml")).optional(),
+        ));
+    }
+
+    providers.push(Arc::new(EnvProvider::with_prefix("FRANCES")));
+    providers.push(Arc::new(SessionConfigProvider::new(db)));
+
+    providers
 }

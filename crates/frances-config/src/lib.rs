@@ -14,6 +14,7 @@
 mod binding;
 mod config;
 mod deserializer;
+mod env_string;
 mod error;
 mod event;
 mod handle;
@@ -24,6 +25,7 @@ mod value;
 
 pub use binding::{ConfigBinding, ConfigBindingRef, RequiredConfigBinding};
 pub use config::{Configuration, ConfigurationRef};
+pub use env_string::{EnvLookup, EnvString, EnvStringExpandError};
 pub use error::{BuildError, ConfigBindError, MapError, ReloadError, SourceLoadError};
 pub use event::{ConfigEvent, EventSender, SendError};
 pub use handle::ConfigHandle;

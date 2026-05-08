@@ -36,6 +36,7 @@ frances-edit.workspace = true
 frances-shell.workspace = true
 async-trait.workspace = true
 url.workspace = true
+xdg.workspace = true
 
 [dev-dependencies]
 frances-anchors.workspace = true

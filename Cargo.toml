@@ -42,3 +42,5 @@ arc-swap = "1"
 toml = "0.8"
 tokio-stream = { version = "0.1", features = ["sync"] }
 url = { version = "2", features = ["serde"] }
+shellexpand = "3"
+xdg = "3"

@@ -1,86 +1,47 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use frances_config::ConfigBinding;
+use frances_config::{ConfigBinding, EnvLookup};
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 use url::Url;
 
-/// Bound at `llm::` in the config tree. Every field has a serde default,
-/// and the type implements `Default`, so `ConfigBinding::get_or_default`
-/// always returns a fully-populated value — even when the user has set no
-/// env vars at all and the `llm::` section doesn't exist.
-#[derive(Debug, Clone, Deserialize)]
-pub struct LlmConfig {
-    #[serde(default = "default_url")]
-    pub url: Url,
-    #[serde(default = "default_model")]
-    pub model: String,
-    #[serde(default = "default_max_tokens")]
-    pub max_tokens: u32,
-    #[serde(default = "default_timeout_secs")]
-    pub timeout_secs: u64,
-    #[serde(default = "default_provider_order")]
-    pub provider_order: Vec<String>,
-}
+use crate::llm::config::{
+    AuthMethod, ModelConfig, ModelsConfig, ProviderConfig, ResponsesModelExtras,
+};
 
-fn default_url() -> Url {
-    Url::parse("https://openrouter.ai/api/v1/chat/completions")
-        .expect("hardcoded openrouter url is valid")
-}
-fn default_model() -> String {
-    "qwen/qwen3-coder-next".into()
-}
-fn default_max_tokens() -> u32 {
-    1000
-}
-fn default_timeout_secs() -> u64 {
-    120
-}
-fn default_provider_order() -> Vec<String> {
-    vec!["parasail".into()]
-}
-
-impl Default for LlmConfig {
-    fn default() -> Self {
-        Self {
-            url: default_url(),
-            model: default_model(),
-            max_tokens: default_max_tokens(),
-            timeout_secs: default_timeout_secs(),
-            provider_order: default_provider_order(),
-        }
-    }
-}
-
+/// Chat-completions client. Vendor-neutral despite the name "Responses"
+/// in `wire_api`: today the wire is OpenAI-style chat completions; if a
+/// new wire is introduced it will live in a sibling module.
 #[derive(Clone)]
-pub struct OpenAiClient {
+pub struct ChatClient {
     http: reqwest::Client,
-    api_key: String,
-    config: ConfigBinding<LlmConfig>,
+    env: Vec<(OsString, OsString)>,
+    providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+    models: ConfigBinding<ModelsConfig>,
+    extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
 }
 
-impl OpenAiClient {
-    pub fn new(env: &[(OsString, OsString)], config: ConfigBinding<LlmConfig>) -> Result<Self> {
-        let api_key = env
-            .iter()
-            .find(|(k, _)| k == "OPENROUTER_API_KEY")
-            .map(|(_, v)| v.to_string_lossy().into_owned())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("OPENROUTER_API_KEY not set in client environment"))?;
-
+impl ChatClient {
+    pub fn new(
+        env: Vec<(OsString, OsString)>,
+        providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+        models: ConfigBinding<ModelsConfig>,
+        extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
+    ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .build()
             .context("build reqwest client")?;
-
         Ok(Self {
             http,
-            api_key,
-            config,
+            env,
+            providers,
+            models,
+            extras,
         })
     }
 
@@ -94,52 +55,57 @@ impl OpenAiClient {
     where
         F: FnMut(&Value) -> Result<()>,
     {
-        let cfg = self.config.get_or_default();
-        let provider_order: Vec<&str> = cfg.provider_order.iter().map(String::as_str).collect();
+        let plan = self.build_request_plan()?;
 
-        let body = ChatRequest {
-            model: &cfg.model,
-            messages,
-            max_tokens: cfg.max_tokens,
-            stream: true,
-            stream_options: StreamOptions {
-                include_usage: true,
-            },
-            reasoning: Reasoning { enabled: true },
-            provider: Provider {
-                order: &provider_order,
-            },
-            tools,
-            tool_choice,
-        };
+        let mut body = serde_json::json!({
+            "model": plan.model.id,
+            "messages": messages,
+            "max_tokens": plan.model.max_tokens,
+            "stream": true,
+            "stream_options": { "include_usage": true },
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(tools)?;
+        }
+        if let Some(tc) = tool_choice {
+            body["tool_choice"] = serde_json::to_value(tc)?;
+        }
+        merge_extras(&mut body, plan.extra_completion_properties.as_deref())?;
 
         debug!(
             messages = messages.len(),
             tools = tools.len(),
-            "calling openrouter chat completions"
+            url = %plan.url,
+            model = %plan.model.id,
+            "calling chat completions"
         );
 
-        let response = self
+        let mut request = self
             .http
-            .post(cfg.url.clone())
-            .timeout(Duration::from_secs(cfg.timeout_secs))
-            .bearer_auth(&self.api_key)
-            .json(&body)
+            .post(plan.url)
+            .timeout(Duration::from_millis(plan.model.stream_idle_timeout_ms))
+            .bearer_auth(&plan.bearer_token)
+            .json(&body);
+        for (k, v) in &plan.headers {
+            request = request.header(k, v);
+        }
+
+        let response = request
             .send()
             .await
-            .context("openrouter request failed")?;
+            .context("chat completion request failed")?;
 
         if !response.status().is_success() {
             let status = response.status();
             let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("openrouter returned {status}: {text}"));
+            return Err(anyhow!("provider returned {status}: {text}"));
         }
 
         let mut stream = response.bytes_stream();
         let mut buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("openai stream chunk")?;
+            let bytes = chunk.context("chat stream chunk")?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(idx) = buffer.find("\n\n") {
@@ -167,6 +133,140 @@ impl OpenAiClient {
         }
 
         Ok(())
+    }
+
+    fn build_request_plan(&self) -> Result<RequestPlan> {
+        let models = self
+            .models
+            .get()
+            .ok_or_else(|| anyhow!("models config missing"))?;
+        let chat: ModelConfig = models.chat.clone();
+
+        let providers = self
+            .providers
+            .get()
+            .ok_or_else(|| anyhow!("model_providers config missing"))?;
+        let provider = case_insensitive_lookup(&providers, &chat.model_provider).ok_or_else(
+            || {
+                anyhow!(
+                    "model_providers.{} is not configured (referenced by models.chat.model_provider)",
+                    chat.model_provider
+                )
+            },
+        )?;
+
+        let bearer_token = resolve_bearer(&provider.auth, &self.env)?;
+
+        let url = provider
+            .base_url
+            .join("chat/completions")
+            .context("join base_url with chat/completions")?;
+
+        let headers = expand_headers(&provider.http_headers, &self.env)?;
+
+        let extras = self.extras.get_or_default();
+        let extra_completion_properties = case_insensitive_lookup(&extras, &chat.id)
+            .and_then(|e| e.extra_completion_properties.clone());
+
+        Ok(RequestPlan {
+            url,
+            bearer_token,
+            headers,
+            model: chat,
+            extra_completion_properties,
+        })
+    }
+}
+
+struct RequestPlan {
+    url: Url,
+    bearer_token: String,
+    headers: Vec<(String, String)>,
+    model: ModelConfig,
+    extra_completion_properties: Option<String>,
+}
+
+fn case_insensitive_lookup<'a, V>(map: &'a HashMap<String, V>, key: &str) -> Option<&'a V> {
+    if let Some(v) = map.get(key) {
+        return Some(v);
+    }
+    map.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v)
+}
+
+fn resolve_bearer(auth: &AuthMethod, env: &[(OsString, OsString)]) -> Result<String> {
+    match auth {
+        AuthMethod::EnvKey {
+            env_key,
+            env_key_instructions,
+        } => env
+            .iter()
+            .find(|(k, _)| k == env_key.as_str())
+            .map(|(_, v)| v.to_string_lossy().into_owned())
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| match env_key_instructions {
+                Some(msg) => anyhow!("{env_key} not set in client environment — {msg}"),
+                None => anyhow!("{env_key} not set in client environment"),
+            }),
+        AuthMethod::Token { token } => Ok(token.clone()),
+        AuthMethod::File { file } => std::fs::read_to_string(file)
+            .with_context(|| format!("read auth file {}", file.display()))
+            .map(|s| s.trim().to_owned()),
+        AuthMethod::Command { .. } => Err(anyhow!("command-backed auth is not implemented yet")),
+    }
+}
+
+fn expand_headers(
+    raw: &BTreeMap<String, frances_config::EnvString>,
+    env: &dyn EnvLookup,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (name, template) in raw {
+        if name.eq_ignore_ascii_case("authorization") {
+            warn!(
+                header = %name,
+                "Authorization header in http_headers is ignored — auth resolves it"
+            );
+            continue;
+        }
+        let value = template
+            .expand(env)
+            .with_context(|| format!("expand header {name}"))?;
+        out.push((name.clone(), value));
+    }
+    Ok(out)
+}
+
+fn merge_extras(body: &mut Value, extras: Option<&str>) -> Result<()> {
+    let Some(extras) = extras else {
+        return Ok(());
+    };
+    let parsed: Value = serde_json::from_str(extras)
+        .context("parse responses_models.<id>.extra_completion_properties as JSON")?;
+    let Value::Object(extras_obj) = parsed else {
+        return Err(anyhow!(
+            "extra_completion_properties must be a JSON object, got {}",
+            type_name_of(&parsed)
+        ));
+    };
+    let Value::Object(body_obj) = body else {
+        unreachable!("body is constructed as a JSON object above");
+    };
+    for (k, v) in extras_obj {
+        body_obj.insert(k, v);
+    }
+    Ok(())
+}
+
+fn type_name_of(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "bool",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -283,7 +383,7 @@ pub fn chunk_usage(chunk: &Value) -> Option<Usage> {
     })
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, serde::Deserialize, Serialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
@@ -362,7 +462,7 @@ struct ToolCallBuilder {
 
 #[derive(Default)]
 pub struct ToolCallAccumulator {
-    in_progress: BTreeMap<u32, ToolCallBuilder>,
+    in_progress: std::collections::BTreeMap<u32, ToolCallBuilder>,
 }
 
 impl ToolCallAccumulator {
@@ -428,36 +528,6 @@ impl ToolCallAccumulator {
     }
 }
 
-#[derive(Serialize)]
-struct ChatRequest<'a> {
-    model: &'a str,
-    messages: &'a [Value],
-    max_tokens: u32,
-    stream: bool,
-    stream_options: StreamOptions,
-    reasoning: Reasoning,
-    provider: Provider<'a>,
-    #[serde(skip_serializing_if = "<[ToolDef]>::is_empty")]
-    tools: &'a [ToolDef],
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_choice: Option<&'a ToolChoice>,
-}
-
-#[derive(Serialize)]
-struct StreamOptions {
-    include_usage: bool,
-}
-
-#[derive(Serialize)]
-struct Reasoning {
-    enabled: bool,
-}
-
-#[derive(Serialize)]
-struct Provider<'a> {
-    order: &'a [&'a str],
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -483,8 +553,6 @@ mod tests {
 
     #[test]
     fn first_chunk_yields_start_event_only() {
-        // Initial OpenAI chunk carries id+name with empty arguments. The
-        // empty fragment is suppressed; we get exactly one Start event.
         let chunk = json!({
             "choices": [{
                 "delta": {
@@ -607,7 +675,6 @@ mod tests {
     #[test]
     fn accumulator_two_parallel_calls_sorted_by_index() {
         let mut acc = ToolCallAccumulator::new();
-        // chunks may arrive interleaved
         acc.push(ToolCallDelta {
             index: 1,
             event: ToolCallEvent::Start {
@@ -725,5 +792,35 @@ mod tests {
         let v = serde_json::to_value(ToolChoice::Function("edit".into())).unwrap();
         assert_eq!(v["type"], "function");
         assert_eq!(v["function"]["name"], "edit");
+    }
+
+    #[test]
+    fn merge_extras_overrides_existing_keys() {
+        let mut body = json!({
+            "model": "qwen",
+            "max_tokens": 1000,
+        });
+        merge_extras(
+            &mut body,
+            Some(r#"{"max_tokens": 2000, "provider": {"order": ["parasail"]}}"#),
+        )
+        .unwrap();
+        assert_eq!(body["max_tokens"], 2000);
+        assert_eq!(body["provider"]["order"][0], "parasail");
+        assert_eq!(body["model"], "qwen");
+    }
+
+    #[test]
+    fn merge_extras_rejects_non_object() {
+        let mut body = json!({});
+        let err = merge_extras(&mut body, Some(r#"["nope"]"#)).unwrap_err();
+        assert!(err.to_string().contains("must be a JSON object"));
+    }
+
+    #[test]
+    fn merge_extras_none_is_noop() {
+        let mut body = json!({"a": 1});
+        merge_extras(&mut body, None).unwrap();
+        assert_eq!(body, json!({"a": 1}));
     }
 }

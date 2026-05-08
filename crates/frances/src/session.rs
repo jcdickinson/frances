@@ -59,8 +59,13 @@ impl Paths {
             }
         };
 
-        let runtime_root = match env::var_os("XDG_RUNTIME_DIR") {
-            Some(value) => PathBuf::from(value).join("frances"),
+        // xdg's `runtime_dir` field is the raw `Option<PathBuf>` view of
+        // `$XDG_RUNTIME_DIR` — no default and no sanity checks. The spec
+        // doesn't define a fallback (the standard explicitly leaves it to
+        // applications), so we keep the previous `/tmp/frances-<uid>`
+        // default for setups without a session manager.
+        let runtime_root = match xdg::BaseDirectories::new().runtime_dir {
+            Some(dir) => dir.join("frances"),
             None => PathBuf::from(format!("/tmp/frances-{}", current_uid())),
         };
 

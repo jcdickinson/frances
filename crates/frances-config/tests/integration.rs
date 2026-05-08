@@ -6,7 +6,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use frances_config::{
     ConfigBinding, ConfigEvent, ConfigHandle, ConfigProvider, Configuration, EnvProvider,
-    EventSender, MapError, Path, ProviderError, RequiredConfigBinding, TomlProvider, Value,
+    EnvString, EventSender, MapError, Path, ProviderError, RequiredConfigBinding, TomlProvider,
+    Value,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -613,4 +614,52 @@ async fn t_preserved_through_chain() {
         }
         let _ = _build;
     }
+}
+
+#[test]
+fn env_string_round_trips_through_config() {
+    let cfg = make_config(&[("auth::header", Value::String("Bearer ${TOKEN}".into()))]);
+    #[derive(Deserialize)]
+    struct Auth {
+        header: EnvString,
+    }
+    let binding = cfg.get("auth").bind::<Auth>().unwrap();
+    let req = binding.required().unwrap();
+    let env: HashMap<String, String> = [("TOKEN".to_owned(), "abc".to_owned())]
+        .into_iter()
+        .collect();
+    assert_eq!(req.get().header.expand(&env).unwrap(), "Bearer abc");
+}
+
+#[test]
+fn untagged_enum_round_trips_through_config() {
+    // Mirrors the AuthMethod enum the llm crate will define: untagged,
+    // each variant disambiguated by required field names. Most-specific
+    // variant first.
+    #[derive(Debug, Deserialize, PartialEq)]
+    #[serde(untagged, deny_unknown_fields)]
+    enum AuthMethod {
+        EnvKey { env_key: String },
+        Token { token: String },
+    }
+
+    let cfg = make_config(&[("auth::env_key", Value::String("FOO".into()))]);
+    let v = cfg.get("auth").bind::<AuthMethod>().unwrap();
+    let req = v.required().unwrap();
+    assert_eq!(
+        *req.get(),
+        AuthMethod::EnvKey {
+            env_key: "FOO".to_owned()
+        }
+    );
+
+    let cfg2 = make_config(&[("auth::token", Value::String("sk-".into()))]);
+    let v2 = cfg2.get("auth").bind::<AuthMethod>().unwrap();
+    let req2 = v2.required().unwrap();
+    assert_eq!(
+        *req2.get(),
+        AuthMethod::Token {
+            token: "sk-".to_owned()
+        }
+    );
 }

@@ -98,6 +98,12 @@ impl Database {
                 anchor BLOB NOT NULL,
                 PRIMARY KEY(path, anchor)
             );
+
+            CREATE TABLE IF NOT EXISTS session_config (
+                path  TEXT PRIMARY KEY,
+                kind  TEXT NOT NULL,
+                value TEXT NOT NULL
+            );
             "#,
         )
         .await
