@@ -5,44 +5,64 @@ use serde::de::DeserializeOwned;
 
 use crate::binding::ConfigBinding;
 use crate::error::ConfigBindError;
-use crate::event::ConfigEvent;
+use crate::event::{ConfigEvent, ProviderId};
 use crate::value::{Path, Value};
 
-/// An immutable snapshot of merged configuration.
+/// An immutable snapshot of layered configuration.
 ///
-/// Each [`ConfigEvent`] applied to a `Configuration` produces a new
-/// `Configuration` with structural sharing for unaffected branches; cloning
-/// is `Arc`-cheap.
-#[derive(Debug, Clone, Default)]
+/// Each node carries one slot per provider (indexed by [`ProviderId`]) plus
+/// a cache of the highest-priority non-null slot, so reads are O(1) and
+/// retraction by a higher-priority provider naturally falls through to the
+/// next provider that has a value at the same path.
+///
+/// Cloning is cheap — three [`Arc`]s.
+#[derive(Debug, Clone)]
 pub struct Configuration {
-    inner: Arc<ConfigInner>,
+    values: Arc<[Value]>,
+    value_index: Option<usize>,
+    children: Arc<HashMap<Value, Configuration>>,
 }
 
-#[derive(Debug, Default)]
-pub(crate) struct ConfigInner {
-    pub value: Option<Value>,
-    pub children: HashMap<Value, Configuration>,
+impl Default for Configuration {
+    fn default() -> Self {
+        Self::empty(1)
+    }
 }
 
 impl Configuration {
+    /// Construct an empty configuration sized for `num_providers` layers.
+    /// Every slot starts as [`Value::Null`].
+    pub fn empty(num_providers: usize) -> Self {
+        let values: Arc<[Value]> = (0..num_providers).map(|_| Value::Null).collect();
+        Self {
+            values,
+            value_index: None,
+            children: Arc::new(HashMap::new()),
+        }
+    }
+
+    /// The highest-priority non-null slot at this node, or `None` if no
+    /// provider has set a value here.
+    pub fn value(&self) -> Option<&Value> {
+        self.value_index.map(|i| &self.values[i])
+    }
+
+    pub(crate) fn children(&self) -> &HashMap<Value, Configuration> {
+        &self.children
+    }
+
     pub fn get(&self, path: impl Into<Path>) -> ConfigurationRef<'_> {
         let path = path.into();
         let mut cursor: Option<&Configuration> = Some(self);
         let mut traversed = Path::new();
         for segment in path.iter() {
             traversed.push(segment.clone());
-            cursor = cursor
-                .and_then(|c| c.inner.children.get(segment))
-                .map(|c: &Configuration| c);
+            cursor = cursor.and_then(|c| c.children.get(segment));
         }
         ConfigurationRef {
             path: traversed,
             config: cursor,
         }
-    }
-
-    pub fn value(&self) -> Option<&Value> {
-        self.inner.value.as_ref()
     }
 
     pub fn bind<T>(&self) -> Result<ConfigBinding<T, T>, ConfigBindError>
@@ -52,105 +72,106 @@ impl Configuration {
         ConfigBinding::from_snapshot(Path::new(), Some(self), Weak::new())
     }
 
-    pub(crate) fn inner(&self) -> &ConfigInner {
-        &self.inner
-    }
-
-    /// Produce a new snapshot with `event` applied.
-    ///
-    /// `Value::Null` removes the leaf at `event.path`. Any other value is
-    /// stored at the leaf, creating intermediate nodes as needed.
-    /// Structural sharing means unaffected branches are not cloned.
+    /// Ergonomic single-event update against [`ProviderId`] 0. Used by tests
+    /// and ad-hoc snapshot construction. The processor uses the batch form.
     pub fn applied(&self, event: ConfigEvent) -> Self {
-        let segments = event.path.segments();
-        let new_inner = if event.value.is_null() {
-            apply_unset(&self.inner, segments)
-        } else {
-            apply_set(&self.inner, segments, event.value)
+        self.applied_batch(ProviderId(0), std::slice::from_ref(&event))
+            .unwrap_or_else(|| Self::empty(self.values.len()))
+    }
+
+    /// Apply a batch of events to a single provider's layer.
+    ///
+    /// Returns `None` when the entire subtree empties out — the caller (or
+    /// the parent in the recursion) should drop this node. Returns
+    /// `Some(updated)` otherwise. Sibling subtrees stay [`Arc`]-shared with
+    /// the original.
+    pub fn applied_batch(&self, provider: ProviderId, events: &[ConfigEvent]) -> Option<Self> {
+        let entries: Vec<(&[Value], &Value)> = events
+            .iter()
+            .map(|e| (e.path.segments(), &e.value))
+            .collect();
+        apply_at_node(self, provider, &entries)
+    }
+}
+
+/// Apply a batch of (remaining-path, value) entries to `node`'s subtree for
+/// `provider`. Recurses by grouping entries on their head segment.
+fn apply_at_node(
+    node: &Configuration,
+    provider: ProviderId,
+    entries: &[(&[Value], &Value)],
+) -> Option<Configuration> {
+    let mut here: Option<&Value> = None;
+    let mut by_child: HashMap<Value, Vec<(&[Value], &Value)>> = HashMap::new();
+    for (path, value) in entries {
+        match path.split_first() {
+            Some((head, tail)) => {
+                by_child
+                    .entry(head.clone())
+                    .or_default()
+                    .push((tail, value));
+            }
+            None => {
+                here = Some(value);
+            }
+        }
+    }
+
+    let (new_values, new_value_index) = match here {
+        Some(v) => update_slot(&node.values, provider.index(), v),
+        None => (node.values.clone(), node.value_index),
+    };
+
+    let mut new_children: HashMap<Value, Configuration> = (*node.children).clone();
+    let mut children_changed = false;
+    for (key, sub_entries) in by_child {
+        let computed = match new_children.get(&key) {
+            Some(child) => apply_at_node(child, provider, &sub_entries),
+            None => {
+                let empty = Configuration::empty(node.values.len());
+                apply_at_node(&empty, provider, &sub_entries)
+            }
         };
-        match new_inner {
-            Some(inner) => Self {
-                inner: Arc::new(inner),
-            },
-            None => Self::default(),
+        match computed {
+            Some(updated) => {
+                new_children.insert(key, updated);
+                children_changed = true;
+            }
+            None => {
+                if new_children.remove(&key).is_some() {
+                    children_changed = true;
+                }
+            }
         }
     }
-}
 
-/// Set the leaf at `segments` (relative to `node`) to `value`. Returns the
-/// new node, or `None` if the result would be empty (which only happens at
-/// the top level when applying to an empty tree with no segments — covered
-/// by the wrapper).
-fn apply_set(node: &ConfigInner, segments: &[Value], value: Value) -> Option<ConfigInner> {
-    if segments.is_empty() {
-        return Some(ConfigInner {
-            value: Some(value),
-            children: node.children.clone(),
-        });
+    let here_changed = here.is_some();
+    if !here_changed && !children_changed {
+        return Some(node.clone());
     }
-    let (head, tail) = segments.split_first().expect("non-empty checked above");
-    let empty;
-    let existing = match node.children.get(head) {
-        Some(c) => c.inner.as_ref(),
-        None => {
-            empty = ConfigInner::default();
-            &empty
-        }
-    };
-    let updated = apply_set(existing, tail, value)?;
-    let mut children = node.children.clone();
-    children.insert(
-        head.clone(),
-        Configuration {
-            inner: Arc::new(updated),
-        },
-    );
-    Some(ConfigInner {
-        value: node.value.clone(),
-        children,
-    })
-}
 
-/// Remove the leaf at `segments`. Returns `None` if removing the leaf left an
-/// empty subtree at this level (caller can then prune the parent's entry).
-fn apply_unset(node: &ConfigInner, segments: &[Value]) -> Option<ConfigInner> {
-    if segments.is_empty() {
-        if node.children.is_empty() {
-            return None;
-        }
-        return Some(ConfigInner {
-            value: None,
-            children: node.children.clone(),
-        });
-    }
-    let (head, tail) = segments.split_first().expect("non-empty checked above");
-    let Some(child) = node.children.get(head) else {
-        return Some(ConfigInner {
-            value: node.value.clone(),
-            children: node.children.clone(),
-        });
-    };
-    let mut children = node.children.clone();
-    match apply_unset(child.inner.as_ref(), tail) {
-        Some(updated) => {
-            children.insert(
-                head.clone(),
-                Configuration {
-                    inner: Arc::new(updated),
-                },
-            );
-        }
-        None => {
-            children.remove(head);
-        }
-    }
-    if node.value.is_none() && children.is_empty() {
+    if new_value_index.is_none() && new_children.is_empty() {
         return None;
     }
-    Some(ConfigInner {
-        value: node.value.clone(),
-        children,
+
+    Some(Configuration {
+        values: new_values,
+        value_index: new_value_index,
+        children: Arc::new(new_children),
     })
+}
+
+/// Replace `values[slot]` with `new_value`, returning the new slice and the
+/// recomputed highest-priority non-null index.
+fn update_slot(
+    values: &Arc<[Value]>,
+    slot: usize,
+    new_value: &Value,
+) -> (Arc<[Value]>, Option<usize>) {
+    let mut next: Vec<Value> = values.iter().cloned().collect();
+    next[slot] = new_value.clone();
+    let index = next.iter().rposition(|v| !v.is_null());
+    (next.into(), index)
 }
 
 /// A borrowed view into a [`Configuration`] subtree, tracking the path so
@@ -170,7 +191,7 @@ impl<'a> ConfigurationRef<'a> {
         let segment = segment.into();
         let mut path = self.path.clone();
         path.push(segment.clone());
-        let next = self.config.and_then(|c| c.inner.children.get(&segment));
+        let next = self.config.and_then(|c| c.children.get(&segment));
         ConfigurationRef { path, config: next }
     }
 
@@ -237,5 +258,27 @@ mod tests {
             .value(),
             Some(&Value::String("alpha".into()))
         );
+    }
+
+    #[test]
+    fn higher_layer_overrides_lower() {
+        let cfg = Configuration::empty(2)
+            .applied_batch(ProviderId(0), &[ev("a::b", "low")])
+            .unwrap()
+            .applied_batch(ProviderId(1), &[ev("a::b", "high")])
+            .unwrap();
+        assert_eq!(cfg.get("a::b").value(), Some(&Value::String("high".into())));
+    }
+
+    #[test]
+    fn unset_falls_through_to_lower_layer() {
+        let cfg = Configuration::empty(2)
+            .applied_batch(ProviderId(0), &[ev("a::b", "low")])
+            .unwrap()
+            .applied_batch(ProviderId(1), &[ev("a::b", "high")])
+            .unwrap()
+            .applied_batch(ProviderId(1), &[ev("a::b", Value::Null)])
+            .unwrap();
+        assert_eq!(cfg.get("a::b").value(), Some(&Value::String("low".into())));
     }
 }

@@ -30,12 +30,27 @@ impl ConfigEvent {
     }
 }
 
+/// Identifies a provider's layer within a layered configuration. Layers are
+/// indexed by build-vec position; higher indices have higher priority. The
+/// top index is reserved for [`ConfigHandle::publish`] (the manual layer).
+///
+/// [`ConfigHandle::publish`]: crate::ConfigHandle::publish
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProviderId(pub(crate) usize);
+
+impl ProviderId {
+    pub(crate) fn index(self) -> usize {
+        self.0
+    }
+}
+
 /// The sender handed to providers' `load()`. Wraps the handle's internal
-/// channel so events go directly into the processor's queue — no
-/// intermediate forwarder, no barrier race.
+/// channel and stamps each batch with the provider's [`ProviderId`] so the
+/// processor can route events into the right layer.
 #[derive(Clone)]
 pub struct EventSender {
     pub(crate) inner: mpsc::Sender<InternalEvent>,
+    pub(crate) provider_id: ProviderId,
 }
 
 impl EventSender {
@@ -45,7 +60,10 @@ impl EventSender {
     /// in a one-element `Vec`.
     pub async fn send(&self, events: Vec<ConfigEvent>) -> Result<(), SendError> {
         self.inner
-            .send(InternalEvent::Batch(events))
+            .send(InternalEvent::Batch {
+                provider_id: self.provider_id,
+                events,
+            })
             .await
             .map_err(|_| SendError)
     }
@@ -65,6 +83,9 @@ pub struct SendError;
 ///
 /// [`build`]: crate::ConfigHandle::build
 pub(crate) enum InternalEvent {
-    Batch(Vec<ConfigEvent>),
+    Batch {
+        provider_id: ProviderId,
+        events: Vec<ConfigEvent>,
+    },
     Barrier(oneshot::Sender<()>),
 }

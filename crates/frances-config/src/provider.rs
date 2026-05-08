@@ -14,6 +14,13 @@ use crate::event::EventSender;
 /// publish further events at runtime (e.g. on a file-watcher tick, or in
 /// response to a manual reload). Providers that have no runtime semantics
 /// simply drop the sender.
+///
+/// Each provider owns its own configuration layer. Emitting a
+/// [`ConfigEvent`] with [`Value::Null`](crate::Value::Null) retracts only
+/// *this provider's* contribution at that path; lower-priority providers'
+/// values fall through.
+///
+/// [`ConfigEvent`]: crate::ConfigEvent
 #[async_trait]
 pub trait ConfigProvider: Send + Sync + 'static {
     async fn load(&self, events: EventSender) -> Result<(), ProviderError>;

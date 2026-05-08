@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::binding::{BindingRefresh, ConfigBinding};
 use crate::config::Configuration;
 use crate::error::{BuildError, ConfigBindError, ReloadError};
-use crate::event::{ConfigEvent, EventSender, InternalEvent};
+use crate::event::{ConfigEvent, EventSender, InternalEvent, ProviderId};
 use crate::provider::ConfigProvider;
 use crate::value::Path;
 
@@ -69,6 +69,9 @@ impl BindingRegistry {
 pub struct ConfigHandle {
     registry: Arc<BindingRegistry>,
     events_tx: mpsc::Sender<InternalEvent>,
+    /// `ProviderId` reserved for [`ConfigHandle::publish`]; sits above all
+    /// providers in priority.
+    manual_id: ProviderId,
     /// Keeps providers alive for the lifetime of the handle so they can
     /// continue publishing runtime events.
     _providers: Arc<Vec<Arc<dyn ConfigProvider>>>,
@@ -77,22 +80,28 @@ pub struct ConfigHandle {
 impl ConfigHandle {
     /// Build a handle from a list of providers.
     ///
-    /// Providers are loaded **sequentially** — events from later providers
-    /// arrive after, and therefore override, events from earlier ones.
-    /// After all providers' `load()` futures have resolved, a barrier is
-    /// sent through the same channel and `build` returns once it has been
-    /// processed, guaranteeing the snapshot reflects every initial event.
+    /// Providers are loaded **sequentially**. Each provider gets its own
+    /// layer; later providers in the vec have higher priority. An additional
+    /// "manual" layer sits above all providers and is the destination for
+    /// [`ConfigHandle::publish`]. After all providers' `load()` futures
+    /// resolve, a barrier is sent through the same channel and `build`
+    /// returns once it has been processed, guaranteeing the snapshot
+    /// reflects every initial event.
     pub async fn build(providers: Vec<Arc<dyn ConfigProvider>>) -> Result<Self, BuildError> {
+        let num_layers = providers.len() + 1;
+        let manual_id = ProviderId(providers.len());
+
         let snapshot: Arc<ArcSwap<Configuration>> =
-            Arc::new(ArcSwap::from_pointee(Configuration::default()));
+            Arc::new(ArcSwap::from_pointee(Configuration::empty(num_layers)));
         let registry = Arc::new(BindingRegistry::new(snapshot.clone()));
         let (events_tx, events_rx) = mpsc::channel::<InternalEvent>(EVENT_BUFFER);
 
-        spawn_processor(events_rx, snapshot.clone(), registry.clone());
+        spawn_processor(events_rx, snapshot.clone(), registry.clone(), num_layers);
 
-        for p in &providers {
+        for (i, p) in providers.iter().enumerate() {
             let sender = EventSender {
                 inner: events_tx.clone(),
+                provider_id: ProviderId(i),
             };
             p.load(sender).await?;
         }
@@ -107,6 +116,7 @@ impl ConfigHandle {
         Ok(Self {
             registry,
             events_tx,
+            manual_id,
             _providers: Arc::new(providers),
         })
     }
@@ -116,10 +126,14 @@ impl ConfigHandle {
         self.registry.snapshot.load()
     }
 
-    /// Manually publish a batch of events.
+    /// Manually publish a batch of events. Events go into the reserved
+    /// manual layer, which sits above all provider layers.
     pub async fn publish(&self, events: Vec<ConfigEvent>) -> Result<(), ReloadError> {
         self.events_tx
-            .send(InternalEvent::Batch(events))
+            .send(InternalEvent::Batch {
+                provider_id: self.manual_id,
+                events,
+            })
             .await
             .map_err(|_| ReloadError::ProcessorGone)
     }
@@ -141,15 +155,19 @@ fn spawn_processor(
     mut events_rx: mpsc::Receiver<InternalEvent>,
     snapshot: Arc<ArcSwap<Configuration>>,
     registry: Arc<BindingRegistry>,
+    num_layers: usize,
 ) {
     tokio::spawn(async move {
         while let Some(event) = events_rx.recv().await {
             match event {
-                InternalEvent::Batch(evs) => {
-                    let mut next: Configuration = (**snapshot.load()).clone();
-                    for ev in evs {
-                        next = next.applied(ev);
-                    }
+                InternalEvent::Batch {
+                    provider_id,
+                    events,
+                } => {
+                    let current = snapshot.load_full();
+                    let next = current
+                        .applied_batch(provider_id, &events)
+                        .unwrap_or_else(|| Configuration::empty(num_layers));
                     let next = Arc::new(next);
                     snapshot.store(next.clone());
                     registry.refresh_all(&next).await;

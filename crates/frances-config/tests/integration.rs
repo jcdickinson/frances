@@ -663,3 +663,81 @@ fn untagged_enum_round_trips_through_config() {
         }
     );
 }
+
+/// Test provider that emits an initial batch and stashes its sender so the
+/// test can drive runtime emits afterwards.
+struct LatchingProvider {
+    initial: std::sync::Mutex<Vec<ConfigEvent>>,
+    sender: std::sync::Mutex<Option<EventSender>>,
+}
+
+impl LatchingProvider {
+    fn new(initial: Vec<ConfigEvent>) -> Arc<Self> {
+        Arc::new(Self {
+            initial: std::sync::Mutex::new(initial),
+            sender: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn emit(&self, events: Vec<ConfigEvent>) {
+        let s = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have loaded");
+        s.send(events).await.unwrap();
+    }
+}
+
+#[async_trait]
+impl ConfigProvider for LatchingProvider {
+    async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
+        let initial = std::mem::take(&mut *self.initial.lock().unwrap());
+        if !initial.is_empty() {
+            events.send(initial).await.unwrap();
+        }
+        *self.sender.lock().unwrap() = Some(events);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn layer_unset_falls_through_to_lower_provider() {
+    let low = LatchingProvider::new(vec![ev("a::b", "first")]);
+    let high = LatchingProvider::new(vec![ev("a::b", "second")]);
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![low.clone(), high.clone()];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+
+    assert_eq!(
+        handle.snapshot().get("a::b").value(),
+        Some(&Value::String("second".into()))
+    );
+
+    high.emit(vec![ConfigEvent::unset(Path::parse("a::b"))])
+        .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert_eq!(
+        handle.snapshot().get("a::b").value(),
+        Some(&Value::String("first".into()))
+    );
+}
+
+#[tokio::test]
+async fn layer_unset_without_prior_layer_yields_none() {
+    let only = LatchingProvider::new(vec![ev("a::b", "x")]);
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![only.clone()];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+
+    assert_eq!(
+        handle.snapshot().get("a::b").value(),
+        Some(&Value::String("x".into()))
+    );
+
+    only.emit(vec![ConfigEvent::unset(Path::parse("a::b"))])
+        .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    assert!(handle.snapshot().get("a::b").value().is_none());
+}

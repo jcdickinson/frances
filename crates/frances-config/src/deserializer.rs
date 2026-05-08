@@ -47,7 +47,7 @@ impl<'a> ConfigDeserializer<'a> {
 
     /// True iff every direct child key is `Value::Int(n)` for n in 0..len.
     fn is_seq(&self) -> bool {
-        let children = &self.config.inner().children;
+        let children = self.config.children();
         if children.is_empty() {
             return false;
         }
@@ -215,7 +215,7 @@ impl<'de, 'a> Deserializer<'de> for ConfigDeserializer<'a> {
     {
         let path = self.path.clone();
         let has_value = self.config.value().is_some();
-        let has_children = !self.config.inner().children.is_empty();
+        let has_children = !self.config.children().is_empty();
         if has_value || has_children {
             visitor.visit_some(self).map_err(|e| e.add_path(&path))
         } else {
@@ -363,7 +363,7 @@ impl<'de, 'a> SeqAccess<'de> for ConfigSeqAccess<'a> {
         T: DeserializeSeed<'de>,
     {
         let key = Value::Int(self.index as i64);
-        match self.config.inner().children.get(&key) {
+        match self.config.children().get(&key) {
             Some(child) => {
                 let child_path = join_path(&self.parent_path, &self.index.to_string());
                 self.index += 1;
@@ -384,7 +384,7 @@ struct ConfigMapAccess<'a> {
 
 impl<'a> ConfigMapAccess<'a> {
     fn new(parent_path: Arc<str>, config: &'a Configuration) -> Self {
-        let keys: Vec<Value> = config.inner().children.keys().cloned().collect();
+        let keys: Vec<Value> = config.children().keys().cloned().collect();
         Self {
             parent_path,
             config,
@@ -425,8 +425,7 @@ impl<'de, 'a> MapAccess<'de> for ConfigMapAccess<'a> {
             })?;
         let child =
             self.config
-                .inner()
-                .children
+                .children()
                 .get(&key)
                 .ok_or_else(|| ConfigBindError::Structural {
                     path: self.parent_path.clone(),
