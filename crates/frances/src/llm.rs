@@ -3,25 +3,69 @@ use std::ffi::OsString;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use frances_config::ConfigBinding;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::{debug, trace};
+use url::Url;
 
-const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
-const MODEL: &str = "qwen/qwen3-coder-next";
-const PROVIDER_ORDER: &[&str] = &["parasail"];
-const MAX_TOKENS: u32 = 1000;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
-
-#[derive(Clone)]
-pub struct InceptionClient {
-    http: reqwest::Client,
-    api_key: String,
+/// Bound at `llm::` in the config tree. Every field has a serde default,
+/// and the type implements `Default`, so `ConfigBinding::get_or_default`
+/// always returns a fully-populated value — even when the user has set no
+/// env vars at all and the `llm::` section doesn't exist.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LlmConfig {
+    #[serde(default = "default_url")]
+    pub url: Url,
+    #[serde(default = "default_model")]
+    pub model: String,
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u32,
+    #[serde(default = "default_timeout_secs")]
+    pub timeout_secs: u64,
+    #[serde(default = "default_provider_order")]
+    pub provider_order: Vec<String>,
 }
 
-impl InceptionClient {
-    pub fn from_env(env: &[(OsString, OsString)]) -> Result<Self> {
+fn default_url() -> Url {
+    Url::parse("https://openrouter.ai/api/v1/chat/completions")
+        .expect("hardcoded openrouter url is valid")
+}
+fn default_model() -> String {
+    "qwen/qwen3-coder-next".into()
+}
+fn default_max_tokens() -> u32 {
+    1000
+}
+fn default_timeout_secs() -> u64 {
+    120
+}
+fn default_provider_order() -> Vec<String> {
+    vec!["parasail".into()]
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            url: default_url(),
+            model: default_model(),
+            max_tokens: default_max_tokens(),
+            timeout_secs: default_timeout_secs(),
+            provider_order: default_provider_order(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct OpenAiClient {
+    http: reqwest::Client,
+    api_key: String,
+    config: ConfigBinding<LlmConfig>,
+}
+
+impl OpenAiClient {
+    pub fn new(env: &[(OsString, OsString)], config: ConfigBinding<LlmConfig>) -> Result<Self> {
         let api_key = env
             .iter()
             .find(|(k, _)| k == "OPENROUTER_API_KEY")
@@ -30,11 +74,14 @@ impl InceptionClient {
             .ok_or_else(|| anyhow!("OPENROUTER_API_KEY not set in client environment"))?;
 
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
             .build()
             .context("build reqwest client")?;
 
-        Ok(Self { http, api_key })
+        Ok(Self {
+            http,
+            api_key,
+            config,
+        })
     }
 
     pub async fn stream<F>(
@@ -47,17 +94,20 @@ impl InceptionClient {
     where
         F: FnMut(&Value) -> Result<()>,
     {
+        let cfg = self.config.get_or_default();
+        let provider_order: Vec<&str> = cfg.provider_order.iter().map(String::as_str).collect();
+
         let body = ChatRequest {
-            model: MODEL,
+            model: &cfg.model,
             messages,
-            max_tokens: MAX_TOKENS,
+            max_tokens: cfg.max_tokens,
             stream: true,
             stream_options: StreamOptions {
                 include_usage: true,
             },
             reasoning: Reasoning { enabled: true },
             provider: Provider {
-                order: PROVIDER_ORDER,
+                order: &provider_order,
             },
             tools,
             tool_choice,
@@ -71,7 +121,8 @@ impl InceptionClient {
 
         let response = self
             .http
-            .post(OPENROUTER_URL)
+            .post(cfg.url.clone())
+            .timeout(Duration::from_secs(cfg.timeout_secs))
             .bearer_auth(&self.api_key)
             .json(&body)
             .send()
@@ -88,7 +139,7 @@ impl InceptionClient {
         let mut buffer = String::new();
 
         while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("inception stream chunk")?;
+            let bytes = chunk.context("openai stream chunk")?;
             buffer.push_str(&String::from_utf8_lossy(&bytes));
 
             while let Some(idx) = buffer.find("\n\n") {

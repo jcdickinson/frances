@@ -755,6 +755,7 @@ dependencies = [
  "clap",
  "crossterm",
  "frances-anchors",
+ "frances-config",
  "frances-core",
  "frances-edit",
  "frances-shell",
@@ -773,6 +774,7 @@ dependencies = [
  "tracing-subscriber",
  "turso",
  "unicode-width 0.2.2",
+ "url",
 ]
 
 [[package]]
@@ -3186,6 +3188,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]

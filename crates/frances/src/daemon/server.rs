@@ -24,10 +24,11 @@ use crate::daemon::protocol::{
 };
 use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
-use crate::llm::{self, InceptionClient, ToolCallAccumulator};
+use crate::llm::{self, LlmConfig, OpenAiClient, ToolCallAccumulator};
 use crate::session::Session;
 use crate::store::Database;
 use crate::tools;
+use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider};
 use frances_edit::EditEngine;
 use frances_shell::Shell;
 
@@ -44,6 +45,11 @@ pub(crate) struct ServerState {
     shell: tokio::sync::Mutex<Option<Shell>>,
     events: EventsRouter,
     shutdown: Notify,
+    /// Kept alive so the config-event-processor task stays running for the
+    /// daemon's lifetime. Bindings are refreshed via this handle's registry.
+    #[expect(dead_code, reason = "held for processor task lifetime")]
+    config: ConfigHandle,
+    llm_config: ConfigBinding<LlmConfig>,
 }
 
 #[derive(Default)]
@@ -206,6 +212,14 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         .with_context(|| format!("failed writing pid file for {}", session.id))?;
 
     let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
+
+    let providers: Vec<Arc<dyn ConfigProvider>> =
+        vec![Arc::new(EnvProvider::with_prefix("FRANCES"))];
+    let config = ConfigHandle::build(providers)
+        .await
+        .context("build config handle")?;
+    let llm_config = config.bind::<LlmConfig>("llm").context("bind llm config")?;
+
     let state = Arc::new(ServerState {
         session: session.clone(),
         client_attached: StdMutex::new(false),
@@ -216,6 +230,8 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         shell: tokio::sync::Mutex::new(None),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
+        config,
+        llm_config,
     });
 
     let events_listener = UnixListener::bind(session.events_socket_path()).with_context(|| {
@@ -441,7 +457,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         (ctx.process.env.clone(), ctx.process.cwd.clone())
     };
 
-    let llm = InceptionClient::from_env(&env)?;
+    let llm = OpenAiClient::new(&env, state.llm_config.clone())?;
 
     let mut next_block: u64 = 1;
     let mut alloc_block = || {
@@ -509,7 +525,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 async fn run_llm_step(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    llm: &InceptionClient,
+    llm: &OpenAiClient,
     alloc_block: &mut impl FnMut() -> BlockId,
     send_error: &mut Option<anyhow::Error>,
     cwd: Option<&std::path::Path>,
@@ -529,7 +545,7 @@ async fn run_llm_step(
     )
     .await;
 
-    let llm_owned: InceptionClient = (*llm).clone();
+    let llm_owned: OpenAiClient = (*llm).clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let llm_task = tokio::spawn(async move {
         llm_owned

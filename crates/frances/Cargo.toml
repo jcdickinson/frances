@@ -30,10 +30,12 @@ unicode-width.workspace = true
 tarpc.workspace = true
 futures.workspace = true
 thiserror.workspace = true
+frances-config.workspace = true
 frances-core.workspace = true
 frances-edit.workspace = true
 frances-shell.workspace = true
 async-trait.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 frances-anchors.workspace = true
