@@ -118,12 +118,6 @@ pub enum BuildError {
     ProcessorGone,
 }
 
-#[derive(Debug, Error)]
-pub enum ReloadError {
-    #[error("event processor terminated")]
-    ProcessorGone,
-}
-
 /// Error produced by an async mapper passed to
 /// [`ConfigBinding::map_async`](crate::ConfigBinding::map_async). Wraps any
 /// concrete `std::error::Error` so mappers can surface their own typed

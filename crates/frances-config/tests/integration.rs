@@ -45,6 +45,55 @@ fn ev(path: &str, value: impl Into<Value>) -> ConfigEvent {
     ConfigEvent::new(Path::parse(path), value)
 }
 
+/// Test provider that captures its [`EventSender`] during `load()` and
+/// optionally emits an initial batch. Tests use `emit` afterwards to
+/// drive runtime events into this provider's layer.
+struct LatchingProvider {
+    initial: std::sync::Mutex<Vec<ConfigEvent>>,
+    sender: std::sync::Mutex<Option<EventSender>>,
+}
+
+impl LatchingProvider {
+    fn new(initial: Vec<ConfigEvent>) -> Arc<Self> {
+        Arc::new(Self {
+            initial: std::sync::Mutex::new(initial),
+            sender: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn emit(&self, events: Vec<ConfigEvent>) {
+        let s = self
+            .sender
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("provider must have loaded");
+        s.send(events).await.unwrap();
+    }
+}
+
+#[async_trait]
+impl ConfigProvider for LatchingProvider {
+    async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
+        let initial = std::mem::take(&mut *self.initial.lock().unwrap());
+        if !initial.is_empty() {
+            events.send(initial).await.unwrap();
+        }
+        *self.sender.lock().unwrap() = Some(events);
+        Ok(())
+    }
+}
+
+/// Build a `(handle, manual)` pair where every `publish`-style test gets a
+/// single `LatchingProvider` it can drive runtime events through. Mirrors
+/// the old `ConfigHandle::build(vec![])` + `handle.publish(...)` shape.
+async fn handle_with_manual() -> (ConfigHandle, Arc<LatchingProvider>) {
+    let manual = LatchingProvider::new(vec![]);
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![manual.clone()];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    (handle, manual)
+}
+
 #[test]
 fn separator_is_double_colon() {
     let cfg = make_config(&[("foo::bar", Value::String("baz".into()))]);
@@ -151,12 +200,8 @@ async fn build_waits_for_initial_load() {
 
 #[tokio::test]
 async fn runtime_event_updates_snapshot() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("llm::model", "qwen")])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("llm::model", "qwen")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         handle.snapshot().get("llm::model").value(),
@@ -166,12 +211,8 @@ async fn runtime_event_updates_snapshot() {
 
 #[tokio::test]
 async fn subscribe_yields_on_event() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("llm::model", "first")])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("llm::model", "first")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle
         .bind::<String>("llm::model")
@@ -179,10 +220,7 @@ async fn subscribe_yields_on_event() {
         .required()
         .unwrap();
     let mut stream = binding.subscribe();
-    handle
-        .publish(vec![ev("llm::model", "second")])
-        .await
-        .unwrap();
+    manual.emit(vec![ev("llm::model", "second")]).await;
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("stream timed out")
@@ -192,12 +230,8 @@ async fn subscribe_yields_on_event() {
 
 #[tokio::test]
 async fn subscribe_now_yields_current_first() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("llm::model", "hello")])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("llm::model", "hello")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle
         .bind::<String>("llm::model")
@@ -214,12 +248,8 @@ async fn subscribe_now_yields_current_first() {
 
 #[tokio::test]
 async fn required_subscribe_skips_absence() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("llm::model", "first")])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("llm::model", "first")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle
         .bind::<String>("llm::model")
@@ -227,16 +257,12 @@ async fn required_subscribe_skips_absence() {
         .required()
         .unwrap();
     let mut stream = binding.subscribe();
-    handle
-        .publish(vec![ConfigEvent::unset(Path::parse("llm::model"))])
-        .await
-        .unwrap();
+    manual
+        .emit(vec![ConfigEvent::unset(Path::parse("llm::model"))])
+        .await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(binding.get().as_str(), "first");
-    handle
-        .publish(vec![ev("llm::model", "third")])
-        .await
-        .unwrap();
+    manual.emit(vec![ev("llm::model", "third")]).await;
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("timeout")
@@ -246,19 +272,14 @@ async fn required_subscribe_skips_absence() {
 
 #[tokio::test]
 async fn optional_subscribe_emits_none_on_absence() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("llm::model", "first")])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("llm::model", "first")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle.bind::<String>("llm::model").unwrap();
     let mut stream = binding.subscribe();
-    handle
-        .publish(vec![ConfigEvent::unset(Path::parse("llm::model"))])
-        .await
-        .unwrap();
+    manual
+        .emit(vec![ConfigEvent::unset(Path::parse("llm::model"))])
+        .await;
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("timeout")
@@ -268,14 +289,13 @@ async fn optional_subscribe_emits_none_on_absence() {
 
 #[tokio::test]
 async fn handle_drops_dead_bindings() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("a", "1")]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("a", "1")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     {
         let _binding = handle.bind::<String>("a").unwrap();
     }
-    handle.publish(vec![ev("a", "2")]).await.unwrap();
+    manual.emit(vec![ev("a", "2")]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle.bind::<String>("a").unwrap().required().unwrap();
     assert_eq!(binding.get().as_str(), "2");
@@ -380,24 +400,22 @@ tokens = 1
 
 #[tokio::test]
 async fn send_batch_one_refresh() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("x", Value::Int(0))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("x", Value::Int(0))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let binding = handle.bind::<i64>("x").unwrap().required().unwrap();
     let mut stream = binding.subscribe();
 
-    handle
-        .publish(vec![
+    manual
+        .emit(vec![
             ev("x", Value::Int(1)),
             ev("x", Value::Int(2)),
             ev("x", Value::Int(3)),
             ev("x", Value::Int(4)),
             ev("x", Value::Int(5)),
         ])
-        .await
-        .unwrap();
+        .await;
 
     // Consume one yield; assert it's the post-batch state.
     let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -450,12 +468,8 @@ async fn optional_required_distinct_types() {
 
 #[tokio::test]
 async fn map_async_initial() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(vec![ev("count", Value::Int(7))])
-        .await
-        .unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("count", Value::Int(7))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let mapped = handle
@@ -470,9 +484,8 @@ async fn map_async_initial() {
 
 #[tokio::test]
 async fn map_async_propagates_initial_error() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("n", Value::Int(0))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("n", Value::Int(0))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let result = handle
@@ -487,9 +500,8 @@ async fn map_async_propagates_initial_error() {
 
 #[tokio::test]
 async fn map_async_refresh_on_upstream() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("n", Value::Int(2))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("n", Value::Int(2))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let mapped = handle
@@ -499,7 +511,7 @@ async fn map_async_refresh_on_upstream() {
         .await
         .unwrap();
     let mut stream = mapped.subscribe();
-    handle.publish(vec![ev("n", Value::Int(5))]).await.unwrap();
+    manual.emit(vec![ev("n", Value::Int(5))]).await;
 
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
@@ -524,9 +536,8 @@ async fn map_async_noop_on_none() {
 
 #[tokio::test]
 async fn map_async_refresh_error_clears_to_none() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("n", Value::Int(2))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("n", Value::Int(2))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let counter = Arc::new(AtomicUsize::new(0));
@@ -549,16 +560,15 @@ async fn map_async_refresh_error_clears_to_none() {
         .unwrap();
 
     assert!(mapped.get().is_some());
-    handle.publish(vec![ev("n", Value::Int(3))]).await.unwrap();
+    manual.emit(vec![ev("n", Value::Int(3))]).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert!(mapped.get().is_none());
 }
 
 #[tokio::test]
 async fn map_async_chain() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("n", Value::Int(3))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("n", Value::Int(3))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let mapped = handle
@@ -577,9 +587,8 @@ async fn map_async_chain() {
 
 #[tokio::test]
 async fn map_async_then_required() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle.publish(vec![ev("n", Value::Int(7))]).await.unwrap();
+    let (handle, manual) = handle_with_manual().await;
+    manual.emit(vec![ev("n", Value::Int(7))]).await;
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let req: RequiredConfigBinding<i64, String> = handle
@@ -592,7 +601,7 @@ async fn map_async_then_required() {
         .unwrap();
 
     assert_eq!(req.get().as_str(), "7");
-    handle.publish(vec![ev("n", Value::Int(42))]).await.unwrap();
+    manual.emit(vec![ev("n", Value::Int(42))]).await;
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(req.get().as_str(), "42");
 }
@@ -664,42 +673,32 @@ fn untagged_enum_round_trips_through_config() {
     );
 }
 
-/// Test provider that emits an initial batch and stashes its sender so the
-/// test can drive runtime emits afterwards.
-struct LatchingProvider {
-    initial: std::sync::Mutex<Vec<ConfigEvent>>,
-    sender: std::sync::Mutex<Option<EventSender>>,
-}
+#[tokio::test]
+async fn scoped_handle_concats_prefix_for_bind() {
+    let (handle, manual) = handle_with_manual().await;
+    manual
+        .emit(vec![
+            ev("models::default::id", "qwen"),
+            ev("models::default::tokens", Value::Int(1000)),
+        ])
+        .await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
 
-impl LatchingProvider {
-    fn new(initial: Vec<ConfigEvent>) -> Arc<Self> {
-        Arc::new(Self {
-            initial: std::sync::Mutex::new(initial),
-            sender: std::sync::Mutex::new(None),
-        })
-    }
+    let scoped = handle.scoped("models::default");
+    let id = scoped.bind::<String>("id").unwrap().required().unwrap();
+    let tokens = scoped.bind::<u32>("tokens").unwrap().required().unwrap();
+    assert_eq!(id.get().as_str(), "qwen");
+    assert_eq!(*tokens.get(), 1000);
 
-    async fn emit(&self, events: Vec<ConfigEvent>) {
-        let s = self
-            .sender
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("provider must have loaded");
-        s.send(events).await.unwrap();
-    }
-}
+    // Refresh propagates through the scoped view's bindings.
+    manual.emit(vec![ev("models::default::id", "kimi")]).await;
+    tokio::time::sleep(Duration::from_millis(10)).await;
+    assert_eq!(id.get().as_str(), "kimi");
 
-#[async_trait]
-impl ConfigProvider for LatchingProvider {
-    async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
-        let initial = std::mem::take(&mut *self.initial.lock().unwrap());
-        if !initial.is_empty() {
-            events.send(initial).await.unwrap();
-        }
-        *self.sender.lock().unwrap() = Some(events);
-        Ok(())
-    }
+    // get() extends the prefix.
+    let nested = handle.scoped("models").get("default");
+    let id2 = nested.bind::<String>("id").unwrap().required().unwrap();
+    assert_eq!(id2.get().as_str(), "kimi");
 }
 
 #[tokio::test]

@@ -26,7 +26,7 @@ use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
 use crate::llm::{
     self, ChatClient, ModelsConfig, ProviderConfig, ResponsesModelExtras, SessionConfigProvider,
-    ToolCallAccumulator,
+    SessionConfigWriter, ToolCallAccumulator,
 };
 use crate::session::Session;
 use crate::store::Database;
@@ -55,6 +55,11 @@ pub(crate) struct ServerState {
     providers: ConfigBinding<HashMap<String, ProviderConfig>>,
     models: ConfigBinding<ModelsConfig>,
     responses_extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
+    /// Writes session-config rows and emits the matching events on the
+    /// DB layer in one call. Held for future RPC handlers that mutate
+    /// session config.
+    #[expect(dead_code, reason = "wired for future session-config writers")]
+    session_config_writer: SessionConfigWriter,
 }
 
 #[derive(Default)]
@@ -188,8 +193,16 @@ pub fn install_logging(session: &Session) -> Result<()> {
     }
     drop(file);
 
+    // Default to warn for the world; raise frances/frances-edit/frances-anchors
+    // /frances-config to trace so we can see our own logs without drowning in
+    // turso/hyper/reqwest internals. Overridable via RUST_LOG.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        tracing_subscriber::EnvFilter::new(
+            "warn,frances=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
+        )
+    });
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::TRACE)
+        .with_env_filter(filter)
         .with_ansi(false)
         .with_writer(io::stderr)
         .try_init()
@@ -218,10 +231,14 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
 
     let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
 
-    let config_providers = build_config_providers(db.clone());
+    let session_provider = Arc::new(SessionConfigProvider::new(db.clone()));
+    let config_providers = build_config_providers(session_provider.clone());
     let config = ConfigHandle::build(config_providers)
         .await
         .context("build config handle")?;
+    let session_config_writer = session_provider
+        .writer()
+        .expect("SessionConfigProvider::load ran during ConfigHandle::build");
     let providers = config
         .bind::<HashMap<String, ProviderConfig>>("model_providers")
         .context("bind model_providers")?;
@@ -246,6 +263,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         providers,
         models,
         responses_extras,
+        session_config_writer,
     });
 
     let events_listener = UnixListener::bind(session.events_socket_path()).with_context(|| {
@@ -786,7 +804,9 @@ fn daemon_status(state: &ServerState) -> DaemonStatus {
 ///
 /// Each TOML file is `.optional()` — running with no config files
 /// present is a supported configuration.
-fn build_config_providers(db: Database) -> Vec<Arc<dyn ConfigProvider>> {
+fn build_config_providers(
+    session_provider: Arc<SessionConfigProvider>,
+) -> Vec<Arc<dyn ConfigProvider>> {
     let xdg_dirs = xdg::BaseDirectories::with_prefix("frances");
 
     let mut providers: Vec<Arc<dyn ConfigProvider>> = Vec::new();
@@ -803,7 +823,7 @@ fn build_config_providers(db: Database) -> Vec<Arc<dyn ConfigProvider>> {
     }
 
     providers.push(Arc::new(EnvProvider::with_prefix("FRANCES")));
-    providers.push(Arc::new(SessionConfigProvider::new(db)));
+    providers.push(session_provider);
 
     providers
 }

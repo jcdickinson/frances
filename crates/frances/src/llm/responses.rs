@@ -79,6 +79,7 @@ impl ChatClient {
             model = %plan.model.id,
             "calling chat completions"
         );
+        trace!(body = %body, "chat completions request body");
 
         let mut request = self
             .http
@@ -94,6 +95,7 @@ impl ChatClient {
             .send()
             .await
             .context("chat completion request failed")?;
+        trace!(status = %response.status(), headers = ?response.headers(), "chat completions response head");
 
         if !response.status().is_success() {
             let status = response.status();
@@ -119,6 +121,7 @@ impl ChatClient {
                         continue;
                     }
 
+                    trace!(payload, "chat completions sse chunk");
                     let value: Value = match serde_json::from_str(payload) {
                         Ok(value) => value,
                         Err(error) => {
@@ -376,8 +379,11 @@ pub fn chunk_usage(chunk: &Value) -> Option<Usage> {
             .get("total_tokens")
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
+        // OpenAI-style chat completions (and OpenRouter's normalized shape)
+        // nest cached prompt tokens under `prompt_tokens_details.cached_tokens`.
         cached_input_tokens: usage
-            .get("cached_input_tokens")
+            .get("prompt_tokens_details")
+            .and_then(|d| d.get("cached_tokens"))
             .and_then(Value::as_u64)
             .unwrap_or(0) as u32,
     })

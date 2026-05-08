@@ -1,0 +1,1 @@
+SIGKILL the bash command currently in flight. The shell itself stays alive — call run_shell again afterward to continue. Returns the final state (exit code and any drained output). No-op if no command is currently running.

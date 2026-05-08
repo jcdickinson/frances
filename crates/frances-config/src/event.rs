@@ -31,10 +31,7 @@ impl ConfigEvent {
 }
 
 /// Identifies a provider's layer within a layered configuration. Layers are
-/// indexed by build-vec position; higher indices have higher priority. The
-/// top index is reserved for [`ConfigHandle::publish`] (the manual layer).
-///
-/// [`ConfigHandle::publish`]: crate::ConfigHandle::publish
+/// indexed by build-vec position; higher indices have higher priority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProviderId(pub(crate) usize);
 

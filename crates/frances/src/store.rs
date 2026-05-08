@@ -100,9 +100,10 @@ impl Database {
             );
 
             CREATE TABLE IF NOT EXISTS session_config (
-                path  TEXT PRIMARY KEY,
-                kind  TEXT NOT NULL,
-                value TEXT NOT NULL
+                path_hash INTEGER PRIMARY KEY,
+                path      JSONB   NOT NULL,
+                kind      TEXT    NOT NULL,
+                value     TEXT    NOT NULL
             );
             "#,
         )
@@ -125,5 +126,52 @@ impl std::fmt::Debug for Database {
         f.debug_struct("Database")
             .field("path", &*self.path)
             .finish()
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::Database;
+    use crate::session::{Paths, Session, SessionMeta};
+    use std::ops::Deref;
+    use tempfile::TempDir;
+
+    /// A [`Database`] backed by a fresh `TempDir` that is removed when the
+    /// `TempDb` drops. `db` is declared before `_dir` so the connection
+    /// closes before the directory is unlinked.
+    pub struct TempDb {
+        db: Database,
+        _dir: TempDir,
+    }
+
+    impl TempDb {
+        pub async fn open() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let session = Session {
+                paths: Paths {
+                    state_root: dir.path().join("state"),
+                    runtime_root: dir.path().join("runtime"),
+                },
+                id: "test".into(),
+                dir: dir.path().to_path_buf(),
+                runtime_dir: dir.path().join("runtime"),
+                meta: SessionMeta {
+                    version: 1,
+                    id: "test".into(),
+                    created: 0,
+                    cwd: None,
+                    reserved: None,
+                },
+            };
+            let db = Database::open(&session).await.unwrap();
+            Self { db, _dir: dir }
+        }
+    }
+
+    impl Deref for TempDb {
+        type Target = Database;
+        fn deref(&self) -> &Database {
+            &self.db
+        }
     }
 }

@@ -794,6 +794,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "turso",
+ "twox-hash",
  "unicode-width 0.2.2",
  "url",
  "xdg",

@@ -120,92 +120,11 @@ pub fn definitions() -> &'static [ToolDef] {
     })
 }
 
-const RUN_SHELL_DESC: &str = "\
-Run a bash command in a long-lived shell. State persists across calls — environment variables, current directory (cd), shell functions, sourced scripts, and `set` flags carry into the next call. The bash code you submit is sourced as-is: write multi-line scripts, pipelines, subshells, heredocs, function definitions, redirections, etc. Do NOT wrap in `bash -c '...'` or escape quotes — pass bash as you would type it interactively.
-
-Returns one of:
-  [exit N]\\n<output>                          — finished with exit code N (stdout+stderr merged in order).
-  [still running — <reason>]\\n<partial>       — wait window expired; call keep_waiting to continue, or kill_running to abort.
-  [shell died]\\n<final>                        — bash itself exited (e.g. you ran `exit`). Next run_shell spawns a fresh shell, losing state.
-
-Optional `quiet_ms` (default 1000) returns 'still running' after that many ms of output silence — the timer resets every time bytes arrive. Optional `max_ms` (no default) returns 'still running' after that wall-clock regardless of streaming. quiet_ms=0 disables silence detection. Use max_ms to bound how long this single tool call blocks.
-
-Interactive apps that hard-require a TTY (vim, top, psql without -c) are NOT supported. Use their non-interactive equivalents (psql -c \"SELECT 1\", ssh host cmd).";
-
-const KEEP_WAITING_DESC: &str = "\
-Continue the bash command that previously returned 'still running'. Same return shape as run_shell. Optional `quiet_ms` and `max_ms` work the same. Errors if no command is currently in flight.";
-
-const KILL_RUNNING_DESC: &str = "\
-SIGKILL the bash command currently in flight. The shell itself stays alive — call run_shell again afterward to continue. Returns the final state (exit code and any drained output). No-op if no command is currently running.";
-
-const READ_FILE_DESC: &str = "\
-Read a file from disk and render it with line anchors. Each line is rendered as `Word§content` — a stable per-line anchor word (e.g. `Apple`, `BananaCarrot`), then `§`, then the line's content. Blank lines render as `Word§` with empty content. Anchors survive external edits and formatter runs. The rendered string of each line is exactly what you pass back as the `anchor` (and `end_anchor`) field of an `edit` call. Always call `read_file` for a path before calling `edit` on it — edit requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
-
-const EDIT_DESC: &str = "\
-Edit one or more files by replacing, inserting after, or inserting before specific anchored lines. You must call `read_file` on each file first this turn so its anchors are cached.
-
-Top-level shape — `files` is an ARRAY of file objects, NOT a string. Each file has an `edits` ARRAY:
-
-{
-  \"files\": [
-    {
-      \"path\": \"src/example.rs\",
-      \"edits\": [
-        { \"edit_type\": \"replace\", \"anchor\": \"...\", \"end_anchor\": \"...\", \"text\": \"...\" },
-        { \"edit_type\": \"insert_after\", \"anchor\": \"...\", \"text\": \"...\" }
-      ]
-    }
-  ]
-}
-
-Do NOT JSON-encode `files` or `edits` as a string. They are inline JSON arrays.
-
-Per-edit fields:
-  edit_type:  one of \"replace\", \"insert_after\", \"insert_before\"
-  anchor:     full anchor line as `read_file` rendered it — \"Word§content\"
-  end_anchor: only for replace; the rendered anchor line of the LAST line in the inclusive range
-  text:       the new content. Use \\n for newlines. Multi-line is fine; do NOT include any anchors in text.
-
-The anchor word must match a line in the latest `read_file` output for that path. The content after § must match the line's content (trimmed comparison). On mismatch, re-read the file and use the latest anchors.
-
-Behaviour:
-  replace        — replaces all lines from `anchor` through `end_anchor` (inclusive) with `text`.
-  insert_after   — inserts `text` immediately after `anchor`.
-  insert_before  — inserts `text` immediately before `anchor`.
-
-Edits within a single call must not touch overlapping line ranges in the same file. If they do the call is rejected — split overlapping work into separate calls.
-
-WORKED EXAMPLE. Suppose read_file on src/greet.py returned:
-
-  Apple§def hello():
-  Banana§    print(\"hi\")
-  Cherry§
-  Daisy§def goodbye():
-
-To replace the print with two prints AND add a docstring before goodbye, the WHOLE tool call body is:
-
-{
-  \"files\": [
-    {
-      \"path\": \"src/greet.py\",
-      \"edits\": [
-        {
-          \"edit_type\": \"replace\",
-          \"anchor\":     \"Banana§    print(\\\"hi\\\")\",
-          \"end_anchor\": \"Banana§    print(\\\"hi\\\")\",
-          \"text\":       \"    print(\\\"hi there\\\")\\n    print(\\\"welcome\\\")\"
-        },
-        {
-          \"edit_type\": \"insert_before\",
-          \"anchor\": \"Daisy§def goodbye():\",
-          \"text\":   \"# Says goodbye.\"
-        }
-      ]
-    }
-  ]
-}
-
-Returns one diff block per file with the new anchors for inserted lines.";
+const RUN_SHELL_DESC: &str = include_str!("tools/run_shell.md");
+const KEEP_WAITING_DESC: &str = include_str!("tools/keep_waiting.md");
+const KILL_RUNNING_DESC: &str = include_str!("tools/kill_running.md");
+const READ_FILE_DESC: &str = include_str!("tools/read_file.md");
+const EDIT_DESC: &str = include_str!("tools/edit.md");
 
 pub async fn dispatch(call: &ToolCall, ctx: ToolContext<'_>) -> ToolOutcome {
     let result = match call.name.as_str() {
