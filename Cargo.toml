@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors", "crates/frances-core", "crates/frances-edit"]
+members = ["crates/frances", "crates/frances-anchors", "crates/frances-core", "crates/frances-edit", "crates/frances-shell"]
 resolver = "2"
 
 [workspace.package]
@@ -33,5 +33,7 @@ async-trait = "0.1"
 frances-anchors = { path = "crates/frances-anchors" }
 frances-core = { path = "crates/frances-core" }
 frances-edit = { path = "crates/frances-edit" }
+frances-shell = { path = "crates/frances-shell" }
 tempfile = "3"
 smallvec = "1"
+getrandom = "0.2"

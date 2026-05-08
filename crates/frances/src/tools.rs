@@ -1,6 +1,8 @@
-//! LLM-callable tools: `read_file` and `edit`. The dispatcher resolves
-//! tool calls against an `EditSession` shared with the daemon, returning
-//! plain-text content suitable to feed back to the model as a tool result.
+//! LLM-callable tools: `read_file`, `edit`, `run_shell`, `keep_waiting`,
+//! `kill_running`. The dispatcher resolves tool calls against the
+//! `EditSession` and the per-session `Shell` shared with the daemon,
+//! returning plain-text content suitable to feed back to the model as a
+//! tool result.
 //!
 //! Tool descriptions intentionally teach the anchor protocol once — runtime
 //! outputs stay pure data per `docs/arch/anchors.md`.
@@ -8,10 +10,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use frances_core::JsonRepair;
+use frances_shell::{QuietReason, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
@@ -21,6 +24,7 @@ use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 pub struct ToolContext<'a> {
     pub edit_session: &'a Mutex<EditSession<AnchorStoreImpl>>,
+    pub shell: &'a Mutex<Option<Shell>>,
     pub cwd: Option<&'a Path>,
 }
 
@@ -42,6 +46,38 @@ pub fn definitions() -> &'static [ToolDef] {
                         "path": { "type": "string" }
                     },
                     "required": ["path"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "run_shell".to_string(),
+                description: RUN_SHELL_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "cmd": { "type": "string" },
+                        "quiet_ms": { "type": "integer", "minimum": 0 },
+                        "max_ms": { "type": "integer", "minimum": 0 }
+                    },
+                    "required": ["cmd"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "keep_waiting".to_string(),
+                description: KEEP_WAITING_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "quiet_ms": { "type": "integer", "minimum": 0 },
+                        "max_ms": { "type": "integer", "minimum": 0 }
+                    }
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "kill_running".to_string(),
+                description: KILL_RUNNING_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {}
                 }),
             }),
             ToolDef::Function(ToolFunction {
@@ -83,6 +119,24 @@ pub fn definitions() -> &'static [ToolDef] {
         ]
     })
 }
+
+const RUN_SHELL_DESC: &str = "\
+Run a bash command in a long-lived shell. State persists across calls — environment variables, current directory (cd), shell functions, sourced scripts, and `set` flags carry into the next call. The bash code you submit is sourced as-is: write multi-line scripts, pipelines, subshells, heredocs, function definitions, redirections, etc. Do NOT wrap in `bash -c '...'` or escape quotes — pass bash as you would type it interactively.
+
+Returns one of:
+  [exit N]\\n<output>                          — finished with exit code N (stdout+stderr merged in order).
+  [still running — <reason>]\\n<partial>       — wait window expired; call keep_waiting to continue, or kill_running to abort.
+  [shell died]\\n<final>                        — bash itself exited (e.g. you ran `exit`). Next run_shell spawns a fresh shell, losing state.
+
+Optional `quiet_ms` (default 1000) returns 'still running' after that many ms of output silence — the timer resets every time bytes arrive. Optional `max_ms` (no default) returns 'still running' after that wall-clock regardless of streaming. quiet_ms=0 disables silence detection. Use max_ms to bound how long this single tool call blocks.
+
+Interactive apps that hard-require a TTY (vim, top, psql without -c) are NOT supported. Use their non-interactive equivalents (psql -c \"SELECT 1\", ssh host cmd).";
+
+const KEEP_WAITING_DESC: &str = "\
+Continue the bash command that previously returned 'still running'. Same return shape as run_shell. Optional `quiet_ms` and `max_ms` work the same. Errors if no command is currently in flight.";
+
+const KILL_RUNNING_DESC: &str = "\
+SIGKILL the bash command currently in flight. The shell itself stays alive — call run_shell again afterward to continue. Returns the final state (exit code and any drained output). No-op if no command is currently running.";
 
 const READ_FILE_DESC: &str = "\
 Read a file from disk and render it with line anchors. Each line is rendered as `Word§content` — a stable per-line anchor word (e.g. `Apple`, `BananaCarrot`), then `§`, then the line's content. Blank lines render as `Word§` with empty content. Anchors survive external edits and formatter runs. The rendered string of each line is exactly what you pass back as the `anchor` (and `end_anchor`) field of an `edit` call. Always call `read_file` for a path before calling `edit` on it — edit requires the file to be cached this turn. The path may be absolute or relative to the client's working directory.";
@@ -157,6 +211,9 @@ pub async fn dispatch(call: &ToolCall, ctx: ToolContext<'_>) -> ToolOutcome {
     let result = match call.name.as_str() {
         "read_file" => run_read_file(&call.arguments, &ctx).await,
         "edit" => run_edit(&call.arguments, &ctx).await,
+        "run_shell" => run_shell(&call.arguments, ctx.shell, ctx.cwd).await,
+        "keep_waiting" => run_keep_waiting(&call.arguments, ctx.shell).await,
+        "kill_running" => run_kill_running(ctx.shell).await,
         other => Err(anyhow!("unknown tool: {other}")),
     };
 
@@ -225,6 +282,118 @@ async fn run_edit(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
             }
             Err(error)
         }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RunShellArgs {
+    cmd: String,
+    quiet_ms: Option<u64>,
+    max_ms: Option<u64>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct WaitArgs {
+    quiet_ms: Option<u64>,
+    max_ms: Option<u64>,
+}
+
+fn wait_opts(quiet_ms: Option<u64>, max_ms: Option<u64>) -> WaitOpts {
+    WaitOpts {
+        quiet: quiet_ms.map(Duration::from_millis),
+        max: max_ms.map(Duration::from_millis),
+    }
+}
+
+async fn run_shell(
+    args: &Value,
+    shell: &Mutex<Option<Shell>>,
+    cwd: Option<&Path>,
+) -> Result<String> {
+    let args: RunShellArgs =
+        serde_json::from_value(args.clone()).context("parse run_shell args")?;
+    let wait = wait_opts(args.quiet_ms, args.max_ms);
+
+    let mut guard = shell.lock().await;
+    if guard.as_ref().map(|s| !s.is_alive()).unwrap_or(true) {
+        let opts = ShellOptions {
+            cwd: cwd.map(Path::to_path_buf),
+            ..ShellOptions::default()
+        };
+        *guard = Some(Shell::spawn(opts).await.context("spawn shell")?);
+    }
+    let shell = guard.as_mut().expect("shell ensured");
+    let outcome = shell.run(&args.cmd, wait).await.context("shell run")?;
+    let result = format_outcome(&outcome);
+    if matches!(outcome, RunOutcome::Dead { .. }) {
+        *guard = None;
+    }
+    Ok(result)
+}
+
+async fn run_keep_waiting(args: &Value, shell: &Mutex<Option<Shell>>) -> Result<String> {
+    let args: WaitArgs = if args.is_null() || matches!(args, Value::Object(o) if o.is_empty()) {
+        WaitArgs::default()
+    } else {
+        serde_json::from_value(args.clone()).context("parse keep_waiting args")?
+    };
+    let wait = wait_opts(args.quiet_ms, args.max_ms);
+
+    let mut guard = shell.lock().await;
+    let shell = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("no active shell — call run_shell first"))?;
+    let outcome = match shell.keep_waiting(wait).await {
+        Ok(o) => o,
+        Err(ShellError::NoRunningCommand) => return Ok("[no command in flight]".to_string()),
+        Err(e) => return Err(anyhow!("shell keep_waiting: {e}")),
+    };
+    let result = format_outcome(&outcome);
+    if matches!(outcome, RunOutcome::Dead { .. }) {
+        *guard = None;
+    }
+    Ok(result)
+}
+
+async fn run_kill_running(shell: &Mutex<Option<Shell>>) -> Result<String> {
+    let mut guard = shell.lock().await;
+    let Some(shell) = guard.as_mut() else {
+        return Ok("[no active shell]".to_string());
+    };
+    if !shell.is_alive() {
+        *guard = None;
+        return Ok("[shell already dead]".to_string());
+    }
+    shell.kill_running().await.context("kill_running")?;
+    // Drain so the LLM gets the final exit code in one round-trip rather
+    // than having to follow up with keep_waiting itself.
+    let drain = WaitOpts {
+        quiet: Some(Duration::from_secs(1)),
+        max: Some(Duration::from_secs(5)),
+    };
+    let outcome = match shell.keep_waiting(drain).await {
+        Ok(o) => o,
+        Err(ShellError::NoRunningCommand) => return Ok("[no command was running]".to_string()),
+        Err(e) => return Err(anyhow!("drain after kill: {e}")),
+    };
+    let result = format_outcome(&outcome);
+    if matches!(outcome, RunOutcome::Dead { .. }) {
+        *guard = None;
+    }
+    Ok(result)
+}
+
+fn format_outcome(outcome: &RunOutcome) -> String {
+    match outcome {
+        RunOutcome::Done { exit_code, output } => format!("[exit {exit_code}]\n{output}"),
+        RunOutcome::Quiet { reason, output } => {
+            let why = match reason {
+                QuietReason::NoOutput => "output silent",
+                QuietReason::MaxElapsed => "max wait reached",
+            };
+            format!("[still running — {why}]\n{output}")
+        }
+        RunOutcome::Dead { output } => format!("[shell died]\n{output}"),
     }
 }
 
@@ -641,5 +810,92 @@ mod tests {
         assert_eq!(split_lines("a\nb"), vec!["a", "b"]);
         assert_eq!(split_lines("a\nb\n\n"), vec!["a", "b", ""]);
         assert_eq!(split_lines(""), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn run_shell_returns_done_with_output() {
+        let shell = Mutex::new(None);
+        let out = run_shell(&json!({ "cmd": "echo hi" }), &shell, None)
+            .await
+            .unwrap();
+        assert!(out.starts_with("[exit 0]\n"), "got: {out}");
+        assert!(out.contains("hi"));
+
+        // State persists across calls within the same shell mutex.
+        run_shell(&json!({ "cmd": "X=42" }), &shell, None)
+            .await
+            .unwrap();
+        let echoed = run_shell(&json!({ "cmd": "echo $X" }), &shell, None)
+            .await
+            .unwrap();
+        assert!(echoed.contains("42"));
+    }
+
+    #[tokio::test]
+    async fn run_shell_quiet_then_keep_waiting() {
+        let shell = Mutex::new(None);
+        let first = run_shell(
+            &json!({ "cmd": "sleep 0.3; echo done", "quiet_ms": 80 }),
+            &shell,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(first.starts_with("[still running"), "got: {first}");
+
+        let second = run_keep_waiting(&json!({}), &shell).await.unwrap();
+        assert!(second.starts_with("[exit 0]\n"), "got: {second}");
+        assert!(second.contains("done"));
+    }
+
+    #[tokio::test]
+    async fn keep_waiting_without_active_shell_errors() {
+        let shell = Mutex::new(None);
+        let res = run_keep_waiting(&json!({}), &shell).await;
+        assert!(res.is_err());
+        assert!(format!("{:?}", res.unwrap_err()).contains("no active shell"));
+    }
+
+    #[tokio::test]
+    async fn kill_running_aborts_and_drains() {
+        let shell = Mutex::new(None);
+        let first = run_shell(&json!({ "cmd": "sleep 60", "quiet_ms": 80 }), &shell, None)
+            .await
+            .unwrap();
+        assert!(first.starts_with("[still running"));
+
+        let killed = run_kill_running(&shell).await.unwrap();
+        assert!(killed.starts_with("[exit "), "got: {killed}");
+
+        // Shell is reusable.
+        let after = run_shell(&json!({ "cmd": "echo alive" }), &shell, None)
+            .await
+            .unwrap();
+        assert!(after.contains("alive"));
+    }
+
+    #[tokio::test]
+    async fn run_shell_exit_marks_dead_and_respawns() {
+        let shell = Mutex::new(None);
+        let first = run_shell(&json!({ "cmd": "exit" }), &shell, None)
+            .await
+            .unwrap();
+        assert!(first.starts_with("[shell died]"), "got: {first}");
+        assert!(shell.lock().await.is_none(), "dead shell should be cleared");
+
+        let second = run_shell(&json!({ "cmd": "echo back" }), &shell, None)
+            .await
+            .unwrap();
+        assert!(second.contains("back"));
+    }
+
+    #[tokio::test]
+    async fn run_shell_respects_cwd() {
+        let shell = Mutex::new(None);
+        let cwd = std::path::PathBuf::from("/tmp");
+        let out = run_shell(&json!({ "cmd": "pwd" }), &shell, Some(&cwd))
+            .await
+            .unwrap();
+        assert!(out.contains("/tmp"));
     }
 }

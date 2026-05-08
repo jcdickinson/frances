@@ -32,6 +32,7 @@ futures.workspace = true
 thiserror.workspace = true
 frances-core.workspace = true
 frances-edit.workspace = true
+frances-shell.workspace = true
 async-trait.workspace = true
 
 [dev-dependencies]

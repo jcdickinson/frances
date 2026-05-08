@@ -29,6 +29,7 @@ use crate::session::Session;
 use crate::store::Database;
 use crate::tools;
 use frances_edit::EditEngine;
+use frances_shell::Shell;
 
 const EVENTS_PAIRING_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
@@ -40,6 +41,7 @@ pub(crate) struct ServerState {
     daemon_pid: u32,
     history: HistoryStore,
     edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
+    shell: tokio::sync::Mutex<Option<Shell>>,
     events: EventsRouter,
     shutdown: Notify,
 }
@@ -211,6 +213,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         daemon_pid: std::process::id(),
         history: HistoryStore::new(db),
         edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
+        shell: tokio::sync::Mutex::new(None),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
     });
@@ -653,6 +656,7 @@ async fn run_llm_step(
             call,
             tools::ToolContext {
                 edit_session: &state.edit_session,
+                shell: &state.shell,
                 cwd,
             },
         )

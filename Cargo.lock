@@ -757,6 +757,7 @@ dependencies = [
  "frances-anchors",
  "frances-core",
  "frances-edit",
+ "frances-shell",
  "futures",
  "futures-util",
  "libc",
@@ -806,6 +807,18 @@ dependencies = [
  "thiserror",
  "tokio",
  "twox-hash",
+]
+
+[[package]]
+name = "frances-shell"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "libc",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -2626,6 +2639,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

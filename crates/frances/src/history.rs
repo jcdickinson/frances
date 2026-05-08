@@ -271,7 +271,10 @@ impl HistoryStore {
         Ok(())
     }
 
-    #[expect(dead_code, reason = "history-replay API; not yet wired into session resume")]
+    #[expect(
+        dead_code,
+        reason = "history-replay API; not yet wired into session resume"
+    )]
     pub async fn messages(&self) -> Result<Vec<Message>> {
         trace!("loading history messages");
 
@@ -331,7 +334,10 @@ impl HistoryStore {
         Ok(messages)
     }
 
-    #[expect(dead_code, reason = "history-replay API; not yet wired into session resume")]
+    #[expect(
+        dead_code,
+        reason = "history-replay API; not yet wired into session resume"
+    )]
     pub async fn clear(&self) -> Result<()> {
         trace!("clearing history tables");
 

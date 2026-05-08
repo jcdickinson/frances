@@ -31,12 +31,21 @@ pub struct SessionMeta {
 
 #[derive(Debug, Clone)]
 pub struct Session {
-    #[expect(dead_code, reason = "carried for any future caller that needs the resolved path roots")]
+    #[expect(
+        dead_code,
+        reason = "carried for any future caller that needs the resolved path roots"
+    )]
     pub paths: Paths,
     pub id: String,
     pub dir: PathBuf,
     pub runtime_dir: PathBuf,
-    #[cfg_attr(not(test), expect(dead_code, reason = "session metadata kept on the struct; tests inspect cwd/version, runtime does not yet"))]
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "session metadata kept on the struct; tests inspect cwd/version, runtime does not yet"
+        )
+    )]
     pub meta: SessionMeta,
 }
 
@@ -220,7 +229,10 @@ impl Session {
         self.runtime_dir.join("daemon.pid")
     }
 
-    #[expect(dead_code, reason = "writers compute this internally; exposed for any future external reader")]
+    #[expect(
+        dead_code,
+        reason = "writers compute this internally; exposed for any future external reader"
+    )]
     pub fn metadata_path(&self) -> PathBuf {
         self.dir.join(METADATA_FILE)
     }

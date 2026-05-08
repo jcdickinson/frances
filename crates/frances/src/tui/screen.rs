@@ -50,7 +50,10 @@ impl Screen {
         self.viewport_height
     }
 
-    #[expect(dead_code, reason = "viewport math accessor; will be used once scrollback rendering is wired")]
+    #[expect(
+        dead_code,
+        reason = "viewport math accessor; will be used once scrollback rendering is wired"
+    )]
     pub fn viewport_top(&self) -> u16 {
         self.height.saturating_sub(self.viewport_height)
     }
