@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use serde::de::DeserializeOwned;
 
@@ -45,11 +45,11 @@ impl Configuration {
         self.inner.value.as_ref()
     }
 
-    pub fn bind<T>(&self) -> Result<ConfigBinding<T>, ConfigBindError>
+    pub fn bind<T>(&self) -> Result<ConfigBinding<T, T>, ConfigBindError>
     where
         T: DeserializeOwned + Send + Sync + 'static,
     {
-        ConfigBinding::from_snapshot(Path::new(), Some(self))
+        ConfigBinding::from_snapshot(Path::new(), Some(self), Weak::new())
     }
 
     pub(crate) fn inner(&self) -> &ConfigInner {
@@ -174,11 +174,11 @@ impl<'a> ConfigurationRef<'a> {
         ConfigurationRef { path, config: next }
     }
 
-    pub fn bind<T>(self) -> Result<ConfigBinding<T>, ConfigBindError>
+    pub fn bind<T>(self) -> Result<ConfigBinding<T, T>, ConfigBindError>
     where
         T: DeserializeOwned + Send + Sync + 'static,
     {
-        ConfigBinding::from_snapshot(self.path, self.config)
+        ConfigBinding::from_snapshot(self.path, self.config, Weak::new())
     }
 
     pub(crate) fn config(&self) -> Option<&'a Configuration> {

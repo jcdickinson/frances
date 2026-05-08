@@ -123,3 +123,20 @@ pub enum ReloadError {
     #[error("event processor terminated")]
     ProcessorGone,
 }
+
+/// Error produced by an async mapper passed to
+/// [`ConfigBinding::map_async`](crate::ConfigBinding::map_async). Wraps any
+/// concrete `std::error::Error` so mappers can surface their own typed
+/// failures without parameterising the binding.
+#[derive(Debug, Error)]
+#[error("{0}")]
+pub struct MapError(pub Box<dyn std::error::Error + Send + Sync + 'static>);
+
+impl MapError {
+    pub fn new<E>(err: E) -> Self
+    where
+        E: std::error::Error + Send + Sync + 'static,
+    {
+        Self(Box::new(err))
+    }
+}

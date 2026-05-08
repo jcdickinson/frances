@@ -61,52 +61,34 @@ impl ConfigProvider for TomlProvider {
                 source: e,
             })
         })?;
-        let mut emitter = Emitter { events: &events };
-        emitter.walk(Path::new(), value).await?;
+        let mut batch = Vec::new();
+        collect(Path::new(), value, &mut batch);
+        if !batch.is_empty() && events.send(batch).await.is_err() {
+            // Receiver gone; nothing useful to do.
+        }
         Ok(())
     }
 }
 
-struct Emitter<'a> {
-    events: &'a EventSender,
-}
-
-impl<'a> Emitter<'a> {
-    fn walk<'s>(
-        &'s mut self,
-        path: Path,
-        value: toml::Value,
-    ) -> futures::future::BoxFuture<'s, Result<(), ProviderError>> {
-        Box::pin(async move {
-            match value {
-                toml::Value::Table(t) => {
-                    for (k, v) in t {
-                        let mut child_path = path.clone();
-                        child_path.push(Value::String(k.into()));
-                        self.walk(child_path, v).await?;
-                    }
-                }
-                toml::Value::Array(arr) => {
-                    for (i, v) in arr.into_iter().enumerate() {
-                        let mut child_path = path.clone();
-                        child_path.push(Value::Int(i as i64));
-                        self.walk(child_path, v).await?;
-                    }
-                }
-                leaf => {
-                    let value = toml_leaf_to_value(leaf);
-                    if self
-                        .events
-                        .send(ConfigEvent::new(path, value))
-                        .await
-                        .is_err()
-                    {
-                        return Ok(());
-                    }
-                }
+fn collect(path: Path, value: toml::Value, batch: &mut Vec<ConfigEvent>) {
+    match value {
+        toml::Value::Table(t) => {
+            for (k, v) in t {
+                let mut child = path.clone();
+                child.push(Value::String(k.into()));
+                collect(child, v, batch);
             }
-            Ok(())
-        })
+        }
+        toml::Value::Array(arr) => {
+            for (i, v) in arr.into_iter().enumerate() {
+                let mut child = path.clone();
+                child.push(Value::Int(i as i64));
+                collect(child, v, batch);
+            }
+        }
+        leaf => {
+            batch.push(ConfigEvent::new(path, toml_leaf_to_value(leaf)));
+        }
     }
 }
 

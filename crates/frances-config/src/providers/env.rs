@@ -79,16 +79,16 @@ impl Default for EnvProvider {
 #[async_trait]
 impl ConfigProvider for EnvProvider {
     async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
+        let mut batch = Vec::new();
         for (key, value) in self.matching_pairs() {
             let path = key_to_path(&key);
             if path.is_empty() {
                 continue;
             }
-            let event = ConfigEvent::new(path, Value::String(value.into()));
-            if events.send(event).await.is_err() {
-                // Receiver gone; nothing useful to do.
-                return Ok(());
-            }
+            batch.push(ConfigEvent::new(path, Value::String(value.into())));
+        }
+        if !batch.is_empty() && events.send(batch).await.is_err() {
+            // Receiver gone; nothing useful to do.
         }
         Ok(())
     }

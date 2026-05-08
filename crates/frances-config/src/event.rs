@@ -39,9 +39,13 @@ pub struct EventSender {
 }
 
 impl EventSender {
-    pub async fn send(&self, event: ConfigEvent) -> Result<(), SendError> {
+    /// Send a batch of events. The batch is applied atomically — the
+    /// processor walks every event into the snapshot before fanning out a
+    /// single binding-refresh pass. Providers emitting one event wrap it
+    /// in a one-element `Vec`.
+    pub async fn send(&self, events: Vec<ConfigEvent>) -> Result<(), SendError> {
         self.inner
-            .send(InternalEvent::Public(event))
+            .send(InternalEvent::Batch(events))
             .await
             .map_err(|_| SendError)
     }
@@ -55,12 +59,12 @@ impl EventSender {
 #[error("config event channel closed")]
 pub struct SendError;
 
-/// Internal event wrapper. Public events flow through `Public`; `Barrier`
+/// Internal event wrapper. Public events flow through `Batch`; `Barrier`
 /// is a oneshot sent after all providers have called `load` to ensure the
 /// processor has applied the initial event burst before [`build`] returns.
 ///
 /// [`build`]: crate::ConfigHandle::build
 pub(crate) enum InternalEvent {
-    Public(ConfigEvent),
+    Batch(Vec<ConfigEvent>),
     Barrier(oneshot::Sender<()>),
 }

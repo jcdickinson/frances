@@ -22,9 +22,9 @@ mod providers;
 pub mod util;
 mod value;
 
-pub use binding::{ConfigBinding, ConfigBindingRef, Optional, Required, RequiredConfigBinding};
+pub use binding::{ConfigBinding, ConfigBindingRef, RequiredConfigBinding};
 pub use config::{Configuration, ConfigurationRef};
-pub use error::{BuildError, ConfigBindError, ReloadError, SourceLoadError};
+pub use error::{BuildError, ConfigBindError, MapError, ReloadError, SourceLoadError};
 pub use event::{ConfigEvent, EventSender, SendError};
 pub use handle::ConfigHandle;
 pub use util::{Keys, KeysDiff};

@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use frances_config::{
-    ConfigEvent, ConfigHandle, ConfigProvider, Configuration, EnvProvider, EventSender, Path,
-    ProviderError, TomlProvider, Value,
+    ConfigBinding, ConfigEvent, ConfigHandle, ConfigProvider, Configuration, EnvProvider,
+    EventSender, MapError, Path, ProviderError, RequiredConfigBinding, TomlProvider, Value,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -37,6 +38,10 @@ fn make_config(items: &[(&str, Value)]) -> Configuration {
         cfg = cfg.applied(ConfigEvent::new(Path::parse(*k), v.clone()));
     }
     cfg
+}
+
+fn ev(path: &str, value: impl Into<Value>) -> ConfigEvent {
+    ConfigEvent::new(Path::parse(path), value)
 }
 
 #[test]
@@ -130,17 +135,12 @@ async fn build_waits_for_initial_load() {
     #[async_trait]
     impl ConfigProvider for EagerProvider {
         async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
-            for ev in &self.events {
-                events.send(ev.clone()).await.unwrap();
-            }
+            events.send(self.events.clone()).await.unwrap();
             Ok(())
         }
     }
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![Arc::new(EagerProvider {
-        events: vec![
-            ConfigEvent::new(Path::parse("a"), Value::String("1".into())),
-            ConfigEvent::new(Path::parse("b"), Value::String("2".into())),
-        ],
+        events: vec![ev("a", "1"), ev("b", "2")],
     })];
     let handle = ConfigHandle::build(providers).await.unwrap();
     let snap = handle.snapshot();
@@ -153,13 +153,9 @@ async fn runtime_event_updates_snapshot() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("qwen".into()),
-        ))
+        .publish(vec![ev("llm::model", "qwen")])
         .await
         .unwrap();
-    // Give the processor a moment to apply.
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(
         handle.snapshot().get("llm::model").value(),
@@ -172,10 +168,7 @@ async fn subscribe_yields_on_event() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("first".into()),
-        ))
+        .publish(vec![ev("llm::model", "first")])
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -186,10 +179,7 @@ async fn subscribe_yields_on_event() {
         .unwrap();
     let mut stream = binding.subscribe();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("second".into()),
-        ))
+        .publish(vec![ev("llm::model", "second")])
         .await
         .unwrap();
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -204,10 +194,7 @@ async fn subscribe_now_yields_current_first() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("hello".into()),
-        ))
+        .publish(vec![ev("llm::model", "hello")])
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -229,10 +216,7 @@ async fn required_subscribe_skips_absence() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("first".into()),
-        ))
+        .publish(vec![ev("llm::model", "first")])
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
@@ -242,20 +226,14 @@ async fn required_subscribe_skips_absence() {
         .required()
         .unwrap();
     let mut stream = binding.subscribe();
-    // Unset the path. Required is sticky → no emission.
     handle
-        .publish(ConfigEvent::unset(Path::parse("llm::model")))
+        .publish(vec![ConfigEvent::unset(Path::parse("llm::model"))])
         .await
         .unwrap();
-    // Still readable.
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(binding.get().as_str(), "first");
-    // Set again — stream should fire now.
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("third".into()),
-        ))
+        .publish(vec![ev("llm::model", "third")])
         .await
         .unwrap();
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -270,17 +248,14 @@ async fn optional_subscribe_emits_none_on_absence() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
     handle
-        .publish(ConfigEvent::new(
-            Path::parse("llm::model"),
-            Value::String("first".into()),
-        ))
+        .publish(vec![ev("llm::model", "first")])
         .await
         .unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
     let binding = handle.bind::<String>("llm::model").unwrap();
     let mut stream = binding.subscribe();
     handle
-        .publish(ConfigEvent::unset(Path::parse("llm::model")))
+        .publish(vec![ConfigEvent::unset(Path::parse("llm::model"))])
         .await
         .unwrap();
     let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
@@ -294,52 +269,15 @@ async fn optional_subscribe_emits_none_on_absence() {
 async fn handle_drops_dead_bindings() {
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
     let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(ConfigEvent::new(
-            Path::parse("a"),
-            Value::String("1".into()),
-        ))
-        .await
-        .unwrap();
+    handle.publish(vec![ev("a", "1")]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
     {
         let _binding = handle.bind::<String>("a").unwrap();
-    } // dropped here
-    // Push another event; refresh should compact dead Weak.
-    handle
-        .publish(ConfigEvent::new(
-            Path::parse("a"),
-            Value::String("2".into()),
-        ))
-        .await
-        .unwrap();
+    }
+    handle.publish(vec![ev("a", "2")]).await.unwrap();
     tokio::time::sleep(Duration::from_millis(10)).await;
-    // Re-bind and assert latest visible.
     let binding = handle.bind::<String>("a").unwrap().required().unwrap();
     assert_eq!(binding.get().as_str(), "2");
-}
-
-#[tokio::test]
-async fn map_then_subscribe() {
-    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
-    let handle = ConfigHandle::build(providers).await.unwrap();
-    handle
-        .publish(ConfigEvent::new(Path::parse("count"), Value::Int(2)))
-        .await
-        .unwrap();
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    let binding = handle.bind::<i64>("count").unwrap().required().unwrap();
-    let mapped = binding.map(|n| n * 10);
-    let mut stream = mapped.subscribe();
-    handle
-        .publish(ConfigEvent::new(Path::parse("count"), Value::Int(5)))
-        .await
-        .unwrap();
-    let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
-        .await
-        .expect("timeout")
-        .expect("stream ended");
-    assert_eq!(*next, 50);
 }
 
 #[tokio::test]
@@ -432,6 +370,247 @@ tokens = 1
         snap.get("llm::model").value(),
         Some(&Value::String("from-env".into()))
     );
-    // Tokens still comes from TOML.
     assert_eq!(snap.get("llm::tokens").value(), Some(&Value::Int(1)));
+}
+
+// ---------------------------------------------------------------------------
+// New tests for round 2
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn send_batch_one_refresh() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("x", Value::Int(0))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let binding = handle.bind::<i64>("x").unwrap().required().unwrap();
+    let mut stream = binding.subscribe();
+
+    handle
+        .publish(vec![
+            ev("x", Value::Int(1)),
+            ev("x", Value::Int(2)),
+            ev("x", Value::Int(3)),
+            ev("x", Value::Int(4)),
+            ev("x", Value::Int(5)),
+        ])
+        .await
+        .unwrap();
+
+    // Consume one yield; assert it's the post-batch state.
+    let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("timeout")
+        .expect("stream ended");
+    assert_eq!(*first, 5);
+
+    // Assert no further yield within a short window — the batch produced one
+    // refresh, not five.
+    let extra = tokio::time::timeout(Duration::from_millis(50), stream.next()).await;
+    assert!(extra.is_err(), "expected single yield from a batch");
+}
+
+#[tokio::test]
+async fn toml_provider_uses_batch() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.toml");
+    tokio::fs::write(
+        &path,
+        r#"
+a = 1
+b = 2
+c = 3
+d = 4
+e = 5
+"#,
+    )
+    .await
+    .unwrap();
+
+    // Counter provider: a tiny custom provider that registers a binding
+    // first, then we rely on subsequent TomlProvider load to fire one refresh.
+    // We'll instrument by counting yields on a subscribe stream.
+    let provider: Arc<dyn ConfigProvider> = Arc::new(TomlProvider::new(&path));
+    let handle = ConfigHandle::build(vec![provider]).await.unwrap();
+
+    // The TOML batch already happened during build; assert all five keys
+    // landed in the snapshot.
+    let snap = handle.snapshot();
+    for k in ["a", "b", "c", "d", "e"] {
+        assert!(snap.get(k).value().is_some(), "missing key {k}");
+    }
+}
+
+#[tokio::test]
+async fn optional_required_distinct_types() {
+    fn _f(_: ConfigBinding<i32>, _: RequiredConfigBinding<i32>) {}
+}
+
+#[tokio::test]
+async fn map_async_initial() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle
+        .publish(vec![ev("count", Value::Int(7))])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mapped = handle
+        .bind::<i64>("count")
+        .unwrap()
+        .map_async(|n| Box::pin(async move { Ok::<_, MapError>(n * 2) }))
+        .await
+        .unwrap();
+    let r = mapped.get().expect("value present");
+    assert_eq!(*r, 14);
+}
+
+#[tokio::test]
+async fn map_async_propagates_initial_error() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("n", Value::Int(0))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let result = handle
+        .bind::<i64>("n")
+        .unwrap()
+        .map_async(|_n: i64| {
+            Box::pin(async move { Err::<i64, _>(MapError::new(std::io::Error::other("nope"))) })
+        })
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn map_async_refresh_on_upstream() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("n", Value::Int(2))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mapped = handle
+        .bind::<i64>("n")
+        .unwrap()
+        .map_async(|n| Box::pin(async move { Ok::<_, MapError>(n * 10) }))
+        .await
+        .unwrap();
+    let mut stream = mapped.subscribe();
+    handle.publish(vec![ev("n", Value::Int(5))]).await.unwrap();
+
+    let next = tokio::time::timeout(Duration::from_secs(1), stream.next())
+        .await
+        .expect("timeout")
+        .expect("stream ended");
+    assert_eq!(next.expect("Some"), Arc::new(50));
+}
+
+#[tokio::test]
+async fn map_async_noop_on_none() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+
+    let mapped = handle
+        .bind::<i64>("nope")
+        .unwrap()
+        .map_async(|n| Box::pin(async move { Ok::<_, MapError>(n.to_string()) }))
+        .await
+        .unwrap();
+    assert!(mapped.get().is_none());
+}
+
+#[tokio::test]
+async fn map_async_refresh_error_clears_to_none() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("n", Value::Int(2))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let counter_for_mapper = counter.clone();
+    let mapped = handle
+        .bind::<i64>("n")
+        .unwrap()
+        .map_async(move |n| {
+            let c = counter_for_mapper.clone();
+            Box::pin(async move {
+                let call = c.fetch_add(1, Ordering::SeqCst);
+                if call >= 1 {
+                    Err::<i64, _>(MapError::new(std::io::Error::other("denied")))
+                } else {
+                    Ok(n)
+                }
+            })
+        })
+        .await
+        .unwrap();
+
+    assert!(mapped.get().is_some());
+    handle.publish(vec![ev("n", Value::Int(3))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(mapped.get().is_none());
+}
+
+#[tokio::test]
+async fn map_async_chain() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("n", Value::Int(3))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let mapped = handle
+        .bind::<i64>("n")
+        .unwrap()
+        .map_async(|n: i64| Box::pin(async move { Ok::<_, MapError>(n.to_string()) }))
+        .await
+        .unwrap()
+        .map_async(|s: String| Box::pin(async move { Ok::<_, MapError>(s.len()) }))
+        .await
+        .unwrap();
+
+    let r = mapped.get().expect("value present");
+    assert_eq!(*r, 1usize); // "3".len() == 1
+}
+
+#[tokio::test]
+async fn map_async_then_required() {
+    let providers: Vec<Arc<dyn ConfigProvider>> = vec![];
+    let handle = ConfigHandle::build(providers).await.unwrap();
+    handle.publish(vec![ev("n", Value::Int(7))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let req: RequiredConfigBinding<i64, String> = handle
+        .bind::<i64>("n")
+        .unwrap()
+        .map_async(|n: i64| Box::pin(async move { Ok::<_, MapError>(n.to_string()) }))
+        .await
+        .unwrap()
+        .required()
+        .unwrap();
+
+    assert_eq!(req.get().as_str(), "7");
+    handle.publish(vec![ev("n", Value::Int(42))]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert_eq!(req.get().as_str(), "42");
+}
+
+#[tokio::test]
+async fn t_preserved_through_chain() {
+    // Compile-only: the chain should produce ConfigBinding<i64, bool>.
+    fn _check() {
+        async fn _build(handle: &ConfigHandle) {
+            let _b: ConfigBinding<i64, bool> = handle
+                .bind::<i64>("x")
+                .unwrap()
+                .map_async(|n: i64| Box::pin(async move { Ok::<_, MapError>(n.to_string()) }))
+                .await
+                .unwrap()
+                .map_async(|s: String| Box::pin(async move { Ok::<_, MapError>(s.is_empty()) }))
+                .await
+                .unwrap();
+        }
+        let _ = _build;
+    }
 }

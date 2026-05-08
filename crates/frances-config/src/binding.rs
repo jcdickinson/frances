@@ -1,161 +1,261 @@
 use std::fmt;
-use std::marker::PhantomData;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Weak};
 
 use arc_swap::{ArcSwapOption, Guard};
+use async_trait::async_trait;
+use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, stream};
 use serde::de::DeserializeOwned;
 use tokio_stream::wrappers::WatchStream;
 
 use crate::config::Configuration;
 use crate::deserializer::ConfigDeserializer;
-use crate::error::ConfigBindError;
+use crate::error::{ConfigBindError, MapError};
+use crate::handle::BindingRegistry;
 use crate::value::Path;
 
-const KIND_OPTIONAL: u8 = 0;
-const KIND_REQUIRED: u8 = 1;
+/// Pulls `T` out of a snapshot. `None` means the path is absent or
+/// deserialisation failed; failures are logged inside the closure via
+/// `tracing::warn!`.
+pub(crate) type DeserializeFn<T> = Arc<dyn Fn(&Configuration) -> Option<T> + Send + Sync>;
 
-/// Marker for bindings that may be missing.
-pub struct Optional;
+/// Composed mapper chain. At construction (initial `bind()`), this is the
+/// identity wrapped in `async`. Each `map_async` replaces it with a
+/// composition of the previous mapper and the new one.
+pub(crate) type MapperFn<T, U> =
+    Arc<dyn Fn(T) -> BoxFuture<'static, Result<U, MapError>> + Send + Sync>;
 
-/// Marker for bindings whose value is guaranteed to exist.
-pub struct Required;
-
-/// Type alias for [`ConfigBinding`] in its required form.
-pub type RequiredConfigBinding<T> = ConfigBinding<T, Required>;
-
-pub struct ConfigBinding<T, K = Optional> {
-    path: Arc<str>,
-    pub(crate) inner: Arc<BindingInner<T>>,
-    _kind: PhantomData<K>,
-}
-
-type RecomputeFn<T> =
-    Box<dyn Fn(&Configuration) -> Result<Option<Arc<T>>, ConfigBindError> + Send + Sync>;
-
-pub(crate) struct BindingInner<T> {
+/// Pure data + the deserialise step + the composed mapper chain. Cloneable
+/// via `Arc`. Both Optional and Required forms share the same inner; the
+/// wrapper type controls absence policy.
+pub(crate) struct BindingInner<T, U> {
     pub(crate) path: Arc<str>,
-    pub(crate) value: ArcSwapOption<T>,
-    /// `KIND_OPTIONAL` or `KIND_REQUIRED`. Mutable so `Optional::required()`
-    /// can flip it without rebuilding the inner.
-    pub(crate) kind: AtomicU8,
+    pub(crate) value: ArcSwapOption<U>,
     pub(crate) notify: tokio::sync::watch::Sender<u64>,
-    pub(crate) recompute: RecomputeFn<T>,
+    pub(crate) deserialize: DeserializeFn<T>,
+    pub(crate) mapper: MapperFn<T, U>,
 }
 
+impl<T, U> BindingInner<T, U> {
+    fn new(
+        path: Arc<str>,
+        initial: Option<Arc<U>>,
+        deserialize: DeserializeFn<T>,
+        mapper: MapperFn<T, U>,
+    ) -> Self {
+        let (notify, _rx) = tokio::sync::watch::channel(0u64);
+        Self {
+            path,
+            value: ArcSwapOption::new(initial),
+            notify,
+            deserialize,
+            mapper,
+        }
+    }
+}
+
+/// Async binding-refresh trait. The handle's registry stores
+/// `Weak<dyn BindingRefresh>` and awaits one refresh per registered binding
+/// per applied event-batch.
+#[async_trait]
 pub(crate) trait BindingRefresh: Send + Sync {
-    fn refresh_from(&self, snapshot: &Configuration);
+    async fn refresh_from(&self, snapshot: Arc<Configuration>);
 }
 
-impl<T> BindingRefresh for BindingInner<T>
+pub(crate) struct OptionalRefresher<T, U> {
+    pub(crate) inner: Arc<BindingInner<T, U>>,
+}
+
+pub(crate) struct RequiredRefresher<T, U> {
+    pub(crate) inner: Arc<BindingInner<T, U>>,
+}
+
+async fn compute_next<T, U>(inner: &BindingInner<T, U>, snapshot: &Configuration) -> Option<Arc<U>>
+where
+    T: Send + 'static,
+    U: Send + Sync + 'static,
+{
+    let t = (inner.deserialize)(snapshot)?;
+    match (inner.mapper)(t).await {
+        Ok(u) => Some(Arc::new(u)),
+        Err(e) => {
+            tracing::warn!(path = %inner.path, error = %e, "mapper failed");
+            None
+        }
+    }
+}
+
+#[async_trait]
+impl<T, U> BindingRefresh for OptionalRefresher<T, U>
 where
     T: Send + Sync + 'static,
+    U: Send + Sync + 'static,
 {
-    fn refresh_from(&self, snapshot: &Configuration) {
-        match (self.recompute)(snapshot) {
-            Ok(Some(next)) => {
-                self.value.store(Some(next));
-                self.notify.send_modify(|v| *v = v.wrapping_add(1));
+    async fn refresh_from(&self, snapshot: Arc<Configuration>) {
+        let next = compute_next(&self.inner, &snapshot).await;
+        self.inner.value.store(next);
+        self.inner.notify.send_modify(|v| *v = v.wrapping_add(1));
+    }
+}
+
+#[async_trait]
+impl<T, U> BindingRefresh for RequiredRefresher<T, U>
+where
+    T: Send + Sync + 'static,
+    U: Send + Sync + 'static,
+{
+    async fn refresh_from(&self, snapshot: Arc<Configuration>) {
+        match compute_next(&self.inner, &snapshot).await {
+            Some(next) => {
+                self.inner.value.store(Some(next));
+                self.inner.notify.send_modify(|v| *v = v.wrapping_add(1));
             }
-            Ok(None) => match self.kind.load(Ordering::Relaxed) {
-                KIND_REQUIRED => {
-                    tracing::warn!(
-                        path = %self.path,
-                        "required config path went absent; retaining last value",
-                    );
-                }
-                _ => {
-                    self.value.store(None);
-                    self.notify.send_modify(|v| *v = v.wrapping_add(1));
-                }
-            },
-            Err(e) => tracing::warn!(
-                path = %self.path,
-                error = %e,
-                "binding refresh failed; retaining previous value",
+            None => tracing::warn!(
+                path = %self.inner.path,
+                "required config path went absent or failed; retaining last value",
             ),
         }
     }
 }
 
-impl<T, K> Clone for ConfigBinding<T, K> {
+/// An optional binding. `T` is the type produced by serde from the
+/// configuration tree; `U` is the type currently exposed to readers (initially
+/// `T`, replaced by `map_async`).
+pub struct ConfigBinding<T, U = T> {
+    pub(crate) inner: Arc<BindingInner<T, U>>,
+    pub(crate) refresher: Arc<OptionalRefresher<T, U>>,
+    pub(crate) registry: Weak<BindingRegistry>,
+}
+
+/// A binding whose value is guaranteed to exist. Sticky on absence: if the
+/// source path goes away or a mapper rejects a refresh, the previous value
+/// is retained and subscribers are not notified.
+pub struct RequiredConfigBinding<T, U = T> {
+    pub(crate) inner: Arc<BindingInner<T, U>>,
+    pub(crate) refresher: Arc<RequiredRefresher<T, U>>,
+    pub(crate) registry: Weak<BindingRegistry>,
+}
+
+impl<T, U> Clone for ConfigBinding<T, U> {
     fn clone(&self) -> Self {
         Self {
-            path: self.path.clone(),
             inner: self.inner.clone(),
-            _kind: PhantomData,
+            refresher: self.refresher.clone(),
+            registry: self.registry.clone(),
         }
     }
 }
 
-impl<T: fmt::Debug, K> fmt::Debug for ConfigBinding<T, K> {
+impl<T, U> Clone for RequiredConfigBinding<T, U> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            refresher: self.refresher.clone(),
+            registry: self.registry.clone(),
+        }
+    }
+}
+
+impl<T, U: fmt::Debug> fmt::Debug for ConfigBinding<T, U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ConfigBinding")
-            .field("path", &self.path)
+            .field("path", &self.inner.path)
             .field("value", &self.inner.value.load_full())
             .finish()
     }
 }
 
-impl<T> ConfigBinding<T, Optional>
+impl<T, U: fmt::Debug> fmt::Debug for RequiredConfigBinding<T, U> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RequiredConfigBinding")
+            .field("path", &self.inner.path)
+            .field("value", &self.inner.value.load_full())
+            .finish()
+    }
+}
+
+// --------------------------------------------------------------------------
+// Construction from snapshots / handles
+// --------------------------------------------------------------------------
+
+impl<T> ConfigBinding<T, T>
 where
     T: DeserializeOwned + Send + Sync + 'static,
 {
-    /// Build an optional binding from a snapshot of the configuration tree.
-    /// Used by [`Configuration::bind`] and [`ConfigurationRef::bind`].
+    /// Build a binding from a snapshot of the configuration tree.
+    ///
+    /// `registry` is the live handle's binding registry; pass `Weak::new()`
+    /// when building from a snapshot directly (refreshes will not fire, but
+    /// transforms still work).
     pub(crate) fn from_snapshot(
         path: Path,
         config: Option<&Configuration>,
+        registry: Weak<BindingRegistry>,
     ) -> Result<Self, ConfigBindError> {
         let path_str: Arc<str> = Arc::from(path.to_string());
-        let path_for_closure = path.clone();
-        let path_str_closure = path_str.clone();
-        let recompute = Box::new(move |snapshot: &Configuration| {
-            let cursor = snapshot.get(path_for_closure.clone());
-            match cursor.config() {
-                None => Ok::<Option<Arc<T>>, ConfigBindError>(None),
-                Some(node) => {
-                    let de = ConfigDeserializer::new(path_str_closure.clone(), node);
-                    T::deserialize(de).map(|v| Some(Arc::new(v)))
+
+        let path_for_de = path.clone();
+        let path_str_de = path_str.clone();
+        let deserialize: DeserializeFn<T> = Arc::new(move |snapshot: &Configuration| {
+            let cursor = snapshot.get(path_for_de.clone());
+            let node = cursor.config()?;
+            let de = ConfigDeserializer::new(path_str_de.clone(), node);
+            match T::deserialize(de) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path_str_de,
+                        error = %e,
+                        "config deserialise failed; treating as absent",
+                    );
+                    None
                 }
             }
         });
-        let initial = match config {
+
+        let mapper: MapperFn<T, T> =
+            Arc::new(|t: T| Box::pin(async move { Ok(t) }) as BoxFuture<'static, _>);
+
+        let initial: Option<Arc<T>> = match config {
             None => None,
             Some(node) => {
                 let de = ConfigDeserializer::new(path_str.clone(), node);
                 Some(Arc::new(T::deserialize(de)?))
             }
         };
-        let (notify, _rx) = tokio::sync::watch::channel(0u64);
-        let inner = Arc::new(BindingInner {
-            path: path_str.clone(),
-            value: ArcSwapOption::new(initial),
-            kind: AtomicU8::new(KIND_OPTIONAL),
-            notify,
-            recompute,
+
+        let inner = Arc::new(BindingInner::new(path_str, initial, deserialize, mapper));
+        let refresher = Arc::new(OptionalRefresher {
+            inner: inner.clone(),
         });
+        if let Some(reg) = registry.upgrade() {
+            reg.register(Arc::downgrade(&refresher) as Weak<dyn BindingRefresh>);
+        }
         Ok(Self {
-            path: path_str,
             inner,
-            _kind: PhantomData,
+            refresher,
+            registry,
         })
     }
 }
 
-impl<T> ConfigBinding<T, Optional>
+// --------------------------------------------------------------------------
+// Optional API
+// --------------------------------------------------------------------------
+
+impl<T, U> ConfigBinding<T, U>
 where
     T: Send + Sync + 'static,
+    U: Send + Sync + 'static,
 {
     pub fn path(&self) -> &str {
-        &self.path
+        &self.inner.path
     }
 
     /// Sync, lock-free read.
-    pub fn get(&self) -> Option<ConfigBindingRef<T>> {
+    pub fn get(&self) -> Option<ConfigBindingRef<U>> {
         let guard = self.inner.value.load();
         if guard.is_some() {
             Some(ConfigBindingRef { guard })
@@ -165,8 +265,8 @@ where
     }
 
     /// Future changes only. Yields `Some(_)` when a value is set or replaced;
-    /// yields `None` when the source path goes absent.
-    pub fn subscribe(&self) -> Pin<Box<dyn Stream<Item = Option<Arc<T>>> + Send>> {
+    /// yields `None` when the source goes absent or a mapper fails.
+    pub fn subscribe(&self) -> Pin<Box<dyn Stream<Item = Option<Arc<U>>> + Send>> {
         let inner = self.inner.clone();
         let rx = self.inner.notify.subscribe();
         Box::pin(WatchStream::from_changes(rx).map(move |_tick| inner.value.load_full()))
@@ -174,7 +274,7 @@ where
 
     /// Same as [`subscribe`](Self::subscribe) but yields the current value
     /// as the first item before waiting for changes.
-    pub fn subscribe_now(&self) -> Pin<Box<dyn Stream<Item = Option<Arc<T>>> + Send>> {
+    pub fn subscribe_now(&self) -> Pin<Box<dyn Stream<Item = Option<Arc<U>>> + Send>> {
         let inner = self.inner.clone();
         let rx = self.inner.notify.subscribe();
         let initial = inner.value.load_full();
@@ -182,19 +282,44 @@ where
         let tail = WatchStream::from_changes(rx).map(move |_tick| inner_for_map.value.load_full());
         Box::pin(stream::iter(std::iter::once(initial)).chain(tail))
     }
+
+    /// Promote to a `Required` form, asserting the value is currently set.
+    /// Re-registers the new refresher with the handle so future refreshes
+    /// follow the sticky-on-absence policy.
+    pub fn required(self) -> Result<RequiredConfigBinding<T, U>, ConfigBindError> {
+        if self.inner.value.load().is_none() {
+            return Err(ConfigBindError::RequiredSection {
+                path: self.inner.path.clone(),
+            });
+        }
+        let refresher = Arc::new(RequiredRefresher {
+            inner: self.inner.clone(),
+        });
+        if let Some(reg) = self.registry.upgrade() {
+            reg.register(Arc::downgrade(&refresher) as Weak<dyn BindingRefresh>);
+        }
+        Ok(RequiredConfigBinding {
+            inner: self.inner,
+            refresher,
+            registry: self.registry,
+        })
+        // self.refresher (the OptionalRefresher) drops here; its Weak in
+        // the registry is GC'd on the next refresh's retain pass.
+    }
 }
 
-impl<T> ConfigBinding<T, Optional>
+impl<T, U> ConfigBinding<T, U>
 where
-    T: Default + Send + Sync + 'static,
+    T: Send + Sync + 'static,
+    U: Default + Send + Sync + 'static,
 {
     /// Returns the current value or, if absent, replaces the slot with
-    /// `T::default()` and returns that.
-    pub fn get_or_default(&self) -> ConfigBindingRef<T> {
+    /// `U::default()` and returns that.
+    pub fn get_or_default(&self) -> ConfigBindingRef<U> {
         if let Some(r) = self.get() {
             return r;
         }
-        let default = Arc::new(T::default());
+        let default = Arc::new(U::default());
         self.inner.value.store(Some(default));
         ConfigBindingRef {
             guard: self.inner.value.load(),
@@ -202,99 +327,105 @@ where
     }
 }
 
-impl<T> ConfigBinding<T, Optional>
+// --------------------------------------------------------------------------
+// map_async
+// --------------------------------------------------------------------------
+
+impl<T, U> ConfigBinding<T, U>
 where
     T: Send + Sync + 'static,
+    U: Send + Sync + 'static,
 {
-    /// Promote this binding to a `Required` form, asserting the value is
-    /// currently set. Flips the inner's kind flag so future refreshes become
-    /// sticky on absence.
-    pub fn required(self) -> Result<ConfigBinding<T, Required>, ConfigBindError> {
-        if self.inner.value.load().is_some() {
-            self.inner.kind.store(KIND_REQUIRED, Ordering::Relaxed);
-            Ok(ConfigBinding {
-                path: self.path,
-                inner: self.inner,
-                _kind: PhantomData,
+    /// Apply an async transform to produce `ConfigBinding<T, U_new>`.
+    ///
+    /// `f` is invoked once at construction on the current `U` (if any); if it
+    /// errors, `map_async` returns `Err(MapError)`. After construction, `f`
+    /// runs as the tail of the composed mapper chain on every refresh.
+    /// Concurrent invocations against the same binding are not possible
+    /// (the processor task serialises refreshes).
+    ///
+    /// Absence is a no-op: when deserialisation yields `None`, the mapper
+    /// chain is not invoked and the mapped binding is `None`.
+    ///
+    /// `T` is preserved through the chain — only `U` changes.
+    pub async fn map_async<UNew, F>(self, f: F) -> Result<ConfigBinding<T, UNew>, MapError>
+    where
+        UNew: Send + Sync + 'static,
+        F: Fn(U) -> BoxFuture<'static, Result<UNew, MapError>> + Send + Sync + 'static,
+    {
+        let f = Arc::new(f);
+        let old_mapper = self.inner.mapper.clone();
+        let f_for_compose = f.clone();
+        let composed: MapperFn<T, UNew> = Arc::new(move |t: T| {
+            let old = old_mapper.clone();
+            let f = f_for_compose.clone();
+            Box::pin(async move {
+                let u = old(t).await?;
+                f(u).await
             })
-        } else {
-            Err(ConfigBindError::RequiredSection { path: self.path })
+        });
+
+        // Compute the initial value by running the deserialise + composed
+        // mapper pipeline against the current snapshot. A mapper error here
+        // propagates as `Err(MapError)`. A None-from-deserialise (path
+        // absent) is a no-op, leaving the mapped binding empty.
+        let path_str = self.inner.path.clone();
+        let initial: Option<Arc<UNew>> = match self.registry.upgrade() {
+            Some(reg) => {
+                let snap = reg.snapshot();
+                match (self.inner.deserialize)(&snap) {
+                    None => None,
+                    Some(t) => Some(Arc::new(composed(t).await?)),
+                }
+            }
+            None => None,
+        };
+
+        let inner = Arc::new(BindingInner::new(
+            path_str,
+            initial,
+            self.inner.deserialize.clone(),
+            composed,
+        ));
+        let refresher = Arc::new(OptionalRefresher {
+            inner: inner.clone(),
+        });
+        if let Some(reg) = self.registry.upgrade() {
+            reg.register(Arc::downgrade(&refresher) as Weak<dyn BindingRefresh>);
         }
+        Ok(ConfigBinding {
+            inner,
+            refresher,
+            registry: self.registry,
+        })
     }
 }
 
-impl<T> ConfigBinding<T, Required>
+// --------------------------------------------------------------------------
+// Required API
+// --------------------------------------------------------------------------
+
+impl<T, U> RequiredConfigBinding<T, U>
 where
     T: Send + Sync + 'static,
+    U: Send + Sync + 'static,
 {
     pub fn path(&self) -> &str {
-        &self.path
+        &self.inner.path
     }
 
-    /// Sync, lock-free read. Always succeeds — the value is guaranteed to be
-    /// present at construction, and Required bindings are sticky on absence.
-    pub fn get(&self) -> ConfigBindingRef<T> {
+    /// Sync, lock-free read. Always succeeds — Required bindings are sticky
+    /// on absence and never observe a `None` after promotion.
+    pub fn get(&self) -> ConfigBindingRef<U> {
         ConfigBindingRef {
             guard: self.inner.value.load(),
         }
     }
 
-    /// Map this binding through `f` to produce a derived `Required` binding.
-    /// The mapper re-runs whenever the source binding refreshes.
-    ///
-    /// A background task is spawned that watches the upstream's notify
-    /// channel; when the upstream binding is dropped (its `Arc<BindingInner>`
-    /// has no remaining strong refs), the task exits.
-    pub fn map<U, F>(self, f: F) -> ConfigBinding<U, Required>
-    where
-        U: Send + Sync + 'static,
-        F: Fn(&T) -> U + Send + Sync + 'static,
-    {
-        let f = Arc::new(f);
-        let initial = self.inner.value.load_full().map(|v| Arc::new(f(&v)));
-        let (notify, _rx) = tokio::sync::watch::channel(0u64);
-        let derived_inner = Arc::new(BindingInner {
-            path: self.path.clone(),
-            value: ArcSwapOption::new(initial),
-            kind: AtomicU8::new(KIND_REQUIRED),
-            notify,
-            // Mapped bindings don't refresh from snapshot — they refresh
-            // via the watcher task wired below. The recompute closure is
-            // kept as a no-op so the trait shape stays uniform.
-            recompute: Box::new(|_| Ok(None)),
-        });
-
-        // Spawn a forwarder. Holds a strong ref to upstream (so its notify
-        // channel stays alive) and a weak ref to derived. When derived dies,
-        // upgrade fails and the task exits.
-        let upstream = self.inner.clone();
-        let derived_weak = Arc::downgrade(&derived_inner);
-        let mapper = f.clone();
-        let mut up_rx = self.inner.notify.subscribe();
-        tokio::spawn(async move {
-            while up_rx.changed().await.is_ok() {
-                let Some(derived) = derived_weak.upgrade() else {
-                    return;
-                };
-                let next = upstream.value.load_full().map(|v| Arc::new(mapper(&v)));
-                if next.is_some() {
-                    derived.value.store(next);
-                    derived.notify.send_modify(|v| *v = v.wrapping_add(1));
-                }
-            }
-        });
-
-        ConfigBinding {
-            path: self.path,
-            inner: derived_inner,
-            _kind: PhantomData,
-        }
-    }
-
     /// Future changes only. Required's stream never emits absence — refresh
-    /// silently skips when the source path goes missing (see
-    /// [`BindingRefresh`] for details).
-    pub fn subscribe(&self) -> Pin<Box<dyn Stream<Item = Arc<T>> + Send>> {
+    /// silently retains the last value when the source goes missing or a
+    /// mapper rejects.
+    pub fn subscribe(&self) -> Pin<Box<dyn Stream<Item = Arc<U>> + Send>> {
         let inner = self.inner.clone();
         let rx = self.inner.notify.subscribe();
         Box::pin(WatchStream::from_changes(rx).map(move |_tick| {
@@ -307,7 +438,7 @@ where
 
     /// Same as [`subscribe`](Self::subscribe) but yields the current value
     /// as the first item before waiting for changes.
-    pub fn subscribe_now(&self) -> Pin<Box<dyn Stream<Item = Arc<T>> + Send>> {
+    pub fn subscribe_now(&self) -> Pin<Box<dyn Stream<Item = Arc<U>> + Send>> {
         let inner = self.inner.clone();
         let rx = self.inner.notify.subscribe();
         let initial = inner
@@ -325,12 +456,16 @@ where
     }
 }
 
-/// A lock-free read guard for a binding's current value. Derefs to `&T`.
-pub struct ConfigBindingRef<T> {
-    guard: Guard<Option<Arc<T>>>,
+// --------------------------------------------------------------------------
+// Read guard
+// --------------------------------------------------------------------------
+
+/// A lock-free read guard for a binding's current value. Derefs to `&U`.
+pub struct ConfigBindingRef<U> {
+    guard: Guard<Option<Arc<U>>>,
 }
 
-impl<T: fmt::Debug> fmt::Debug for ConfigBindingRef<T> {
+impl<U: fmt::Debug> fmt::Debug for ConfigBindingRef<U> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_tuple("ConfigBindingRef")
             .field(&self.deref())
@@ -338,10 +473,10 @@ impl<T: fmt::Debug> fmt::Debug for ConfigBindingRef<T> {
     }
 }
 
-impl<T> Deref for ConfigBindingRef<T> {
-    type Target = T;
+impl<U> Deref for ConfigBindingRef<U> {
+    type Target = U;
 
-    fn deref(&self) -> &T {
+    fn deref(&self) -> &U {
         match self.guard.as_ref() {
             Some(v) => v.as_ref(),
             None => unreachable!("ConfigBindingRef constructed only when value is Some"),
