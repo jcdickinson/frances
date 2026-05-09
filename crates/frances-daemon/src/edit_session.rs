@@ -2,12 +2,13 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use anyhow::{Result, anyhow};
 use frances_edit::{
     Anchor, AnchorParseError, AnchorStore, EditEngine, EditHints, EditOp, FileAnchorState, Pool,
     Truncated, WorkingFile, apply_ops, reconcile, render_diff_block, render_file,
 };
 use thiserror::Error;
+
+use crate::Result;
 
 const DIFF_CONTEXT: usize = 2;
 const ANCHOR_SEP: char = '§';
@@ -80,6 +81,10 @@ pub enum EditError {
         "cannot create {path} with 'new' because the file already exists; use 'overwrite' instead"
     )]
     NewFileExists { path: PathBuf },
+    #[error("{path} is not cached; call file_read first")]
+    NotCached { path: PathBuf },
+    #[error("{path} is not cached; call file_read before 'overwrite'")]
+    NotCachedForOverwrite { path: PathBuf },
 }
 
 pub struct EditSession<S: AnchorStore> {
@@ -190,10 +195,12 @@ impl<S: AnchorStore> EditSession<S> {
     }
 
     fn cached_working(&self, path: &Path) -> Result<WorkingFile> {
-        self.open_files
-            .get(path)
-            .cloned()
-            .ok_or_else(|| anyhow!("{} is not cached; call file_read first", path.display()))
+        self.open_files.get(path).cloned().ok_or_else(|| {
+            EditError::NotCached {
+                path: path.to_path_buf(),
+            }
+            .into()
+        })
     }
 
     /// Common pipeline for line-level edits: replay one `EditOp` into a
@@ -296,11 +303,8 @@ impl<S: AnchorStore> EditSession<S> {
         let working = self
             .open_files
             .get(path)
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} is not cached; call file_read before 'overwrite'",
-                    path.display()
-                )
+            .ok_or_else(|| EditError::NotCachedForOverwrite {
+                path: path.to_path_buf(),
             })?
             .clone();
         let draft = split_text_to_lines(text);
@@ -340,7 +344,8 @@ impl<S: AnchorStore> EditSession<S> {
     /// End-of-turn cleanup. Caller invokes when assistant message's tool
     /// calls are fully processed.
     pub async fn end_turn(&mut self) -> Result<()> {
-        self.engine.end_turn().await
+        self.engine.end_turn().await?;
+        Ok(())
     }
 }
 
@@ -536,8 +541,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let downcast = err.downcast_ref::<EditError>().expect("EditError downcast");
-        assert!(matches!(downcast, EditError::AnchorNotFound { .. }));
+        assert!(matches!(
+            err,
+            crate::Error::Edit(EditError::AnchorNotFound { .. })
+        ));
     }
 
     /// Returns a real dict word that isn't currently used as an anchor in
@@ -607,8 +614,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let downcast = err.downcast_ref::<EditError>().unwrap();
-        assert!(matches!(downcast, EditError::ContentMismatch { .. }));
+        assert!(matches!(
+            err,
+            crate::Error::Edit(EditError::ContentMismatch { .. })
+        ));
     }
 
     #[tokio::test]
@@ -631,8 +640,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let downcast = err.downcast_ref::<EditError>().unwrap();
-        assert!(matches!(downcast, EditError::MalformedAnchor { .. }));
+        assert!(matches!(
+            err,
+            crate::Error::Edit(EditError::MalformedAnchor { .. })
+        ));
     }
 
     #[tokio::test]
@@ -672,7 +683,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.downcast_ref::<EditError>().is_some());
+        assert!(matches!(err, crate::Error::Edit(_)));
 
         // Cache survives. A well-formed retry against the same anchors works.
         let target = anchor_field(&session, &path, 1);
@@ -735,8 +746,10 @@ mod tests {
             )
             .await
             .unwrap_err();
-        let downcast = err.downcast_ref::<EditError>().unwrap();
-        assert!(matches!(downcast, EditError::NewFileExists { .. }));
+        assert!(matches!(
+            err,
+            crate::Error::Edit(EditError::NewFileExists { .. })
+        ));
     }
 
     #[tokio::test]

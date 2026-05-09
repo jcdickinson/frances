@@ -12,13 +12,20 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use anyhow::{Context, Result};
 use serde::Deserialize;
+use thiserror::Error;
 use tokio::net::UnixStream;
 use uuid::Uuid;
 
-use crate::daemon::client::write_message;
-use crate::daemon::protocol::StreamFrame;
+use crate::Result;
+use crate::protocol::StreamFrame;
+use crate::transport::write_message;
+
+#[derive(Debug, Error)]
+pub enum WorkflowError {
+    #[error("split workflow args: {0}")]
+    SplitArgs(#[from] shell_words::ParseError),
+}
 
 /// One row of the `workflows` config table.
 ///
@@ -30,24 +37,12 @@ use crate::daemon::protocol::StreamFrame;
 /// it as `migrations = ["0001_init.sql"]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowConfig {
-    #[expect(
-        dead_code,
-        reason = "consumed by the future migration loader; scaffold only stores it"
-    )]
     pub id: Uuid,
-    #[expect(
-        dead_code,
-        reason = "consumed by the future Lua execution path; scaffold only stores it"
-    )]
     pub file: PathBuf,
     /// SQL migration files, resolved relative to [`Self::file`]'s
     /// parent. Order is the apply order; once a workflow ships, treat
     /// the prefix as immutable — the migration runner refuses to load
     /// when a recorded migration's name or content drifts.
-    #[expect(
-        dead_code,
-        reason = "consumed by the future migration loader; scaffold only stores it"
-    )]
     #[serde(default)]
     pub migrations: Vec<PathBuf>,
 }
@@ -58,7 +53,9 @@ pub struct WorkflowConfig {
 /// input (`/`, `/  foo`, no leading slash). Returns `Err` only when the
 /// input looks like a command but the args fail to shell-parse, so the
 /// caller can surface a precise error to the user.
-fn parse_slash_command(text: &str) -> Result<Option<(&str, Vec<String>)>> {
+fn parse_slash_command(
+    text: &str,
+) -> std::result::Result<Option<(&str, Vec<String>)>, WorkflowError> {
     let Some(body) = text.strip_prefix('/') else {
         return Ok(None);
     };
@@ -69,7 +66,7 @@ fn parse_slash_command(text: &str) -> Result<Option<(&str, Vec<String>)>> {
     if name.is_empty() {
         return Ok(None);
     }
-    let args = shell_words::split(rest.trim()).context("split workflow args")?;
+    let args = shell_words::split(rest.trim())?;
     Ok(Some((name, args)))
 }
 
@@ -88,7 +85,7 @@ pub async fn dispatch_slash_command(
         Err(error) => {
             write_message(
                 stream,
-                &StreamFrame::Error(format!("bad workflow args: {error:#}")),
+                &StreamFrame::Error(format!("bad workflow args: {error}")),
             )
             .await?;
             return Ok(true);

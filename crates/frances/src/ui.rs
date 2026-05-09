@@ -10,10 +10,11 @@ use crossterm::terminal::{Clear, ClearType};
 use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::daemon::client;
-use crate::daemon::protocol::{BlockId, BlockKind, DaemonStatus, PromptId, StreamFrame};
-use crate::llm::Usage;
-use crate::session::Session;
+use frances_daemon::llm::Usage;
+use frances_daemon::protocol::{BlockId, BlockKind, DaemonStatus, PromptId, StreamFrame};
+use frances_daemon::session::Session;
+
+use crate::client;
 use crate::tui::region::Region;
 use crate::tui::textarea::INPUT_HEIGHT;
 use crate::tui::widget::Widget;

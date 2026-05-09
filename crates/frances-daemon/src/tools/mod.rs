@@ -15,21 +15,23 @@
 //! `edit_insert_before`); runtime outputs stay pure data per
 //! `docs/arch/anchors.md`.
 
-mod file;
-mod shell;
+pub mod file;
+pub mod shell;
 
 use std::collections::HashMap;
 use std::fs;
+use std::num::TryFromIntError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{SystemTime, SystemTimeError};
 
-use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use frances_shell::Shell;
+use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::Result;
 use crate::anchor_store::AnchorStoreImpl;
 use crate::edit_session::EditSession;
 use crate::llm::{ToolCall, ToolDef};
@@ -37,6 +39,18 @@ use crate::llm::{ToolCall, ToolDef};
 pub use file::FileTools;
 pub use file::SCHEMA as FILE_SCHEMA;
 pub use shell::ShellTools;
+
+#[derive(Debug, Error)]
+pub enum ToolRegistryError {
+    #[error("duplicate tool name: {0}")]
+    DuplicateTool(String),
+    #[error("file modified-time read: {0}")]
+    ReadMtime(#[from] std::io::Error),
+    #[error("file modified time before unix epoch: {0}")]
+    MtimeBeforeEpoch(#[from] SystemTimeError),
+    #[error("file mtime ns overflow: {0}")]
+    MtimeOverflow(#[from] TryFromIntError),
+}
 
 pub struct ToolContext<'a> {
     pub edit_session: &'a Mutex<EditSession<AnchorStoreImpl>>,
@@ -67,7 +81,7 @@ impl ToolOutcome {
     fn from_result(result: Result<String>) -> Self {
         match result {
             Ok(content) => Self::ok(content),
-            Err(error) => Self::err(format!("{error:#}")),
+            Err(error) => Self::err(format!("{error}")),
         }
     }
 }
@@ -145,7 +159,6 @@ impl ToolRegistry {
     /// Drop the cached defs and re-fetch from every tool. Always
     /// re-fetches, even if a concurrent caller just rebuilt — that's the
     /// point of an explicit refresh.
-    #[expect(dead_code, reason = "wired up later for /tools refresh slash command")]
     pub async fn refresh(&self) -> Result<Vec<ToolDef>> {
         let _guard = self.build_lock.lock().await;
         self.cache.store(None);
@@ -159,7 +172,7 @@ impl ToolRegistry {
         let cache = match self.ensure_cache().await {
             Ok(cache) => cache,
             Err(error) => {
-                return ToolOutcome::err(format!("tool registry init failed: {error:#}"));
+                return ToolOutcome::err(format!("tool registry init failed: {error}"));
             }
         };
         let Some(&idx) = cache.name_to_tool.get(&call.name) else {
@@ -173,9 +186,10 @@ impl ToolRegistry {
             return Ok(cache);
         }
         self.definitions().await?;
-        self.cache
+        Ok(self
+            .cache
             .load_full()
-            .ok_or_else(|| anyhow!("tool registry cache empty after build"))
+            .expect("tool registry cache populated by definitions() above; ArcSwap snapshot stale"))
     }
 
     async fn collect(&self) -> Result<RegistryCache> {
@@ -185,7 +199,7 @@ impl ToolRegistry {
             for def in tool.definitions().await? {
                 let ToolDef::Function(function) = &def;
                 if name_to_tool.insert(function.name.clone(), idx).is_some() {
-                    return Err(anyhow!("duplicate tool name: {}", function.name));
+                    return Err(ToolRegistryError::DuplicateTool(function.name.clone()).into());
                 }
                 defs.push(def);
             }
@@ -223,12 +237,10 @@ fn split_lines(s: &str) -> Vec<String> {
     lines
 }
 
-fn mtime_ns_from(meta: &fs::Metadata) -> Result<i64> {
-    let modified = meta.modified().context("modified time")?;
-    let dur = modified
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .context("modified before unix epoch")?;
-    i64::try_from(dur.as_nanos()).context("mtime overflow")
+fn mtime_ns_from(meta: &fs::Metadata) -> std::result::Result<i64, ToolRegistryError> {
+    let modified = meta.modified()?;
+    let dur = modified.duration_since(SystemTime::UNIX_EPOCH)?;
+    Ok(i64::try_from(dur.as_nanos())?)
 }
 
 #[cfg(test)]

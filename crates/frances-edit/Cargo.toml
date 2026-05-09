@@ -9,7 +9,6 @@ authors.workspace = true
 frances-anchors.workspace = true
 similar.workspace = true
 async-trait.workspace = true
-anyhow.workspace = true
 thiserror.workspace = true
 twox-hash.workspace = true
 smallvec.workspace = true

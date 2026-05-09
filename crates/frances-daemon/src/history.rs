@@ -1,10 +1,11 @@
-use anyhow::{Context, Result, anyhow};
 use frances_llm::{HistoryInput, Provider};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use thiserror::Error;
 use tracing::trace;
 use uuid::Uuid;
 
+use crate::Result;
 use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
@@ -16,6 +17,38 @@ pub static SCHEMA: EntitySchema = EntitySchema {
         sql: include_str!("history/migrations/0001_init.sql"),
     }],
 };
+
+#[derive(Debug, Error)]
+pub enum HistoryError {
+    #[error("turso: {0}")]
+    Turso(#[from] turso::Error),
+    #[error("encode {what}: {source}")]
+    Encode {
+        what: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("decode {what}: {source}")]
+    Decode {
+        what: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("chat_session {0} not found")]
+    ChatSessionNotFound(ChatSessionId),
+    #[error("expected text in {column}, got {found:?}")]
+    NonTextColumn {
+        column: &'static str,
+        found: turso::Value,
+    },
+    #[error("primitive of type {kind:?} missing field {field:?}")]
+    PrimitiveMissingField {
+        kind: &'static str,
+        field: &'static str,
+    },
+    #[error("unknown primitive type {0:?}")]
+    UnknownPrimitiveType(String),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -147,14 +180,18 @@ impl HistoryStore {
                 .as_secs(),
         )
         .unwrap_or(i64::MAX);
-        let intents_json = serde_json::to_string(model_intents).context("encode model_intents")?;
+        let intents_json =
+            serde_json::to_string(model_intents).map_err(|source| HistoryError::Encode {
+                what: "model_intents",
+                source,
+            })?;
         conn.execute(
             "INSERT INTO chat_sessions (session_id, model_intents, created_at) \
              VALUES (?1, jsonb(?2), ?3)",
             (session_id, intents_json, created_at),
         )
         .await
-        .context("insert chat_session")?;
+        .map_err(HistoryError::Turso)?;
         let id = last_insert_rowid(&conn).await?;
         Ok(ChatSessionId(id))
     }
@@ -167,16 +204,19 @@ impl HistoryStore {
                 (id.0,),
             )
             .await
-            .context("query chat_session")?;
+            .map_err(HistoryError::Turso)?;
         let row = rows
             .next()
             .await
-            .context("read chat_session row")?
-            .ok_or_else(|| anyhow!("chat_session {id} not found"))?;
-        let session_id: String = row.get(0).context("chat_session.session_id")?;
-        let intents_text: String = row.get(1).context("chat_session.model_intents")?;
+            .map_err(HistoryError::Turso)?
+            .ok_or(HistoryError::ChatSessionNotFound(id))?;
+        let session_id: String = row.get(0).map_err(HistoryError::Turso)?;
+        let intents_text: String = row.get(1).map_err(HistoryError::Turso)?;
         let model_intents: Vec<String> =
-            serde_json::from_str(&intents_text).context("decode model_intents")?;
+            serde_json::from_str(&intents_text).map_err(|source| HistoryError::Decode {
+                what: "model_intents",
+                source,
+            })?;
         Ok(ChatSessionRow {
             id,
             session_id,
@@ -194,11 +234,10 @@ impl HistoryStore {
                 (),
             )
             .await
-            .context("query primary_chat_session")?;
-        match rows.next().await.context("read primary_chat_session row")? {
+            .map_err(HistoryError::Turso)?;
+        match rows.next().await.map_err(HistoryError::Turso)? {
             Some(row) => Ok(Some(ChatSessionId(
-                row.get::<i64>(0)
-                    .context("primary_chat_session.chat_session_id")?,
+                row.get::<i64>(0).map_err(HistoryError::Turso)?,
             ))),
             None => Ok(None),
         }
@@ -213,7 +252,7 @@ impl HistoryStore {
             (id.0,),
         )
         .await
-        .context("insert primary_chat_session")?;
+        .map_err(HistoryError::Turso)?;
         Ok(())
     }
 
@@ -293,14 +332,18 @@ impl HistoryStore {
         let conn = self.db.connect();
         for payload in payloads {
             let seq = next_seq(&conn, session).await?;
-            let payload_text = serde_json::to_string(payload).context("encode history payload")?;
+            let payload_text =
+                serde_json::to_string(payload).map_err(|source| HistoryError::Encode {
+                    what: "history payload",
+                    source,
+                })?;
             conn.execute(
                 "INSERT INTO chat_messages (chat_session_id, seq, type, history, kind, provider_id) \
                  VALUES (?1, ?2, 'history', jsonb(?3), ?4, ?5)",
                 (session.0, seq.0, payload_text, kind, provider_id),
             )
             .await
-            .context("insert history row")?;
+            .map_err(HistoryError::Turso)?;
         }
 
         Ok(())
@@ -318,15 +361,25 @@ impl HistoryStore {
                 (session.0,),
             )
             .await
-            .context("query history payloads")?;
+            .map_err(HistoryError::Turso)?;
 
         let mut payloads = Vec::new();
-        while let Some(row) = rows.next().await.context("iterate history payloads")? {
-            let text = match row.get_value(0).context("history column")? {
+        while let Some(row) = rows.next().await.map_err(HistoryError::Turso)? {
+            let text = match row.get_value(0).map_err(HistoryError::Turso)? {
                 turso::Value::Text(value) => value,
-                other => return Err(anyhow!("unexpected history value: {other:?}")),
+                other => {
+                    return Err(HistoryError::NonTextColumn {
+                        column: "history",
+                        found: other,
+                    }
+                    .into());
+                }
             };
-            let value: Value = serde_json::from_str(&text).context("decode history payload")?;
+            let value: Value =
+                serde_json::from_str(&text).map_err(|source| HistoryError::Decode {
+                    what: "history payload",
+                    source,
+                })?;
             payloads.push(value);
         }
 
@@ -334,10 +387,6 @@ impl HistoryStore {
     }
 
     /// Translate non-history rows for the (currently unwired) TUI replay path.
-    #[expect(
-        dead_code,
-        reason = "history-replay API; not yet wired into session resume"
-    )]
     pub async fn replay_for_tui(&self, session: ChatSessionId) -> Result<Vec<Block>> {
         let primitives = self.load_primitives(session).await?;
         Ok(primitives
@@ -371,10 +420,6 @@ impl HistoryStore {
     /// Drop the wire-tagged history rows for `session` and re-forge from
     /// primitives under the supplied provider's wire shape. Currently
     /// unused — swap detection is future work.
-    #[expect(
-        dead_code,
-        reason = "swap-time re-forge; provider-change detection is future work"
-    )]
     pub async fn purge_and_reforge<P: Provider + 'static>(
         &self,
         session: ChatSessionId,
@@ -387,7 +432,7 @@ impl HistoryStore {
             (session.0,),
         )
         .await
-        .context("clear history rows")?;
+        .map_err(HistoryError::Turso)?;
 
         let primitives = self.load_primitives(session).await?;
         let inputs: Vec<HistoryInput<'_>> = primitives
@@ -407,15 +452,19 @@ impl HistoryStore {
     ) -> Result<RowId> {
         let conn = self.db.connect();
         let seq = next_seq(&conn, session).await?;
-        let payload_text = serde_json::to_string(primitive).context("encode primitive")?;
+        let payload_text =
+            serde_json::to_string(primitive).map_err(|source| HistoryError::Encode {
+                what: "primitive",
+                source,
+            })?;
         conn.execute(
             "INSERT INTO chat_messages (chat_session_id, seq, type, primitive) \
              VALUES (?1, ?2, ?3, jsonb(?4))",
             (session.0, seq.0, ty, payload_text),
         )
         .await
-        .with_context(|| format!("insert {ty} primitive"))?;
-        last_insert_rowid(&conn).await.map(RowId)
+        .map_err(HistoryError::Turso)?;
+        Ok(RowId(last_insert_rowid(&conn).await?))
     }
 
     async fn load_primitives(&self, session: ChatSessionId) -> Result<Vec<OwnedHistoryInput>> {
@@ -427,42 +476,53 @@ impl HistoryStore {
                 (session.0,),
             )
             .await
-            .context("query primitive rows")?;
+            .map_err(HistoryError::Turso)?;
 
         let mut out = Vec::new();
-        while let Some(row) = rows.next().await.context("iterate primitive rows")? {
-            let ty = row.get::<String>(0).context("primitive type")?;
-            let payload_text = match row.get_value(1).context("primitive payload")? {
+        while let Some(row) = rows.next().await.map_err(HistoryError::Turso)? {
+            let ty = row.get::<String>(0).map_err(HistoryError::Turso)?;
+            let payload_text = match row.get_value(1).map_err(HistoryError::Turso)? {
                 turso::Value::Text(value) => value,
-                other => return Err(anyhow!("unexpected primitive value: {other:?}")),
+                other => {
+                    return Err(HistoryError::NonTextColumn {
+                        column: "primitive",
+                        found: other,
+                    }
+                    .into());
+                }
             };
             let payload: Value =
-                serde_json::from_str(&payload_text).context("decode primitive payload")?;
+                serde_json::from_str(&payload_text).map_err(|source| HistoryError::Decode {
+                    what: "primitive",
+                    source,
+                })?;
 
             let owned = match ty.as_str() {
                 "user" => OwnedHistoryInput::User {
-                    text: take_string(&payload, "text")?,
+                    text: take_string(&payload, "user", "text")?,
                 },
                 "assistant" => OwnedHistoryInput::Assistant {
-                    text: take_string(&payload, "text")?,
+                    text: take_string(&payload, "assistant", "text")?,
                 },
                 "tool_call" => OwnedHistoryInput::ToolCall {
-                    id: take_string(&payload, "id")?,
-                    name: take_string(&payload, "name")?,
-                    arguments: payload
-                        .get("arguments")
-                        .cloned()
-                        .ok_or_else(|| anyhow!("tool_call primitive missing 'arguments'"))?,
+                    id: take_string(&payload, "tool_call", "id")?,
+                    name: take_string(&payload, "tool_call", "name")?,
+                    arguments: payload.get("arguments").cloned().ok_or(
+                        HistoryError::PrimitiveMissingField {
+                            kind: "tool_call",
+                            field: "arguments",
+                        },
+                    )?,
                 },
                 "tool_result" => OwnedHistoryInput::ToolResult {
-                    call_id: take_string(&payload, "call_id")?,
-                    content: take_string(&payload, "content")?,
+                    call_id: take_string(&payload, "tool_result", "call_id")?,
+                    content: take_string(&payload, "tool_result", "content")?,
                     is_error: payload
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                 },
-                other => return Err(anyhow!("unexpected primitive type {other:?}")),
+                other => return Err(HistoryError::UnknownPrimitiveType(other.to_string()).into()),
             };
             out.push(owned);
         }
@@ -471,39 +531,40 @@ impl HistoryStore {
     }
 }
 
-fn take_string(value: &Value, key: &str) -> Result<String> {
+fn take_string(
+    value: &Value,
+    kind: &'static str,
+    key: &'static str,
+) -> std::result::Result<String, HistoryError> {
     value
         .get(key)
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("primitive missing string field {key:?}"))
+        .ok_or(HistoryError::PrimitiveMissingField { kind, field: key })
 }
 
-async fn next_seq(conn: &turso::Connection, session: ChatSessionId) -> Result<RowSeq> {
+async fn next_seq(
+    conn: &turso::Connection,
+    session: ChatSessionId,
+) -> std::result::Result<RowSeq, HistoryError> {
     let mut rows = conn
         .query(
             "SELECT COALESCE(MAX(seq), -1) + 1 FROM chat_messages WHERE chat_session_id = ?1",
             (session.0,),
         )
-        .await
-        .context("query next seq")?;
+        .await?;
     let row = rows
         .next()
-        .await
-        .context("read next seq row")?
-        .ok_or_else(|| anyhow!("next seq query returned no rows"))?;
-    Ok(RowSeq(row.get::<i64>(0).context("decode next seq")?))
+        .await?
+        .expect("COALESCE(MAX(seq), -1) + 1 always returns one row");
+    Ok(RowSeq(row.get::<i64>(0)?))
 }
 
-async fn last_insert_rowid(conn: &turso::Connection) -> Result<i64> {
-    let mut rows = conn
-        .query("SELECT last_insert_rowid()", ())
-        .await
-        .context("query last_insert_rowid")?;
+async fn last_insert_rowid(conn: &turso::Connection) -> std::result::Result<i64, HistoryError> {
+    let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
     let row = rows
         .next()
-        .await
-        .context("read last_insert_rowid row")?
-        .ok_or_else(|| anyhow!("last_insert_rowid query returned no rows"))?;
-    row.get::<i64>(0).context("decode last_insert_rowid")
+        .await?
+        .expect("last_insert_rowid() always returns one row");
+    Ok(row.get::<i64>(0)?)
 }

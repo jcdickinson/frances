@@ -3,35 +3,37 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
 use futures::StreamExt;
 use tarpc::context;
 use tarpc::server::Channel;
 use tarpc::tokio_serde::formats::Bincode;
+use thiserror::Error;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Notify, oneshot};
 use tracing::{debug, info, trace, warn};
 
+use crate::Result;
 use crate::anchor_store::AnchorStoreImpl;
 use crate::chat::{ChatSession, ChatSessionBuilder, ChatSessionManager};
 use crate::context::InvocationContext;
-use crate::daemon::client::{read_message, remove_socket_if_present, write_message};
-use crate::daemon::protocol::{
-    AttachResponse, BlockId, BlockKind, Client, DaemonPid, DaemonStatus, PROTOCOL_VERSION,
-    PromptId, SessionId, StreamFrame,
-};
 use crate::edit_session::EditSession;
 use crate::history::HistoryStore;
 use crate::llm::provider_cache::ProviderCache;
 use crate::llm::{ModelConfig, SessionConfigProvider, SessionConfigWriter, StreamEvent};
+use crate::protocol::{
+    AttachResponse, BlockId, BlockKind, Client, DaemonPid, DaemonStatus, PROTOCOL_VERSION,
+    PromptId, SessionId, StreamFrame,
+};
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
 use crate::store::Database;
 use crate::tools::{self, ToolRegistry};
+use crate::transport::{TransportError, read_message, remove_socket_if_present, write_message};
 use crate::workflows::{self, WorkflowConfig};
 use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
@@ -39,6 +41,60 @@ use frances_shell::Shell;
 
 const EVENTS_PAIRING_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_GRACE: Duration = Duration::from_millis(100);
+
+#[derive(Debug, Error)]
+pub enum ServerError {
+    #[error("no client context — attach first")]
+    NoClientContext,
+    #[error("open daemon log {path}: {source}")]
+    OpenDaemonLog {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("dup2 stdout to daemon log: {0}")]
+    Dup2Stdout(#[source] io::Error),
+    #[error("dup2 stderr to daemon log: {0}")]
+    Dup2Stderr(#[source] io::Error),
+    #[error("install tracing subscriber: {0}")]
+    InstallSubscriber(#[from] tracing_subscriber::util::TryInitError),
+    #[error("create runtime dir {path}: {source}")]
+    CreateRuntimeDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("write pid file for {session_id}: {source}")]
+    WritePidFile {
+        session_id: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("bind {label} socket {path}: {source}")]
+    BindSocket {
+        label: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("models::default is required")]
+    DefaultModelMissing,
+    #[error("llm task panicked: {0}")]
+    LlmTaskPanicked(#[from] tokio::task::JoinError),
+    #[error("send stream frame: {0}")]
+    Send(#[from] TransportError),
+    #[error("clean up {label} socket {path}: {source}")]
+    CleanupSocket {
+        label: &'static str,
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("control protocol I/O: {0}")]
+    ControlIo(#[source] io::Error),
+    #[error("client transport listen: {0}")]
+    ClientListen(#[source] io::Error),
+}
 
 pub(crate) struct ServerState {
     session: Session,
@@ -164,7 +220,7 @@ impl Client for ClientServer {
         _: context::Context,
         prompt_id: PromptId,
         text: String,
-    ) -> Result<(), String> {
+    ) -> std::result::Result<(), String> {
         let stream = self
             .state
             .events
@@ -186,15 +242,18 @@ pub fn install_logging(session: &Session) -> Result<()> {
         .create(true)
         .append(true)
         .open(&log_path)
-        .with_context(|| format!("failed to open daemon log {}", log_path.display()))?;
+        .map_err(|source| ServerError::OpenDaemonLog {
+            path: log_path.clone(),
+            source,
+        })?;
 
     let fd = file.as_raw_fd();
     unsafe {
         if libc::dup2(fd, libc::STDOUT_FILENO) < 0 {
-            return Err(io::Error::last_os_error()).context("dup2 stdout to daemon log");
+            return Err(ServerError::Dup2Stdout(io::Error::last_os_error()).into());
         }
         if libc::dup2(fd, libc::STDERR_FILENO) < 0 {
-            return Err(io::Error::last_os_error()).context("dup2 stderr to daemon log");
+            return Err(ServerError::Dup2Stderr(io::Error::last_os_error()).into());
         }
     }
     drop(file);
@@ -204,15 +263,17 @@ pub fn install_logging(session: &Session) -> Result<()> {
     // turso/hyper/reqwest internals. Overridable via RUST_LOG.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
-            "warn,frances=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
+            "warn,frances=trace,frances_daemon=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
         )
     });
+    use tracing_subscriber::util::SubscriberInitExt;
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
         .with_writer(io::stderr)
+        .finish()
         .try_init()
-        .map_err(|error| anyhow::anyhow!("failed to install tracing subscriber: {error}"))?;
+        .map_err(ServerError::InstallSubscriber)?;
 
     info!(session_id = %session.id, log = %log_path.display(), "daemon logging installed");
     Ok(())
@@ -221,48 +282,60 @@ pub fn install_logging(session: &Session) -> Result<()> {
 pub async fn run(session: Session, db: Database) -> Result<()> {
     debug!(session_id = %session.id, "starting daemon server");
 
-    fs::create_dir_all(&session.runtime_dir).with_context(|| {
-        format!(
-            "failed to create runtime dir {}",
-            session.runtime_dir.display()
-        )
+    fs::create_dir_all(&session.runtime_dir).map_err(|source| ServerError::CreateRuntimeDir {
+        path: session.runtime_dir.clone(),
+        source,
     })?;
 
-    remove_socket_if_present(&session.control_socket_path())?;
-    remove_socket_if_present(&session.client_socket_path())?;
-    remove_socket_if_present(&session.events_socket_path())?;
+    remove_socket_if_present(&session.control_socket_path()).map_err(|source| {
+        ServerError::CleanupSocket {
+            label: "control",
+            path: session.control_socket_path(),
+            source,
+        }
+    })?;
+    remove_socket_if_present(&session.client_socket_path()).map_err(|source| {
+        ServerError::CleanupSocket {
+            label: "client",
+            path: session.client_socket_path(),
+            source,
+        }
+    })?;
+    remove_socket_if_present(&session.events_socket_path()).map_err(|source| {
+        ServerError::CleanupSocket {
+            label: "events",
+            path: session.events_socket_path(),
+            source,
+        }
+    })?;
 
-    fs::write(session.pid_path(), std::process::id().to_string())
-        .with_context(|| format!("failed writing pid file for {}", session.id))?;
+    fs::write(session.pid_path(), std::process::id().to_string()).map_err(|source| {
+        ServerError::WritePidFile {
+            session_id: session.id.clone(),
+            source,
+        }
+    })?;
 
     let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
 
     let session_provider = Arc::new(SessionConfigProvider::new(db.clone()));
     let config_providers = build_config_providers(session_provider.clone());
-    let config = ConfigHandle::build(config_providers)
-        .await
-        .context("build config handle")?;
+    let config = ConfigHandle::build(config_providers).await?;
     let session_config_writer = session_provider
         .writer()
         .expect("SessionConfigProvider::load ran during ConfigHandle::build");
     let default_model = config
-        .bind::<ModelConfig>(["models", "default"])
-        .context("bind models::default")?
+        .bind::<ModelConfig>(["models", "default"])?
         .required()
-        .context("models::default is required")?;
-    let provider_cache =
-        Arc::new(ProviderCache::new(config.clone()).context("build provider cache")?);
-    let workflows = config
-        .bind::<HashMap<String, WorkflowConfig>>("workflows")
-        .context("bind workflows")?;
+        .map_err(|_| ServerError::DefaultModelMissing)?;
+    let provider_cache = Arc::new(ProviderCache::new(config.clone())?);
+    let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
 
     let history = HistoryStore::new(db);
-    let chat = ChatSessionManager::new(provider_cache, config.clone(), default_model, history)
-        .context("build chat session manager")?;
+    let chat = ChatSessionManager::new(provider_cache, config.clone(), default_model, history)?;
     let primary_chat = chat
         .primary(ChatSessionBuilder::new().with_model_intents(["chat".to_string()]))
-        .await
-        .context("load or create primary chat session")?;
+        .await?;
 
     let state = Arc::new(ServerState {
         session: session.clone(),
@@ -281,11 +354,12 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         session_config_writer,
     });
 
-    let events_listener = UnixListener::bind(session.events_socket_path()).with_context(|| {
-        format!(
-            "failed to bind events socket {}",
-            session.events_socket_path().display()
-        )
+    let events_listener = UnixListener::bind(session.events_socket_path()).map_err(|source| {
+        ServerError::BindSocket {
+            label: "events",
+            path: session.events_socket_path(),
+            source,
+        }
     })?;
     let events_state = state.clone();
     tokio::spawn(async move {
@@ -347,9 +421,15 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
 //   server → client: "ok\n" or "err <msg>\n"
 //                    optional "key=value\n" lines
 //                    "\n"  (blank line ends response)
-async fn serve_control(path: std::path::PathBuf, state: Arc<ServerState>) -> Result<()> {
-    let listener = UnixListener::bind(&path)
-        .with_context(|| format!("bind control socket {}", path.display()))?;
+async fn serve_control(
+    path: PathBuf,
+    state: Arc<ServerState>,
+) -> std::result::Result<(), ServerError> {
+    let listener = UnixListener::bind(&path).map_err(|source| ServerError::BindSocket {
+        label: "control",
+        path: path.clone(),
+        source,
+    })?;
     loop {
         let (mut stream, _) = match listener.accept().await {
             Ok(pair) => pair,
@@ -367,7 +447,10 @@ async fn serve_control(path: std::path::PathBuf, state: Arc<ServerState>) -> Res
     }
 }
 
-async fn handle_control_conn(stream: &mut UnixStream, state: Arc<ServerState>) -> Result<()> {
+async fn handle_control_conn(
+    stream: &mut UnixStream,
+    state: Arc<ServerState>,
+) -> std::result::Result<(), ServerError> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     let (read_half, mut write_half) = stream.split();
@@ -376,12 +459,18 @@ async fn handle_control_conn(stream: &mut UnixStream, state: Arc<ServerState>) -
     // before issuing any command.
     write_half
         .write_all(format!("{PROTOCOL_VERSION:016x}\n").as_bytes())
-        .await?;
-    write_half.flush().await?;
+        .await
+        .map_err(ServerError::ControlIo)?;
+    write_half.flush().await.map_err(ServerError::ControlIo)?;
 
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    if reader.read_line(&mut line).await? == 0 {
+    if reader
+        .read_line(&mut line)
+        .await
+        .map_err(ServerError::ControlIo)?
+        == 0
+    {
         return Ok(());
     }
     let request = line.trim();
@@ -413,13 +502,21 @@ async fn handle_control_conn(stream: &mut UnixStream, state: Arc<ServerState>) -
         other => format!("err unknown command: {other}\n\n"),
     };
 
-    write_half.write_all(response.as_bytes()).await?;
-    write_half.flush().await?;
+    write_half
+        .write_all(response.as_bytes())
+        .await
+        .map_err(ServerError::ControlIo)?;
+    write_half.flush().await.map_err(ServerError::ControlIo)?;
     Ok(())
 }
 
-async fn serve_client(path: std::path::PathBuf, state: Arc<ServerState>) -> Result<()> {
-    let mut listener = tarpc::serde_transport::unix::listen(&path, Bincode::default).await?;
+async fn serve_client(
+    path: PathBuf,
+    state: Arc<ServerState>,
+) -> std::result::Result<(), ServerError> {
+    let mut listener = tarpc::serde_transport::unix::listen(&path, Bincode::default)
+        .await
+        .map_err(ServerError::ClientListen)?;
     listener.config_mut().max_frame_length(usize::MAX);
     while let Some(transport) = listener.next().await {
         let transport = match transport {
@@ -472,7 +569,7 @@ async fn accept_events(listener: UnixListener, state: Arc<ServerState>) {
 async fn run_prompt(state: Arc<ServerState>, mut stream: UnixStream, text: String) {
     if let Err(error) = stream_prompt(&state, &mut stream, text).await {
         warn!(%error, "prompt handler failed");
-        match write_message(&mut stream, &StreamFrame::Error(format!("{error:#}"))).await {
+        match write_message(&mut stream, &StreamFrame::Error(format!("{error}"))).await {
             Ok(()) => trace!("wrote error frame"),
             Err(e) => warn!(error = %e, "failed to write error frame"),
         }
@@ -510,9 +607,7 @@ async fn run_handler(
 async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: String) -> Result<()> {
     let (env, cwd) = {
         let guard = state.last_context.lock().expect("last_context poisoned");
-        let ctx = guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("no client context — attach first"))?;
+        let ctx = guard.as_ref().ok_or(ServerError::NoClientContext)?;
         (ctx.process.env.clone(), ctx.process.cwd.clone())
     };
 
@@ -525,7 +620,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         id
     };
 
-    let mut send_error: Option<anyhow::Error> = None;
+    let mut send_error: Option<TransportError> = None;
 
     chat.submit_user(&text).await?;
 
@@ -568,7 +663,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
     }
 
     if let Some(error) = send_error {
-        return Err(error);
+        return Err(ServerError::Send(error).into());
     }
     Ok(())
 }
@@ -583,7 +678,7 @@ async fn run_llm_step(
     chat: &Arc<ChatSession>,
     env: &HashMap<OsString, OsString>,
     alloc_block: &mut impl FnMut() -> BlockId,
-    send_error: &mut Option<anyhow::Error>,
+    send_error: &mut Option<TransportError>,
     cwd: Option<&std::path::Path>,
 ) -> Result<bool> {
     let assistant_id = alloc_block();
@@ -673,7 +768,7 @@ async fn run_llm_step(
         try_write(stream, &StreamFrame::BlockStop { id }, send_error).await;
     }
 
-    let stream_result = llm_task.await.context("llm task panicked")?;
+    let stream_result = llm_task.await.map_err(ServerError::LlmTaskPanicked)?;
     let outcome = stream_result?;
     let tool_calls = outcome.tool_calls;
 
@@ -749,7 +844,7 @@ async fn run_llm_step(
 /// a runtime annotation, not part of the model conversation.
 async fn emit_classification_block(
     stream: &mut UnixStream,
-    send_error: &mut Option<anyhow::Error>,
+    send_error: &mut Option<TransportError>,
     id: BlockId,
     classification: &ShellClassification,
 ) {
@@ -778,13 +873,13 @@ async fn emit_classification_block(
 async fn try_write(
     stream: &mut UnixStream,
     frame: &StreamFrame,
-    send_error: &mut Option<anyhow::Error>,
+    send_error: &mut Option<TransportError>,
 ) {
     if send_error.is_some() {
         return;
     }
     if let Err(error) = write_message(stream, frame).await {
-        *send_error = Some(anyhow::Error::new(error));
+        *send_error = Some(error);
     }
 }
 

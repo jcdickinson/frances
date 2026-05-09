@@ -8,7 +8,7 @@ use unicode_width::UnicodeWidthChar;
 
 use super::region::Region;
 use super::widget::{RenderCtx, Widget};
-use crate::daemon::protocol::BlockKind;
+use frances_daemon::protocol::BlockKind;
 
 pub struct BlockView<'a> {
     pub kind: &'a BlockKind,

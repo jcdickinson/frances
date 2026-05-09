@@ -11,7 +11,6 @@
 
 use std::sync::{Arc, OnceLock};
 
-use anyhow::Context;
 use async_trait::async_trait;
 use frances_config::{ConfigEvent, ConfigProvider, EventSender, Path, ProviderError, Value};
 use thiserror::Error;
@@ -67,9 +66,7 @@ impl ConfigProvider for SessionConfigProvider {
         // Capture before consuming so writers can keep emitting after load.
         let _ = self.sender.set(events.clone());
 
-        let rows = read_rows(&self.db)
-            .await
-            .map_err(|err| ProviderError::new(SessionConfigLoadError::from_anyhow(err)))?;
+        let rows = read_rows(&self.db).await.map_err(ProviderError::new)?;
 
         let mut batch = Vec::with_capacity(rows.len());
         for row in rows {
@@ -101,10 +98,6 @@ pub struct SessionConfigWriter {
 
 impl SessionConfigWriter {
     /// Persist `events` to `session_config` and emit them on the DB layer.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "writer API; awaiting first non-test caller")
-    )]
     pub async fn write(&self, events: Vec<ConfigEvent>) -> Result<(), SessionConfigWriteError> {
         write_rows(&self.db, &events).await?;
         let _ = self.sender.send(events).await;
@@ -174,45 +167,34 @@ enum SessionConfigRowError {
 }
 
 #[derive(Debug, Error)]
-#[error("session_config load failed: {0}")]
-struct SessionConfigLoadError(String);
-
-impl SessionConfigLoadError {
-    fn from_anyhow(err: anyhow::Error) -> Self {
-        Self(format!("{err:#}"))
-    }
+pub enum SessionConfigLoadError {
+    #[error("session_config load: {0}")]
+    Turso(#[from] turso::Error),
 }
 
 #[derive(Debug, Error)]
 pub enum SessionConfigWriteError {
-    #[error("session_config write failed: {0}")]
-    Db(String),
+    #[error("session_config write: {0}")]
+    Turso(#[from] turso::Error),
     #[error(
         "session_config write at {path}: {kind} values are not supported (only string|int|float|bool)"
     )]
     UnsupportedKind { path: String, kind: &'static str },
 }
 
-impl SessionConfigWriteError {
-    fn from_anyhow(err: anyhow::Error) -> Self {
-        Self::Db(format!("{err:#}"))
-    }
-}
-
-async fn read_rows(db: &Database) -> anyhow::Result<Vec<Result<RawRow, SessionConfigRowError>>> {
+async fn read_rows(
+    db: &Database,
+) -> Result<Vec<Result<RawRow, SessionConfigRowError>>, SessionConfigLoadError> {
     let conn = db.connect();
     let mut rows = conn
         .query("SELECT json(path), kind, value FROM session_config", ())
-        .await
-        .context("query session_config")?;
+        .await?;
 
     let mut out = Vec::new();
-    while let Some(row) = rows.next().await.context("iterate session_config")? {
-        let path_json = row.get::<String>(0).context("session_config.path column")?;
-        let kind = row.get::<String>(1).context("session_config.kind column")?;
-        let value = row
-            .get::<String>(2)
-            .context("session_config.value column")?;
+    while let Some(row) = rows.next().await? {
+        let path_json = row.get::<String>(0)?;
+        let kind = row.get::<String>(1)?;
+        let value = row.get::<String>(2)?;
         out.push(parse_path_json(&path_json).map(|path| RawRow { path, kind, value }));
     }
     Ok(out)
@@ -234,15 +216,11 @@ async fn write_rows(db: &Database, events: &[ConfigEvent]) -> Result<(), Session
                          value = excluded.value",
                     (hash, path_json, kind.to_string(), value),
                 )
-                .await
-                .with_context(|| format!("upsert session_config row {}", event.path))
-                .map_err(SessionConfigWriteError::from_anyhow)?;
+                .await?;
             }
             None if event.value.is_null() => {
                 conn.execute("DELETE FROM session_config WHERE path_hash = ?1", (hash,))
-                    .await
-                    .with_context(|| format!("delete session_config row {}", event.path))
-                    .map_err(SessionConfigWriteError::from_anyhow)?;
+                    .await?;
             }
             None => {
                 return Err(SessionConfigWriteError::UnsupportedKind {
@@ -332,7 +310,6 @@ fn variant_name(value: &Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::test_support::TempDb;
     use frances_config::ConfigHandle;
     use std::sync::Arc;
 
@@ -351,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_persists_and_emits() {
-        let db = TempDb::open().await;
+        let db = Database::open_in_memory().await.unwrap();
 
         let provider = Arc::new(SessionConfigProvider::new(db.clone()));
         let providers: Vec<Arc<dyn ConfigProvider>> = vec![provider.clone()];

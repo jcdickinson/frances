@@ -2,22 +2,18 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
 use frances_llm::{
     CompletionOutcome, ErasedError, HistoryInput, ProviderRequest, StreamEvent, ToolChoice, ToolDef,
 };
 use serde_json::Value;
 
-use crate::chat::manager::ChatSessionManager;
+use crate::chat::ChatError;
+use crate::chat::manager::{ChatSessionManager, log_and_typed};
 use crate::history::{ChatSessionId, OwnedHistoryInput};
+use crate::{Error, Result};
 
-fn into_erased(e: anyhow::Error) -> ErasedError {
-    e.into()
-}
-
-fn log_and_generic(provider_id: &str, e: ErasedError) -> anyhow::Error {
-    tracing::error!(provider = %provider_id, error = %e, "provider error");
-    anyhow!("provider {} encountered an error", provider_id)
+fn into_erased(e: Error) -> ErasedError {
+    Box::new(e)
 }
 
 pub struct ChatSession {
@@ -112,12 +108,11 @@ impl ChatSession {
     {
         let model = self.manager.resolve_model(&self.model_intents);
         let provider_id = model.model_provider.clone();
-        let provider = self.manager.cache().get(&provider_id).ok_or_else(|| {
-            anyhow!(
-                "model_providers.{} not available (no config or factory missing)",
-                provider_id
-            )
-        })?;
+        let provider = self
+            .manager
+            .cache()
+            .get(&provider_id)
+            .ok_or_else(|| ChatError::ProviderUnavailable(provider_id.clone()))?;
         let provider_kind = provider.kind();
 
         let pending: Vec<OwnedHistoryInput> =
@@ -148,7 +143,7 @@ impl ChatSession {
         let completion = provider
             .stream(req, &mut wrapped)
             .await
-            .map_err(|e| log_and_generic(&provider_id, e))?;
+            .map_err(|source| log_and_typed(&provider_id, source))?;
 
         self.manager
             .history()

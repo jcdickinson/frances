@@ -1,20 +1,16 @@
-use std::path::Path;
-
-use serde::Serialize;
-use serde::de::DeserializeOwned;
+use frances_daemon::context::InvocationContext;
+use frances_daemon::protocol::{
+    AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId, SessionId, StreamFrame,
+};
+use frances_daemon::session::Session;
+use frances_daemon::transport::{TransportError, read_message, write_message};
 use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Bincode;
 use thiserror::Error;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tracing::trace;
-
-use crate::context::InvocationContext;
-use crate::daemon::protocol::{
-    AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId, SessionId, StreamFrame,
-};
-use crate::session::Session;
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -22,12 +18,8 @@ pub enum ClientError {
     Io(#[from] std::io::Error),
     #[error("rpc error: {0}")]
     Rpc(#[from] RpcError),
-    #[error("encode error: {0}")]
-    Encode(#[from] bincode::error::EncodeError),
-    #[error("decode error: {0}")]
-    Decode(#[from] bincode::error::DecodeError),
-    #[error("message too large for protocol framing")]
-    MessageTooLarge,
+    #[error(transparent)]
+    Transport(#[from] TransportError),
     /// Control socket reached EOF before sending the banner line.
     #[error("daemon closed before sending control banner")]
     NoBanner,
@@ -208,34 +200,5 @@ where
         if stop {
             return Ok(());
         }
-    }
-}
-
-pub async fn write_message<T: Serialize>(
-    stream: &mut UnixStream,
-    value: &T,
-) -> Result<(), ClientError> {
-    let bytes = bincode::serde::encode_to_vec(value, bincode::config::standard())?;
-    let len = u32::try_from(bytes.len()).map_err(|_| ClientError::MessageTooLarge)?;
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(&bytes).await?;
-    Ok(())
-}
-
-pub async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> Result<T, ClientError> {
-    let mut len_bytes = [0_u8; 4];
-    stream.read_exact(&mut len_bytes).await?;
-    let len = u32::from_be_bytes(len_bytes) as usize;
-    let mut payload = vec![0_u8; len];
-    stream.read_exact(&mut payload).await?;
-    let (message, _) = bincode::serde::decode_from_slice(&payload, bincode::config::standard())?;
-    Ok(message)
-}
-
-pub fn remove_socket_if_present(path: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
     }
 }

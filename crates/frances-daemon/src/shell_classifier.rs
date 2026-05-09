@@ -23,13 +23,22 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 
-use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use thiserror::Error;
 use tracing::warn;
 
+use crate::Result;
 use crate::chat::{ChatSessionManager, CompleteRequest};
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
+
+#[derive(Debug, Error)]
+pub enum ShellClassifierError {
+    #[error("unexpected classifier tool: {0}")]
+    UnexpectedTool(String),
+    #[error("parse classifier args: {0}")]
+    ParseArgs(#[from] serde_json::Error),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -95,7 +104,7 @@ pub async fn classify_shell(
             warn!(%error, "shell classifier errored — defaulting to unsafe");
             ShellClassification {
                 kind: ShellKind::Unsafe,
-                description: format!("classifier error: {error:#}"),
+                description: format!("classifier error: {error}"),
             }
         }
     }
@@ -127,11 +136,10 @@ async fn try_classify(
                 tools: &tools,
                 tool_choice: None,
             })
-            .await
-            .context("shell classifier llm call")?;
+            .await?;
 
         if let Some(call) = outcome.tool_calls.first() {
-            return parse_classification(call);
+            return Ok(parse_classification(call)?);
         }
 
         if attempt == 0 {
@@ -146,7 +154,9 @@ async fn try_classify(
     })
 }
 
-fn parse_classification(call: &ToolCall) -> Result<ShellClassification> {
+fn parse_classification(
+    call: &ToolCall,
+) -> std::result::Result<ShellClassification, ShellClassifierError> {
     #[derive(Deserialize)]
     struct Args {
         description: String,
@@ -156,10 +166,9 @@ fn parse_classification(call: &ToolCall) -> Result<ShellClassification> {
         "read" => ShellKind::Read,
         "write" => ShellKind::Write,
         "unsafe" => ShellKind::Unsafe,
-        other => return Err(anyhow!("unexpected classifier tool: {other}")),
+        other => return Err(ShellClassifierError::UnexpectedTool(other.to_string())),
     };
-    let args: Args =
-        serde_json::from_value(call.arguments.clone()).context("parse classifier args")?;
+    let args: Args = serde_json::from_value(call.arguments.clone())?;
     Ok(ShellClassification {
         kind,
         description: args.description,
@@ -234,7 +243,7 @@ mod tests {
             arguments: json!({"description": "..."}),
         };
         let err = parse_classification(&call).unwrap_err();
-        assert!(err.to_string().contains("burninate"));
+        assert!(matches!(err, ShellClassifierError::UnexpectedTool(name) if name == "burninate"));
     }
 
     #[test]
@@ -245,7 +254,7 @@ mod tests {
             arguments: json!({}),
         };
         let err = parse_classification(&call).unwrap_err();
-        assert!(err.to_string().contains("classifier args"));
+        assert!(matches!(err, ShellClassifierError::ParseArgs(_)));
     }
 
     #[test]

@@ -3,17 +3,43 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 
-use anyhow::{Result, anyhow};
-use frances_config::{ConfigBinding, ConfigHandle, Keys};
+use frances_config::{ConfigBindError, ConfigBinding, ConfigHandle, Keys};
 use futures::Stream;
 use futures::StreamExt;
 use futures::task::noop_waker_ref;
+use thiserror::Error;
 use tracing::warn;
 
 use frances_llm::providers::openai;
 use frances_llm::{
     ErasedError, ErasedProvider, Provider, ProviderConfig, ResponsesModelExtras, WireApi,
 };
+
+#[derive(Debug, Error)]
+pub enum ProviderCacheError {
+    #[error("bind {path}: {source}")]
+    Bind {
+        path: &'static str,
+        #[source]
+        source: ConfigBindError,
+    },
+    #[error("bind model_providers::{id}: {source}")]
+    BindProvider {
+        id: String,
+        #[source]
+        source: ConfigBindError,
+    },
+    #[error("bind model_provider_extensions::{id}: {source}")]
+    BindExtensions {
+        id: String,
+        #[source]
+        source: ConfigBindError,
+    },
+    #[error("ProviderConfig missing for current id")]
+    ProviderConfigMissing,
+    #[error("provider build: {0}")]
+    Build(#[source] ErasedError),
+}
 
 /// Drain-on-get cache of constructed [`ErasedProvider`]s, keyed by provider
 /// id. Each entry owns the subscribe streams for its `ProviderConfig` and
@@ -51,14 +77,22 @@ impl Entry {
 }
 
 trait EntryFactory: Send + Sync {
-    fn build(&self, handle: &ConfigHandle, id: &str) -> Result<Entry>;
+    fn build(
+        &self,
+        handle: &ConfigHandle,
+        id: &str,
+    ) -> std::result::Result<Entry, ProviderCacheError>;
 }
 
 impl ProviderCache {
-    pub fn new(handle: ConfigHandle) -> Result<Self> {
-        let keys = handle
-            .bind::<Keys>("model_providers")
-            .map_err(|e| anyhow!("bind model_providers: {e}"))?;
+    pub fn new(handle: ConfigHandle) -> std::result::Result<Self, ProviderCacheError> {
+        let keys =
+            handle
+                .bind::<Keys>("model_providers")
+                .map_err(|source| ProviderCacheError::Bind {
+                    path: "model_providers",
+                    source,
+                })?;
         // subscribe_now seeds the stream with the current snapshot so the
         // first `refresh_id_set` learns the existing key set.
         let keys_stream = keys.subscribe_now();
@@ -136,13 +170,23 @@ impl ProviderCache {
 struct OpenAiFactory;
 
 impl EntryFactory for OpenAiFactory {
-    fn build(&self, handle: &ConfigHandle, id: &str) -> Result<Entry> {
+    fn build(
+        &self,
+        handle: &ConfigHandle,
+        id: &str,
+    ) -> std::result::Result<Entry, ProviderCacheError> {
         let pc = handle
             .bind::<ProviderConfig>(["model_providers", id])
-            .map_err(|e| anyhow!("bind model_providers::{id}: {e}"))?;
+            .map_err(|source| ProviderCacheError::BindProvider {
+                id: id.to_owned(),
+                source,
+            })?;
         let ex = handle
             .bind::<ResponsesModelExtras>(["model_provider_extensions", id])
-            .map_err(|e| anyhow!("bind model_provider_extensions::{id}: {e}"))?;
+            .map_err(|source| ProviderCacheError::BindExtensions {
+                id: id.to_owned(),
+                source,
+            })?;
 
         let initial = build_provider::<openai::Provider>(&pc, &ex)?;
 
@@ -175,17 +219,18 @@ impl EntryFactory for OpenAiFactory {
 fn build_provider<P>(
     pc: &ConfigBinding<ProviderConfig>,
     ex: &ConfigBinding<P::Extras>,
-) -> Result<Arc<ErasedProvider>>
+) -> std::result::Result<Arc<ErasedProvider>, ProviderCacheError>
 where
     P: Provider + 'static,
+    P::BuildError: Into<ErasedError>,
     P::Error: Into<ErasedError> + From<ErasedError>,
 {
     let cfg = pc
         .get()
-        .ok_or_else(|| anyhow!("ProviderConfig missing"))?
+        .ok_or(ProviderCacheError::ProviderConfigMissing)?
         .clone();
     let extras = ex.get().map(|g| (*g).clone()).unwrap_or_default();
-    let arc = P::new(cfg, extras).map_err(|e| anyhow!("provider build: {e}"))?;
+    let arc = P::new(cfg, extras).map_err(|e| ProviderCacheError::Build(e.into()))?;
     Ok(Arc::new(ErasedProvider::new(arc)))
 }
 
@@ -221,9 +266,9 @@ mod tests {
     }
 
     struct Tiny {
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "test fixture; kept to assert construction args")]
         config: ProviderConfig,
-        #[allow(dead_code)]
+        #[expect(dead_code, reason = "test fixture; kept to assert construction args")]
         extras: TinyExtras,
     }
 
@@ -295,18 +340,28 @@ mod tests {
     }
 
     /// A `ProviderCache` wired with a `Tiny` factory only.
-    fn tiny_cache(handle: ConfigHandle) -> Result<ProviderCache> {
+    fn tiny_cache(handle: ConfigHandle) -> std::result::Result<ProviderCache, ProviderCacheError> {
         let mut cache = ProviderCache::new(handle)?;
         // Replace the default factory map with one that builds Tiny for any wire.
         struct TinyFactory;
         impl EntryFactory for TinyFactory {
-            fn build(&self, handle: &ConfigHandle, id: &str) -> Result<Entry> {
+            fn build(
+                &self,
+                handle: &ConfigHandle,
+                id: &str,
+            ) -> std::result::Result<Entry, ProviderCacheError> {
                 let pc = handle
                     .bind::<ProviderConfig>(["model_providers", id])
-                    .map_err(|e| anyhow!("{e}"))?;
+                    .map_err(|source| ProviderCacheError::BindProvider {
+                        id: id.to_owned(),
+                        source,
+                    })?;
                 let ex = handle
                     .bind::<TinyExtras>(["model_provider_extensions", id])
-                    .map_err(|e| anyhow!("{e}"))?;
+                    .map_err(|source| ProviderCacheError::BindExtensions {
+                        id: id.to_owned(),
+                        source,
+                    })?;
                 let initial = build_provider::<Tiny>(&pc, &ex)?;
                 let mut pc_stream = pc.subscribe();
                 let mut ex_stream = ex.subscribe();

@@ -1,27 +1,16 @@
-mod anchor_store;
-mod chat;
-mod context;
-mod daemon;
-mod edit_session;
-mod history;
-mod llm;
-mod migrations;
-mod session;
-mod shell_classifier;
-mod store;
-mod tools;
+mod client;
+mod spawn;
 mod tty;
 mod tui;
 mod ui;
-mod workflows;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use daemon::{client, protocol, server, spawn};
+use frances_daemon::context::InvocationContext;
+use frances_daemon::session::{Paths, Session};
+use frances_daemon::{protocol, server, store};
 use tracing::debug;
 
-use crate::context::InvocationContext;
-use crate::session::{Paths, Session};
 use crate::ui::App;
 
 #[derive(Debug, Parser)]
@@ -70,7 +59,7 @@ async fn real_main() -> Result<()> {
         let session = paths.load_session(&session_id)?;
         server::install_logging(&session)?;
         let db = store::Database::open(&session).await?;
-        return server::run(session, db).await;
+        return Ok(server::run(session, db).await?);
     }
 
     let tty_key = tty::controlling_tty_key()?;
@@ -134,7 +123,10 @@ async fn real_main() -> Result<()> {
     Ok(())
 }
 
-fn resolve_existing_session_for_tty(paths: &Paths, tty_key: &tty::TtyKey) -> Result<Session> {
+fn resolve_existing_session_for_tty(
+    paths: &Paths,
+    tty_key: &frances_daemon::tty::TtyKey,
+) -> Result<Session> {
     paths
         .resolve_tty_link(tty_key)?
         .ok_or_else(|| anyhow!("no frances session is linked to the current TTY"))

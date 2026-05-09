@@ -4,12 +4,13 @@
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use frances_shell::{QuietReason, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
 use serde_json::{Value, json};
+use thiserror::Error;
 use tokio::sync::Mutex;
 
+use crate::Result;
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 use super::{Tool, ToolContext, ToolOutcome};
@@ -17,6 +18,30 @@ use super::{Tool, ToolContext, ToolOutcome};
 const SHELL_RUN_DESC: &str = include_str!("desc/shell_run.md");
 const SHELL_WAIT_DESC: &str = include_str!("desc/shell_wait.md");
 const SHELL_KILL_DESC: &str = include_str!("desc/shell_kill.md");
+
+#[derive(Debug, Error)]
+pub enum ShellToolError {
+    #[error("unknown shell tool: {0}")]
+    UnknownTool(String),
+    #[error("parse {tool} args: {source}")]
+    ParseArgs {
+        tool: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("spawn shell: {0}")]
+    Spawn(#[source] ShellError),
+    #[error("shell run: {0}")]
+    Run(#[source] ShellError),
+    #[error("no active shell — call shell_run first")]
+    NoActiveShell,
+    #[error("shell_wait: {0}")]
+    Wait(#[source] ShellError),
+    #[error("shell_kill: {0}")]
+    Kill(#[source] ShellError),
+    #[error("drain after kill: {0}")]
+    DrainAfterKill(#[source] ShellError),
+}
 
 pub struct ShellTools;
 
@@ -64,7 +89,7 @@ impl Tool for ShellTools {
             "shell_run" => run_shell(&call.arguments, ctx.shell, ctx.cwd).await,
             "shell_wait" => run_keep_waiting(&call.arguments, ctx.shell).await,
             "shell_kill" => run_kill_running(ctx.shell).await,
-            other => Err(anyhow!("unknown shell tool: {other}")),
+            other => Err(ShellToolError::UnknownTool(other.to_string()).into()),
         };
         ToolOutcome::from_result(result)
     }
@@ -96,7 +121,10 @@ async fn run_shell(
     cwd: Option<&Path>,
 ) -> Result<String> {
     let args: RunShellArgs =
-        serde_json::from_value(args.clone()).context("parse shell_run args")?;
+        serde_json::from_value(args.clone()).map_err(|source| ShellToolError::ParseArgs {
+            tool: "shell_run",
+            source,
+        })?;
     let wait = wait_opts(args.quiet_ms, args.max_ms);
 
     let mut guard = shell.lock().await;
@@ -105,10 +133,13 @@ async fn run_shell(
             cwd: cwd.map(Path::to_path_buf),
             ..ShellOptions::default()
         };
-        *guard = Some(Shell::spawn(opts).await.context("spawn shell")?);
+        *guard = Some(Shell::spawn(opts).await.map_err(ShellToolError::Spawn)?);
     }
     let shell = guard.as_mut().expect("shell ensured");
-    let outcome = shell.run(&args.cmd, wait).await.context("shell run")?;
+    let outcome = shell
+        .run(&args.cmd, wait)
+        .await
+        .map_err(ShellToolError::Run)?;
     let result = format_outcome(&outcome);
     if matches!(outcome, RunOutcome::Dead { .. }) {
         *guard = None;
@@ -120,18 +151,19 @@ async fn run_keep_waiting(args: &Value, shell: &Mutex<Option<Shell>>) -> Result<
     let args: WaitArgs = if args.is_null() || matches!(args, Value::Object(o) if o.is_empty()) {
         WaitArgs::default()
     } else {
-        serde_json::from_value(args.clone()).context("parse shell_wait args")?
+        serde_json::from_value(args.clone()).map_err(|source| ShellToolError::ParseArgs {
+            tool: "shell_wait",
+            source,
+        })?
     };
     let wait = wait_opts(args.quiet_ms, args.max_ms);
 
     let mut guard = shell.lock().await;
-    let shell = guard
-        .as_mut()
-        .ok_or_else(|| anyhow!("no active shell — call shell_run first"))?;
+    let shell = guard.as_mut().ok_or(ShellToolError::NoActiveShell)?;
     let outcome = match shell.keep_waiting(wait).await {
         Ok(o) => o,
         Err(ShellError::NoRunningCommand) => return Ok("[no command in flight]".to_string()),
-        Err(e) => return Err(anyhow!("shell_wait: {e}")),
+        Err(e) => return Err(ShellToolError::Wait(e).into()),
     };
     let result = format_outcome(&outcome);
     if matches!(outcome, RunOutcome::Dead { .. }) {
@@ -149,7 +181,7 @@ async fn run_kill_running(shell: &Mutex<Option<Shell>>) -> Result<String> {
         *guard = None;
         return Ok("[shell already dead]".to_string());
     }
-    shell.kill_running().await.context("shell_kill")?;
+    shell.kill_running().await.map_err(ShellToolError::Kill)?;
     // Drain so the LLM gets the final exit code in one round-trip rather
     // than having to follow up with shell_wait itself.
     let drain = WaitOpts {
@@ -159,7 +191,7 @@ async fn run_kill_running(shell: &Mutex<Option<Shell>>) -> Result<String> {
     let outcome = match shell.keep_waiting(drain).await {
         Ok(o) => o,
         Err(ShellError::NoRunningCommand) => return Ok("[no command was running]".to_string()),
-        Err(e) => return Err(anyhow!("drain after kill: {e}")),
+        Err(e) => return Err(ShellToolError::DrainAfterKill(e).into()),
     };
     let result = format_outcome(&outcome);
     if matches!(outcome, RunOutcome::Dead { .. }) {
@@ -226,8 +258,11 @@ mod tests {
     async fn keep_waiting_without_active_shell_errors() {
         let shell = Mutex::new(None);
         let res = run_keep_waiting(&json!({}), &shell).await;
-        assert!(res.is_err());
-        assert!(format!("{:?}", res.unwrap_err()).contains("no active shell"));
+        let err = res.unwrap_err();
+        assert!(matches!(
+            err,
+            crate::Error::ShellTool(ShellToolError::NoActiveShell)
+        ));
     }
 
     #[tokio::test]

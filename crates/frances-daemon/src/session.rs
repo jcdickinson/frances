@@ -6,13 +6,70 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
+use crate::Result;
 use crate::tty::TtyKey;
 
 const METADATA_FILE: &str = "metadata.bin";
 const SESSION_DIR_MODE: u32 = 0o700;
+
+#[derive(Debug, Error)]
+pub enum SessionError {
+    #[error("HOME is not set")]
+    HomeNotSet,
+    #[error("session metadata id mismatch for {requested}: file says {found}")]
+    MetadataIdMismatch { requested: String, found: String },
+    #[error("invalid tty link target for {tty_key}: {}", target.display())]
+    InvalidTtyLinkTarget { tty_key: String, target: PathBuf },
+    #[error("create directory {path}: {source}")]
+    CreateDir {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("set permissions on {path}: {source}")]
+    SetPermissions {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("write metadata {path}: {source}")]
+    WriteMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("read metadata {path}: {source}")]
+    ReadMetadata {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("encode metadata: {0}")]
+    EncodeMetadata(#[from] bincode::error::EncodeError),
+    #[error("decode metadata: {0}")]
+    DecodeMetadata(#[from] bincode::error::DecodeError),
+    #[error("read tty link {tty_key}: {source}")]
+    ReadTtyLink {
+        tty_key: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("create tty link for {tty_key}: {source}")]
+    CreateTtyLink {
+        tty_key: String,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("remove tty link {tty_key}: {source}")]
+    RemoveTtyLink {
+        tty_key: String,
+        #[source]
+        source: std::io::Error,
+    },
+}
 
 #[derive(Debug, Clone)]
 pub struct Paths {
@@ -31,21 +88,10 @@ pub struct SessionMeta {
 
 #[derive(Debug, Clone)]
 pub struct Session {
-    #[expect(
-        dead_code,
-        reason = "carried for any future caller that needs the resolved path roots"
-    )]
     pub paths: Paths,
     pub id: String,
     pub dir: PathBuf,
     pub runtime_dir: PathBuf,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "session metadata kept on the struct; tests inspect cwd/version, runtime does not yet"
-        )
-    )]
     pub meta: SessionMeta,
 }
 
@@ -54,7 +100,7 @@ impl Paths {
         let state_root = match env::var_os("XDG_STATE_HOME") {
             Some(value) => PathBuf::from(value).join("frances"),
             None => {
-                let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+                let home = env::var_os("HOME").ok_or(SessionError::HomeNotSet)?;
                 PathBuf::from(home).join(".local/state/frances")
             }
         };
@@ -128,11 +174,14 @@ impl Paths {
     pub fn load_session(&self, id: &str) -> Result<Session> {
         let dir = self.sessions_root().join(id);
         let runtime_dir = self.runtime_sessions_root().join(id);
-        let meta = read_metadata(&dir.join(METADATA_FILE))
-            .with_context(|| format!("failed to load metadata for session {id}"))?;
+        let meta = read_metadata(&dir.join(METADATA_FILE))?;
 
         if meta.id != id {
-            return Err(anyhow!("session metadata id mismatch for {id}"));
+            return Err(SessionError::MetadataIdMismatch {
+                requested: id.to_string(),
+                found: meta.id,
+            }
+            .into());
         }
 
         create_private_dir(&runtime_dir)?;
@@ -169,8 +218,12 @@ impl Paths {
         let target = match fs::read_link(&link_path) {
             Ok(target) => target,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error).with_context(|| format!("failed reading tty link {tty_key}"));
+            Err(source) => {
+                return Err(SessionError::ReadTtyLink {
+                    tty_key: tty_key.to_string(),
+                    source,
+                }
+                .into());
             }
         };
 
@@ -182,7 +235,10 @@ impl Paths {
         let session_id = target
             .file_name()
             .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow!("invalid tty link target for {tty_key}"))?;
+            .ok_or_else(|| SessionError::InvalidTtyLinkTarget {
+                tty_key: tty_key.to_string(),
+                target: target.clone(),
+            })?;
 
         match self.load_session(session_id) {
             Ok(session) => Ok(Some(session)),
@@ -198,8 +254,10 @@ impl Paths {
         if link_path.exists() {
             let _ = fs::remove_file(&link_path);
         }
-        symlink(&session.dir, &link_path)
-            .with_context(|| format!("failed creating tty link for {tty_key}"))?;
+        symlink(&session.dir, &link_path).map_err(|source| SessionError::CreateTtyLink {
+            tty_key: tty_key.to_string(),
+            source,
+        })?;
         Ok(())
     }
 
@@ -208,7 +266,11 @@ impl Paths {
         match fs::remove_file(&link_path) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error).with_context(|| format!("failed removing tty link {tty_key}")),
+            Err(source) => Err(SessionError::RemoveTtyLink {
+                tty_key: tty_key.to_string(),
+                source,
+            }
+            .into()),
         }
     }
 
@@ -234,10 +296,6 @@ impl Session {
         self.runtime_dir.join("daemon.pid")
     }
 
-    #[expect(
-        dead_code,
-        reason = "writers compute this internally; exposed for any future external reader"
-    )]
     pub fn metadata_path(&self) -> PathBuf {
         self.dir.join(METADATA_FILE)
     }
@@ -267,25 +325,35 @@ fn current_uid() -> u32 {
 }
 
 fn create_private_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path)
-        .with_context(|| format!("failed to create directory {}", path.display()))?;
+    fs::create_dir_all(path).map_err(|source| SessionError::CreateDir {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let permissions = fs::Permissions::from_mode(SESSION_DIR_MODE);
-    fs::set_permissions(path, permissions)
-        .with_context(|| format!("failed to set permissions on {}", path.display()))?;
+    fs::set_permissions(path, permissions).map_err(|source| SessionError::SetPermissions {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
 fn write_metadata(path: &Path, meta: &SessionMeta) -> Result<()> {
-    let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())?;
-    fs::write(path, bytes)
-        .with_context(|| format!("failed writing metadata {}", path.display()))?;
+    let bytes = bincode::serde::encode_to_vec(meta, bincode::config::standard())
+        .map_err(SessionError::EncodeMetadata)?;
+    fs::write(path, bytes).map_err(|source| SessionError::WriteMetadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok(())
 }
 
 fn read_metadata(path: &Path) -> Result<SessionMeta> {
-    let bytes =
-        fs::read(path).with_context(|| format!("failed reading metadata {}", path.display()))?;
-    let (meta, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())?;
+    let bytes = fs::read(path).map_err(|source| SessionError::ReadMetadata {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let (meta, _) = bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
+        .map_err(SessionError::DecodeMetadata)?;
     Ok(meta)
 }
 

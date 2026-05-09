@@ -1,10 +1,8 @@
 use std::collections::HashSet;
 use std::path::Path;
 
-use anyhow::Result;
-
 use crate::anchor::Anchor;
-use crate::store::AnchorStore;
+use crate::store::{AnchorStore, StoreResult};
 
 pub struct Pool {
     used: HashSet<Anchor>,
@@ -12,7 +10,7 @@ pub struct Pool {
 }
 
 impl Pool {
-    pub async fn load<S: AnchorStore + ?Sized>(store: &S, path: &Path) -> Result<Self> {
+    pub async fn load<S: AnchorStore + ?Sized>(store: &S, path: &Path) -> StoreResult<Self> {
         let used = store.used_anchors(path).await?;
         Ok(Self::from_used(used))
     }

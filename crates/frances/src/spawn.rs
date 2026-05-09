@@ -5,9 +5,11 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tracing::info;
 
-use crate::daemon::client;
-use crate::daemon::protocol::PROTOCOL_VERSION;
-use crate::session::Session;
+use frances_daemon::protocol::PROTOCOL_VERSION;
+use frances_daemon::session::Session;
+use frances_daemon::transport;
+
+use crate::client;
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(5);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -91,9 +93,9 @@ pub fn cleanup_stale_runtime(session: &Session) -> Result<()> {
         return Ok(());
     }
 
-    client::remove_socket_if_present(&session.control_socket_path())?;
-    client::remove_socket_if_present(&session.client_socket_path())?;
-    client::remove_socket_if_present(&session.events_socket_path())?;
+    transport::remove_socket_if_present(&session.control_socket_path())?;
+    transport::remove_socket_if_present(&session.client_socket_path())?;
+    transport::remove_socket_if_present(&session.events_socket_path())?;
 
     match fs::remove_file(session.pid_path()) {
         Ok(()) => {}

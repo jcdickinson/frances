@@ -9,9 +9,6 @@ authors.workspace = true
 name = "frances"
 path = "src/main.rs"
 
-[build-dependencies]
-sha2 = "0.10"
-
 [dependencies]
 anyhow.workspace = true
 bincode.workspace = true
@@ -21,29 +18,10 @@ clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+futures.workspace = true
 futures-util.workspace = true
-reqwest.workspace = true
-serde_json.workspace = true
-turso.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
 tarpc.workspace = true
-futures.workspace = true
 thiserror.workspace = true
-frances-config.workspace = true
-frances-core.workspace = true
-frances-edit.workspace = true
-frances-llm.workspace = true
-frances-shell.workspace = true
-async-trait.workspace = true
-arc-swap.workspace = true
-url.workspace = true
-xdg.workspace = true
-twox-hash.workspace = true
-shell-words.workspace = true
-uuid.workspace = true
-
-[dev-dependencies]
-frances-anchors.workspace = true
-frances-edit = { workspace = true, features = ["test-utils"] }
-tempfile.workspace = true
+frances-daemon.workspace = true

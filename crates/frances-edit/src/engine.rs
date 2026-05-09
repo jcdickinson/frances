@@ -1,13 +1,12 @@
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
 use frances_anchors::hash_lines;
 
 use crate::anchor::Anchor;
 use crate::pool::Pool;
 use crate::reconcile::reconcile;
 use crate::state::{FileAnchorState, LineEntry, content_digest};
-use crate::store::AnchorStore;
+use crate::store::{AnchorStore, StoreResult};
 
 #[derive(Debug, Clone)]
 pub struct WorkingFile {
@@ -42,7 +41,7 @@ impl<S: AnchorStore> EditEngine<S> {
         on_disk_lines: Vec<String>,
         mtime_ns: i64,
         size: u64,
-    ) -> Result<WorkingFile> {
+    ) -> StoreResult<WorkingFile> {
         let cached = self.store.load(&path).await?;
 
         let state = match cached {
@@ -112,7 +111,7 @@ impl<S: AnchorStore> EditEngine<S> {
         mtime_ns: i64,
         size: u64,
         tombstones: &[Anchor],
-    ) -> Result<()> {
+    ) -> StoreResult<()> {
         let mut state_with_meta = state.clone();
         state_with_meta.mtime_ns = mtime_ns;
         state_with_meta.size = size;
@@ -124,11 +123,11 @@ impl<S: AnchorStore> EditEngine<S> {
     }
 
     /// Clear the tombstones table at the end of a turn.
-    pub async fn end_turn(&self) -> Result<()> {
+    pub async fn end_turn(&self) -> StoreResult<()> {
         self.store.clear_tombstones().await
     }
 
-    async fn persist_state(&self, path: &Path, state: &FileAnchorState) -> Result<()> {
+    async fn persist_state(&self, path: &Path, state: &FileAnchorState) -> StoreResult<()> {
         self.store.truncate_lines(path).await?;
         let rows: Vec<(u32, u64, Anchor)> = state
             .lines

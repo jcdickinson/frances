@@ -5,32 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use serde::{Deserialize, Serialize};
-
-/// Hashed identifier for the invoking process's controlling TTY. Used as a
-/// session-link filename. Distinct from arbitrary strings to prevent
-/// confusion with session ids, paths, etc.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct TtyKey(pub String);
-
-impl TtyKey {
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl std::fmt::Display for TtyKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl AsRef<str> for TtyKey {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
+use frances_daemon::tty::TtyKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pid(pub i32);

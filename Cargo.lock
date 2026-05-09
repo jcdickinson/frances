@@ -771,37 +771,20 @@ name = "frances"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "arc-swap",
- "async-trait",
  "bincode 2.0.1",
  "clap",
  "crossterm",
- "frances-anchors",
- "frances-config",
- "frances-core",
- "frances-edit",
- "frances-llm",
- "frances-shell",
+ "frances-daemon",
  "futures",
  "futures-util",
  "libc",
- "reqwest",
  "serde",
- "serde_json",
- "sha2",
- "shell-words",
  "tarpc",
- "tempfile",
  "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "turso",
- "twox-hash",
  "unicode-width 0.2.2",
- "url",
- "uuid",
- "xdg",
 ]
 
 [[package]]
@@ -839,10 +822,47 @@ dependencies = [
 ]
 
 [[package]]
+name = "frances-daemon"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bincode 2.0.1",
+ "frances-anchors",
+ "frances-config",
+ "frances-core",
+ "frances-edit",
+ "frances-llm",
+ "frances-shell",
+ "futures",
+ "futures-util",
+ "getrandom 0.2.17",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "shellexpand",
+ "similar",
+ "smallvec",
+ "tarpc",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "twox-hash",
+ "url",
+ "uuid",
+ "xdg",
+]
+
+[[package]]
 name = "frances-edit"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "bincode 2.0.1",
  "frances-anchors",

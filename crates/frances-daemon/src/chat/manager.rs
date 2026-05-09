@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
 use frances_config::{ConfigBinding, ConfigHandle, RequiredConfigBinding};
 use frances_llm::{
     CompletionOutcome, ErasedError, HistoryInput, ModelConfig, ProviderRequest, ToolChoice, ToolDef,
@@ -10,6 +9,8 @@ use frances_llm::{
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::Result;
+use crate::chat::ChatError;
 use crate::chat::builder::ChatSessionBuilder;
 use crate::chat::session::ChatSession;
 use crate::history::{ChatSessionId, ChatSessionRow, HistoryStore};
@@ -54,7 +55,7 @@ impl ChatSessionManager {
         default_model: RequiredConfigBinding<ModelConfig>,
         history: HistoryStore,
     ) -> Result<Arc<Self>> {
-        let models = config.bind::<Models>("models").context("bind models")?;
+        let models = config.bind::<Models>("models")?;
         Ok(Arc::new(Self {
             cache,
             default_model,
@@ -120,12 +121,10 @@ impl ChatSessionManager {
     pub async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome> {
         let model = self.resolve_model(req.intents);
         let provider_id = model.model_provider.clone();
-        let provider = self.cache.get(&provider_id).ok_or_else(|| {
-            anyhow!(
-                "model_providers.{} not available (no config or factory missing)",
-                provider_id
-            )
-        })?;
+        let provider = self
+            .cache
+            .get(&provider_id)
+            .ok_or_else(|| ChatError::ProviderUnavailable(provider_id.clone()))?;
         let provider_req = ProviderRequest {
             session_id: req.session_id,
             model: &model,
@@ -138,7 +137,7 @@ impl ChatSessionManager {
         provider
             .complete(provider_req)
             .await
-            .map_err(|e| log_and_generic(&provider_id, e))
+            .map_err(|source| log_and_typed(&provider_id, source).into())
     }
 
     pub(crate) fn cache(&self) -> &Arc<ProviderCache> {
@@ -171,7 +170,10 @@ impl ChatSessionManager {
     }
 }
 
-fn log_and_generic(provider_id: &str, e: ErasedError) -> anyhow::Error {
-    tracing::error!(provider = %provider_id, error = %e, "provider error");
-    anyhow!("provider {} encountered an error", provider_id)
+pub(crate) fn log_and_typed(provider_id: &str, source: ErasedError) -> ChatError {
+    tracing::error!(provider = %provider_id, error = %source, "provider error");
+    ChatError::Provider {
+        provider_id: provider_id.to_owned(),
+        source,
+    }
 }

@@ -4,14 +4,16 @@
 //! routes by call name.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use thiserror::Error;
 use uuid::Uuid;
 
-use crate::edit_session::{EditError, LlmEdit};
+use crate::Result;
+use crate::edit_session::LlmEdit;
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
 use crate::migrations::{EntitySchema, Migration};
 
@@ -25,7 +27,9 @@ pub static SCHEMA: EntitySchema = EntitySchema {
     }],
 };
 
-use super::{Tool, ToolContext, ToolOutcome, mtime_ns_from, resolve_path, split_lines};
+use super::{
+    Tool, ToolContext, ToolOutcome, ToolRegistryError, mtime_ns_from, resolve_path, split_lines,
+};
 
 const FILE_READ_DESC: &str = include_str!("desc/file_read.md");
 const FILE_REPLACE_DESC: &str = include_str!("desc/file_replace.md");
@@ -33,6 +37,44 @@ const FILE_INSERT_AFTER_DESC: &str = include_str!("desc/file_insert_after.md");
 const FILE_INSERT_BEFORE_DESC: &str = include_str!("desc/file_insert_before.md");
 const FILE_NEW_DESC: &str = include_str!("desc/file_new.md");
 const FILE_OVERWRITE_DESC: &str = include_str!("desc/file_overwrite.md");
+
+#[derive(Debug, Error)]
+pub enum FileToolError {
+    #[error("unknown file tool: {0}")]
+    UnknownTool(String),
+    #[error("parse {tool} args: {source}")]
+    ParseArgs {
+        tool: &'static str,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("read {path}: {source}")]
+    ReadDisk {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("stat {path}: {source}")]
+    Stat {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("write {path}: {source}")]
+    WriteDisk {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("read-back {path}: {source}")]
+    ReadBack {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Mtime(#[from] ToolRegistryError),
+}
 
 pub struct FileTools;
 
@@ -124,7 +166,7 @@ impl Tool for FileTools {
         }
         let edit = match parse_edit(&call.name, &call.arguments, ctx.cwd) {
             Ok(edit) => edit,
-            Err(error) => return ToolOutcome::err(format!("{error:#}")),
+            Err(error) => return ToolOutcome::err(format!("{error}")),
         };
         ToolOutcome::from_result(apply_edit(ctx, edit).await)
     }
@@ -136,22 +178,27 @@ struct ReadArgs {
 }
 
 async fn run_read(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
-    let args: ReadArgs = serde_json::from_value(args.clone()).context("parse file_read args")?;
+    let args: ReadArgs =
+        serde_json::from_value(args.clone()).map_err(|source| FileToolError::ParseArgs {
+            tool: "file_read",
+            source,
+        })?;
     let path = resolve_path(ctx.cwd, &args.path);
-
-    let (lines, mtime_ns, size) =
-        read_file_from_disk(&path).with_context(|| format!("file_read: {}", path.display()))?;
+    let (lines, mtime_ns, size) = read_file_from_disk(&path)?;
 
     let mut session = ctx.edit_session.lock().await;
-    session
-        .read_file(path, lines, mtime_ns, size)
-        .await
-        .context("file_read")
+    session.read_file(path, lines, mtime_ns, size).await
 }
 
-fn read_file_from_disk(path: &Path) -> Result<(Vec<String>, i64, u64)> {
-    let content = fs::read_to_string(path).context("read")?;
-    let meta = fs::metadata(path).context("stat")?;
+fn read_file_from_disk(path: &Path) -> std::result::Result<(Vec<String>, i64, u64), FileToolError> {
+    let content = fs::read_to_string(path).map_err(|source| FileToolError::ReadDisk {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let meta = fs::metadata(path).map_err(|source| FileToolError::Stat {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let mtime_ns = mtime_ns_from(&meta)?;
     let size = meta.len();
     let lines = split_lines(&content);
@@ -180,10 +227,13 @@ struct WholeFileArgs {
 }
 
 fn parse_edit(name: &str, args: &Value, cwd: Option<&Path>) -> Result<LlmEdit> {
+    fn parse(tool: &'static str) -> impl FnOnce(serde_json::Error) -> FileToolError {
+        move |source| FileToolError::ParseArgs { tool, source }
+    }
     match name {
         "file_replace" => {
             let a: ReplaceArgs =
-                serde_json::from_value(args.clone()).context("parse file_replace args")?;
+                serde_json::from_value(args.clone()).map_err(parse("file_replace"))?;
             Ok(LlmEdit::Replace {
                 path: resolve_path(cwd, &a.path),
                 anchor: a.anchor,
@@ -193,7 +243,7 @@ fn parse_edit(name: &str, args: &Value, cwd: Option<&Path>) -> Result<LlmEdit> {
         }
         "file_insert_after" => {
             let a: InsertArgs =
-                serde_json::from_value(args.clone()).context("parse file_insert_after args")?;
+                serde_json::from_value(args.clone()).map_err(parse("file_insert_after"))?;
             Ok(LlmEdit::InsertAfter {
                 path: resolve_path(cwd, &a.path),
                 anchor: a.anchor,
@@ -202,7 +252,7 @@ fn parse_edit(name: &str, args: &Value, cwd: Option<&Path>) -> Result<LlmEdit> {
         }
         "file_insert_before" => {
             let a: InsertArgs =
-                serde_json::from_value(args.clone()).context("parse file_insert_before args")?;
+                serde_json::from_value(args.clone()).map_err(parse("file_insert_before"))?;
             Ok(LlmEdit::InsertBefore {
                 path: resolve_path(cwd, &a.path),
                 anchor: a.anchor,
@@ -211,7 +261,7 @@ fn parse_edit(name: &str, args: &Value, cwd: Option<&Path>) -> Result<LlmEdit> {
         }
         "file_new" => {
             let a: WholeFileArgs =
-                serde_json::from_value(args.clone()).context("parse file_new args")?;
+                serde_json::from_value(args.clone()).map_err(parse("file_new"))?;
             Ok(LlmEdit::New {
                 path: resolve_path(cwd, &a.path),
                 text: a.text,
@@ -219,42 +269,43 @@ fn parse_edit(name: &str, args: &Value, cwd: Option<&Path>) -> Result<LlmEdit> {
         }
         "file_overwrite" => {
             let a: WholeFileArgs =
-                serde_json::from_value(args.clone()).context("parse file_overwrite args")?;
+                serde_json::from_value(args.clone()).map_err(parse("file_overwrite"))?;
             Ok(LlmEdit::Overwrite {
                 path: resolve_path(cwd, &a.path),
                 text: a.text,
             })
         }
-        other => Err(anyhow!("unknown file tool: {other}")),
+        other => Err(FileToolError::UnknownTool(other.to_string()).into()),
     }
 }
 
 async fn apply_edit(ctx: &ToolContext<'_>, edit: LlmEdit) -> Result<String> {
     let mut session = ctx.edit_session.lock().await;
-    match session.edit(edit, write_draft).await {
-        Ok(diff) => Ok(diff),
-        Err(error) => {
-            // Surface validator errors via their bespoke Display so the model
-            // sees the same wording the type designed for it ("anchor not
-            // found", "content mismatch", etc.) rather than anyhow's chain.
-            if let Some(edit_error) = error.downcast_ref::<EditError>() {
-                return Err(anyhow!(edit_error.to_string()));
-            }
-            Err(error)
-        }
-    }
+    // Validator failures (`EditError`) flow back through the trait's
+    // generic Display — that's exactly the wording designed for the model.
+    // Other errors keep their wrapped chain.
+    session.edit(edit, write_draft).await
 }
 
 fn write_draft(path: &Path, draft: &[String]) -> Result<(Vec<String>, i64, u64)> {
     let mut content = draft.join("\n");
     content.push('\n');
-    fs::write(path, &content).with_context(|| format!("write {}", path.display()))?;
+    fs::write(path, &content).map_err(|source| FileToolError::WriteDisk {
+        path: path.to_path_buf(),
+        source,
+    })?;
 
-    let meta = fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
-    let mtime_ns = mtime_ns_from(&meta)?;
+    let meta = fs::metadata(path).map_err(|source| FileToolError::Stat {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let mtime_ns = mtime_ns_from(&meta).map_err(FileToolError::Mtime)?;
     let size = meta.len();
 
-    let post = fs::read_to_string(path).with_context(|| format!("read-back {}", path.display()))?;
+    let post = fs::read_to_string(path).map_err(|source| FileToolError::ReadBack {
+        path: path.to_path_buf(),
+        source,
+    })?;
     Ok((split_lines(&post), mtime_ns, size))
 }
 
@@ -281,17 +332,17 @@ mod tests {
     ) -> ToolOutcome {
         let args: ReadArgs = match serde_json::from_value(args) {
             Ok(a) => a,
-            Err(e) => return ToolOutcome::err(format!("{e:#}")),
+            Err(e) => return ToolOutcome::err(format!("{e}")),
         };
         let path = resolve_path(cwd, &args.path);
         let (lines, mtime_ns, size) = match read_file_from_disk(&path) {
             Ok(t) => t,
-            Err(e) => return ToolOutcome::err(format!("file_read: {}: {e:#}", path.display())),
+            Err(e) => return ToolOutcome::err(format!("file_read: {}: {e}", path.display())),
         };
         let mut sess = session.lock().await;
         match sess.read_file(path, lines, mtime_ns, size).await {
             Ok(content) => ToolOutcome::ok(content),
-            Err(e) => ToolOutcome::err(format!("{e:#}")),
+            Err(e) => ToolOutcome::err(format!("{e}")),
         }
     }
 
@@ -304,13 +355,8 @@ mod tests {
         let mut sess = session.lock().await;
         match sess.edit(edit, write_draft).await {
             Ok(diff) => ToolOutcome::ok(diff),
-            Err(error) => {
-                if let Some(edit_error) = error.downcast_ref::<EditError>() {
-                    ToolOutcome::err(edit_error.to_string())
-                } else {
-                    ToolOutcome::err(format!("{error:#}"))
-                }
-            }
+            Err(crate::Error::Edit(edit_error)) => ToolOutcome::err(edit_error.to_string()),
+            Err(error) => ToolOutcome::err(format!("{error}")),
         }
     }
 

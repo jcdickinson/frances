@@ -22,7 +22,7 @@
 use std::hash::Hasher;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use thiserror::Error;
 use turso::{Connection, Value};
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
@@ -42,6 +42,54 @@ pub struct EntitySchema {
     pub entity: Uuid,
     pub migrations: &'static [Migration],
 }
+
+#[derive(Debug, Error)]
+pub enum MigrationError {
+    #[error("turso: {0}")]
+    Turso(#[from] turso::Error),
+    #[error(
+        "entity {entity}: database has {applied} migration(s) recorded but only {declared} declared in code; refusing to load"
+    )]
+    DeclaredShrunk {
+        entity: Uuid,
+        applied: usize,
+        declared: usize,
+    },
+    #[error(
+        "entity {entity}: migration at index {index} has version {found} on disk, expected {expected}"
+    )]
+    VersionMismatch {
+        entity: Uuid,
+        index: usize,
+        expected: i64,
+        found: i64,
+    },
+    #[error(
+        "entity {entity}: migration {index} renamed: applied {applied:?}, declared {declared:?}"
+    )]
+    Renamed {
+        entity: Uuid,
+        index: usize,
+        applied: String,
+        declared: &'static str,
+    },
+    #[error(
+        "entity {entity}: migration {index} ({name}) checksum mismatch: applied {applied:#018x}, declared {declared:#018x}"
+    )]
+    ChecksumMismatch {
+        entity: Uuid,
+        index: usize,
+        name: &'static str,
+        applied: u64,
+        declared: u64,
+    },
+    #[error("expected integer {column}, got {found:?}")]
+    NonIntegerColumn { column: &'static str, found: Value },
+    #[error("expected text {column}, got {found:?}")]
+    NonTextColumn { column: &'static str, found: Value },
+}
+
+pub type Result<T> = std::result::Result<T, MigrationError>;
 
 /// xxh3-64 of the migration body, stored as a signed i64 in the
 /// `checksum` column. Chosen because it's already a workspace dep and
@@ -73,8 +121,7 @@ pub async fn ensure_table(conn: &Connection) -> Result<()> {
         );
         "#,
     )
-    .await
-    .context("create _migrations table")?;
+    .await?;
     Ok(())
 }
 
@@ -90,21 +137,35 @@ async fn load_applied(conn: &Connection, entity: &[u8]) -> Result<Vec<AppliedRow
             "SELECT version, name, checksum FROM _migrations WHERE entity = ?1 ORDER BY version",
             (entity.to_vec(),),
         )
-        .await
-        .context("query _migrations")?;
+        .await?;
     let mut out = Vec::new();
-    while let Some(row) = rows.next().await.context("iterate _migrations")? {
-        let version = match row.get_value(0).context("version column")? {
+    while let Some(row) = rows.next().await? {
+        let version = match row.get_value(0)? {
             Value::Integer(v) => v,
-            other => bail!("expected integer version, got {other:?}"),
+            other => {
+                return Err(MigrationError::NonIntegerColumn {
+                    column: "version",
+                    found: other,
+                });
+            }
         };
-        let name = match row.get_value(1).context("name column")? {
+        let name = match row.get_value(1)? {
             Value::Text(t) => t,
-            other => bail!("expected text name, got {other:?}"),
+            other => {
+                return Err(MigrationError::NonTextColumn {
+                    column: "name",
+                    found: other,
+                });
+            }
         };
-        let checksum = match row.get_value(2).context("checksum column")? {
+        let checksum = match row.get_value(2)? {
             Value::Integer(v) => v,
-            other => bail!("expected integer checksum, got {other:?}"),
+            other => {
+                return Err(MigrationError::NonIntegerColumn {
+                    column: "checksum",
+                    found: other,
+                });
+            }
         };
         out.push(AppliedRow {
             version,
@@ -128,52 +189,47 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
     let applied = load_applied(conn, &entity_bytes).await?;
 
     if applied.len() > schema.migrations.len() {
-        bail!(
-            "entity {}: database has {} migration(s) recorded but only {} declared in code; refusing to load",
-            schema.entity,
-            applied.len(),
-            schema.migrations.len(),
-        );
+        return Err(MigrationError::DeclaredShrunk {
+            entity: schema.entity,
+            applied: applied.len(),
+            declared: schema.migrations.len(),
+        });
     }
 
     for (i, row) in applied.iter().enumerate() {
         let declared = &schema.migrations[i];
         let expected_version = i as i64;
         if row.version != expected_version {
-            bail!(
-                "entity {}: migration at index {i} has version {} on disk, expected {expected_version}",
-                schema.entity,
-                row.version,
-            );
+            return Err(MigrationError::VersionMismatch {
+                entity: schema.entity,
+                index: i,
+                expected: expected_version,
+                found: row.version,
+            });
         }
         if row.name != declared.name {
-            bail!(
-                "entity {}: migration {i} renamed: applied {:?}, declared {:?}",
-                schema.entity,
-                row.name,
-                declared.name,
-            );
+            return Err(MigrationError::Renamed {
+                entity: schema.entity,
+                index: i,
+                applied: row.name.clone(),
+                declared: declared.name,
+            });
         }
         let declared_sum = checksum(declared.sql);
         if row.checksum != declared_sum {
-            bail!(
-                "entity {}: migration {i} ({}) checksum mismatch: applied {:#018x}, declared {:#018x}",
-                schema.entity,
-                declared.name,
-                row.checksum as u64,
-                declared_sum as u64,
-            );
+            return Err(MigrationError::ChecksumMismatch {
+                entity: schema.entity,
+                index: i,
+                name: declared.name,
+                applied: row.checksum as u64,
+                declared: declared_sum as u64,
+            });
         }
     }
 
     for (i, m) in schema.migrations.iter().enumerate().skip(applied.len()) {
-        let tx = conn
-            .unchecked_transaction()
-            .await
-            .context("begin migration tx")?;
-        tx.execute_batch(m.sql)
-            .await
-            .with_context(|| format!("entity {}: migration {} ({})", schema.entity, i, m.name))?;
+        let tx = conn.unchecked_transaction().await?;
+        tx.execute_batch(m.sql).await?;
         tx.execute(
             "INSERT INTO _migrations (entity, version, name, checksum, applied_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -185,19 +241,8 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
                 now_ns(),
             ),
         )
-        .await
-        .with_context(|| {
-            format!(
-                "entity {}: record migration {} ({})",
-                schema.entity, i, m.name
-            )
-        })?;
-        tx.commit().await.with_context(|| {
-            format!(
-                "entity {}: commit migration {} ({})",
-                schema.entity, i, m.name
-            )
-        })?;
+        .await?;
+        tx.commit().await?;
     }
 
     Ok(())
@@ -332,7 +377,7 @@ mod tests {
             migrations: RENAMED,
         };
         let err = run(&conn, &renamed).await.unwrap_err();
-        assert!(err.to_string().contains("renamed"), "{err:#}");
+        assert!(matches!(err, MigrationError::Renamed { .. }), "{err:#}");
     }
 
     #[tokio::test]
@@ -350,7 +395,10 @@ mod tests {
             migrations: EDITED,
         };
         let err = run(&conn, &edited).await.unwrap_err();
-        assert!(err.to_string().contains("checksum mismatch"), "{err:#}");
+        assert!(
+            matches!(err, MigrationError::ChecksumMismatch { .. }),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]
@@ -360,7 +408,10 @@ mod tests {
         run(&conn, &schema_v2()).await.unwrap();
 
         let err = run(&conn, &schema_v1()).await.unwrap_err();
-        assert!(err.to_string().contains("refusing to load"), "{err:#}");
+        assert!(
+            matches!(err, MigrationError::DeclaredShrunk { .. }),
+            "{err:#}"
+        );
     }
 
     #[tokio::test]

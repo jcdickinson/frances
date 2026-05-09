@@ -1,12 +1,22 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
-use frances_edit::{Anchor, AnchorStore, FileAnchorState, LineEntry};
+use frances_edit::{Anchor, AnchorStore, FileAnchorState, LineEntry, StoreError, StoreResult};
+use thiserror::Error;
 use turso::Value;
 
 use crate::store::Database;
+
+#[derive(Debug, Error)]
+enum AnchorRowError {
+    #[error("non-UTF8 path: {0}")]
+    NonUtf8Path(PathBuf),
+    #[error("expected integer in {column}, got {found:?}")]
+    NonIntegerColumn { column: &'static str, found: Value },
+    #[error("expected blob in {column}, got {found:?}")]
+    NonBlobColumn { column: &'static str, found: Value },
+}
 
 pub struct AnchorStoreImpl {
     db: Database,
@@ -18,29 +28,35 @@ impl AnchorStoreImpl {
     }
 }
 
-fn path_str(p: &Path) -> Result<String> {
+fn path_str(p: &Path) -> StoreResult<String> {
     p.to_str()
         .map(str::to_owned)
-        .ok_or_else(|| anyhow!("non-UTF8 path: {}", p.display()))
+        .ok_or_else(|| StoreError::new(AnchorRowError::NonUtf8Path(p.to_path_buf())))
 }
 
-fn col_i64(row: &turso::Row, idx: usize) -> Result<i64> {
-    match row.get_value(idx).context("column value")? {
+fn col_i64(row: &turso::Row, idx: usize, column: &'static str) -> StoreResult<i64> {
+    match row.get_value(idx).map_err(StoreError::new)? {
         Value::Integer(v) => Ok(v),
-        other => Err(anyhow!("expected integer, got {other:?}")),
+        other => Err(StoreError::new(AnchorRowError::NonIntegerColumn {
+            column,
+            found: other,
+        })),
     }
 }
 
-fn col_blob(row: &turso::Row, idx: usize) -> Result<Vec<u8>> {
-    match row.get_value(idx).context("column value")? {
+fn col_blob(row: &turso::Row, idx: usize, column: &'static str) -> StoreResult<Vec<u8>> {
+    match row.get_value(idx).map_err(StoreError::new)? {
         Value::Blob(v) => Ok(v),
-        other => Err(anyhow!("expected blob, got {other:?}")),
+        other => Err(StoreError::new(AnchorRowError::NonBlobColumn {
+            column,
+            found: other,
+        })),
     }
 }
 
 #[async_trait]
 impl AnchorStore for AnchorStoreImpl {
-    async fn load(&self, path: &Path) -> Result<Option<FileAnchorState>> {
+    async fn load(&self, path: &Path) -> StoreResult<Option<FileAnchorState>> {
         let conn = self.db.connect();
         let p = path_str(path)?;
 
@@ -50,14 +66,14 @@ impl AnchorStore for AnchorStoreImpl {
                 (p.clone(),),
             )
             .await
-            .context("query file_meta")?;
-        let row = match rows.next().await.context("iterate file_meta")? {
+            .map_err(StoreError::new)?;
+        let row = match rows.next().await.map_err(StoreError::new)? {
             Some(r) => r,
             None => return Ok(None),
         };
-        let mtime_ns = col_i64(&row, 0)?;
-        let size = col_i64(&row, 1)? as u64;
-        let content_digest = col_i64(&row, 2)? as u64;
+        let mtime_ns = col_i64(&row, 0, "mtime_ns")?;
+        let size = col_i64(&row, 1, "size")? as u64;
+        let content_digest = col_i64(&row, 2, "content_digest")? as u64;
 
         let mut rows = conn
             .query(
@@ -65,14 +81,13 @@ impl AnchorStore for AnchorStoreImpl {
                 (p,),
             )
             .await
-            .context("query file_lines")?;
+            .map_err(StoreError::new)?;
 
         let mut lines: Vec<LineEntry> = Vec::new();
-        while let Some(row) = rows.next().await.context("iterate file_lines")? {
-            let hash = col_i64(&row, 0)? as u64;
-            let anchor_bytes = col_blob(&row, 1)?;
-            let anchor = Anchor::from_bytes(&anchor_bytes)
-                .map_err(|e| anyhow!("decode anchor blob: {e}"))?;
+        while let Some(row) = rows.next().await.map_err(StoreError::new)? {
+            let hash = col_i64(&row, 0, "hash")? as u64;
+            let anchor_bytes = col_blob(&row, 1, "anchor")?;
+            let anchor = Anchor::from_bytes(&anchor_bytes).map_err(StoreError::new)?;
             lines.push(LineEntry { hash, anchor });
         }
 
@@ -91,18 +106,18 @@ impl AnchorStore for AnchorStoreImpl {
         mtime_ns: i64,
         size: u64,
         content_digest: u64,
-    ) -> Result<()> {
+    ) -> StoreResult<()> {
         let conn = self.db.connect();
         conn.execute(
             "INSERT OR REPLACE INTO file_meta (path, mtime_ns, size, content_digest) VALUES (?1, ?2, ?3, ?4)",
             (path_str(path)?, mtime_ns, size as i64, content_digest as i64),
         )
         .await
-        .context("upsert file_meta")?;
+        .map_err(StoreError::new)?;
         Ok(())
     }
 
-    async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> Result<()> {
+    async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()> {
         let conn = self.db.connect();
         let p = path_str(path)?;
         for (line_no, hash, anchor) in lines {
@@ -116,12 +131,12 @@ impl AnchorStore for AnchorStoreImpl {
                 ),
             )
             .await
-            .context("upsert file_lines")?;
+            .map_err(StoreError::new)?;
         }
         Ok(())
     }
 
-    async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> Result<()> {
+    async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()> {
         let conn = self.db.connect();
         let p = path_str(path)?;
         for n in line_nos {
@@ -130,20 +145,20 @@ impl AnchorStore for AnchorStoreImpl {
                 (p.clone(), *n as i64),
             )
             .await
-            .context("delete file_lines")?;
+            .map_err(StoreError::new)?;
         }
         Ok(())
     }
 
-    async fn truncate_lines(&self, path: &Path) -> Result<()> {
+    async fn truncate_lines(&self, path: &Path) -> StoreResult<()> {
         let conn = self.db.connect();
         conn.execute("DELETE FROM file_lines WHERE path = ?1", (path_str(path)?,))
             .await
-            .context("truncate file_lines")?;
+            .map_err(StoreError::new)?;
         Ok(())
     }
 
-    async fn used_anchors(&self, path: &Path) -> Result<HashSet<Anchor>> {
+    async fn used_anchors(&self, path: &Path) -> StoreResult<HashSet<Anchor>> {
         let conn = self.db.connect();
         let p = path_str(path)?;
         let mut rows = conn
@@ -154,18 +169,17 @@ impl AnchorStore for AnchorStoreImpl {
                 (p,),
             )
             .await
-            .context("query used anchors")?;
+            .map_err(StoreError::new)?;
         let mut out = HashSet::new();
-        while let Some(row) = rows.next().await.context("iterate used anchors")? {
-            let bytes = col_blob(&row, 0)?;
-            let anchor =
-                Anchor::from_bytes(&bytes).map_err(|e| anyhow!("decode anchor blob: {e}"))?;
+        while let Some(row) = rows.next().await.map_err(StoreError::new)? {
+            let bytes = col_blob(&row, 0, "anchor")?;
+            let anchor = Anchor::from_bytes(&bytes).map_err(StoreError::new)?;
             out.insert(anchor);
         }
         Ok(out)
     }
 
-    async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> Result<()> {
+    async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()> {
         let conn = self.db.connect();
         let p = path_str(path)?;
         for anchor in anchors {
@@ -174,31 +188,31 @@ impl AnchorStore for AnchorStoreImpl {
                 (p.clone(), anchor.to_bytes()),
             )
             .await
-            .context("insert tombstone")?;
+            .map_err(StoreError::new)?;
         }
         Ok(())
     }
 
-    async fn clear_tombstones(&self) -> Result<()> {
+    async fn clear_tombstones(&self) -> StoreResult<()> {
         let conn = self.db.connect();
         conn.execute("DELETE FROM file_tombstones", ())
             .await
-            .context("clear tombstones")?;
+            .map_err(StoreError::new)?;
         Ok(())
     }
 
-    async fn forget(&self, path: &Path) -> Result<()> {
+    async fn forget(&self, path: &Path) -> StoreResult<()> {
         let conn = self.db.connect();
         let p = path_str(path)?;
         conn.execute("DELETE FROM file_meta WHERE path = ?1", (p.clone(),))
             .await
-            .context("delete file_meta")?;
+            .map_err(StoreError::new)?;
         conn.execute("DELETE FROM file_lines WHERE path = ?1", (p.clone(),))
             .await
-            .context("delete file_lines")?;
+            .map_err(StoreError::new)?;
         conn.execute("DELETE FROM file_tombstones WHERE path = ?1", (p,))
             .await
-            .context("delete file_tombstones")?;
+            .map_err(StoreError::new)?;
         Ok(())
     }
 }
