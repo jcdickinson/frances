@@ -31,7 +31,8 @@ use crate::llm::{
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
 use crate::store::Database;
-use crate::tools;
+use crate::tools::{self, ToolRegistry};
+use crate::workflows::{self, WorkflowConfig};
 use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
 use frances_shell::Shell;
@@ -47,6 +48,7 @@ pub(crate) struct ServerState {
     history: HistoryStore,
     edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
     shell: tokio::sync::Mutex<Option<Shell>>,
+    tool_registry: ToolRegistry,
     events: EventsRouter,
     shutdown: Notify,
     /// Kept alive so the config-event-processor task stays running for the
@@ -56,6 +58,7 @@ pub(crate) struct ServerState {
     providers: ConfigBinding<HashMap<String, ProviderConfig>>,
     models: ConfigBinding<ModelsConfig>,
     responses_extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
+    workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
     /// session config.
@@ -249,6 +252,9 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let responses_extras = config
         .bind::<HashMap<String, ResponsesModelExtras>>("responses_models")
         .context("bind responses_models")?;
+    let workflows = config
+        .bind::<HashMap<String, WorkflowConfig>>("workflows")
+        .context("bind workflows")?;
 
     let state = Arc::new(ServerState {
         session: session.clone(),
@@ -258,12 +264,14 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         history: HistoryStore::new(db),
         edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
         shell: tokio::sync::Mutex::new(None),
+        tool_registry: ToolRegistry::builtin(),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         config,
         providers,
         models,
         responses_extras,
+        workflows,
         session_config_writer,
     });
 
@@ -474,11 +482,23 @@ async fn stream_prompt(
     stream: &mut UnixStream,
     text: String,
 ) -> Result<()> {
-    let result = run_turn(state, stream, text).await;
+    let result = run_handler(state, stream, text).await;
     if let Err(error) = state.edit_session.lock().await.end_turn().await {
         warn!(%error, "edit_session::end_turn failed");
     }
     result
+}
+
+async fn run_handler(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    text: String,
+) -> Result<()> {
+    let workflows = state.workflows.get_or_default();
+    if workflows::dispatch_slash_command(&workflows, stream, &text).await? {
+        return Ok(());
+    }
+    run_turn(state, stream, text).await
 }
 
 async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: String) -> Result<()> {
@@ -583,6 +603,8 @@ async fn run_llm_step(
     )
     .await;
 
+    let tool_defs = state.tool_registry.definitions().await?;
+
     let llm_owned: ChatClient = (*llm).clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
     let llm_task = tokio::spawn(async move {
@@ -590,7 +612,7 @@ async fn run_llm_step(
             .stream(
                 ModelRole::Chat,
                 &payloads,
-                tools::definitions(),
+                &tool_defs,
                 None,
                 move |chunk: &serde_json::Value| {
                     let _ = tx.send(chunk.clone());
@@ -707,7 +729,7 @@ async fn run_llm_step(
     }
 
     for call in &tool_calls {
-        if call.name == "run_shell"
+        if call.name == "shell_run"
             && let Some(cmd) = call
                 .arguments
                 .get("cmd")
@@ -718,15 +740,17 @@ async fn run_llm_step(
             emit_classification_block(stream, send_error, cls_id, &classification).await;
         }
 
-        let outcome = tools::dispatch(
-            call,
-            tools::ToolContext {
-                edit_session: &state.edit_session,
-                shell: &state.shell,
-                cwd,
-            },
-        )
-        .await;
+        let outcome = state
+            .tool_registry
+            .dispatch(
+                call,
+                &tools::ToolContext {
+                    edit_session: &state.edit_session,
+                    shell: &state.shell,
+                    cwd,
+                },
+            )
+            .await;
 
         let result_id = alloc_block();
         try_write(

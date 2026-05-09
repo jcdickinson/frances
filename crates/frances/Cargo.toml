@@ -35,9 +35,11 @@ frances-core.workspace = true
 frances-edit.workspace = true
 frances-shell.workspace = true
 async-trait.workspace = true
+arc-swap.workspace = true
 url.workspace = true
 xdg.workspace = true
 twox-hash.workspace = true
+shell-words.workspace = true
 
 [dev-dependencies]
 frances-anchors.workspace = true

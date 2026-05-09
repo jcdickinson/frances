@@ -2,13 +2,13 @@ Run a bash command in a long-lived shell. State persists across calls — enviro
 
 Returns one of:
   [exit N]\n<output>                          — finished with exit code N (stdout+stderr merged in order).
-  [still running — <reason>]\n<partial>       — wait window expired; call keep_waiting to continue, or kill_running to abort.
-  [shell died]\n<final>                        — bash itself exited (e.g. you ran `exit`). Next run_shell spawns a fresh shell, losing state.
+  [still running — <reason>]\n<partial>       — wait window expired; call shell_wait to continue, or shell_kill to abort.
+  [shell died]\n<final>                        — bash itself exited (e.g. you ran `exit`). Next shell_run spawns a fresh shell, losing state.
 
 Optional `quiet_ms` (default 1000) returns 'still running' after that many ms of output silence — the timer resets every time bytes arrive. Optional `max_ms` (no default) returns 'still running' after that wall-clock regardless of streaming. quiet_ms=0 disables silence detection. Use max_ms to bound how long this single tool call blocks.
 
-Neither `quiet_ms` nor `max_ms` kills the command — they just yield control back to you with the output so far while the command keeps running. Use kill_running if you actually want to terminate it.
+Neither `quiet_ms` nor `max_ms` kills the command — they just yield control back to you with the output so far while the command keeps running. Use shell_kill if you actually want to terminate it.
 
-When you get 'still running', do NOT write prose narrating the wait ("the build is still going…"). Just call keep_waiting (or kill_running) immediately as your next tool call. Save tokens for actual progress.
+When you get 'still running', do NOT write prose narrating the wait ("the build is still going…"). Just call shell_wait (or shell_kill) immediately as your next tool call. Save tokens for actual progress.
 
 Interactive apps that hard-require a TTY (vim, top, psql without -c) are NOT supported. Use their non-interactive equivalents (psql -c "SELECT 1", ssh host cmd).

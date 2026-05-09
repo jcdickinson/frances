@@ -691,7 +691,7 @@ mod tests {
             "choices": [{
                 "delta": {
                     "tool_calls": [
-                        {"index": 0, "id": "a", "function": {"name": "read_file"}},
+                        {"index": 0, "id": "a", "function": {"name": "file_read"}},
                         {"index": 1, "id": "b", "function": {"name": "edit"}}
                     ]
                 }
@@ -756,7 +756,7 @@ mod tests {
             index: 0,
             event: ToolCallEvent::Start {
                 id: "a",
-                name: "read_file",
+                name: "file_read",
             },
         })
         .unwrap();
@@ -773,7 +773,7 @@ mod tests {
         let calls = acc.finalize().unwrap();
         assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "a");
-        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].name, "file_read");
         assert_eq!(calls[1].id, "b");
         assert_eq!(calls[1].name, "edit");
     }

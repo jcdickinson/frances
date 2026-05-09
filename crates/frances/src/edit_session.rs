@@ -12,11 +12,11 @@ use thiserror::Error;
 const DIFF_CONTEXT: usize = 2;
 const ANCHOR_SEP: char = '§';
 
-/// One structured edit. The dispatcher in `tools.rs` deserializes the
-/// per-tool args struct (e.g. `edit_replace` → `{ path, anchor, end_anchor,
+/// One structured edit. The dispatcher in `tools::file` deserializes the
+/// per-tool args struct (e.g. `file_replace` → `{ path, anchor, end_anchor,
 /// text }`) and constructs the matching variant. `anchor` and `end_anchor`
 /// are full rendered anchor lines (`Word§content`) — the same string
-/// `read_file` produced for that line; the engine splits on the first `§` to
+/// `file_read` produced for that line; the engine splits on the first `§` to
 /// recover the anchor word and validates the content (trimmed) against the
 /// cached file.
 ///
@@ -95,7 +95,7 @@ impl<S: AnchorStore> EditSession<S> {
         }
     }
 
-    /// Tool: read_file. Caller supplies the file's current content;
+    /// Tool: file_read. Caller supplies the file's current content;
     /// we drift-reconcile against any cached anchor state, render, and cache
     /// the resulting WorkingFile for subsequent edits in this session.
     /// Returns the anchored render as plain text.
@@ -193,7 +193,7 @@ impl<S: AnchorStore> EditSession<S> {
         self.open_files
             .get(path)
             .cloned()
-            .ok_or_else(|| anyhow!("{} is not cached; call read_file first", path.display()))
+            .ok_or_else(|| anyhow!("{} is not cached; call file_read first", path.display()))
     }
 
     /// Common pipeline for line-level edits: replay one `EditOp` into a
@@ -298,7 +298,7 @@ impl<S: AnchorStore> EditSession<S> {
             .get(path)
             .ok_or_else(|| {
                 anyhow!(
-                    "{} is not cached; call read_file before 'overwrite'",
+                    "{} is not cached; call file_read before 'overwrite'",
                     path.display()
                 )
             })?

@@ -1,4 +1,4 @@
-//! Pre-flight classifier for `run_shell` calls.
+//! Pre-flight classifier for `shell_run` calls.
 //!
 //! The classifier opens a single-turn conversation with the
 //! `models.shell_classify` model and exposes three tools — `read`,

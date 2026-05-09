@@ -11,6 +11,7 @@ mod tools;
 mod tty;
 mod tui;
 mod ui;
+mod workflows;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
