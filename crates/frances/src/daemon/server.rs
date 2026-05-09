@@ -25,10 +25,11 @@ use crate::daemon::protocol::{
 use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
 use crate::llm::{
-    self, ChatClient, ModelsConfig, ProviderConfig, ResponsesModelExtras, SessionConfigProvider,
-    SessionConfigWriter, ToolCallAccumulator,
+    self, ChatClient, ModelRole, ModelsConfig, ProviderConfig, ResponsesModelExtras,
+    SessionConfigProvider, SessionConfigWriter, ToolCallAccumulator,
 };
 use crate::session::Session;
+use crate::shell_classifier::{self, ShellClassification};
 use crate::store::Database;
 use crate::tools;
 use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
@@ -587,6 +588,7 @@ async fn run_llm_step(
     let llm_task = tokio::spawn(async move {
         llm_owned
             .stream(
+                ModelRole::Chat,
                 &payloads,
                 tools::definitions(),
                 None,
@@ -705,6 +707,17 @@ async fn run_llm_step(
     }
 
     for call in &tool_calls {
+        if call.name == "run_shell"
+            && let Some(cmd) = call
+                .arguments
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+        {
+            let classification = shell_classifier::classify_shell(llm, cmd).await;
+            let cls_id = alloc_block();
+            emit_classification_block(stream, send_error, cls_id, &classification).await;
+        }
+
         let outcome = tools::dispatch(
             call,
             tools::ToolContext {
@@ -757,6 +770,35 @@ async fn run_llm_step(
     }
 
     Ok(true)
+}
+
+/// Surfaces a [`ShellClassification`] to the client as a single
+/// AssistantText block. Permission-asking is out of scope for now — the
+/// classifier's verdict is just informational, displayed in the same
+/// stream as model output. The block is not persisted to history: it's
+/// a runtime annotation, not part of the model conversation.
+async fn emit_classification_block(
+    stream: &mut UnixStream,
+    send_error: &mut Option<anyhow::Error>,
+    id: BlockId,
+    classification: &ShellClassification,
+) {
+    let text = format!(
+        "[shell-classify: {}] {}",
+        classification.kind.as_str(),
+        classification.description,
+    );
+    try_write(
+        stream,
+        &StreamFrame::BlockStart {
+            id,
+            kind: BlockKind::AssistantText,
+        },
+        send_error,
+    )
+    .await;
+    try_write(stream, &StreamFrame::BlockDelta { id, text }, send_error).await;
+    try_write(stream, &StreamFrame::BlockStop { id }, send_error).await;
 }
 
 /// Best-effort frame write that records the first send error and silently

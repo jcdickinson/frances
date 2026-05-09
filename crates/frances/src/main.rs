@@ -5,6 +5,7 @@ mod edit_session;
 mod history;
 mod llm;
 mod session;
+mod shell_classifier;
 mod store;
 mod tools;
 mod tty;

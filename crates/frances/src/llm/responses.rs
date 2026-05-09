@@ -47,6 +47,7 @@ impl ChatClient {
 
     pub async fn stream<F>(
         &self,
+        role: ModelRole,
         messages: &[Value],
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
@@ -55,7 +56,7 @@ impl ChatClient {
     where
         F: FnMut(&Value) -> Result<()>,
     {
-        let plan = self.build_request_plan()?;
+        let plan = self.build_request_plan(role)?;
 
         let mut body = serde_json::json!({
             "model": plan.model.id,
@@ -138,25 +139,60 @@ impl ChatClient {
         Ok(())
     }
 
-    fn build_request_plan(&self) -> Result<RequestPlan> {
+    /// One-shot wrapper around [`stream`](Self::stream): drives the SSE
+    /// stream to completion and returns the full assistant text plus any
+    /// finalized tool calls. Use this when the caller doesn't need to
+    /// surface mid-stream deltas (e.g. the shell classifier).
+    pub async fn complete(
+        &self,
+        role: ModelRole,
+        messages: &[Value],
+        tools: &[ToolDef],
+        tool_choice: Option<&ToolChoice>,
+    ) -> Result<CompletionOutcome> {
+        let mut text = String::new();
+        let mut accumulator = ToolCallAccumulator::new();
+        self.stream(role, messages, tools, tool_choice, |chunk| {
+            for delta in chunk_text_deltas(chunk) {
+                text.push_str(delta);
+            }
+            for delta in chunk_tool_call_deltas(chunk) {
+                accumulator.push(delta)?;
+            }
+            Ok(())
+        })
+        .await?;
+        Ok(CompletionOutcome {
+            text,
+            tool_calls: accumulator.finalize()?,
+        })
+    }
+
+    fn build_request_plan(&self, role: ModelRole) -> Result<RequestPlan> {
         let models = self
             .models
             .get()
             .ok_or_else(|| anyhow!("models config missing"))?;
-        let chat: ModelConfig = models.chat.clone();
+        let model: ModelConfig = match role {
+            ModelRole::Chat => models.chat.clone(),
+            ModelRole::ShellClassify => models
+                .shell_classify
+                .clone()
+                .ok_or_else(|| anyhow!("models.shell_classify is not configured"))?,
+        };
 
         let providers = self
             .providers
             .get()
             .ok_or_else(|| anyhow!("model_providers config missing"))?;
-        let provider = case_insensitive_lookup(&providers, &chat.model_provider).ok_or_else(
-            || {
+        let provider =
+            case_insensitive_lookup(&providers, &model.model_provider).ok_or_else(|| {
                 anyhow!(
-                    "model_providers.{} is not configured (referenced by models.chat.model_provider)",
-                    chat.model_provider
+                    "model_providers.{} is not configured (referenced by models.{}.model_provider)",
+                    model.model_provider,
+                    role.config_key()
                 )
-            },
-        )?;
+            })?;
 
         let bearer_token = resolve_bearer(&provider.auth, &self.env)?;
 
@@ -168,17 +204,44 @@ impl ChatClient {
         let headers = expand_headers(&provider.http_headers, &self.env)?;
 
         let extras = self.extras.get_or_default();
-        let extra_completion_properties = case_insensitive_lookup(&extras, &chat.id)
+        let extra_completion_properties = case_insensitive_lookup(&extras, &model.id)
             .and_then(|e| e.extra_completion_properties.clone());
 
         Ok(RequestPlan {
             url,
             bearer_token,
             headers,
-            model: chat,
+            model,
             extra_completion_properties,
         })
     }
+}
+
+/// Selects which `models.<role>` entry the request targets. New roles get a
+/// variant here (and a matching arm in `build_request_plan`) — providers and
+/// extras lookups are shared across all roles.
+#[derive(Clone, Copy, Debug)]
+pub enum ModelRole {
+    Chat,
+    ShellClassify,
+}
+
+impl ModelRole {
+    fn config_key(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::ShellClassify => "shell_classify",
+        }
+    }
+}
+
+/// Final result of [`ChatClient::complete`]. `text` is the concatenation of
+/// all `content` deltas; `tool_calls` is the parsed tool-call list (ordered
+/// by index, like `ToolCallAccumulator::finalize`).
+#[derive(Debug, Clone)]
+pub struct CompletionOutcome {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
 }
 
 struct RequestPlan {

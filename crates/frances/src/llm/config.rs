@@ -105,7 +105,6 @@ pub struct ModelsConfig {
     #[expect(dead_code, reason = "summarize role wired up in a later pass")]
     #[serde(default)]
     pub summarize: Option<ModelConfig>,
-    #[expect(dead_code, reason = "shell_classify role wired up in a later pass")]
     #[serde(default)]
     pub shell_classify: Option<ModelConfig>,
 }
