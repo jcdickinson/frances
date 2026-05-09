@@ -24,9 +24,9 @@ use crate::daemon::protocol::{
 };
 use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
+use crate::llm::provider_cache::ProviderCache;
 use crate::llm::{
-    self, ChatClient, ModelConfig, ProviderConfig, ResponsesModelExtras, SessionConfigProvider,
-    SessionConfigWriter, ToolCallAccumulator,
+    self, ChatClient, ModelConfig, SessionConfigProvider, SessionConfigWriter, ToolCallAccumulator,
 };
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
@@ -57,9 +57,8 @@ pub(crate) struct ServerState {
     /// daemon's lifetime. Also handed to `ChatClient` so it can lazily bind
     /// `models::<name>` on demand when callers request a named model.
     config: ConfigHandle,
-    providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+    provider_cache: Arc<ProviderCache>,
     default_model: RequiredConfigBinding<ModelConfig>,
-    responses_extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
     workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
@@ -245,17 +244,13 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let session_config_writer = session_provider
         .writer()
         .expect("SessionConfigProvider::load ran during ConfigHandle::build");
-    let providers = config
-        .bind::<HashMap<String, ProviderConfig>>("model_providers")
-        .context("bind model_providers")?;
     let default_model = config
         .bind::<ModelConfig>(["models", "default"])
         .context("bind models::default")?
         .required()
         .context("models::default is required")?;
-    let responses_extras = config
-        .bind::<HashMap<String, ResponsesModelExtras>>("responses_models")
-        .context("bind responses_models")?;
+    let provider_cache =
+        Arc::new(ProviderCache::new(config.clone()).context("build provider cache")?);
     let workflows = config
         .bind::<HashMap<String, WorkflowConfig>>("workflows")
         .context("bind workflows")?;
@@ -272,9 +267,8 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         config,
-        providers,
+        provider_cache,
         default_model,
-        responses_extras,
         workflows,
         session_config_writer,
     });
@@ -516,10 +510,10 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 
     let llm = ChatClient::new(
         env,
-        state.providers.clone(),
+        state.session.id.clone(),
+        state.provider_cache.clone(),
         state.config.clone(),
         state.default_model.clone(),
-        state.responses_extras.clone(),
     )?;
 
     let mut next_block: u64 = 1;

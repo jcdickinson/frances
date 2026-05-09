@@ -25,10 +25,6 @@ pub struct ProviderConfig {
     )]
     #[serde(default)]
     pub query_params: BTreeMap<String, EnvString>,
-    #[expect(
-        dead_code,
-        reason = "only one variant exists today; consulted when a second wire ships"
-    )]
     #[serde(default)]
     pub wire_api: WireApi,
     #[expect(dead_code, reason = "WebSocket transport is a follow-up")]
@@ -51,7 +47,7 @@ pub struct ProviderConfig {
 /// Vendor-neutral name for the wire protocol the provider speaks. Today
 /// the only variant is `Responses` (OpenAI-style chat completions); a
 /// future variant will slot in here without breaking existing config.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum WireApi {
     #[default]
@@ -121,10 +117,11 @@ pub struct ModelConfig {
     pub service_tier: Option<u8>,
 }
 
-/// Wire-specific extras keyed by the wire model id. The Responses-API
-/// client reads its own `responses_models::<id>` binding so the
-/// universal `ModelConfig` stays clean. Providers using a different wire
-/// would have their own `<wire>_models::<id>` table.
+/// Wire-specific extras for the Responses-API. Bound by the
+/// `ProviderCache` at `model_provider_extensions::<provider_id>` and
+/// passed by value to [`OpenAiLikeProvider::new`] as its associated
+/// `Extras` type. Other wires' implementations carry their own extras
+/// type; the cache deserialises whichever shape the impl declares.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct ResponsesModelExtras {
     /// JSON-encoded object. Shallow-merged into the chat-completion body

@@ -29,7 +29,7 @@ pub use env_string::{EnvLookup, EnvString, EnvStringExpandError};
 pub use error::{BuildError, ConfigBindError, MapError, SourceLoadError};
 pub use event::{ConfigEvent, EventSender, SendError};
 pub use handle::{ConfigHandle, ConfigHandleRef};
-pub use util::{Keys, KeysDiff};
 pub use provider::{ConfigProvider, ProviderError};
 pub use providers::{EnvProvider, TomlProvider};
+pub use util::{Keys, KeysDiff};
 pub use value::{Path, SEPARATOR, Value};

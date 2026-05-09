@@ -83,15 +83,9 @@ impl EnvLookup for HashMap<String, String> {
     }
 }
 
-impl EnvLookup for Vec<(OsString, OsString)> {
+impl EnvLookup for HashMap<OsString, OsString> {
     fn get(&self, name: &str) -> Option<&str> {
-        slice_lookup(self, name)
-    }
-}
-
-impl EnvLookup for &[(OsString, OsString)] {
-    fn get(&self, name: &str) -> Option<&str> {
-        slice_lookup(self, name)
+        HashMap::get(self, std::ffi::OsStr::new(name)).and_then(|v| v.to_str())
     }
 }
 
@@ -99,13 +93,6 @@ impl<T: EnvLookup + ?Sized> EnvLookup for &T {
     fn get(&self, name: &str) -> Option<&str> {
         T::get(self, name)
     }
-}
-
-fn slice_lookup<'a>(pairs: &'a [(OsString, OsString)], name: &str) -> Option<&'a str> {
-    pairs
-        .iter()
-        .find(|(k, _)| k == name)
-        .and_then(|(_, v)| v.to_str())
 }
 
 #[derive(Debug, Error)]
@@ -193,10 +180,10 @@ mod tests {
     }
 
     #[test]
-    fn lookup_for_os_pairs() {
-        let pairs: Vec<(OsString, OsString)> =
-            vec![(OsString::from("HOME"), OsString::from("/home/jono"))];
+    fn lookup_for_os_map() {
+        let mut env: HashMap<OsString, OsString> = HashMap::new();
+        env.insert(OsString::from("HOME"), OsString::from("/home/jono"));
         let s = EnvString::new("${HOME}/cache");
-        assert_eq!(s.expand(&pairs).unwrap(), "/home/jono/cache");
+        assert_eq!(s.expand(&env).unwrap(), "/home/jono/cache");
     }
 }

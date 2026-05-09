@@ -1,17 +1,28 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use frances_config::{ConfigBinding, ConfigHandle, EnvLookup, RequiredConfigBinding};
-use futures_util::StreamExt;
+use frances_config::{ConfigBinding, ConfigHandle, RequiredConfigBinding};
 use serde::Serialize;
 use serde_json::Value;
-use tracing::{debug, trace, warn};
-use url::Url;
 
-use crate::llm::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
+use crate::llm::config::ModelConfig;
+use crate::llm::provider::{ErasedError, ProviderRequest};
+use crate::llm::provider_cache::ProviderCache;
+
+/// Convert an internal `anyhow::Error` to an [`ErasedError`] for the
+/// [`crate::llm::provider::ErasedProvider`] boundary.
+fn into_erased(e: anyhow::Error) -> ErasedError {
+    e.into()
+}
+
+/// Log the underlying erased error and substitute a generic message before
+/// it crosses back into anyhow-using daemon code.
+fn log_and_generic(provider_id: &str, e: ErasedError) -> anyhow::Error {
+    tracing::error!(provider = %provider_id, error = %e, "provider error");
+    anyhow!("provider {} encountered an error", provider_id)
+}
 
 /// Chat-completions client. Vendor-neutral despite the name "Responses"
 /// in `wire_api`: today the wire is OpenAI-style chat completions; if a
@@ -24,34 +35,29 @@ use crate::llm::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModel
 /// which is bound as required at startup.
 #[derive(Clone)]
 pub struct ChatClient {
-    http: reqwest::Client,
-    env: Vec<(OsString, OsString)>,
-    providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+    env: HashMap<OsString, OsString>,
+    session_id: String,
+    cache: Arc<ProviderCache>,
     config: ConfigHandle,
     default_model: RequiredConfigBinding<ModelConfig>,
     model_cache: Arc<Mutex<HashMap<String, ConfigBinding<ModelConfig>>>>,
-    extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
 }
 
 impl ChatClient {
     pub fn new(
-        env: Vec<(OsString, OsString)>,
-        providers: ConfigBinding<HashMap<String, ProviderConfig>>,
+        env: HashMap<OsString, OsString>,
+        session_id: String,
+        cache: Arc<ProviderCache>,
         config: ConfigHandle,
         default_model: RequiredConfigBinding<ModelConfig>,
-        extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
     ) -> Result<Self> {
-        let http = reqwest::Client::builder()
-            .build()
-            .context("build reqwest client")?;
         Ok(Self {
-            http,
             env,
-            providers,
+            session_id,
+            cache,
             config,
             default_model,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
-            extras,
         })
     }
 
@@ -64,89 +70,29 @@ impl ChatClient {
         mut on_chunk: F,
     ) -> Result<()>
     where
-        F: FnMut(&Value) -> Result<()>,
+        F: FnMut(&Value) -> Result<()> + Send,
     {
-        let plan = self.build_request_plan(names)?;
-
-        let mut body = serde_json::json!({
-            "model": plan.model.id,
-            "messages": messages,
-            "max_tokens": plan.model.max_tokens,
-            "stream": true,
-            "stream_options": { "include_usage": true },
-        });
-        if !tools.is_empty() {
-            body["tools"] = serde_json::to_value(tools)?;
-        }
-        if let Some(tc) = tool_choice {
-            body["tool_choice"] = serde_json::to_value(tc)?;
-        }
-        merge_extras(&mut body, plan.extra_completion_properties.as_deref())?;
-
-        debug!(
-            messages = messages.len(),
-            tools = tools.len(),
-            url = %plan.url,
-            model = %plan.model.id,
-            "calling chat completions"
-        );
-        trace!(body = %body, "chat completions request body");
-
-        let mut request = self
-            .http
-            .post(plan.url)
-            .timeout(Duration::from_millis(plan.model.stream_idle_timeout_ms))
-            .bearer_auth(&plan.bearer_token)
-            .json(&body);
-        for (k, v) in &plan.headers {
-            request = request.header(k, v);
-        }
-
-        let response = request
-            .send()
+        let model = self.resolve_model(names)?;
+        let provider_id = model.model_provider.clone();
+        let provider = self.cache.get(&provider_id).ok_or_else(|| {
+            anyhow!(
+                "model_providers.{} not available (no config or factory missing)",
+                provider_id
+            )
+        })?;
+        let req = ProviderRequest {
+            session_id: &self.session_id,
+            model: &model,
+            messages,
+            tools,
+            tool_choice,
+            env: &self.env,
+        };
+        let mut wrapped = |v: &Value| on_chunk(v).map_err(into_erased);
+        provider
+            .stream(req, &mut wrapped)
             .await
-            .context("chat completion request failed")?;
-        trace!(status = %response.status(), headers = ?response.headers(), "chat completions response head");
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let text = response.text().await.unwrap_or_default();
-            return Err(anyhow!("provider returned {status}: {text}"));
-        }
-
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let bytes = chunk.context("chat stream chunk")?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
-
-            while let Some(idx) = buffer.find("\n\n") {
-                let frame: String = buffer.drain(..idx + 2).collect();
-                for line in frame.lines() {
-                    let Some(payload) = line.strip_prefix("data:") else {
-                        continue;
-                    };
-                    let payload = payload.trim();
-                    if payload.is_empty() || payload == "[DONE]" {
-                        continue;
-                    }
-
-                    trace!(payload, "chat completions sse chunk");
-                    let value: Value = match serde_json::from_str(payload) {
-                        Ok(value) => value,
-                        Err(error) => {
-                            trace!(%error, payload, "skipping unparsable sse payload");
-                            continue;
-                        }
-                    };
-
-                    on_chunk(&value)?;
-                }
-            }
-        }
-
-        Ok(())
+            .map_err(|e| log_and_generic(&provider_id, e))
     }
 
     /// One-shot wrapper around [`stream`](Self::stream): drives the SSE
@@ -160,59 +106,26 @@ impl ChatClient {
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<CompletionOutcome> {
-        let mut text = String::new();
-        let mut accumulator = ToolCallAccumulator::new();
-        self.stream(names, messages, tools, tool_choice, |chunk| {
-            for delta in chunk_text_deltas(chunk) {
-                text.push_str(delta);
-            }
-            for delta in chunk_tool_call_deltas(chunk) {
-                accumulator.push(delta)?;
-            }
-            Ok(())
-        })
-        .await?;
-        Ok(CompletionOutcome {
-            text,
-            tool_calls: accumulator.finalize()?,
-        })
-    }
-
-    fn build_request_plan(&self, names: &[&str]) -> Result<RequestPlan> {
         let model = self.resolve_model(names)?;
-
-        let providers = self
-            .providers
-            .get()
-            .ok_or_else(|| anyhow!("model_providers config missing"))?;
-        let provider =
-            case_insensitive_lookup(&providers, &model.model_provider).ok_or_else(|| {
-                anyhow!(
-                    "model_providers.{} is not configured (referenced by a model's model_provider)",
-                    model.model_provider,
-                )
-            })?;
-
-        let bearer_token = resolve_bearer(&provider.auth, &self.env)?;
-
-        let url = provider
-            .base_url
-            .join("chat/completions")
-            .context("join base_url with chat/completions")?;
-
-        let headers = expand_headers(&provider.http_headers, &self.env)?;
-
-        let extras = self.extras.get_or_default();
-        let extra_completion_properties = case_insensitive_lookup(&extras, &model.id)
-            .and_then(|e| e.extra_completion_properties.clone());
-
-        Ok(RequestPlan {
-            url,
-            bearer_token,
-            headers,
-            model,
-            extra_completion_properties,
-        })
+        let provider_id = model.model_provider.clone();
+        let provider = self.cache.get(&provider_id).ok_or_else(|| {
+            anyhow!(
+                "model_providers.{} not available (no config or factory missing)",
+                provider_id
+            )
+        })?;
+        let req = ProviderRequest {
+            session_id: &self.session_id,
+            model: &model,
+            messages,
+            tools,
+            tool_choice,
+            env: &self.env,
+        };
+        provider
+            .complete(req)
+            .await
+            .map_err(|e| log_and_generic(&provider_id, e))
     }
 
     /// Walks `names` in order, returning the first one whose `models::<name>`
@@ -258,98 +171,6 @@ impl ChatClient {
 pub struct CompletionOutcome {
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
-}
-
-struct RequestPlan {
-    url: Url,
-    bearer_token: String,
-    headers: Vec<(String, String)>,
-    model: ModelConfig,
-    extra_completion_properties: Option<String>,
-}
-
-fn case_insensitive_lookup<'a, V>(map: &'a HashMap<String, V>, key: &str) -> Option<&'a V> {
-    if let Some(v) = map.get(key) {
-        return Some(v);
-    }
-    map.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v)
-}
-
-fn resolve_bearer(auth: &AuthMethod, env: &[(OsString, OsString)]) -> Result<String> {
-    match auth {
-        AuthMethod::EnvKey {
-            env_key,
-            env_key_instructions,
-        } => env
-            .iter()
-            .find(|(k, _)| k == env_key.as_str())
-            .map(|(_, v)| v.to_string_lossy().into_owned())
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| match env_key_instructions {
-                Some(msg) => anyhow!("{env_key} not set in client environment — {msg}"),
-                None => anyhow!("{env_key} not set in client environment"),
-            }),
-        AuthMethod::Token { token } => Ok(token.clone()),
-        AuthMethod::File { file } => std::fs::read_to_string(file)
-            .with_context(|| format!("read auth file {}", file.display()))
-            .map(|s| s.trim().to_owned()),
-        AuthMethod::Command { .. } => Err(anyhow!("command-backed auth is not implemented yet")),
-    }
-}
-
-fn expand_headers(
-    raw: &BTreeMap<String, frances_config::EnvString>,
-    env: &dyn EnvLookup,
-) -> Result<Vec<(String, String)>> {
-    let mut out = Vec::with_capacity(raw.len());
-    for (name, template) in raw {
-        if name.eq_ignore_ascii_case("authorization") {
-            warn!(
-                header = %name,
-                "Authorization header in http_headers is ignored — auth resolves it"
-            );
-            continue;
-        }
-        let value = template
-            .expand(env)
-            .with_context(|| format!("expand header {name}"))?;
-        out.push((name.clone(), value));
-    }
-    Ok(out)
-}
-
-fn merge_extras(body: &mut Value, extras: Option<&str>) -> Result<()> {
-    let Some(extras) = extras else {
-        return Ok(());
-    };
-    let parsed: Value = serde_json::from_str(extras)
-        .context("parse responses_models.<id>.extra_completion_properties as JSON")?;
-    let Value::Object(extras_obj) = parsed else {
-        return Err(anyhow!(
-            "extra_completion_properties must be a JSON object, got {}",
-            type_name_of(&parsed)
-        ));
-    };
-    let Value::Object(body_obj) = body else {
-        unreachable!("body is constructed as a JSON object above");
-    };
-    for (k, v) in extras_obj {
-        body_obj.insert(k, v);
-    }
-    Ok(())
-}
-
-fn type_name_of(v: &Value) -> &'static str {
-    match v {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
 }
 
 pub fn chunk_text_deltas(chunk: &Value) -> impl Iterator<Item = &str> {
@@ -877,35 +698,5 @@ mod tests {
         let v = serde_json::to_value(ToolChoice::Function("edit".into())).unwrap();
         assert_eq!(v["type"], "function");
         assert_eq!(v["function"]["name"], "edit");
-    }
-
-    #[test]
-    fn merge_extras_overrides_existing_keys() {
-        let mut body = json!({
-            "model": "qwen",
-            "max_tokens": 1000,
-        });
-        merge_extras(
-            &mut body,
-            Some(r#"{"max_tokens": 2000, "provider": {"order": ["parasail"]}}"#),
-        )
-        .unwrap();
-        assert_eq!(body["max_tokens"], 2000);
-        assert_eq!(body["provider"]["order"][0], "parasail");
-        assert_eq!(body["model"], "qwen");
-    }
-
-    #[test]
-    fn merge_extras_rejects_non_object() {
-        let mut body = json!({});
-        let err = merge_extras(&mut body, Some(r#"["nope"]"#)).unwrap_err();
-        assert!(err.to_string().contains("must be a JSON object"));
-    }
-
-    #[test]
-    fn merge_extras_none_is_noop() {
-        let mut body = json!({"a": 1});
-        merge_extras(&mut body, None).unwrap();
-        assert_eq!(body, json!({"a": 1}));
     }
 }

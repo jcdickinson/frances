@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use crate::tty::TtyKey;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessContext {
     pub cwd: Option<PathBuf>,
-    pub env: Vec<(OsString, OsString)>,
+    pub env: HashMap<OsString, OsString>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
