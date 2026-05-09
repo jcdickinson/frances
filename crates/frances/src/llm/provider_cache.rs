@@ -10,8 +10,10 @@ use futures::StreamExt;
 use futures::task::noop_waker_ref;
 use tracing::warn;
 
-use crate::llm::config::{ProviderConfig, ResponsesModelExtras, WireApi};
-use crate::llm::provider::{ErasedError, ErasedProvider, OpenAiLikeProvider, Provider};
+use frances_llm::providers::openai;
+use frances_llm::{
+    ErasedError, ErasedProvider, Provider, ProviderConfig, ResponsesModelExtras, WireApi,
+};
 
 /// Drain-on-get cache of constructed [`ErasedProvider`]s, keyed by provider
 /// id. Each entry owns the subscribe streams for its `ProviderConfig` and
@@ -20,7 +22,7 @@ use crate::llm::provider::{ErasedError, ErasedProvider, OpenAiLikeProvider, Prov
 ///
 /// Construction of a per-id provider goes through a [`EntryFactory`] picked
 /// by [`ProviderConfig::wire_api`]. Today only `WireApi::Responses →
-/// OpenAiLikeProvider` is registered.
+/// OpenAiProvider` is registered.
 pub struct ProviderCache {
     handle: ConfigHandle,
     keys: ConfigBinding<Keys>,
@@ -61,7 +63,7 @@ impl ProviderCache {
         // first `refresh_id_set` learns the existing key set.
         let keys_stream = keys.subscribe_now();
         let mut factories: HashMap<WireApi, Arc<dyn EntryFactory>> = HashMap::new();
-        factories.insert(WireApi::Responses, Arc::new(OpenAiLikeFactory));
+        factories.insert(WireApi::Responses, Arc::new(OpenAiFactory));
         Ok(Self {
             handle,
             keys,
@@ -131,9 +133,9 @@ impl ProviderCache {
     }
 }
 
-struct OpenAiLikeFactory;
+struct OpenAiFactory;
 
-impl EntryFactory for OpenAiLikeFactory {
+impl EntryFactory for OpenAiFactory {
     fn build(&self, handle: &ConfigHandle, id: &str) -> Result<Entry> {
         let pc = handle
             .bind::<ProviderConfig>(["model_providers", id])
@@ -142,7 +144,7 @@ impl EntryFactory for OpenAiLikeFactory {
             .bind::<ResponsesModelExtras>(["model_provider_extensions", id])
             .map_err(|e| anyhow!("bind model_provider_extensions::{id}: {e}"))?;
 
-        let initial = build_provider::<OpenAiLikeProvider>(&pc, &ex)?;
+        let initial = build_provider::<openai::Provider>(&pc, &ex)?;
 
         let mut pc_stream = pc.subscribe();
         let mut ex_stream = ex.subscribe();
@@ -154,7 +156,7 @@ impl EntryFactory for OpenAiLikeFactory {
             if !pc_fired && !ex_fired {
                 return None;
             }
-            match build_provider::<OpenAiLikeProvider>(&pc_for_refresh, &ex_for_refresh) {
+            match build_provider::<openai::Provider>(&pc_for_refresh, &ex_for_refresh) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     warn!(error = %e, "provider rebuild failed; retaining previous");
@@ -202,11 +204,11 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::provider::ProviderRequest;
     use async_trait::async_trait;
     use frances_config::{
         ConfigEvent, ConfigProvider, EventSender, Path, ProviderError, Value as CValue,
     };
+    use frances_llm::{CompletionOutcome, ProviderRequest, StreamEvent};
     use serde::Deserialize;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -241,21 +243,9 @@ mod tests {
         async fn stream(
             &self,
             _req: ProviderRequest<'_>,
-            _on_chunk: &mut (
-                     dyn for<'v> FnMut(
-                &'v serde_json::Value,
-            ) -> std::result::Result<(), ErasedError>
-                         + Send
-                 ),
-        ) -> std::result::Result<(), ErasedError> {
-            Ok(())
-        }
-
-        async fn complete(
-            &self,
-            _req: ProviderRequest<'_>,
-        ) -> std::result::Result<crate::llm::responses::CompletionOutcome, ErasedError> {
-            Ok(crate::llm::responses::CompletionOutcome {
+            _on_event: &mut (dyn FnMut(StreamEvent) -> std::result::Result<(), ErasedError> + Send),
+        ) -> std::result::Result<CompletionOutcome, ErasedError> {
+            Ok(CompletionOutcome {
                 text: String::new(),
                 tool_calls: Vec::new(),
             })

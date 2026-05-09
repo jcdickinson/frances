@@ -9,37 +9,28 @@ use url::Url;
 /// table in the config tree. The `id` itself is the binding key, not a field.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
-    #[expect(
-        dead_code,
-        reason = "human-facing display only; not yet surfaced in the TUI"
-    )]
+    /// Human-facing display name; not yet surfaced in the TUI.
     #[serde(default)]
     pub name: Option<String>,
     pub base_url: Url,
     pub auth: AuthMethod,
     #[serde(default)]
     pub http_headers: BTreeMap<String, EnvString>,
-    #[expect(
-        dead_code,
-        reason = "applied at request time; wired up after auth lands"
-    )]
+    /// Applied at request time; wired up after auth lands.
     #[serde(default)]
     pub query_params: BTreeMap<String, EnvString>,
     #[serde(default)]
     pub wire_api: WireApi,
-    #[expect(dead_code, reason = "WebSocket transport is a follow-up")]
+    /// WebSocket transport is a follow-up.
     #[serde(default)]
     pub supports_websockets: bool,
-    #[expect(dead_code, reason = "retry policy not enforced this pass")]
+    /// Retry policy not enforced this pass.
     #[serde(default = "default_request_max_retries")]
     pub request_max_retries: u32,
-    #[expect(dead_code, reason = "retry policy not enforced this pass")]
+    /// Retry policy not enforced this pass.
     #[serde(default = "default_stream_max_retries")]
     pub stream_max_retries: u32,
-    #[expect(
-        dead_code,
-        reason = "per-request stream timeout currently sourced from the model"
-    )]
+    /// Per-request stream timeout currently sourced from the model.
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
 }
@@ -60,8 +51,8 @@ pub enum WireApi {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum AuthMethod {
+    /// Command auth is parsed but not yet implemented.
     Command {
-        #[expect(dead_code, reason = "command auth is parsed but not yet implemented")]
         command: AuthCommand,
     },
     EnvKey {
@@ -77,20 +68,17 @@ pub enum AuthMethod {
     },
 }
 
+/// Command auth not implemented this pass — fields parse and round-trip,
+/// runtime side is a follow-up.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthCommand {
-    #[expect(dead_code, reason = "command auth not implemented this pass")]
     pub command: String,
-    #[expect(dead_code, reason = "command auth not implemented this pass")]
     #[serde(default)]
     pub args: Vec<String>,
-    #[expect(dead_code, reason = "command auth not implemented this pass")]
     #[serde(default)]
     pub cwd: Option<PathBuf>,
-    #[expect(dead_code, reason = "command auth not implemented this pass")]
     #[serde(default = "default_refresh_interval_ms")]
     pub refresh_interval_ms: u64,
-    #[expect(dead_code, reason = "command auth not implemented this pass")]
     #[serde(default = "default_auth_timeout_ms")]
     pub timeout_ms: u64,
 }
@@ -103,23 +91,17 @@ pub struct ModelConfig {
     pub max_tokens: u32,
     #[serde(default = "default_model_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
-    #[expect(
-        dead_code,
-        reason = "0..=100 → provider-specific scale not implemented yet"
-    )]
+    /// 0..=100 → provider-specific scale not implemented yet.
     #[serde(default)]
     pub reasoning_effort: Option<u8>,
-    #[expect(
-        dead_code,
-        reason = "0..=100 → provider-specific scale not implemented yet"
-    )]
+    /// 0..=100 → provider-specific scale not implemented yet.
     #[serde(default)]
     pub service_tier: Option<u8>,
 }
 
 /// Wire-specific extras for the Responses-API. Bound by the
 /// `ProviderCache` at `model_provider_extensions::<provider_id>` and
-/// passed by value to [`OpenAiLikeProvider::new`] as its associated
+/// passed by value to [`crate::OpenAiProvider::new`] as its associated
 /// `Extras` type. Other wires' implementations carry their own extras
 /// type; the cache deserialises whichever shape the impl declares.
 #[derive(Debug, Clone, Default, Deserialize)]

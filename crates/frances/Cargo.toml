@@ -33,6 +33,7 @@ thiserror.workspace = true
 frances-config.workspace = true
 frances-core.workspace = true
 frances-edit.workspace = true
+frances-llm.workspace = true
 frances-shell.workspace = true
 async-trait.workspace = true
 arc-swap.workspace = true

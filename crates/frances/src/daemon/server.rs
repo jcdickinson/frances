@@ -26,7 +26,7 @@ use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
 use crate::llm::provider_cache::ProviderCache;
 use crate::llm::{
-    self, ChatClient, ModelConfig, SessionConfigProvider, SessionConfigWriter, ToolCallAccumulator,
+    ChatClient, ModelConfig, SessionConfigProvider, SessionConfigWriter, StreamEvent,
 };
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
@@ -605,7 +605,7 @@ async fn run_llm_step(
     let tool_defs = state.tool_registry.definitions().await?;
 
     let llm_owned: ChatClient = (*llm).clone();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
     let llm_task = tokio::spawn(async move {
         llm_owned
             .stream(
@@ -613,8 +613,8 @@ async fn run_llm_step(
                 &payloads,
                 &tool_defs,
                 None,
-                move |chunk: &serde_json::Value| {
-                    let _ = tx.send(chunk.clone());
+                move |event: StreamEvent| {
+                    let _ = tx.send(event);
                     Ok(())
                 },
             )
@@ -622,73 +622,54 @@ async fn run_llm_step(
     });
 
     let mut accumulated_text = String::new();
-    let mut chunks: Vec<serde_json::Value> = Vec::new();
-    let mut accumulator = ToolCallAccumulator::new();
-    // streaming-index → wire BlockId for the most recently started tool block.
-    // The TUI is single-active-block: a fresh BlockStart auto-closes the
-    // previous block on the wire, so we never explicitly Stop them — the only
-    // explicit Stop is for whichever block is `wire_active` when the stream ends.
-    let mut tool_block_for_index: HashMap<u32, BlockId> = HashMap::new();
 
-    while let Some(chunk) = rx.recv().await {
-        for delta in llm::chunk_text_deltas(&chunk) {
-            accumulated_text.push_str(delta);
-            // Text deltas only make sense if the assistant block is still the
-            // active one. Once a tool call has started, we drop further text
-            // deltas on the wire (they'd address a closed block) — the model
-            // rarely emits text after tool_calls in OpenAI's stream anyway.
-            if wire_active == Some(assistant_id) {
-                try_write(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: assistant_id,
-                        text: delta.to_string(),
-                    },
-                    send_error,
-                )
-                .await;
-            }
-        }
-        for tool_delta in llm::chunk_tool_call_deltas(&chunk) {
-            match &tool_delta.event {
-                llm::ToolCallEvent::Start { name, .. } => {
-                    let block_id = alloc_block();
-                    tool_block_for_index.insert(tool_delta.index, block_id);
-                    wire_active = Some(block_id);
+    while let Some(event) = rx.recv().await {
+        match event {
+            StreamEvent::TextDelta(delta) => {
+                accumulated_text.push_str(&delta);
+                if wire_active == Some(assistant_id) {
                     try_write(
                         stream,
-                        &StreamFrame::BlockStart {
-                            id: block_id,
-                            kind: BlockKind::ToolUse {
-                                name: (*name).to_string(),
-                            },
+                        &StreamFrame::BlockDelta {
+                            id: assistant_id,
+                            text: delta,
                         },
                         send_error,
                     )
                     .await;
                 }
-                llm::ToolCallEvent::Append(fragment) => {
-                    if let Some(&block_id) = tool_block_for_index.get(&tool_delta.index)
-                        && wire_active == Some(block_id)
-                    {
-                        try_write(
-                            stream,
-                            &StreamFrame::BlockDelta {
-                                id: block_id,
-                                text: (*fragment).to_string(),
-                            },
-                            send_error,
-                        )
-                        .await;
-                    }
-                }
             }
-            accumulator.push(tool_delta)?;
+            StreamEvent::ToolCall(call) => {
+                if let Some(active) = wire_active.take() {
+                    try_write(stream, &StreamFrame::BlockStop { id: active }, send_error).await;
+                }
+                let block_id = alloc_block();
+                wire_active = Some(block_id);
+                try_write(
+                    stream,
+                    &StreamFrame::BlockStart {
+                        id: block_id,
+                        kind: BlockKind::ToolUse {
+                            name: call.name.clone(),
+                        },
+                    },
+                    send_error,
+                )
+                .await;
+                try_write(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block_id,
+                        text: call.arguments.to_string(),
+                    },
+                    send_error,
+                )
+                .await;
+            }
+            StreamEvent::Usage(usage) => {
+                try_write(stream, &StreamFrame::Usage(usage), send_error).await;
+            }
         }
-        if let Some(usage) = llm::chunk_usage(&chunk) {
-            try_write(stream, &StreamFrame::Usage(usage), send_error).await;
-        }
-        chunks.push(chunk);
     }
 
     if let Some(id) = wire_active.take() {
@@ -696,9 +677,8 @@ async fn run_llm_step(
     }
 
     let stream_result = llm_task.await.context("llm task panicked")?;
-    stream_result?;
-
-    let tool_calls = accumulator.finalize()?;
+    let outcome = stream_result?;
+    let tool_calls = outcome.tool_calls;
 
     let mut assistant_blocks: Vec<Block> = Vec::new();
     if !accumulated_text.is_empty() {
@@ -717,10 +697,6 @@ async fn run_llm_step(
     state
         .history
         .finish_assistant(assistant_message_id, assistant_blocks, assistant_payload)
-        .await?;
-    state
-        .history
-        .append_response_chunks(assistant_message_id, &chunks)
         .await?;
 
     if tool_calls.is_empty() {

@@ -250,38 +250,6 @@ impl HistoryStore {
         Ok(payloads)
     }
 
-    pub async fn append_response_chunks(
-        &self,
-        message_id: MessageId,
-        chunks: &[serde_json::Value],
-    ) -> Result<()> {
-        if chunks.is_empty() {
-            return Ok(());
-        }
-
-        trace!(
-            %message_id,
-            chunks = chunks.len(),
-            "persisting response chunks"
-        );
-
-        let conn = self.db.connect();
-        for (index, chunk) in chunks.iter().enumerate() {
-            let chunk_text = serde_json::to_string(chunk).context("encode chunk")?;
-            conn.execute(
-                "INSERT INTO openai_response_chunks (message_id, seq, chunk) VALUES (?1, ?2, jsonb(?3))",
-                (
-                    message_id.0,
-                    i64::try_from(index).context("chunk index overflow")?,
-                    chunk_text,
-                ),
-            )
-            .await
-            .with_context(|| format!("insert response chunk {index}"))?;
-        }
-
-        Ok(())
-    }
 
     #[expect(
         dead_code,

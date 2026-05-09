@@ -780,6 +780,7 @@ dependencies = [
  "frances-config",
  "frances-core",
  "frances-edit",
+ "frances-llm",
  "frances-shell",
  "futures",
  "futures-util",
@@ -853,6 +854,22 @@ dependencies = [
  "thiserror",
  "tokio",
  "twox-hash",
+]
+
+[[package]]
+name = "frances-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "frances-config",
+ "futures",
+ "futures-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "url",
 ]
 
 [[package]]
