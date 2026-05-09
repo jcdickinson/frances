@@ -1,10 +1,12 @@
-//! LLM-callable tools: `read_file`, `edit`, `run_shell`, `keep_waiting`,
-//! `kill_running`. The dispatcher resolves tool calls against the
-//! `EditSession` and the per-session `Shell` shared with the daemon,
-//! returning plain-text content suitable to feed back to the model as a
-//! tool result.
+//! LLM-callable tools: `read_file`, the `edit_*` family (`edit_replace`,
+//! `edit_insert_after`, `edit_insert_before`, `edit_new`, `edit_overwrite`),
+//! `run_shell`, `keep_waiting`, `kill_running`. The dispatcher resolves tool
+//! calls against the `EditSession` and the per-session `Shell` shared with
+//! the daemon, returning plain-text content suitable to feed back to the
+//! model as a tool result.
 //!
-//! Tool descriptions intentionally teach the anchor protocol once — runtime
+//! The anchor protocol is taught in the three line-editing tool descriptions
+//! (`edit_replace`, `edit_insert_after`, `edit_insert_before`); runtime
 //! outputs stay pure data per `docs/arch/anchors.md`.
 
 use std::fs;
@@ -13,13 +15,12 @@ use std::sync::OnceLock;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
-use frances_core::JsonRepair;
 use frances_shell::{QuietReason, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::anchor_store::AnchorStoreImpl;
-use crate::edit_session::{EditError, EditInput, EditSession};
+use crate::edit_session::{EditError, EditSession, LlmEdit};
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 pub struct ToolContext<'a> {
@@ -81,39 +82,67 @@ pub fn definitions() -> &'static [ToolDef] {
                 }),
             }),
             ToolDef::Function(ToolFunction {
-                name: "edit".to_string(),
-                description: EDIT_DESC.to_string(),
+                name: "edit_replace".to_string(),
+                description: EDIT_REPLACE_DESC.to_string(),
                 parameters: json!({
                     "type": "object",
                     "properties": {
-                        "files": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "path": { "type": "string" },
-                                    "edits": {
-                                        "type": "array",
-                                        "items": {
-                                            "type": "object",
-                                            "properties": {
-                                                "edit_type": {
-                                                    "type": "string",
-                                                    "enum": ["replace", "insert_after", "insert_before", "new", "overwrite"]
-                                                },
-                                                "anchor": { "type": "string" },
-                                                "end_anchor": { "type": "string" },
-                                                "text": { "type": "string" }
-                                            },
-                                            "required": ["edit_type", "text"]
-                                        }
-                                    }
-                                },
-                                "required": ["path", "edits"]
-                            }
-                        }
+                        "path": { "type": "string" },
+                        "anchor": { "type": "string" },
+                        "end_anchor": { "type": "string" },
+                        "text": { "type": "string" }
                     },
-                    "required": ["files"]
+                    "required": ["path", "anchor", "end_anchor", "text"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "edit_insert_after".to_string(),
+                description: EDIT_INSERT_AFTER_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "anchor": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["path", "anchor", "text"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "edit_insert_before".to_string(),
+                description: EDIT_INSERT_BEFORE_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "anchor": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["path", "anchor", "text"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "edit_new".to_string(),
+                description: EDIT_NEW_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["path", "text"]
+                }),
+            }),
+            ToolDef::Function(ToolFunction {
+                name: "edit_overwrite".to_string(),
+                description: EDIT_OVERWRITE_DESC.to_string(),
+                parameters: json!({
+                    "type": "object",
+                    "properties": {
+                        "path": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["path", "text"]
                 }),
             }),
         ]
@@ -124,12 +153,20 @@ const RUN_SHELL_DESC: &str = include_str!("tools/run_shell.md");
 const KEEP_WAITING_DESC: &str = include_str!("tools/keep_waiting.md");
 const KILL_RUNNING_DESC: &str = include_str!("tools/kill_running.md");
 const READ_FILE_DESC: &str = include_str!("tools/read_file.md");
-const EDIT_DESC: &str = include_str!("tools/edit.md");
+const EDIT_REPLACE_DESC: &str = include_str!("tools/edit_replace.md");
+const EDIT_INSERT_AFTER_DESC: &str = include_str!("tools/edit_insert_after.md");
+const EDIT_INSERT_BEFORE_DESC: &str = include_str!("tools/edit_insert_before.md");
+const EDIT_NEW_DESC: &str = include_str!("tools/edit_new.md");
+const EDIT_OVERWRITE_DESC: &str = include_str!("tools/edit_overwrite.md");
 
 pub async fn dispatch(call: &ToolCall, ctx: ToolContext<'_>) -> ToolOutcome {
     let result = match call.name.as_str() {
         "read_file" => run_read_file(&call.arguments, &ctx).await,
-        "edit" => run_edit(&call.arguments, &ctx).await,
+        "edit_replace" => run_edit_replace(&call.arguments, &ctx).await,
+        "edit_insert_after" => run_edit_insert_after(&call.arguments, &ctx).await,
+        "edit_insert_before" => run_edit_insert_before(&call.arguments, &ctx).await,
+        "edit_new" => run_edit_new(&call.arguments, &ctx).await,
+        "edit_overwrite" => run_edit_overwrite(&call.arguments, &ctx).await,
         "run_shell" => run_shell(&call.arguments, ctx.shell, ctx.cwd).await,
         "keep_waiting" => run_keep_waiting(&call.arguments, ctx.shell).await,
         "kill_running" => run_kill_running(ctx.shell).await,
@@ -167,30 +204,99 @@ async fn run_read_file(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
         .context("read_file")
 }
 
-async fn run_edit(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
-    // `JsonRepair` absorbs the qwen3-coder family quirk where array fields
-    // (`files`, per-entry `edits`) arrive as JSON-encoded strings. On a clean
-    // input the strict path runs and we're a passthrough.
-    let raw = JsonRepair::<EditInput>::from_value(args.clone())
-        .context("parse edit args")?
-        .into_inner();
+#[derive(serde::Deserialize)]
+struct ReplaceArgs {
+    path: PathBuf,
+    anchor: String,
+    end_anchor: String,
+    text: String,
+}
 
-    let resolved_files = raw
-        .files
-        .into_iter()
-        .map(|entry| crate::edit_session::EditFileEntry {
-            path: resolve_path(ctx.cwd, &entry.path),
-            edits: entry.edits,
-        })
-        .collect::<Vec<_>>();
-    let input = EditInput {
-        files: resolved_files,
-    };
+#[derive(serde::Deserialize)]
+struct InsertArgs {
+    path: PathBuf,
+    anchor: String,
+    text: String,
+}
 
+#[derive(serde::Deserialize)]
+struct WholeFileArgs {
+    path: PathBuf,
+    text: String,
+}
+
+async fn run_edit_replace(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
+    let args: ReplaceArgs =
+        serde_json::from_value(args.clone()).context("parse edit_replace args")?;
+    apply_edit(
+        ctx,
+        LlmEdit::Replace {
+            path: resolve_path(ctx.cwd, &args.path),
+            anchor: args.anchor,
+            end_anchor: args.end_anchor,
+            text: args.text,
+        },
+    )
+    .await
+}
+
+async fn run_edit_insert_after(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
+    let args: InsertArgs =
+        serde_json::from_value(args.clone()).context("parse edit_insert_after args")?;
+    apply_edit(
+        ctx,
+        LlmEdit::InsertAfter {
+            path: resolve_path(ctx.cwd, &args.path),
+            anchor: args.anchor,
+            text: args.text,
+        },
+    )
+    .await
+}
+
+async fn run_edit_insert_before(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
+    let args: InsertArgs =
+        serde_json::from_value(args.clone()).context("parse edit_insert_before args")?;
+    apply_edit(
+        ctx,
+        LlmEdit::InsertBefore {
+            path: resolve_path(ctx.cwd, &args.path),
+            anchor: args.anchor,
+            text: args.text,
+        },
+    )
+    .await
+}
+
+async fn run_edit_new(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
+    let args: WholeFileArgs =
+        serde_json::from_value(args.clone()).context("parse edit_new args")?;
+    apply_edit(
+        ctx,
+        LlmEdit::New {
+            path: resolve_path(ctx.cwd, &args.path),
+            text: args.text,
+        },
+    )
+    .await
+}
+
+async fn run_edit_overwrite(args: &Value, ctx: &ToolContext<'_>) -> Result<String> {
+    let args: WholeFileArgs =
+        serde_json::from_value(args.clone()).context("parse edit_overwrite args")?;
+    apply_edit(
+        ctx,
+        LlmEdit::Overwrite {
+            path: resolve_path(ctx.cwd, &args.path),
+            text: args.text,
+        },
+    )
+    .await
+}
+
+async fn apply_edit(ctx: &ToolContext<'_>, edit: LlmEdit) -> Result<String> {
     let mut session = ctx.edit_session.lock().await;
-    let outcome = session.edit(input, write_draft).await;
-
-    match outcome {
+    match session.edit(edit, write_draft).await {
         Ok(diff) => Ok(diff),
         Err(error) => {
             // Surface validator errors via their bespoke Display so the model
@@ -424,7 +530,6 @@ pub fn tool_result_payload(tool_use_id: &str, content: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::edit_session::EditFileEntry;
     use frances_edit::EditEngine;
     use tempfile::TempDir;
 
@@ -479,32 +584,15 @@ mod tests {
         }
     }
 
+    /// Generic dispatcher used by the per-tool helpers below. Constructs an
+    /// `LlmEdit` directly (anchored args were resolved by the caller) and
+    /// runs the same `EditSession::edit` path as the production handlers.
     async fn dispatch_edit<S: frances_edit::AnchorStore + Send + Sync>(
         session: &Mutex<EditSession<S>>,
-        cwd: Option<&Path>,
-        args: Value,
+        edit: LlmEdit,
     ) -> ToolOutcome {
-        let raw = match JsonRepair::<EditInput>::from_value(args) {
-            Ok(i) => i.into_inner(),
-            Err(e) => {
-                return ToolOutcome {
-                    content: format!("{e:#}"),
-                    is_error: true,
-                };
-            }
-        };
-        let input = EditInput {
-            files: raw
-                .files
-                .into_iter()
-                .map(|f| EditFileEntry {
-                    path: resolve_path(cwd, &f.path),
-                    edits: f.edits,
-                })
-                .collect(),
-        };
         let mut sess = session.lock().await;
-        match sess.edit(input, write_draft).await {
+        match sess.edit(edit, write_draft).await {
             Ok(diff) => ToolOutcome {
                 content: diff,
                 is_error: false,
@@ -571,18 +659,12 @@ mod tests {
 
         let outcome = dispatch_edit(
             &session,
-            None,
-            json!({
-                "files": [{
-                    "path": path.to_str().unwrap(),
-                    "edits": [{
-                        "edit_type": "replace",
-                        "anchor": line_b,
-                        "end_anchor": line_b,
-                        "text": "B2"
-                    }]
-                }]
-            }),
+            LlmEdit::Replace {
+                path: path.clone(),
+                anchor: line_b.clone(),
+                end_anchor: line_b,
+                text: "B2".into(),
+            },
         )
         .await;
         assert!(!outcome.is_error, "unexpected error: {}", outcome.content);
@@ -602,55 +684,15 @@ mod tests {
 
         let outcome = dispatch_edit(
             &session,
-            None,
-            json!({
-                "files": [{
-                    "path": path.to_str().unwrap(),
-                    "edits": [{
-                        "edit_type": "insert_after",
-                        "anchor": "Wizard§a",
-                        "text": "X"
-                    }]
-                }]
-            }),
+            LlmEdit::InsertAfter {
+                path: path.clone(),
+                anchor: "Wizard§a".into(),
+                text: "X".into(),
+            },
         )
         .await;
         assert!(outcome.is_error);
         assert!(outcome.content.contains("not found"));
-    }
-
-    /// Exercises the qwen3-coder family quirk: the model emits `files` (and
-    /// each entry's `edits`) as a JSON-encoded string instead of an inline
-    /// array. `JsonRepair` in `run_edit` should unwrap both layers and the
-    /// edit should apply normally.
-    #[tokio::test]
-    async fn edit_with_stringified_files_and_edits_succeeds() {
-        let (session, dir) = fresh_ctx();
-        let path = dir.path().join("file.txt");
-        fs::write(&path, "a\nb\nc\n").unwrap();
-
-        let read = dispatch_read_file(&session, None, json!({ "path": path.to_str().unwrap() }))
-            .await
-            .content;
-        let line_b = anchor_line(&read, 1);
-
-        let edits_str = serde_json::to_string(&json!([{
-            "edit_type": "replace",
-            "anchor": line_b,
-            "end_anchor": line_b,
-            "text": "B2"
-        }]))
-        .unwrap();
-        let files_str = serde_json::to_string(&json!([{
-            "path": path.to_str().unwrap(),
-            "edits": edits_str
-        }]))
-        .unwrap();
-
-        let outcome = dispatch_edit(&session, None, json!({ "files": files_str })).await;
-        assert!(!outcome.is_error, "unexpected error: {}", outcome.content);
-
-        assert_eq!(fs::read_to_string(&path).unwrap(), "a\nB2\nc\n");
     }
 
     #[tokio::test]
@@ -669,18 +711,12 @@ mod tests {
 
         let outcome = dispatch_edit(
             &session,
-            None,
-            json!({
-                "files": [{
-                    "path": path.to_str().unwrap(),
-                    "edits": [{
-                        "edit_type": "replace",
-                        "anchor": wrong,
-                        "end_anchor": wrong,
-                        "text": "x"
-                    }]
-                }]
-            }),
+            LlmEdit::Replace {
+                path: path.clone(),
+                anchor: wrong.clone(),
+                end_anchor: wrong,
+                text: "x".into(),
+            },
         )
         .await;
         assert!(outcome.is_error);
