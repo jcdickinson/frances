@@ -23,7 +23,7 @@ use crate::daemon::protocol::{
     PromptId, SessionId, StreamFrame,
 };
 use crate::edit_session::EditSession;
-use crate::history::{Block, HistoryStore, Role};
+use crate::history::HistoryStore;
 use crate::llm::provider_cache::ProviderCache;
 use crate::llm::{
     ChatClient, ModelConfig, SessionConfigProvider, SessionConfigWriter, StreamEvent,
@@ -514,6 +514,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         state.provider_cache.clone(),
         state.config.clone(),
         state.default_model.clone(),
+        state.history.clone(),
     )?;
 
     let mut next_block: u64 = 1;
@@ -525,12 +526,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 
     let mut send_error: Option<anyhow::Error> = None;
 
-    let user_block = Block::Text { text: text.clone() };
-    let user_payload = serde_json::json!({ "role": "user", "content": text });
-    state
-        .history
-        .append(Role::User, vec![user_block], user_payload)
-        .await?;
+    llm.submit_user(&text).await?;
 
     let user_id = alloc_block();
     for frame in [
@@ -587,9 +583,6 @@ async fn run_llm_step(
     send_error: &mut Option<anyhow::Error>,
     cwd: Option<&std::path::Path>,
 ) -> Result<bool> {
-    let assistant_message_id = state.history.start_assistant().await?;
-    let payloads = state.history.openai_payloads().await?;
-
     let assistant_id = alloc_block();
     let mut wire_active: Option<BlockId> = Some(assistant_id);
     try_write(
@@ -608,25 +601,16 @@ async fn run_llm_step(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
     let llm_task = tokio::spawn(async move {
         llm_owned
-            .stream(
-                &["chat"],
-                &payloads,
-                &tool_defs,
-                None,
-                move |event: StreamEvent| {
-                    let _ = tx.send(event);
-                    Ok(())
-                },
-            )
+            .run(&["chat"], &tool_defs, None, move |event: StreamEvent| {
+                let _ = tx.send(event);
+                Ok(())
+            })
             .await
     });
-
-    let mut accumulated_text = String::new();
 
     while let Some(event) = rx.recv().await {
         match event {
             StreamEvent::TextDelta(delta) => {
-                accumulated_text.push_str(&delta);
                 if wire_active == Some(assistant_id) {
                     try_write(
                         stream,
@@ -669,6 +653,10 @@ async fn run_llm_step(
             StreamEvent::Usage(usage) => {
                 try_write(stream, &StreamFrame::Usage(usage), send_error).await;
             }
+            StreamEvent::History(_) => {
+                // ChatClient::run consumes History events internally; this
+                // arm exists only to keep the match exhaustive.
+            }
         }
     }
 
@@ -679,25 +667,6 @@ async fn run_llm_step(
     let stream_result = llm_task.await.context("llm task panicked")?;
     let outcome = stream_result?;
     let tool_calls = outcome.tool_calls;
-
-    let mut assistant_blocks: Vec<Block> = Vec::new();
-    if !accumulated_text.is_empty() {
-        assistant_blocks.push(Block::Text {
-            text: accumulated_text.clone(),
-        });
-    }
-    for call in &tool_calls {
-        assistant_blocks.push(Block::ToolUse {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            input: call.arguments.clone(),
-        });
-    }
-    let assistant_payload = tools::assistant_payload(&accumulated_text, &tool_calls);
-    state
-        .history
-        .finish_assistant(assistant_message_id, assistant_blocks, assistant_payload)
-        .await?;
 
     if tool_calls.is_empty() {
         return Ok(false);
@@ -756,15 +725,7 @@ async fn run_llm_step(
         )
         .await;
 
-        let result_block = Block::ToolResult {
-            tool_use_id: call.id.clone(),
-            content: outcome.content.clone(),
-            is_error: outcome.is_error,
-        };
-        let result_payload = tools::tool_result_payload(&call.id, &outcome.content);
-        state
-            .history
-            .append(Role::Tool, vec![result_block], result_payload)
+        llm.submit_tool_result(&call.id, &outcome.content, outcome.is_error)
             .await?;
     }
 

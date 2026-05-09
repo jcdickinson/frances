@@ -8,6 +8,6 @@ pub use config::{
     AuthCommand, AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras, WireApi,
 };
 pub use provider::{
-    ChunkAbort, CompletionOutcome, ErasedError, ErasedProvider, ErasedResult, Provider,
-    ProviderRequest, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolFunction, Usage,
+    ChunkAbort, CompletionOutcome, ErasedError, ErasedProvider, ErasedResult, HistoryInput,
+    Provider, ProviderRequest, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolFunction, Usage,
 };

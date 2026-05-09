@@ -28,7 +28,6 @@ use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use frances_shell::Shell;
-use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::anchor_store::AnchorStoreImpl;
@@ -201,46 +200,6 @@ impl Default for ToolRegistry {
     }
 }
 
-pub fn assistant_payload(text: &str, tool_calls: &[ToolCall]) -> Value {
-    let content = if text.is_empty() {
-        Value::Null
-    } else {
-        Value::String(text.to_string())
-    };
-    let mut payload = json!({
-        "role": "assistant",
-        "content": content,
-    });
-    if !tool_calls.is_empty() {
-        let calls: Vec<Value> = tool_calls
-            .iter()
-            .map(|c| {
-                json!({
-                    "id": c.id,
-                    "type": "function",
-                    "function": {
-                        "name": c.name,
-                        "arguments": serde_json::to_string(&c.arguments).unwrap_or_default(),
-                    }
-                })
-            })
-            .collect();
-        payload
-            .as_object_mut()
-            .expect("payload is object")
-            .insert("tool_calls".to_string(), Value::Array(calls));
-    }
-    payload
-}
-
-pub fn tool_result_payload(tool_use_id: &str, content: &str) -> Value {
-    json!({
-        "role": "tool",
-        "tool_call_id": tool_use_id,
-        "content": content,
-    })
-}
-
 fn resolve_path(cwd: Option<&Path>, path: &Path) -> PathBuf {
     if path.is_absolute() {
         path.to_path_buf()
@@ -275,43 +234,6 @@ fn mtime_ns_from(meta: &fs::Metadata) -> Result<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::ToolCall;
-
-    #[test]
-    fn assistant_payload_with_tool_calls() {
-        let calls = vec![ToolCall {
-            id: "call_1".to_string(),
-            name: "read_file".to_string(),
-            arguments: json!({ "path": "x.rs" }),
-        }];
-        let payload = assistant_payload("hello", &calls);
-        assert_eq!(payload["role"], "assistant");
-        assert_eq!(payload["content"], "hello");
-        let tcs = payload["tool_calls"].as_array().unwrap();
-        assert_eq!(tcs.len(), 1);
-        assert_eq!(tcs[0]["id"], "call_1");
-        assert_eq!(tcs[0]["type"], "function");
-        assert_eq!(tcs[0]["function"]["name"], "read_file");
-        let args_str = tcs[0]["function"]["arguments"].as_str().unwrap();
-        let parsed: Value = serde_json::from_str(args_str).unwrap();
-        assert_eq!(parsed, json!({ "path": "x.rs" }));
-    }
-
-    #[test]
-    fn assistant_payload_empty_text_yields_null_content() {
-        let payload = assistant_payload("", &[]);
-        assert_eq!(payload["role"], "assistant");
-        assert!(payload["content"].is_null());
-        assert!(payload.get("tool_calls").is_none());
-    }
-
-    #[test]
-    fn tool_result_payload_uses_openai_field_name() {
-        let payload = tool_result_payload("call_1", "anchored content");
-        assert_eq!(payload["role"], "tool");
-        assert_eq!(payload["tool_call_id"], "call_1");
-        assert_eq!(payload["content"], "anchored content");
-    }
 
     #[test]
     fn split_lines_strips_trailing_newline_only() {

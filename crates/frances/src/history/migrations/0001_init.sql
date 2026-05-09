@@ -1,32 +1,22 @@
-CREATE TABLE IF NOT EXISTS messages (
+CREATE TABLE IF NOT EXISTS rows (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     seq INTEGER NOT NULL UNIQUE,
-    role TEXT NOT NULL
+    -- 'user' | 'assistant' | 'tool_call' | 'tool_result' | 'history'
+    type TEXT NOT NULL,
+    -- Set on non-history rows only; carries the primitive content typed by `type`.
+    primitive JSONB,
+    -- Set on history rows only; the wire JSON the provider emitted.
+    history JSONB,
+    -- Set on history rows only.
+    kind TEXT,
+    provider_id TEXT,
+    CHECK (
+        (type = 'history' AND history IS NOT NULL AND primitive IS NULL
+                          AND kind IS NOT NULL AND provider_id IS NOT NULL)
+        OR
+        (type != 'history' AND primitive IS NOT NULL AND history IS NULL
+                           AND kind IS NULL AND provider_id IS NULL)
+    )
 );
 
-CREATE TABLE IF NOT EXISTS blocks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL,
-    seq INTEGER NOT NULL,
-    payload JSONB NOT NULL,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_blocks_message_seq ON blocks(message_id, seq);
-
-CREATE TABLE IF NOT EXISTS openai_messages (
-    message_id INTEGER PRIMARY KEY,
-    payload JSONB NOT NULL,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS openai_response_chunks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    message_id INTEGER NOT NULL,
-    seq INTEGER NOT NULL,
-    chunk JSONB NOT NULL,
-    FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_openai_response_chunks_message_seq
-    ON openai_response_chunks(message_id, seq);
+CREATE INDEX IF NOT EXISTS idx_rows_history ON rows(seq) WHERE history IS NOT NULL;

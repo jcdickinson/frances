@@ -100,7 +100,7 @@ async fn try_classify(llm: &ChatClient, cmd: &str) -> Result<ShellClassification
     // burn tokens — at that point the model is unlikely to comply.
     for attempt in 0..2 {
         let outcome = llm
-            .complete(&["shell_classify"], &messages, &tools, None)
+            .complete(&["shell_classify"], &messages, &[], &tools, None)
             .await
             .context("shell classifier llm call")?;
 

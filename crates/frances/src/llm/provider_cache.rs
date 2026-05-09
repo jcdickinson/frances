@@ -208,7 +208,7 @@ mod tests {
     use frances_config::{
         ConfigEvent, ConfigProvider, EventSender, Path, ProviderError, Value as CValue,
     };
-    use frances_llm::{CompletionOutcome, ProviderRequest, StreamEvent};
+    use frances_llm::{CompletionOutcome, HistoryInput, ProviderRequest, StreamEvent};
     use serde::Deserialize;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -233,11 +233,19 @@ mod tests {
         type BuildError = ErasedError;
         type Error = ErasedError;
 
+        fn kind(&self) -> &'static str {
+            "tiny-test"
+        }
+
         fn new(
             config: ProviderConfig,
             extras: Self::Extras,
         ) -> std::result::Result<Arc<Self>, ErasedError> {
             Ok(Arc::new(Tiny { config, extras }))
+        }
+
+        fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<serde_json::Value> {
+            inputs.iter().map(|_| serde_json::Value::Null).collect()
         }
 
         async fn stream(

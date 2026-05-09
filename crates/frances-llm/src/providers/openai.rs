@@ -14,7 +14,8 @@ use url::Url;
 
 use crate::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
 use crate::provider::{
-    self, CompletionOutcome, ErasedError, ProviderRequest, StreamEvent, ToolCall, Usage,
+    self, CompletionOutcome, ErasedError, HistoryInput, ProviderRequest, StreamEvent, ToolCall,
+    Usage,
 };
 
 /// OpenAI-style chat-completions provider.
@@ -98,6 +99,10 @@ impl provider::Provider for Provider {
     type BuildError = Error;
     type Error = Error;
 
+    fn kind(&self) -> &'static str {
+        "openai-chat-completions"
+    }
+
     fn new(
         provider_config: ProviderConfig,
         extras: ResponsesModelExtras,
@@ -112,6 +117,45 @@ impl provider::Provider for Provider {
         }))
     }
 
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+        inputs
+            .iter()
+            .map(|input| match input {
+                HistoryInput::User { text } => {
+                    serde_json::json!({ "role": "user", "content": text })
+                }
+                HistoryInput::Assistant { text } => {
+                    serde_json::json!({ "role": "assistant", "content": text })
+                }
+                HistoryInput::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => serde_json::json!({
+                    "role": "assistant",
+                    "content": Value::Null,
+                    "tool_calls": [{
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": serde_json::to_string(arguments).unwrap_or_default(),
+                        }
+                    }]
+                }),
+                HistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    is_error: _,
+                } => serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": content,
+                }),
+            })
+            .collect()
+    }
+
     async fn stream(
         &self,
         req: ProviderRequest<'_>,
@@ -120,9 +164,20 @@ impl provider::Provider for Provider {
         let _ = req.session_id; // OpenAI auto-caches; we don't need to thread the id today.
         let plan = self.build_request_plan(req.model, req.env)?;
 
+        // Forge new_inputs upfront, emit one History event per output, then
+        // assemble the request body's messages array as `req.history` ++
+        // forged_new_inputs.
+        let forged_new = self.forge_history(req.new_inputs);
+        for payload in &forged_new {
+            on_event(StreamEvent::History(payload.clone()))?;
+        }
+        let mut messages: Vec<Value> = Vec::with_capacity(req.history.len() + forged_new.len());
+        messages.extend(req.history.iter().cloned());
+        messages.extend(forged_new);
+
         let mut body = serde_json::json!({
             "model": plan.model.id,
-            "messages": req.messages,
+            "messages": messages,
             "max_tokens": plan.model.max_tokens,
             "stream": true,
             "stream_options": { "include_usage": true },
@@ -136,7 +191,7 @@ impl provider::Provider for Provider {
         merge_extras(&mut body, plan.extra_completion_properties.as_deref())?;
 
         debug!(
-            messages = req.messages.len(),
+            messages = messages.len(),
             tools = req.tools.len(),
             url = %plan.url,
             model = %plan.model.id,
@@ -208,11 +263,48 @@ impl provider::Provider for Provider {
         }
 
         let tool_calls = accumulator.finalize()?;
+        // Emit one consolidated assistant History event covering the text
+        // and any tool_calls. (For OpenAI's wire, all of these belong to
+        // a single assistant message.)
+        let assistant_payload = build_assistant_payload(&text, &tool_calls);
+        on_event(StreamEvent::History(assistant_payload))?;
         for call in &tool_calls {
             on_event(StreamEvent::ToolCall(call.clone()))?;
         }
         Ok(CompletionOutcome { text, tool_calls })
     }
+}
+
+fn build_assistant_payload(text: &str, tool_calls: &[ToolCall]) -> Value {
+    let content = if text.is_empty() {
+        Value::Null
+    } else {
+        Value::String(text.to_string())
+    };
+    let mut payload = serde_json::json!({
+        "role": "assistant",
+        "content": content,
+    });
+    if !tool_calls.is_empty() {
+        let calls: Vec<Value> = tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "id": c.id,
+                    "type": "function",
+                    "function": {
+                        "name": c.name,
+                        "arguments": serde_json::to_string(&c.arguments).unwrap_or_default(),
+                    }
+                })
+            })
+            .collect();
+        payload
+            .as_object_mut()
+            .expect("payload is object")
+            .insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    payload
 }
 
 impl Provider {
@@ -470,14 +562,13 @@ impl ToolCallAccumulator {
         self.in_progress
             .into_values()
             .map(|b| {
-                let arguments: Value =
-                    serde_json::from_str(&b.arguments).map_err(|source| {
-                        ToolCallError::ParseArguments {
-                            id: b.id.clone(),
-                            name: b.name.clone(),
-                            source,
-                        }
-                    })?;
+                let arguments: Value = serde_json::from_str(&b.arguments).map_err(|source| {
+                    ToolCallError::ParseArguments {
+                        id: b.id.clone(),
+                        name: b.name.clone(),
+                        source,
+                    }
+                })?;
                 Ok(ToolCall {
                     id: b.id,
                     name: b.name,

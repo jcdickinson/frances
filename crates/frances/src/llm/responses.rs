@@ -6,9 +6,11 @@ use anyhow::{Context, Result, anyhow};
 use frances_config::{ConfigBinding, ConfigHandle, RequiredConfigBinding};
 use serde_json::Value;
 
+use crate::history::{HistoryStore, OwnedHistoryInput};
 use crate::llm::provider_cache::ProviderCache;
 use frances_llm::{
-    CompletionOutcome, ErasedError, ModelConfig, ProviderRequest, StreamEvent, ToolChoice, ToolDef,
+    CompletionOutcome, ErasedError, HistoryInput, ModelConfig, ProviderRequest, StreamEvent,
+    ToolChoice, ToolDef,
 };
 
 /// Convert an internal `anyhow::Error` to an [`ErasedError`] for the
@@ -24,15 +26,14 @@ fn log_and_generic(provider_id: &str, e: ErasedError) -> anyhow::Error {
     anyhow!("provider {} encountered an error", provider_id)
 }
 
-/// Chat-completions client. Vendor-neutral despite the name "Responses"
-/// in `wire_api`: today the wire is OpenAI-style chat completions; if a
-/// new wire is introduced it will live in a sibling module.
+/// Chat-completions client. Owns the conversation's persistence: callers
+/// `submit_user` / `submit_tool_result` to enqueue inputs, then `run` to
+/// drive the LLM. History rows and primitive rows land in [`HistoryStore`]
+/// automatically.
 ///
-/// Model selection is name-driven: callers pass a fallback list of names
-/// (e.g. `&["chat"]`) and the client looks each one up under
-/// `models::<name>`. Bindings are cached on first use so repeat lookups
-/// are lock-free reads. The fallback always terminates in `default_model`,
-/// which is bound as required at startup.
+/// `complete` exists for one-shot, non-persisted calls (e.g. the shell
+/// classifier) — it threads `history` and `new_inputs` through to the
+/// provider verbatim and writes nothing.
 #[derive(Clone)]
 pub struct ChatClient {
     env: HashMap<OsString, OsString>,
@@ -40,7 +41,11 @@ pub struct ChatClient {
     cache: Arc<ProviderCache>,
     config: ConfigHandle,
     default_model: RequiredConfigBinding<ModelConfig>,
+    history: HistoryStore,
     model_cache: Arc<Mutex<HashMap<String, ConfigBinding<ModelConfig>>>>,
+    /// Inputs accepted via `submit_user` / `submit_tool_result` since the
+    /// last `run`. Drained by `run` and handed to the provider.
+    pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
 }
 
 impl ChatClient {
@@ -50,6 +55,7 @@ impl ChatClient {
         cache: Arc<ProviderCache>,
         config: ConfigHandle,
         default_model: RequiredConfigBinding<ModelConfig>,
+        history: HistoryStore,
     ) -> Result<Self> {
         Ok(Self {
             env,
@@ -57,14 +63,52 @@ impl ChatClient {
             cache,
             config,
             default_model,
+            history,
             model_cache: Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(Vec::new())),
         })
     }
 
-    pub async fn stream<F>(
+    /// Persist a user-typed message and queue it for the next `run`.
+    pub async fn submit_user(&self, text: &str) -> Result<()> {
+        self.history.append_primitive_user(text).await?;
+        self.pending
+            .lock()
+            .expect("chat pending poisoned")
+            .push(OwnedHistoryInput::User {
+                text: text.to_owned(),
+            });
+        Ok(())
+    }
+
+    /// Persist a tool result and queue it for the next `run`.
+    pub async fn submit_tool_result(
+        &self,
+        call_id: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Result<()> {
+        self.history
+            .append_primitive_tool_result(call_id, content, is_error)
+            .await?;
+        self.pending
+            .lock()
+            .expect("chat pending poisoned")
+            .push(OwnedHistoryInput::ToolResult {
+                call_id: call_id.to_owned(),
+                content: content.to_owned(),
+                is_error,
+            });
+        Ok(())
+    }
+
+    /// Drive the LLM with the queued inputs + persisted history. Streams
+    /// events to `on_event`; the daemon handles `TextDelta` / `ToolCall` /
+    /// `Usage`. `StreamEvent::History` events are captured internally and
+    /// persisted; they are *not* forwarded to `on_event`.
+    pub async fn run<F>(
         &self,
         names: &[&str],
-        messages: &[Value],
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
         mut on_event: F,
@@ -80,29 +124,64 @@ impl ChatClient {
                 provider_id
             )
         })?;
+        let provider_kind = provider.kind();
+
+        let pending: Vec<OwnedHistoryInput> =
+            std::mem::take(&mut *self.pending.lock().expect("chat pending poisoned"));
+        let new_inputs: Vec<HistoryInput<'_>> =
+            pending.iter().map(OwnedHistoryInput::as_borrowed).collect();
+        let history = self.history.loaded_history().await?;
+
         let req = ProviderRequest {
             session_id: &self.session_id,
             model: &model,
-            messages,
+            history: &history,
+            new_inputs: &new_inputs,
             tools,
             tool_choice,
             env: &self.env,
         };
-        let mut wrapped = |ev: StreamEvent| on_event(ev).map_err(into_erased);
-        provider
+
+        let mut emitted_payloads: Vec<Value> = Vec::new();
+        let mut wrapped = |ev: StreamEvent| match ev {
+            StreamEvent::History(payload) => {
+                emitted_payloads.push(payload);
+                Ok(())
+            }
+            other => on_event(other).map_err(into_erased),
+        };
+
+        let completion = provider
             .stream(req, &mut wrapped)
             .await
-            .map_err(|e| log_and_generic(&provider_id, e))
+            .map_err(|e| log_and_generic(&provider_id, e))?;
+
+        self.history
+            .append_history(provider_kind, &provider_id, &emitted_payloads)
+            .await?;
+
+        if !completion.text.is_empty() {
+            self.history
+                .append_primitive_assistant(&completion.text)
+                .await?;
+        }
+        for call in &completion.tool_calls {
+            self.history
+                .append_primitive_tool_call(&call.id, &call.name, &call.arguments)
+                .await?;
+        }
+
+        Ok(completion)
     }
 
-    /// One-shot wrapper around [`stream`](Self::stream): drives the SSE
-    /// stream to completion and returns the full assistant text plus any
-    /// finalized tool calls. Use this when the caller doesn't need to
-    /// surface mid-stream deltas (e.g. the shell classifier).
+    /// One-shot, non-persisted call. Caller supplies the full `history` +
+    /// `new_inputs`; nothing is read from or written to [`HistoryStore`].
+    /// Used by the shell classifier.
     pub async fn complete(
         &self,
         names: &[&str],
-        messages: &[Value],
+        history: &[Value],
+        new_inputs: &[HistoryInput<'_>],
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<CompletionOutcome> {
@@ -117,7 +196,8 @@ impl ChatClient {
         let req = ProviderRequest {
             session_id: &self.session_id,
             model: &model,
-            messages,
+            history,
+            new_inputs,
             tools,
             tool_choice,
             env: &self.env,
@@ -129,11 +209,7 @@ impl ChatClient {
     }
 
     /// Walks `names` in order, returning the first one whose `models::<name>`
-    /// binding currently has a value. Falls through to `default_model`, which
-    /// is a required (sticky-on-absence) binding and therefore always
-    /// resolves. Bindings are looked up via [`Self::binding_for`] so the
-    /// arc-swap snapshot is always consulted live and config updates are
-    /// picked up without restart.
+    /// binding currently has a value. Falls through to `default_model`.
     fn resolve_model(&self, names: &[&str]) -> Result<ModelConfig> {
         for name in names {
             let binding = self.binding_for(name)?;
@@ -144,12 +220,6 @@ impl ChatClient {
         Ok((*self.default_model.get()).clone())
     }
 
-    /// Returns the cached binding for `models::<name>`, creating one on first
-    /// use. The cache stores the binding object, not its current value —
-    /// `ConfigBinding::get()` is re-evaluated on every call so live config
-    /// edits propagate. Names that are never present in config still get a
-    /// binding kept around, which is fine: the set of distinct names asked
-    /// for is bounded by the call sites in the binary.
     fn binding_for(&self, name: &str) -> Result<ConfigBinding<ModelConfig>> {
         let mut cache = self.model_cache.lock().expect("model_cache poisoned");
         if let Some(b) = cache.get(name) {

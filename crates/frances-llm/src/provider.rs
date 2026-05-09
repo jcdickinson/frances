@@ -15,29 +15,66 @@ use crate::config::{ModelConfig, ProviderConfig};
 /// cache-scoping hint (e.g. Anthropic prompt-cache breakpoints, OpenAI's
 /// automatic cache key). Implementations that don't support token caching
 /// ignore it.
+///
+/// `history` is the already-forged wire JSON from prior turns (whatever the
+/// provider previously emitted as `StreamEvent::History`, in order).
+/// `new_inputs` is the delta since last call — primitives the provider
+/// should forge inline (emitting one `StreamEvent::History` per output) and
+/// include in the request body.
 pub struct ProviderRequest<'a> {
     pub session_id: &'a str,
     pub model: &'a ModelConfig,
-    pub messages: &'a [Value],
+    pub history: &'a [Value],
+    pub new_inputs: &'a [HistoryInput<'a>],
     pub tools: &'a [ToolDef],
     pub tool_choice: Option<&'a ToolChoice>,
     pub env: &'a HashMap<OsString, OsString>,
 }
 
+/// Primitive content the provider may need to forge into wire shape — both
+/// inline during `stream` (for the just-arrived turn delta) and in batch
+/// during a swap-time `forge_history` call (rebuilding the cache from
+/// every primitive row in the conversation).
+#[derive(Debug, Clone)]
+pub enum HistoryInput<'a> {
+    User {
+        text: &'a str,
+    },
+    Assistant {
+        text: &'a str,
+    },
+    ToolCall {
+        id: &'a str,
+        name: &'a str,
+        arguments: &'a Value,
+    },
+    ToolResult {
+        call_id: &'a str,
+        content: &'a str,
+        is_error: bool,
+    },
+}
+
 /// Streaming events emitted by [`Provider::stream`].
 ///
-/// Tool calls are emitted once each as a fully-parsed [`ToolCall`].
+/// `History` events carry the wire-shape JSON the provider would put back
+/// into the next request. The provider emits one (or more) per
+/// `req.new_inputs` entry it forges, plus one (or more) for the assistant
+/// turn it just produced. The daemon caches them verbatim.
+///
+/// `ToolCall` events are emitted once each as a fully-parsed [`ToolCall`].
 /// OpenAI-shaped wires can't reliably mark per-call completion mid-stream,
 /// so the implementation fires these at end-of-stream just before the
-/// stream returns; future wires that signal per-call completion can emit
-/// them as they finish. The same calls are also returned in
-/// [`CompletionOutcome::tool_calls`] for callers who'd rather batch.
+/// stream returns. The same calls are also returned in
+/// [`CompletionOutcome::tool_calls`].
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     /// A fragment of assistant text. Concatenate to obtain the running text.
     TextDelta(String),
     /// A completed tool call.
     ToolCall(ToolCall),
+    /// A wire-shape JSON to be persisted for use as future history.
+    History(Value),
     /// Final-frame token accounting. May be emitted once at the end of the
     /// stream; not all wires populate it.
     Usage(Usage),
@@ -49,12 +86,24 @@ pub trait Provider: Send + Sync {
     type BuildError: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
     type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
 
+    /// Stable identifier for this provider's wire shape. Tagged onto every
+    /// persisted history row so we know what wire it was forged for.
+    /// Conventionally each impl returns a `'static` literal.
+    fn kind(&self) -> &'static str;
+
     fn new(
         provider_config: ProviderConfig,
         extras: Self::Extras,
     ) -> Result<Arc<Self>, Self::BuildError>
     where
         Self: Sized;
+
+    /// Batch wire-encoder. Used **only** at swap time, when the daemon
+    /// rebuilds the entire history cache from primitive rows under a new
+    /// provider's tag. The output `Vec` may be a different length than
+    /// `inputs` — a provider can map one primitive to several wire
+    /// messages or coalesce many into one. Order is preserved.
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value>;
 
     /// Drive a single chat call. Typed [`StreamEvent`]s are delivered to
     /// `on_event` synchronously as they're parsed; the call's full result
@@ -67,10 +116,7 @@ pub trait Provider: Send + Sync {
 
     /// Convenience: same as [`stream`](Self::stream) with a no-op event
     /// handler. Override only if you can be cheaper than the default.
-    async fn complete(
-        &self,
-        req: ProviderRequest<'_>,
-    ) -> Result<CompletionOutcome, Self::Error> {
+    async fn complete(&self, req: ProviderRequest<'_>) -> Result<CompletionOutcome, Self::Error> {
         self.stream(req, &mut |_| Ok(())).await
     }
 }
@@ -89,6 +135,10 @@ pub struct ErasedProvider {
 }
 
 trait ErasedInner: Send + Sync {
+    fn kind(&self) -> &'static str;
+
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value>;
+
     fn stream<'a>(
         &'a self,
         req: ProviderRequest<'a>,
@@ -106,6 +156,14 @@ where
     P: Provider + 'static,
     P::Error: Into<ErasedError> + From<ErasedError>,
 {
+    fn kind(&self) -> &'static str {
+        Provider::kind(self)
+    }
+
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+        Provider::forge_history(self, inputs)
+    }
+
     fn stream<'a>(
         &'a self,
         req: ProviderRequest<'a>,
@@ -155,6 +213,14 @@ impl ErasedProvider {
         P::Error: Into<ErasedError> + From<ErasedError>,
     {
         Self { inner: provider }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.inner.kind()
+    }
+
+    pub fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+        self.inner.forge_history(inputs)
     }
 
     pub async fn stream(

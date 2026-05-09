@@ -1,13 +1,14 @@
 use anyhow::{Context, Result, anyhow};
+use frances_llm::{HistoryInput, Provider};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tracing::trace;
 use uuid::Uuid;
 
 use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
-/// Owns the LLM transcript tables: messages, blocks, openai_messages,
-/// openai_response_chunks. UUID is permanent — never edit.
+/// Owns the conversation history. UUID is permanent — never edit.
 pub static SCHEMA: EntitySchema = EntitySchema {
     entity: Uuid::from_u128(0x7ffee42d_48de_4090_8fc6_a25e66f33a02),
     migrations: &[Migration {
@@ -18,9 +19,9 @@ pub static SCHEMA: EntitySchema = EntitySchema {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MessageId(pub i64);
+pub struct RowId(pub i64);
 
-impl std::fmt::Display for MessageId {
+impl std::fmt::Display for RowId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.0.fmt(f)
     }
@@ -28,77 +29,74 @@ impl std::fmt::Display for MessageId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct MessageSeq(pub i64);
+pub struct RowSeq(pub i64);
 
-impl std::fmt::Display for MessageSeq {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
+/// A primitive row read back from storage; mirrors [`HistoryInput`] but
+/// owns its strings so it can outlive the SQL row buffer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OwnedHistoryInput {
+    User {
+        text: String,
+    },
+    Assistant {
+        text: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        call_id: String,
+        content: String,
+        is_error: bool,
+    },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Role {
-    System,
-    User,
-    Assistant,
-    Tool,
-}
-
-impl Role {
-    pub fn as_str(self) -> &'static str {
+impl OwnedHistoryInput {
+    pub fn as_borrowed(&self) -> HistoryInput<'_> {
         match self {
-            Self::System => "system",
-            Self::User => "user",
-            Self::Assistant => "assistant",
-            Self::Tool => "tool",
-        }
-    }
-
-    fn parse(value: &str) -> Result<Self> {
-        match value {
-            "system" => Ok(Self::System),
-            "user" => Ok(Self::User),
-            "assistant" => Ok(Self::Assistant),
-            "tool" => Ok(Self::Tool),
-            _ => Err(anyhow!("unknown role {value:?}")),
+            Self::User { text } => HistoryInput::User { text },
+            Self::Assistant { text } => HistoryInput::Assistant { text },
+            Self::ToolCall {
+                id,
+                name,
+                arguments,
+            } => HistoryInput::ToolCall {
+                id,
+                name,
+                arguments,
+            },
+            Self::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => HistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error: *is_error,
+            },
         }
     }
 }
 
-/// Discriminated union of block payloads. The variant *is* the schema —
-/// you can't construct a `Text` block with image data, or a `ToolUse` with
-/// no name. Persisted as a single JSONB column (`blocks.payload`).
+/// Translation target for the (currently unwired) TUI replay path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Block {
     Text {
         text: String,
     },
-    Thinking {
-        text: String,
-    },
-    Image {
-        description: String,
-        data: serde_json::Value,
-    },
     ToolUse {
         id: String,
         name: String,
-        input: serde_json::Value,
+        input: Value,
     },
     ToolResult {
         tool_use_id: String,
         content: String,
         is_error: bool,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Message {
-    pub id: MessageId,
-    pub seq: MessageSeq,
-    pub role: Role,
-    pub blocks: Vec<Block>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,230 +109,246 @@ impl HistoryStore {
         Self { db }
     }
 
-    pub async fn append(
-        &self,
-        role: Role,
-        blocks: Vec<Block>,
-        openai_payload: serde_json::Value,
-    ) -> Result<Message> {
-        trace!(
-            role = role.as_str(),
-            blocks = blocks.len(),
-            "appending history message"
-        );
-
-        let conn = self.db.connect();
-        let seq = next_seq(&conn).await?;
-
-        conn.execute(
-            "INSERT INTO messages (seq, role) VALUES (?1, ?2)",
-            (seq.0, role.as_str()),
-        )
-        .await
-        .context("insert message")?;
-
-        let message_id = last_insert_rowid(&conn).await?;
-
-        for (index, block) in blocks.iter().enumerate() {
-            let payload = serde_json::to_string(block).context("encode block")?;
-            conn.execute(
-                "INSERT INTO blocks (message_id, seq, payload) VALUES (?1, ?2, jsonb(?3))",
-                (
-                    message_id.0,
-                    i64::try_from(index).context("block index overflow")?,
-                    payload,
-                ),
-            )
-            .await
-            .with_context(|| format!("insert block {index}"))?;
-        }
-
-        let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
-        conn.execute(
-            "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
-            (message_id.0, payload_text),
-        )
-        .await
-        .context("insert openai payload")?;
-
-        Ok(Message {
-            id: message_id,
-            seq,
-            role,
-            blocks,
-        })
+    pub async fn append_primitive_user(&self, text: &str) -> Result<RowId> {
+        let primitive = serde_json::json!({ "text": text });
+        self.append_primitive("user", &primitive).await
     }
 
-    pub async fn start_assistant(&self) -> Result<MessageId> {
-        trace!("starting empty assistant message");
-
-        let conn = self.db.connect();
-        let seq = next_seq(&conn).await?;
-
-        conn.execute(
-            "INSERT INTO messages (seq, role) VALUES (?1, ?2)",
-            (seq.0, Role::Assistant.as_str()),
-        )
-        .await
-        .context("insert assistant placeholder")?;
-
-        last_insert_rowid(&conn).await
+    pub async fn append_primitive_assistant(&self, text: &str) -> Result<RowId> {
+        let primitive = serde_json::json!({ "text": text });
+        self.append_primitive("assistant", &primitive).await
     }
 
-    pub async fn finish_assistant(
+    pub async fn append_primitive_tool_call(
         &self,
-        message_id: MessageId,
-        blocks: Vec<Block>,
-        openai_payload: serde_json::Value,
+        id: &str,
+        name: &str,
+        arguments: &Value,
+    ) -> Result<RowId> {
+        let primitive = serde_json::json!({
+            "id": id,
+            "name": name,
+            "arguments": arguments,
+        });
+        self.append_primitive("tool_call", &primitive).await
+    }
+
+    pub async fn append_primitive_tool_result(
+        &self,
+        call_id: &str,
+        content: &str,
+        is_error: bool,
+    ) -> Result<RowId> {
+        let primitive = serde_json::json!({
+            "call_id": call_id,
+            "content": content,
+            "is_error": is_error,
+        });
+        self.append_primitive("tool_result", &primitive).await
+    }
+
+    /// Bulk-insert wire-tagged history rows. Each `payload` becomes one row
+    /// with the supplied `(kind, provider_id)` tag; rows take consecutive
+    /// auto-incremented seq values.
+    pub async fn append_history(
+        &self,
+        kind: &str,
+        provider_id: &str,
+        payloads: &[Value],
     ) -> Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
         trace!(
-            %message_id,
-            blocks = blocks.len(),
-            "finishing assistant message"
+            kind = kind,
+            provider_id = provider_id,
+            count = payloads.len(),
+            "appending history rows"
         );
 
         let conn = self.db.connect();
-
-        for (index, block) in blocks.iter().enumerate() {
-            let payload = serde_json::to_string(block).context("encode block")?;
+        for payload in payloads {
+            let seq = next_seq(&conn).await?;
+            let payload_text = serde_json::to_string(payload).context("encode history payload")?;
             conn.execute(
-                "INSERT INTO blocks (message_id, seq, payload) VALUES (?1, ?2, jsonb(?3))",
-                (
-                    message_id.0,
-                    i64::try_from(index).context("block index overflow")?,
-                    payload,
-                ),
+                "INSERT INTO rows (seq, type, history, kind, provider_id) \
+                 VALUES (?1, 'history', jsonb(?2), ?3, ?4)",
+                (seq.0, payload_text, kind, provider_id),
             )
             .await
-            .with_context(|| format!("insert block {index}"))?;
+            .context("insert history row")?;
         }
-
-        let payload_text = serde_json::to_string(&openai_payload).context("encode payload")?;
-        conn.execute(
-            "INSERT INTO openai_messages (message_id, payload) VALUES (?1, jsonb(?2))",
-            (message_id.0, payload_text),
-        )
-        .await
-        .context("insert openai payload")?;
 
         Ok(())
     }
 
-    pub async fn openai_payloads(&self) -> Result<Vec<serde_json::Value>> {
-        trace!("loading openai payloads");
+    /// Wire JSON to send to the LLM, in seq order.
+    pub async fn loaded_history(&self) -> Result<Vec<Value>> {
+        trace!("loading history payloads");
 
         let conn = self.db.connect();
         let mut rows = conn
             .query(
-                "
-                SELECT json(om.payload)
-                FROM messages m
-                JOIN openai_messages om ON om.message_id = m.id
-                ORDER BY m.seq
-                ",
+                "SELECT json(history) FROM rows WHERE history IS NOT NULL ORDER BY seq",
                 (),
             )
             .await
-            .context("query openai payloads")?;
+            .context("query history payloads")?;
 
         let mut payloads = Vec::new();
-        while let Some(row) = rows.next().await.context("iterate openai payloads")? {
-            let text = match row.get_value(0).context("payload column")? {
+        while let Some(row) = rows.next().await.context("iterate history payloads")? {
+            let text = match row.get_value(0).context("history column")? {
                 turso::Value::Text(value) => value,
-                other => return Err(anyhow!("unexpected payload value: {other:?}")),
+                other => return Err(anyhow!("unexpected history value: {other:?}")),
             };
-            let value: serde_json::Value = serde_json::from_str(&text).context("decode payload")?;
+            let value: Value = serde_json::from_str(&text).context("decode history payload")?;
             payloads.push(value);
         }
 
         Ok(payloads)
     }
 
-
+    /// Translate non-history rows into `Block`s for the TUI replay path.
+    /// Currently unused; resume flow is future work.
     #[expect(
         dead_code,
         reason = "history-replay API; not yet wired into session resume"
     )]
-    pub async fn messages(&self) -> Result<Vec<Message>> {
-        trace!("loading history messages");
+    pub async fn replay_for_tui(&self) -> Result<Vec<Block>> {
+        let primitives = self.load_primitives().await?;
+        Ok(primitives
+            .into_iter()
+            .map(|p| match p {
+                OwnedHistoryInput::User { text } | OwnedHistoryInput::Assistant { text } => {
+                    Block::Text { text }
+                }
+                OwnedHistoryInput::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => Block::ToolUse {
+                    id,
+                    name,
+                    input: arguments,
+                },
+                OwnedHistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => Block::ToolResult {
+                    tool_use_id: call_id,
+                    content,
+                    is_error,
+                },
+            })
+            .collect())
+    }
 
+    /// Drop the wire-tagged history rows and re-forge from primitives under
+    /// the supplied provider's wire shape. Currently unused — swap detection
+    /// is future work.
+    #[expect(
+        dead_code,
+        reason = "swap-time re-forge; provider-change detection is future work"
+    )]
+    pub async fn purge_and_reforge<P: Provider + 'static>(
+        &self,
+        provider: &P,
+        provider_id: &str,
+    ) -> Result<()> {
+        let conn = self.db.connect();
+        conn.execute("DELETE FROM rows WHERE type = 'history'", ())
+            .await
+            .context("clear history rows")?;
+
+        let primitives = self.load_primitives().await?;
+        let inputs: Vec<HistoryInput<'_>> = primitives
+            .iter()
+            .map(OwnedHistoryInput::as_borrowed)
+            .collect();
+        let payloads = provider.forge_history(&inputs);
+        self.append_history(provider.kind(), provider_id, &payloads)
+            .await
+    }
+
+    async fn append_primitive(&self, ty: &str, primitive: &Value) -> Result<RowId> {
+        let conn = self.db.connect();
+        let seq = next_seq(&conn).await?;
+        let payload_text = serde_json::to_string(primitive).context("encode primitive")?;
+        conn.execute(
+            "INSERT INTO rows (seq, type, primitive) VALUES (?1, ?2, jsonb(?3))",
+            (seq.0, ty, payload_text),
+        )
+        .await
+        .with_context(|| format!("insert {ty} primitive"))?;
+        last_insert_rowid(&conn).await
+    }
+
+    async fn load_primitives(&self) -> Result<Vec<OwnedHistoryInput>> {
         let conn = self.db.connect();
         let mut rows = conn
             .query(
-                "
-                SELECT m.id, m.seq, m.role, json(b.payload)
-                FROM messages m
-                LEFT JOIN blocks b ON b.message_id = m.id
-                ORDER BY m.seq, b.seq
-                ",
+                "SELECT type, json(primitive) FROM rows \
+                 WHERE primitive IS NOT NULL ORDER BY seq",
                 (),
             )
             .await
-            .context("query messages")?;
+            .context("query primitive rows")?;
 
-        let mut messages: Vec<Message> = Vec::new();
-
-        while let Some(row) = rows.next().await.context("iterate messages")? {
-            let message_id = MessageId(row.get::<i64>(0).context("message id")?);
-            let message_seq = MessageSeq(row.get::<i64>(1).context("message seq")?);
-            let message_role = Role::parse(&row.get::<String>(2).context("message role")?)?;
-
-            let needs_new = messages
-                .last()
-                .map(|message| message.id != message_id)
-                .unwrap_or(true);
-
-            if needs_new {
-                messages.push(Message {
-                    id: message_id,
-                    seq: message_seq,
-                    role: message_role,
-                    blocks: Vec::new(),
-                });
-            }
-
-            let Some(message) = messages.last_mut() else {
-                continue;
-            };
-
-            let payload_value = row.get_value(3).context("block payload")?;
-            if let turso::Value::Null = payload_value {
-                continue;
-            }
-
-            let payload_text = match payload_value {
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.context("iterate primitive rows")? {
+            let ty = row.get::<String>(0).context("primitive type")?;
+            let payload_text = match row.get_value(1).context("primitive payload")? {
                 turso::Value::Text(value) => value,
-                other => return Err(anyhow!("unexpected block payload value: {other:?}")),
+                other => return Err(anyhow!("unexpected primitive value: {other:?}")),
             };
-            let block: Block =
-                serde_json::from_str(&payload_text).context("decode block payload")?;
-            message.blocks.push(block);
+            let payload: Value =
+                serde_json::from_str(&payload_text).context("decode primitive payload")?;
+
+            let owned = match ty.as_str() {
+                "user" => OwnedHistoryInput::User {
+                    text: take_string(&payload, "text")?,
+                },
+                "assistant" => OwnedHistoryInput::Assistant {
+                    text: take_string(&payload, "text")?,
+                },
+                "tool_call" => OwnedHistoryInput::ToolCall {
+                    id: take_string(&payload, "id")?,
+                    name: take_string(&payload, "name")?,
+                    arguments: payload
+                        .get("arguments")
+                        .cloned()
+                        .ok_or_else(|| anyhow!("tool_call primitive missing 'arguments'"))?,
+                },
+                "tool_result" => OwnedHistoryInput::ToolResult {
+                    call_id: take_string(&payload, "call_id")?,
+                    content: take_string(&payload, "content")?,
+                    is_error: payload
+                        .get("is_error")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                },
+                other => return Err(anyhow!("unexpected primitive type {other:?}")),
+            };
+            out.push(owned);
         }
 
-        Ok(messages)
-    }
-
-    #[expect(
-        dead_code,
-        reason = "history-replay API; not yet wired into session resume"
-    )]
-    pub async fn clear(&self) -> Result<()> {
-        trace!("clearing history tables");
-
-        let conn = self.db.connect();
-        conn.execute("DELETE FROM blocks", ())
-            .await
-            .context("clear blocks")?;
-        conn.execute("DELETE FROM messages", ())
-            .await
-            .context("clear messages")?;
-        Ok(())
+        Ok(out)
     }
 }
 
-async fn next_seq(conn: &turso::Connection) -> Result<MessageSeq> {
+fn take_string(value: &Value, key: &str) -> Result<String> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("primitive missing string field {key:?}"))
+}
+
+async fn next_seq(conn: &turso::Connection) -> Result<RowSeq> {
     let mut rows = conn
-        .query("SELECT COALESCE(MAX(seq), -1) + 1 FROM messages", ())
+        .query("SELECT COALESCE(MAX(seq), -1) + 1 FROM rows", ())
         .await
         .context("query next seq")?;
     let row = rows
@@ -342,10 +356,10 @@ async fn next_seq(conn: &turso::Connection) -> Result<MessageSeq> {
         .await
         .context("read next seq row")?
         .ok_or_else(|| anyhow!("next seq query returned no rows"))?;
-    Ok(MessageSeq(row.get::<i64>(0).context("decode next seq")?))
+    Ok(RowSeq(row.get::<i64>(0).context("decode next seq")?))
 }
 
-async fn last_insert_rowid(conn: &turso::Connection) -> Result<MessageId> {
+async fn last_insert_rowid(conn: &turso::Connection) -> Result<RowId> {
     let mut rows = conn
         .query("SELECT last_insert_rowid()", ())
         .await
@@ -355,7 +369,7 @@ async fn last_insert_rowid(conn: &turso::Connection) -> Result<MessageId> {
         .await
         .context("read last_insert_rowid row")?
         .ok_or_else(|| anyhow!("last_insert_rowid query returned no rows"))?;
-    Ok(MessageId(
+    Ok(RowId(
         row.get::<i64>(0).context("decode last_insert_rowid")?,
     ))
 }
