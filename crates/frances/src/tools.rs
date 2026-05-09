@@ -99,13 +99,13 @@ pub fn definitions() -> &'static [ToolDef] {
                                             "properties": {
                                                 "edit_type": {
                                                     "type": "string",
-                                                    "enum": ["replace", "insert_after", "insert_before"]
+                                                    "enum": ["replace", "insert_after", "insert_before", "new", "overwrite"]
                                                 },
                                                 "anchor": { "type": "string" },
                                                 "end_anchor": { "type": "string" },
                                                 "text": { "type": "string" }
                                             },
-                                            "required": ["edit_type", "anchor", "text"]
+                                            "required": ["edit_type", "text"]
                                         }
                                     }
                                 },

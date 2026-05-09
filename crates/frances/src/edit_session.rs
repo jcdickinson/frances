@@ -29,6 +29,10 @@ pub struct EditFileEntry {
 /// `read_file` produced for that line. The validator splits on the first
 /// `§` to recover the anchor word and validates the content (trimmed) against
 /// the cached file.
+///
+/// `New` and `Overwrite` are whole-file operations: they replace the file's
+/// content with `text` outright. They must be the only edit in their file's
+/// `edits` array.
 #[derive(Deserialize, Debug)]
 #[serde(tag = "edit_type", rename_all = "snake_case")]
 pub enum LlmEdit {
@@ -45,6 +49,18 @@ pub enum LlmEdit {
         anchor: String,
         text: String,
     },
+    New {
+        text: String,
+    },
+    Overwrite {
+        text: String,
+    },
+}
+
+impl LlmEdit {
+    fn is_file_level(&self) -> bool {
+        matches!(self, LlmEdit::New { .. } | LlmEdit::Overwrite { .. })
+    }
 }
 
 #[derive(Error, Debug)]
@@ -82,6 +98,18 @@ pub enum EditError {
         b_start: u32,
         b_end: u32,
     },
+    #[error(
+        "'new' and 'overwrite' must be the only edit for {path}; split unrelated edits into separate calls"
+    )]
+    FileLevelEditNotAlone { path: PathBuf },
+    #[error(
+        "{path} appears more than once in this call but uses 'new' or 'overwrite'; that path must be unique"
+    )]
+    FileLevelPathDuplicated { path: PathBuf },
+    #[error(
+        "cannot create {path} with 'new' because the file already exists; use 'overwrite' instead"
+    )]
+    NewFileExists { path: PathBuf },
 }
 
 pub struct EditSession<S: AnchorStore> {
@@ -117,21 +145,38 @@ impl<S: AnchorStore> EditSession<S> {
         Ok(rendered)
     }
 
-    /// Tool: edit. For each file in `input`, validates each structured edit
-    /// against the cached state, builds internal `EditOp`s, replays them into
-    /// a draft, hands the draft to `on_draft` (which writes to disk, optionally
-    /// runs a formatter, and returns the post-format content + metadata), then
-    /// reconciles and commits. Returns the concatenated diff blocks (one per
-    /// file) as plain text.
+    /// Tool: edit. For each file in `input`, dispatches on the kind of edit:
+    /// file-level (`new`/`overwrite`) replace the whole file; line-level edits
+    /// are validated against the cached anchored state, replayed into a
+    /// draft, written via `on_draft`, then reconciled. Returns the
+    /// concatenated diff blocks (one per file) as plain text.
     ///
-    /// Each path in `input` must already be cached via `read_file`.
+    /// Line-level edits and `overwrite` require the path to be cached via
+    /// `read_file`. `new` requires the file not to exist on disk.
     pub async fn edit<F>(&mut self, input: EditInput, mut on_draft: F) -> Result<String>
     where
         F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
     {
+        ensure_file_level_paths_unique(&input.files)?;
+
         let mut blocks = Vec::new();
         for entry in input.files {
             let path = entry.path;
+
+            if entry.edits.iter().any(LlmEdit::is_file_level) {
+                if entry.edits.len() != 1 {
+                    return Err(EditError::FileLevelEditNotAlone { path }.into());
+                }
+                let block = match entry.edits.into_iter().next().expect("len == 1") {
+                    LlmEdit::New { text } => self.apply_new(&path, &text, &mut on_draft).await?,
+                    LlmEdit::Overwrite { text } => {
+                        self.apply_overwrite(&path, &text, &mut on_draft).await?
+                    }
+                    _ => unreachable!("guarded by is_file_level"),
+                };
+                blocks.push(format!("--- {} ---\n{}", path.display(), block));
+                continue;
+            }
 
             let working = self
                 .open_files
@@ -179,10 +224,139 @@ impl<S: AnchorStore> EditSession<S> {
         Ok(blocks.join("\n"))
     }
 
+    /// Create a brand-new file. Fails if the file already exists on disk —
+    /// the model must use `overwrite` for that case (which itself requires a
+    /// fresh `read_file` so the model has actually seen the prior content).
+    /// Mints fresh anchors for every line and renders a diff against an
+    /// empty pre-state (all `+` lines).
+    async fn apply_new<F>(&mut self, path: &Path, text: &str, on_draft: &mut F) -> Result<String>
+    where
+        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+    {
+        if path.exists() {
+            return Err(EditError::NewFileExists {
+                path: path.to_path_buf(),
+            }
+            .into());
+        }
+        let draft = split_text_to_lines(text);
+        let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
+        let working = self
+            .engine
+            .open(path.to_path_buf(), post_lines, mtime_ns, size)
+            .await?;
+        let empty_pre = empty_state(path);
+        let block = render_diff_block(
+            &empty_pre,
+            &[],
+            &working.state,
+            &working.lines,
+            DIFF_CONTEXT,
+        );
+        self.open_files.insert(path.to_path_buf(), working);
+        Ok(block)
+    }
+
+    /// Overwrite an existing, already-read file. Up-to-date read enforced via
+    /// the cache: every cached entry was populated by `read_file` in the
+    /// current session. Tombstones every prior anchor and mints fresh ones
+    /// via the normal reconcile path.
+    async fn apply_overwrite<F>(
+        &mut self,
+        path: &Path,
+        text: &str,
+        on_draft: &mut F,
+    ) -> Result<String>
+    where
+        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+    {
+        let working = self
+            .open_files
+            .get(path)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is not cached; call read_file before 'overwrite'",
+                    path.display()
+                )
+            })?
+            .clone();
+        let draft = split_text_to_lines(text);
+        let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
+        let used = self.engine.store().used_anchors(path).await?;
+        let mut pool = Pool::from_used(used);
+        let hints = EditHints {
+            deleted_anchors: working
+                .state
+                .lines
+                .iter()
+                .map(|le| le.anchor.clone())
+                .collect(),
+        };
+        let outcome = reconcile(&working.state, &post_lines, &mut pool, Some(&hints));
+        self.engine
+            .commit(path, &outcome.state, mtime_ns, size, &outcome.tombstoned)
+            .await?;
+        let block = render_diff_block(
+            &working.state,
+            &working.lines,
+            &outcome.state,
+            &post_lines,
+            DIFF_CONTEXT,
+        );
+        self.open_files.insert(
+            path.to_path_buf(),
+            WorkingFile {
+                path: path.to_path_buf(),
+                state: outcome.state,
+                lines: post_lines,
+            },
+        );
+        Ok(block)
+    }
+
     /// End-of-turn cleanup. Caller invokes when assistant message's tool
     /// calls are fully processed.
     pub async fn end_turn(&mut self) -> Result<()> {
         self.engine.end_turn().await
+    }
+}
+
+/// Split a model-supplied `text` payload into a draft line array. Mirrors
+/// `apply_ops`: callers split on `\n` exactly so the on-disk line count
+/// matches what the model wrote.
+fn split_text_to_lines(text: &str) -> Vec<String> {
+    text.split('\n').map(str::to_owned).collect()
+}
+
+/// A `new`/`overwrite` is a destructive whole-file op; allowing the same path
+/// to appear elsewhere in the same call would let line-level edits run
+/// against stale anchors (or after the file has been freshly minted) with no
+/// useful semantics. Reject any path that uses a file-level edit and also
+/// appears in another entry.
+fn ensure_file_level_paths_unique(files: &[EditFileEntry]) -> Result<(), EditError> {
+    let mut counts: HashMap<&Path, usize> = HashMap::with_capacity(files.len());
+    for entry in files {
+        *counts.entry(entry.path.as_path()).or_insert(0) += 1;
+    }
+    for entry in files {
+        if entry.edits.iter().any(LlmEdit::is_file_level) && counts[entry.path.as_path()] > 1 {
+            return Err(EditError::FileLevelPathDuplicated {
+                path: entry.path.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Empty pre-state for diffing newly-created files. Only `lines` is read by
+/// `render_diff_block`; the meta fields are placeholders.
+fn empty_state(path: &Path) -> FileAnchorState {
+    FileAnchorState {
+        path: path.to_path_buf(),
+        mtime_ns: 0,
+        size: 0,
+        content_digest: 0,
+        lines: Vec::new(),
     }
 }
 
@@ -321,6 +495,9 @@ fn build_op(
                 AffectedRange::InsertAt(idx),
                 Vec::new(),
             ))
+        }
+        LlmEdit::New { .. } | LlmEdit::Overwrite { .. } => {
+            unreachable!("file-level edits are dispatched before validate_edits");
         }
     }
 }
@@ -709,6 +886,154 @@ mod tests {
         };
         session.edit(good, no_format).await.unwrap();
         assert_eq!(session.open_files[&path].lines, vec!["a", "B2", "c"]);
+    }
+
+    #[tokio::test]
+    async fn edit_new_creates_file_and_caches_anchors() {
+        let mut session = fresh_session();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brand_new.txt");
+
+        let input = EditInput {
+            files: vec![EditFileEntry {
+                path: path.clone(),
+                edits: vec![LlmEdit::New {
+                    text: "alpha\nbeta".into(),
+                }],
+            }],
+        };
+        let block = session.edit(input, no_format).await.unwrap();
+
+        assert!(block.contains("§alpha"));
+        assert!(block.contains("§beta"));
+        // Diff vs empty pre-state ⇒ both lines emitted as `+`.
+        assert_eq!(block.matches("\n+").count(), 2);
+
+        let cached = session.open_files.get(&path).expect("cached after new");
+        assert_eq!(cached.lines, vec!["alpha", "beta"]);
+    }
+
+    #[tokio::test]
+    async fn edit_new_on_existing_file_errors() {
+        let mut session = fresh_session();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("exists.txt");
+        std::fs::write(&path, "preexisting\n").unwrap();
+
+        let input = EditInput {
+            files: vec![EditFileEntry {
+                path: path.clone(),
+                edits: vec![LlmEdit::New { text: "x".into() }],
+            }],
+        };
+        let err = session.edit(input, no_format).await.unwrap_err();
+        let downcast = err.downcast_ref::<EditError>().unwrap();
+        assert!(matches!(downcast, EditError::NewFileExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_overwrite_replaces_content_and_tombstones_old() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb\nc"), 100, 5)
+            .await
+            .unwrap();
+        let old_anchors: Vec<_> = session.open_files[&path]
+            .state
+            .lines
+            .iter()
+            .map(|le| le.anchor.clone())
+            .collect();
+
+        let input = EditInput {
+            files: vec![EditFileEntry {
+                path: path.clone(),
+                edits: vec![LlmEdit::Overwrite {
+                    text: "x\ny\nz".into(),
+                }],
+            }],
+        };
+        session.edit(input, no_format).await.unwrap();
+
+        assert_eq!(session.open_files[&path].lines, vec!["x", "y", "z"]);
+
+        let used = session.engine.store().used_anchors(&path).await.unwrap();
+        for old in &old_anchors {
+            assert!(used.contains(old), "old anchor not tombstoned: {old}");
+        }
+    }
+
+    #[tokio::test]
+    async fn edit_overwrite_without_read_errors() {
+        let mut session = fresh_session();
+        let input = EditInput {
+            files: vec![EditFileEntry {
+                path: "/never-read".into(),
+                edits: vec![LlmEdit::Overwrite { text: "x".into() }],
+            }],
+        };
+        let err = session.edit(input, no_format).await.unwrap_err();
+        assert!(err.to_string().contains("not cached"));
+    }
+
+    #[tokio::test]
+    async fn edit_file_level_duplicate_path_rejected() {
+        let mut session = fresh_session();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+
+        let input = EditInput {
+            files: vec![
+                EditFileEntry {
+                    path: path.clone(),
+                    edits: vec![LlmEdit::New {
+                        text: "first".into(),
+                    }],
+                },
+                EditFileEntry {
+                    path: path.clone(),
+                    edits: vec![LlmEdit::Overwrite {
+                        text: "second".into(),
+                    }],
+                },
+            ],
+        };
+        let err = session.edit(input, no_format).await.unwrap_err();
+        let downcast = err.downcast_ref::<EditError>().unwrap();
+        assert!(matches!(
+            downcast,
+            EditError::FileLevelPathDuplicated { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn edit_file_level_mixed_with_line_edits_rejected() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        let input = EditInput {
+            files: vec![EditFileEntry {
+                path: path.clone(),
+                edits: vec![
+                    LlmEdit::Overwrite {
+                        text: "fresh".into(),
+                    },
+                    LlmEdit::InsertAfter {
+                        anchor: target,
+                        text: "X".into(),
+                    },
+                ],
+            }],
+        };
+        let err = session.edit(input, no_format).await.unwrap_err();
+        let downcast = err.downcast_ref::<EditError>().unwrap();
+        assert!(matches!(downcast, EditError::FileLevelEditNotAlone { .. }));
     }
 
     #[tokio::test]
