@@ -1,4 +1,5 @@
 mod anchor_store;
+mod chat;
 mod context;
 mod daemon;
 mod edit_session;

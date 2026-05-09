@@ -20,12 +20,16 @@
 //! description, again because surfacing to the user is the safe
 //! default.
 
+use std::collections::HashMap;
+use std::ffi::OsString;
+
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::llm::{ChatClient, ToolCall, ToolDef, ToolFunction};
+use crate::chat::{ChatSessionManager, CompleteRequest};
+use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -75,8 +79,17 @@ const FALLBACK_DESCRIPTION: &str =
 /// Classifies `cmd` and returns a verdict. Never fails: any internal
 /// error collapses into a `ShellKind::Unsafe` result with the error
 /// surfaced via `description` (and logged at `warn!`).
-pub async fn classify_shell(llm: &ChatClient, cmd: &str) -> ShellClassification {
-    match try_classify(llm, cmd).await {
+///
+/// `session_id` is threaded into the underlying provider request for
+/// token caching — pass the parent chat session's id so classifier
+/// calls share its caching scope.
+pub async fn classify_shell(
+    chat: &ChatSessionManager,
+    session_id: &str,
+    env: &HashMap<OsString, OsString>,
+    cmd: &str,
+) -> ShellClassification {
+    match try_classify(chat, session_id, env, cmd).await {
         Ok(classification) => classification,
         Err(error) => {
             warn!(%error, "shell classifier errored — defaulting to unsafe");
@@ -88,7 +101,12 @@ pub async fn classify_shell(llm: &ChatClient, cmd: &str) -> ShellClassification 
     }
 }
 
-async fn try_classify(llm: &ChatClient, cmd: &str) -> Result<ShellClassification> {
+async fn try_classify(
+    chat: &ChatSessionManager,
+    session_id: &str,
+    env: &HashMap<OsString, OsString>,
+    cmd: &str,
+) -> Result<ShellClassification> {
     let tools = tool_defs();
     let mut messages = vec![
         json!({"role": "system", "content": SYSTEM_PROMPT}),
@@ -99,8 +117,16 @@ async fn try_classify(llm: &ChatClient, cmd: &str) -> Result<ShellClassification
     // the model finished without a tool call. Three or more would just
     // burn tokens — at that point the model is unlikely to comply.
     for attempt in 0..2 {
-        let outcome = llm
-            .complete(&["shell_classify"], &messages, &[], &tools, None)
+        let outcome = chat
+            .complete(CompleteRequest {
+                intents: &["shell_classify"],
+                session_id,
+                env,
+                history: &messages,
+                new_inputs: &[],
+                tools: &tools,
+                tool_choice: None,
+            })
             .await
             .context("shell classifier llm call")?;
 

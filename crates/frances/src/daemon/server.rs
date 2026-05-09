@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -16,6 +17,7 @@ use tokio::sync::{Notify, oneshot};
 use tracing::{debug, info, trace, warn};
 
 use crate::anchor_store::AnchorStoreImpl;
+use crate::chat::{ChatSession, ChatSessionBuilder, ChatSessionManager};
 use crate::context::InvocationContext;
 use crate::daemon::client::{read_message, remove_socket_if_present, write_message};
 use crate::daemon::protocol::{
@@ -25,17 +27,13 @@ use crate::daemon::protocol::{
 use crate::edit_session::EditSession;
 use crate::history::HistoryStore;
 use crate::llm::provider_cache::ProviderCache;
-use crate::llm::{
-    ChatClient, ModelConfig, SessionConfigProvider, SessionConfigWriter, StreamEvent,
-};
+use crate::llm::{ModelConfig, SessionConfigProvider, SessionConfigWriter, StreamEvent};
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
 use crate::store::Database;
 use crate::tools::{self, ToolRegistry};
 use crate::workflows::{self, WorkflowConfig};
-use frances_config::{
-    ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, RequiredConfigBinding, TomlProvider,
-};
+use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
 use frances_shell::Shell;
 
@@ -47,18 +45,21 @@ pub(crate) struct ServerState {
     client_attached: StdMutex<bool>,
     last_context: StdMutex<Option<InvocationContext>>,
     daemon_pid: u32,
-    history: HistoryStore,
     edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
     shell: tokio::sync::Mutex<Option<Shell>>,
     tool_registry: ToolRegistry,
     events: EventsRouter,
     shutdown: Notify,
     /// Kept alive so the config-event-processor task stays running for the
-    /// daemon's lifetime. Also handed to `ChatClient` so it can lazily bind
-    /// `models::<name>` on demand when callers request a named model.
+    /// daemon's lifetime. The chat manager and provider cache hold their
+    /// own bindings, but parking the handle here makes the lifetime
+    /// guarantee explicit.
+    #[expect(dead_code, reason = "lifetime anchor for the config event processor")]
     config: ConfigHandle,
-    provider_cache: Arc<ProviderCache>,
-    default_model: RequiredConfigBinding<ModelConfig>,
+    chat: Arc<ChatSessionManager>,
+    /// The session driving the TUI's hardcoded turn workflow. There's
+    /// only one for now; loaded (or created) once at daemon startup.
+    primary_chat: Arc<ChatSession>,
     workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
@@ -255,20 +256,27 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         .bind::<HashMap<String, WorkflowConfig>>("workflows")
         .context("bind workflows")?;
 
+    let history = HistoryStore::new(db);
+    let chat = ChatSessionManager::new(provider_cache, config.clone(), default_model, history)
+        .context("build chat session manager")?;
+    let primary_chat = chat
+        .primary(ChatSessionBuilder::new().with_model_intents(["chat".to_string()]))
+        .await
+        .context("load or create primary chat session")?;
+
     let state = Arc::new(ServerState {
         session: session.clone(),
         client_attached: StdMutex::new(false),
         last_context: StdMutex::new(None),
         daemon_pid: std::process::id(),
-        history: HistoryStore::new(db),
         edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
         shell: tokio::sync::Mutex::new(None),
         tool_registry: ToolRegistry::builtin(),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         config,
-        provider_cache,
-        default_model,
+        chat,
+        primary_chat,
         workflows,
         session_config_writer,
     });
@@ -508,14 +516,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         (ctx.process.env.clone(), ctx.process.cwd.clone())
     };
 
-    let llm = ChatClient::new(
-        env,
-        state.session.id.clone(),
-        state.provider_cache.clone(),
-        state.config.clone(),
-        state.default_model.clone(),
-        state.history.clone(),
-    )?;
+    let chat = state.primary_chat.clone();
 
     let mut next_block: u64 = 1;
     let mut alloc_block = || {
@@ -526,7 +527,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 
     let mut send_error: Option<anyhow::Error> = None;
 
-    llm.submit_user(&text).await?;
+    chat.submit_user(&text).await?;
 
     let user_id = alloc_block();
     for frame in [
@@ -553,7 +554,8 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         let made_tool_calls = run_llm_step(
             state,
             stream,
-            &llm,
+            &chat,
+            &env,
             &mut alloc_block,
             &mut send_error,
             cwd.as_deref(),
@@ -578,7 +580,8 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 async fn run_llm_step(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    llm: &ChatClient,
+    chat: &Arc<ChatSession>,
+    env: &HashMap<OsString, OsString>,
     alloc_block: &mut impl FnMut() -> BlockId,
     send_error: &mut Option<anyhow::Error>,
     cwd: Option<&std::path::Path>,
@@ -597,14 +600,20 @@ async fn run_llm_step(
 
     let tool_defs = state.tool_registry.definitions().await?;
 
-    let llm_owned: ChatClient = (*llm).clone();
+    let chat_for_task = chat.clone();
+    let env_for_task = env.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
     let llm_task = tokio::spawn(async move {
-        llm_owned
-            .run(&["chat"], &tool_defs, None, move |event: StreamEvent| {
-                let _ = tx.send(event);
-                Ok(())
-            })
+        chat_for_task
+            .run(
+                &env_for_task,
+                &tool_defs,
+                None,
+                move |event: StreamEvent| {
+                    let _ = tx.send(event);
+                    Ok(())
+                },
+            )
             .await
     });
 
@@ -654,7 +663,7 @@ async fn run_llm_step(
                 try_write(stream, &StreamFrame::Usage(usage), send_error).await;
             }
             StreamEvent::History(_) => {
-                // ChatClient::run consumes History events internally; this
+                // ChatSession::run consumes History events internally; this
                 // arm exists only to keep the match exhaustive.
             }
         }
@@ -679,7 +688,8 @@ async fn run_llm_step(
                 .get("cmd")
                 .and_then(serde_json::Value::as_str)
         {
-            let classification = shell_classifier::classify_shell(llm, cmd).await;
+            let classification =
+                shell_classifier::classify_shell(&state.chat, chat.session_id(), env, cmd).await;
             let cls_id = alloc_block();
             emit_classification_block(stream, send_error, cls_id, &classification).await;
         }
@@ -725,7 +735,7 @@ async fn run_llm_step(
         )
         .await;
 
-        llm.submit_tool_result(&call.id, &outcome.content, outcome.is_error)
+        chat.submit_tool_result(&call.id, &outcome.content, outcome.is_error)
             .await?;
     }
 
