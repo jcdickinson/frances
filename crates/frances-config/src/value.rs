@@ -265,6 +265,16 @@ impl<const N: usize> From<[Value; N]> for Path {
     }
 }
 
+/// Convenience constructor for the common case of building a path from
+/// string literals or owned strings: `Path::from(["models", name])`. Each
+/// segment is parsed via [`parse_segment`] so numeric-looking strings
+/// become [`Value::Int`], matching [`Path::parse`].
+impl<S: AsRef<str>, const N: usize> From<[S; N]> for Path {
+    fn from(arr: [S; N]) -> Self {
+        Self(arr.iter().map(|s| parse_segment(s.as_ref())).collect())
+    }
+}
+
 impl fmt::Display for Path {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let mut first = true;
@@ -326,6 +336,30 @@ mod tests {
         assert_eq!(Value::String(Arc::from("7")).as_usize(), Some(7));
         assert_eq!(Value::Int(-1).as_usize(), None);
         assert_eq!(Value::String(Arc::from("nope")).as_usize(), None);
+    }
+
+    #[test]
+    fn path_from_str_array_parses_segments() {
+        let p: Path = ["models", "chat"].into();
+        assert_eq!(
+            p.segments(),
+            &[
+                Value::String(Arc::from("models")),
+                Value::String(Arc::from("chat")),
+            ]
+        );
+
+        // numeric-looking segments still become Int, like Path::parse
+        let p: Path = ["tags", "0"].into();
+        assert_eq!(
+            p.segments(),
+            &[Value::String(Arc::from("tags")), Value::Int(0)]
+        );
+
+        // works with owned strings too
+        let name = String::from("default");
+        let p: Path = ["models", name.as_str()].into();
+        assert_eq!(p.to_string(), "models::default");
     }
 
     #[test]

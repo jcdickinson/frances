@@ -36,6 +36,7 @@ use crate::edit_session::EditSession;
 use crate::llm::{ToolCall, ToolDef};
 
 pub use file::FileTools;
+pub use file::SCHEMA as FILE_SCHEMA;
 pub use shell::ShellTools;
 
 pub struct ToolContext<'a> {

@@ -25,15 +25,17 @@ use crate::daemon::protocol::{
 use crate::edit_session::EditSession;
 use crate::history::{Block, HistoryStore, Role};
 use crate::llm::{
-    self, ChatClient, ModelRole, ModelsConfig, ProviderConfig, ResponsesModelExtras,
-    SessionConfigProvider, SessionConfigWriter, ToolCallAccumulator,
+    self, ChatClient, ModelConfig, ProviderConfig, ResponsesModelExtras, SessionConfigProvider,
+    SessionConfigWriter, ToolCallAccumulator,
 };
 use crate::session::Session;
 use crate::shell_classifier::{self, ShellClassification};
 use crate::store::Database;
 use crate::tools::{self, ToolRegistry};
 use crate::workflows::{self, WorkflowConfig};
-use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
+use frances_config::{
+    ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, RequiredConfigBinding, TomlProvider,
+};
 use frances_edit::EditEngine;
 use frances_shell::Shell;
 
@@ -52,11 +54,11 @@ pub(crate) struct ServerState {
     events: EventsRouter,
     shutdown: Notify,
     /// Kept alive so the config-event-processor task stays running for the
-    /// daemon's lifetime. Bindings are refreshed via this handle's registry.
-    #[expect(dead_code, reason = "held for processor task lifetime")]
+    /// daemon's lifetime. Also handed to `ChatClient` so it can lazily bind
+    /// `models::<name>` on demand when callers request a named model.
     config: ConfigHandle,
     providers: ConfigBinding<HashMap<String, ProviderConfig>>,
-    models: ConfigBinding<ModelsConfig>,
+    default_model: RequiredConfigBinding<ModelConfig>,
     responses_extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
     workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     /// Writes session-config rows and emits the matching events on the
@@ -246,9 +248,11 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let providers = config
         .bind::<HashMap<String, ProviderConfig>>("model_providers")
         .context("bind model_providers")?;
-    let models = config
-        .bind::<ModelsConfig>("models")
-        .context("bind models")?;
+    let default_model = config
+        .bind::<ModelConfig>(["models", "default"])
+        .context("bind models::default")?
+        .required()
+        .context("models::default is required")?;
     let responses_extras = config
         .bind::<HashMap<String, ResponsesModelExtras>>("responses_models")
         .context("bind responses_models")?;
@@ -269,7 +273,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         shutdown: Notify::new(),
         config,
         providers,
-        models,
+        default_model,
         responses_extras,
         workflows,
         session_config_writer,
@@ -513,7 +517,8 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
     let llm = ChatClient::new(
         env,
         state.providers.clone(),
-        state.models.clone(),
+        state.config.clone(),
+        state.default_model.clone(),
         state.responses_extras.clone(),
     )?;
 
@@ -610,7 +615,7 @@ async fn run_llm_step(
     let llm_task = tokio::spawn(async move {
         llm_owned
             .stream(
-                ModelRole::Chat,
+                &["chat"],
                 &payloads,
                 &tool_defs,
                 None,

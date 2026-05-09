@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use tracing::trace;
 use turso::{Builder, Connection};
 
+use crate::migrations;
 use crate::session::Session;
 
 #[derive(Clone)]
@@ -42,73 +43,17 @@ impl Database {
             .context("build turso database")?;
         let conn = database.connect().context("connect turso database")?;
 
-        trace!(path = %path.display(), "initializing turso schema");
-        conn.execute_batch(
-            r#"
-            CREATE TABLE IF NOT EXISTS messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                seq INTEGER NOT NULL UNIQUE,
-                role TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS blocks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL,
-                seq INTEGER NOT NULL,
-                payload JSONB NOT NULL,
-                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_blocks_message_seq ON blocks(message_id, seq);
-
-            CREATE TABLE IF NOT EXISTS openai_messages (
-                message_id INTEGER PRIMARY KEY,
-                payload JSONB NOT NULL,
-                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS openai_response_chunks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                message_id INTEGER NOT NULL,
-                seq INTEGER NOT NULL,
-                chunk JSONB NOT NULL,
-                FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_openai_response_chunks_message_seq
-                ON openai_response_chunks(message_id, seq);
-
-            CREATE TABLE IF NOT EXISTS file_meta (
-                path           TEXT PRIMARY KEY,
-                mtime_ns       INTEGER NOT NULL,
-                size           INTEGER NOT NULL,
-                content_digest INTEGER NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS file_lines (
-                path    TEXT    NOT NULL,
-                line_no INTEGER NOT NULL,
-                hash    INTEGER NOT NULL,
-                anchor  BLOB    NOT NULL,
-                PRIMARY KEY(path, line_no)
-            );
-
-            CREATE TABLE IF NOT EXISTS file_tombstones (
-                path   TEXT NOT NULL,
-                anchor BLOB NOT NULL,
-                PRIMARY KEY(path, anchor)
-            );
-
-            CREATE TABLE IF NOT EXISTS session_config (
-                path_hash INTEGER PRIMARY KEY,
-                path      JSONB   NOT NULL,
-                kind      TEXT    NOT NULL,
-                value     TEXT    NOT NULL
-            );
-            "#,
+        trace!(path = %path.display(), "running schema migrations");
+        migrations::run_all(
+            &conn,
+            &[
+                &crate::tools::FILE_SCHEMA,
+                &crate::history::SCHEMA,
+                &crate::llm::session_provider::SCHEMA,
+            ],
         )
         .await
-        .context("initialize turso schema")?;
+        .context("run schema migrations")?;
 
         Ok(Self {
             conn,

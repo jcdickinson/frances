@@ -15,18 +15,41 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use tokio::net::UnixStream;
+use uuid::Uuid;
 
 use crate::daemon::client::write_message;
 use crate::daemon::protocol::StreamFrame;
 
 /// One row of the `workflows` config table.
+///
+/// Each workflow owns a chunk of the per-session DB schema via the
+/// migration system: `id` is its stable [`Uuid`] entity (see
+/// `crate::migrations`), and `migrations` lists the SQL files in apply
+/// order. Migration paths are resolved **relative to `file`'s parent
+/// directory** — co-locate `0001_init.sql` with the `.lua` and refer to
+/// it as `migrations = ["0001_init.sql"]`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct WorkflowConfig {
+    #[expect(
+        dead_code,
+        reason = "consumed by the future migration loader; scaffold only stores it"
+    )]
+    pub id: Uuid,
     #[expect(
         dead_code,
         reason = "consumed by the future Lua execution path; scaffold only stores it"
     )]
     pub file: PathBuf,
+    /// SQL migration files, resolved relative to [`Self::file`]'s
+    /// parent. Order is the apply order; once a workflow ships, treat
+    /// the prefix as immutable — the migration runner refuses to load
+    /// when a recorded migration's name or content drifts.
+    #[expect(
+        dead_code,
+        reason = "consumed by the future migration loader; scaffold only stores it"
+    )]
+    #[serde(default)]
+    pub migrations: Vec<PathBuf>,
 }
 
 /// Splits `/<name> [args...]` into the command name and its shell-split args.

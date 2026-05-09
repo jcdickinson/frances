@@ -9,9 +9,21 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use serde_json::{Value, json};
+use uuid::Uuid;
 
 use crate::edit_session::{EditError, LlmEdit};
 use crate::llm::{ToolCall, ToolDef, ToolFunction};
+use crate::migrations::{EntitySchema, Migration};
+
+/// Owns file_meta, file_lines, file_tombstones — the anchor edit
+/// state that backs the `file_*` tools. UUID is permanent.
+pub static SCHEMA: EntitySchema = EntitySchema {
+    entity: Uuid::from_u128(0x97acb11c_b9a1_4f71_af62_0368f2ca9913),
+    migrations: &[Migration {
+        name: "0001_init.sql",
+        sql: include_str!("file/migrations/0001_init.sql"),
+    }],
+};
 
 use super::{Tool, ToolContext, ToolOutcome, mtime_ns_from, resolve_path, split_lines};
 

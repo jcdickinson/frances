@@ -4,6 +4,7 @@ mod daemon;
 mod edit_session;
 mod history;
 mod llm;
+mod migrations;
 mod session;
 mod shell_classifier;
 mod store;

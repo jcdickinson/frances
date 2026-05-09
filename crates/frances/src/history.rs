@@ -1,8 +1,20 @@
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use tracing::trace;
+use uuid::Uuid;
 
+use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
+
+/// Owns the LLM transcript tables: messages, blocks, openai_messages,
+/// openai_response_chunks. UUID is permanent — never edit.
+pub static SCHEMA: EntitySchema = EntitySchema {
+    entity: Uuid::from_u128(0x7ffee42d_48de_4090_8fc6_a25e66f33a02),
+    migrations: &[Migration {
+        name: "0001_init.sql",
+        sql: include_str!("history/migrations/0001_init.sql"),
+    }],
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]

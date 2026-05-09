@@ -17,8 +17,19 @@ use frances_config::{ConfigEvent, ConfigProvider, EventSender, Path, ProviderErr
 use thiserror::Error;
 use tracing::{debug, warn};
 use twox_hash::XxHash3_64;
+use uuid::Uuid;
 
+use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
+
+/// Owns the `session_config` table. UUID is permanent.
+pub static SCHEMA: EntitySchema = EntitySchema {
+    entity: Uuid::from_u128(0x33578ba6_759b_42c5_8c7f_94932a153732),
+    migrations: &[Migration {
+        name: "0001_init.sql",
+        sql: include_str!("session_provider/migrations/0001_init.sql"),
+    }],
+};
 
 /// Reads `(path, kind, value)` rows from `session_config` on the
 /// per-session DB and emits them as [`ConfigEvent`]s. After `load()` has

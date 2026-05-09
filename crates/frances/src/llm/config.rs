@@ -100,16 +100,6 @@ pub struct AuthCommand {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct ModelsConfig {
-    pub chat: ModelConfig,
-    #[expect(dead_code, reason = "summarize role wired up in a later pass")]
-    #[serde(default)]
-    pub summarize: Option<ModelConfig>,
-    #[serde(default)]
-    pub shell_classify: Option<ModelConfig>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
 pub struct ModelConfig {
     pub model_provider: String,
     pub id: String,

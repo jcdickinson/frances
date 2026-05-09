@@ -25,7 +25,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::warn;
 
-use crate::llm::{ChatClient, ModelRole, ToolCall, ToolDef, ToolFunction};
+use crate::llm::{ChatClient, ToolCall, ToolDef, ToolFunction};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellKind {
@@ -100,7 +100,7 @@ async fn try_classify(llm: &ChatClient, cmd: &str) -> Result<ShellClassification
     // burn tokens — at that point the model is unlikely to comply.
     for attempt in 0..2 {
         let outcome = llm
-            .complete(ModelRole::ShellClassify, &messages, &tools, None)
+            .complete(&["shell_classify"], &messages, &tools, None)
             .await
             .context("shell classifier llm call")?;
 

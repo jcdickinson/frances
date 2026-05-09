@@ -1,28 +1,35 @@
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use frances_config::{ConfigBinding, EnvLookup};
+use frances_config::{ConfigBinding, ConfigHandle, EnvLookup, RequiredConfigBinding};
 use futures_util::StreamExt;
 use serde::Serialize;
 use serde_json::Value;
 use tracing::{debug, trace, warn};
 use url::Url;
 
-use crate::llm::config::{
-    AuthMethod, ModelConfig, ModelsConfig, ProviderConfig, ResponsesModelExtras,
-};
+use crate::llm::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
 
 /// Chat-completions client. Vendor-neutral despite the name "Responses"
 /// in `wire_api`: today the wire is OpenAI-style chat completions; if a
 /// new wire is introduced it will live in a sibling module.
+///
+/// Model selection is name-driven: callers pass a fallback list of names
+/// (e.g. `&["chat"]`) and the client looks each one up under
+/// `models::<name>`. Bindings are cached on first use so repeat lookups
+/// are lock-free reads. The fallback always terminates in `default_model`,
+/// which is bound as required at startup.
 #[derive(Clone)]
 pub struct ChatClient {
     http: reqwest::Client,
     env: Vec<(OsString, OsString)>,
     providers: ConfigBinding<HashMap<String, ProviderConfig>>,
-    models: ConfigBinding<ModelsConfig>,
+    config: ConfigHandle,
+    default_model: RequiredConfigBinding<ModelConfig>,
+    model_cache: Arc<Mutex<HashMap<String, ConfigBinding<ModelConfig>>>>,
     extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
 }
 
@@ -30,7 +37,8 @@ impl ChatClient {
     pub fn new(
         env: Vec<(OsString, OsString)>,
         providers: ConfigBinding<HashMap<String, ProviderConfig>>,
-        models: ConfigBinding<ModelsConfig>,
+        config: ConfigHandle,
+        default_model: RequiredConfigBinding<ModelConfig>,
         extras: ConfigBinding<HashMap<String, ResponsesModelExtras>>,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
@@ -40,14 +48,16 @@ impl ChatClient {
             http,
             env,
             providers,
-            models,
+            config,
+            default_model,
+            model_cache: Arc::new(Mutex::new(HashMap::new())),
             extras,
         })
     }
 
     pub async fn stream<F>(
         &self,
-        role: ModelRole,
+        names: &[&str],
         messages: &[Value],
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
@@ -56,7 +66,7 @@ impl ChatClient {
     where
         F: FnMut(&Value) -> Result<()>,
     {
-        let plan = self.build_request_plan(role)?;
+        let plan = self.build_request_plan(names)?;
 
         let mut body = serde_json::json!({
             "model": plan.model.id,
@@ -145,14 +155,14 @@ impl ChatClient {
     /// surface mid-stream deltas (e.g. the shell classifier).
     pub async fn complete(
         &self,
-        role: ModelRole,
+        names: &[&str],
         messages: &[Value],
         tools: &[ToolDef],
         tool_choice: Option<&ToolChoice>,
     ) -> Result<CompletionOutcome> {
         let mut text = String::new();
         let mut accumulator = ToolCallAccumulator::new();
-        self.stream(role, messages, tools, tool_choice, |chunk| {
+        self.stream(names, messages, tools, tool_choice, |chunk| {
             for delta in chunk_text_deltas(chunk) {
                 text.push_str(delta);
             }
@@ -168,18 +178,8 @@ impl ChatClient {
         })
     }
 
-    fn build_request_plan(&self, role: ModelRole) -> Result<RequestPlan> {
-        let models = self
-            .models
-            .get()
-            .ok_or_else(|| anyhow!("models config missing"))?;
-        let model: ModelConfig = match role {
-            ModelRole::Chat => models.chat.clone(),
-            ModelRole::ShellClassify => models
-                .shell_classify
-                .clone()
-                .ok_or_else(|| anyhow!("models.shell_classify is not configured"))?,
-        };
+    fn build_request_plan(&self, names: &[&str]) -> Result<RequestPlan> {
+        let model = self.resolve_model(names)?;
 
         let providers = self
             .providers
@@ -188,9 +188,8 @@ impl ChatClient {
         let provider =
             case_insensitive_lookup(&providers, &model.model_provider).ok_or_else(|| {
                 anyhow!(
-                    "model_providers.{} is not configured (referenced by models.{}.model_provider)",
+                    "model_providers.{} is not configured (referenced by a model's model_provider)",
                     model.model_provider,
-                    role.config_key()
                 )
             })?;
 
@@ -215,23 +214,40 @@ impl ChatClient {
             extra_completion_properties,
         })
     }
-}
 
-/// Selects which `models.<role>` entry the request targets. New roles get a
-/// variant here (and a matching arm in `build_request_plan`) — providers and
-/// extras lookups are shared across all roles.
-#[derive(Clone, Copy, Debug)]
-pub enum ModelRole {
-    Chat,
-    ShellClassify,
-}
-
-impl ModelRole {
-    fn config_key(self) -> &'static str {
-        match self {
-            Self::Chat => "chat",
-            Self::ShellClassify => "shell_classify",
+    /// Walks `names` in order, returning the first one whose `models::<name>`
+    /// binding currently has a value. Falls through to `default_model`, which
+    /// is a required (sticky-on-absence) binding and therefore always
+    /// resolves. Bindings are looked up via [`Self::binding_for`] so the
+    /// arc-swap snapshot is always consulted live and config updates are
+    /// picked up without restart.
+    fn resolve_model(&self, names: &[&str]) -> Result<ModelConfig> {
+        for name in names {
+            let binding = self.binding_for(name)?;
+            if let Some(model) = binding.get() {
+                return Ok((*model).clone());
+            }
         }
+        Ok((*self.default_model.get()).clone())
+    }
+
+    /// Returns the cached binding for `models::<name>`, creating one on first
+    /// use. The cache stores the binding object, not its current value —
+    /// `ConfigBinding::get()` is re-evaluated on every call so live config
+    /// edits propagate. Names that are never present in config still get a
+    /// binding kept around, which is fine: the set of distinct names asked
+    /// for is bounded by the call sites in the binary.
+    fn binding_for(&self, name: &str) -> Result<ConfigBinding<ModelConfig>> {
+        let mut cache = self.model_cache.lock().expect("model_cache poisoned");
+        if let Some(b) = cache.get(name) {
+            return Ok(b.clone());
+        }
+        let b = self
+            .config
+            .bind::<ModelConfig>(["models", name])
+            .with_context(|| format!("bind models::{name}"))?;
+        cache.insert(name.to_string(), b.clone());
+        Ok(b)
     }
 }
 
