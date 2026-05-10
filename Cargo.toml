@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors", "crates/frances-config", "crates/frances-core", "crates/frances-daemon", "crates/frances-edit", "crates/frances-llm", "crates/frances-shell"]
+members = ["crates/frances", "crates/frances-anchors", "crates/frances-config", "crates/frances-core", "crates/frances-daemon", "crates/frances-edit", "crates/frances-llm", "crates/frances-shell", "crates/frances-workflow"]
 resolver = "2"
 
 [workspace.package]
@@ -15,7 +15,7 @@ bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
@@ -37,6 +37,7 @@ frances-daemon = { path = "crates/frances-daemon" }
 frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
 frances-shell = { path = "crates/frances-shell" }
+frances-workflow = { path = "crates/frances-workflow" }
 tempfile = "3"
 smallvec = "1"
 getrandom = "0.2"
@@ -48,3 +49,5 @@ shellexpand = "3"
 xdg = "3"
 shell-words = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
+rquickjs = { version = "0.11", features = ["futures", "loader", "parallel", "macro"] }
+deno_ast = { version = "0.53", features = ["transpiling"] }

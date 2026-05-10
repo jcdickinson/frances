@@ -18,9 +18,10 @@ use crate::session::Session;
 use crate::store::Database;
 use crate::tools::ToolRegistry;
 use crate::transport::remove_socket_if_present;
-use crate::workflows::WorkflowConfig;
+use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
+use frances_workflow::Runtime as WorkflowRuntime;
 
 use super::client_rpc::serve_client;
 use super::control::serve_control;
@@ -99,6 +100,8 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         chat,
         primary_chat,
         workflows,
+        workflow_runtime: Arc::new(WorkflowRuntime::new()?),
+        workflow_stack: WorkflowStack::new(),
         session_config_writer,
     });
 

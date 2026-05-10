@@ -1,174 +1,258 @@
-//! Slash-command workflows.
+//! Per-session workflow stack.
 //!
-//! A workflow is a Lua-defined hook that completely takes over a turn.
-//! Workflows are declared per-id in the layered config tree as
-//! `workflows.<id>.file = "/path/to/foo.lua"` and invoked from the TUI by
-//! typing `/<id> [args...]`.
+//! User input always dispatches to whatever's on top of the stack. The
+//! stack is bootstrapped with a single [`Frame::LegacyLlmTurn`] at the
+//! bottom — that frame is the existing Rust-driven chat loop and is
+//! never popped. Slash commands push new [`Frame::Js`] frames on top;
+//! when a JS workflow terminates (top-level body settles or
+//! `workflow.exit()`), the frame pops.
 //!
-//! This pass is scaffolding only — [`run_workflow`] just `todo!()`s. The
-//! Lua runtime, history bridging, and stream-frame surface a workflow
-//! gets to use are all follow-ups.
+//! This module owns the dispatch glue between the daemon's wire
+//! protocol ([`StreamFrame`], the client `UnixStream`) and the workflow
+//! runtime in [`frances_workflow`].
 
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use serde::Deserialize;
-use thiserror::Error;
 use tokio::net::UnixStream;
-use uuid::Uuid;
+use tokio::sync::Mutex as AsyncMutex;
+use tracing::warn;
 
 use crate::Result;
-use crate::protocol::StreamFrame;
+use crate::protocol::{BlockId, BlockKind, StreamFrame};
+use crate::server::ServerState;
 use crate::transport::write_message;
 
-#[derive(Debug, Error)]
-pub enum WorkflowError {
-    #[error("split workflow args: {0}")]
-    SplitArgs(#[from] shell_words::ParseError),
+use frances_workflow::{HostFrame, Invocation, UserInput, WorkflowHandle, parse_slash_command};
+pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
+
+/// The session-scoped workflow stack. One per `ServerState`.
+pub struct WorkflowStack {
+    frames: AsyncMutex<Vec<Frame>>,
 }
 
-/// One row of the `workflows` config table.
-///
-/// Each workflow owns a chunk of the per-session DB schema via the
-/// migration system: `id` is its stable [`Uuid`] entity (see
-/// `crate::migrations`), and `migrations` lists the SQL files in apply
-/// order. Migration paths are resolved **relative to `file`'s parent
-/// directory** — co-locate `0001_init.sql` with the `.lua` and refer to
-/// it as `migrations = ["0001_init.sql"]`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct WorkflowConfig {
-    pub id: Uuid,
-    pub file: PathBuf,
-    /// SQL migration files, resolved relative to [`Self::file`]'s
-    /// parent. Order is the apply order; once a workflow ships, treat
-    /// the prefix as immutable — the migration runner refuses to load
-    /// when a recorded migration's name or content drifts.
-    #[serde(default)]
-    pub migrations: Vec<PathBuf>,
-}
-
-/// Splits `/<name> [args...]` into the command name and its shell-split args.
-///
-/// Returns `Ok(None)` for plain prose or for malformed-but-not-a-command
-/// input (`/`, `/  foo`, no leading slash). Returns `Err` only when the
-/// input looks like a command but the args fail to shell-parse, so the
-/// caller can surface a precise error to the user.
-fn parse_slash_command(
-    text: &str,
-) -> std::result::Result<Option<(&str, Vec<String>)>, WorkflowError> {
-    let Some(body) = text.strip_prefix('/') else {
-        return Ok(None);
-    };
-    let (name, rest) = match body.find(char::is_whitespace) {
-        Some(idx) => (&body[..idx], &body[idx..]),
-        None => (body, ""),
-    };
-    if name.is_empty() {
-        return Ok(None);
+impl Default for WorkflowStack {
+    fn default() -> Self {
+        Self::new()
     }
-    let args = shell_words::split(rest.trim())?;
-    Ok(Some((name, args)))
 }
 
-/// Server-side dispatch hook called from `stream_prompt`. Returns `Ok(true)`
-/// when the input was a slash command (handed off to a workflow, or surfaced
-/// as an unknown-command error frame). Returns `Ok(false)` when the caller
-/// should fall through to the normal LLM turn.
-pub async fn dispatch_slash_command(
-    workflows: &HashMap<String, WorkflowConfig>,
+impl WorkflowStack {
+    /// Builds a fresh stack with the legacy chat-loop frame at the
+    /// bottom. That frame stays for the daemon's lifetime.
+    pub fn new() -> Self {
+        Self {
+            frames: AsyncMutex::new(vec![Frame::LegacyLlmTurn]),
+        }
+    }
+}
+
+/// One entry on the stack.
+enum Frame {
+    /// Today's Rust-driven LLM chat turn. Wraps [`run_legacy_llm_turn`].
+    /// Never popped.
+    LegacyLlmTurn,
+    /// A running JS workflow. Popped when the body terminates.
+    Js(WorkflowHandle),
+}
+
+/// Top-level entry from the prompt RPC. Parses the input and either
+/// pushes a fresh JS workflow (for slash commands) or hands the text to
+/// the topmost frame. Always finishes one "cycle" — i.e. drives the
+/// topmost frame until it parks waiting for input or terminates.
+pub(crate) async fn cycle(
+    state: &Arc<ServerState>,
     stream: &mut UnixStream,
     text: &str,
-) -> Result<bool> {
-    let (name, args) = match parse_slash_command(text) {
-        Ok(Some(p)) => p,
-        Ok(None) => return Ok(false),
+) -> Result<()> {
+    match parse_slash_command(text) {
+        Ok(Some((name, args))) => {
+            let name = name.to_owned();
+            push_and_drive(state, stream, &name, args).await
+        }
+        Ok(None) => dispatch_topmost(state, stream, text).await,
         Err(error) => {
             write_message(
                 stream,
                 &StreamFrame::Error(format!("bad workflow args: {error}")),
             )
             .await?;
-            return Ok(true);
+            Ok(())
         }
-    };
+    }
+}
 
+async fn push_and_drive(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    name: &str,
+    args: Vec<String>,
+) -> Result<()> {
+    let workflows = state.workflows.get_or_default();
     let Some(cfg) = workflows.get(name) else {
         write_message(
             stream,
             &StreamFrame::Error(format!("unknown workflow: {name}")),
         )
         .await?;
-        return Ok(true);
+        return Ok(());
     };
 
-    run_workflow(stream, name, &args, cfg).await?;
-    Ok(true)
+    let invocation = Invocation {
+        source_path: cfg.file.clone(),
+        args,
+    };
+
+    let handle = match state.workflow_runtime.start(invocation) {
+        Ok(handle) => handle,
+        Err(error) => {
+            write_message(stream, &StreamFrame::Error(format!("workflow: {error}"))).await?;
+            return Ok(());
+        }
+    };
+
+    let mut frame = Frame::Js(handle);
+    let exited = drive(&mut frame, stream).await?;
+    if !exited {
+        state.workflow_stack.frames.lock().await.push(frame);
+    }
+    Ok(())
 }
 
-async fn run_workflow(
-    _stream: &mut UnixStream,
-    _name: &str,
-    _args: &[String],
-    _cfg: &WorkflowConfig,
+async fn dispatch_topmost(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    text: &str,
 ) -> Result<()> {
-    todo!("lua workflow execution not yet implemented")
+    // Pop the topmost frame so we can hand it to `drive` without
+    // holding the stack lock across the drain. If it stays alive we
+    // push it back; the legacy frame is always re-pushed.
+    let mut top = {
+        let mut stack = state.workflow_stack.frames.lock().await;
+        stack.pop().expect("stack is never empty")
+    };
+
+    let outcome = match &mut top {
+        Frame::LegacyLlmTurn => {
+            run_legacy_llm_turn(state, stream, text).await?;
+            DriveOutcome::Continue
+        }
+        Frame::Js(handle) => {
+            // Sending to a dropped receiver would mean the body has
+            // already exited and we just didn't observe it yet; treat
+            // that as "exited" and let the drive loop confirm.
+            let _ = handle.input_tx.send(UserInput {
+                message: text.to_owned(),
+            });
+            if drive(&mut top, stream).await? {
+                DriveOutcome::Exited
+            } else {
+                DriveOutcome::Continue
+            }
+        }
+    };
+
+    if matches!(outcome, DriveOutcome::Continue) {
+        state.workflow_stack.frames.lock().await.push(top);
+    }
+    Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+enum DriveOutcome {
+    Continue,
+    Exited,
+}
 
-    fn parse(text: &str) -> Option<(String, Vec<String>)> {
-        parse_slash_command(text)
-            .expect("parse should not error")
-            .map(|(n, a)| (n.to_string(), a))
-    }
+/// Drains the frame's host-frame channel until the body either parks
+/// waiting for input or terminates. Returns `true` if the body exited.
+async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
+    let Frame::Js(handle) = frame else {
+        // LegacyLlmTurn is driven by `run_legacy_llm_turn` directly;
+        // it never reaches this path.
+        return Ok(false);
+    };
 
-    #[test]
-    fn bare_name() {
-        assert_eq!(parse("/plan"), Some(("plan".into(), vec![])));
-    }
+    let mut next_block: u64 = 1;
+    let mut alloc = || {
+        let id = BlockId(next_block);
+        next_block += 1;
+        id
+    };
 
-    #[test]
-    fn name_and_args() {
-        assert_eq!(
-            parse("/plan foo bar"),
-            Some(("plan".into(), vec!["foo".into(), "bar".into()])),
-        );
+    loop {
+        while let Ok(host_frame) = handle.frames.try_recv() {
+            emit(stream, &mut alloc, host_frame).await?;
+        }
+        tokio::select! {
+            biased;
+            Some(host_frame) = handle.frames.recv() => {
+                emit(stream, &mut alloc, host_frame).await?;
+            }
+            done = &mut handle.done => {
+                while let Ok(host_frame) = handle.frames.try_recv() {
+                    emit(stream, &mut alloc, host_frame).await?;
+                }
+                if let Ok(Err(error)) = done {
+                    write_message(
+                        stream,
+                        &StreamFrame::Error(format!("workflow: {error}")),
+                    )
+                    .await?;
+                } else if let Err(error) = done {
+                    warn!(%error, "workflow done channel closed without value");
+                }
+                return Ok(true);
+            }
+            () = handle.parked.notified() => {
+                while let Ok(host_frame) = handle.frames.try_recv() {
+                    emit(stream, &mut alloc, host_frame).await?;
+                }
+                return Ok(false);
+            }
+        }
     }
+}
 
-    #[test]
-    fn quoted_arg_collapses() {
-        assert_eq!(
-            parse(r#"/plan "two words""#),
-            Some(("plan".into(), vec!["two words".into()])),
-        );
+async fn emit(
+    stream: &mut UnixStream,
+    alloc: &mut impl FnMut() -> BlockId,
+    frame: HostFrame,
+) -> Result<()> {
+    match frame {
+        HostFrame::Text(text) => write_text_block(stream, alloc(), text).await?,
+        HostFrame::Error(text) => write_message(stream, &StreamFrame::Error(text)).await?,
+        HostFrame::Json { tag, value } => {
+            // No structured frame variant for tagged JSON yet; render
+            // it as assistant text so it at least surfaces in the UI.
+            // Replace with a typed frame when the gate/recall surfaces
+            // need machine-readable workflow events.
+            let body = serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
+            write_text_block(stream, alloc(), format!("[{tag}] {body}")).await?;
+        }
     }
+    Ok(())
+}
 
-    #[test]
-    fn unterminated_quote_errors() {
-        assert!(parse_slash_command("/plan 'unterminated").is_err());
-    }
+async fn write_text_block(stream: &mut UnixStream, id: BlockId, text: String) -> Result<()> {
+    write_message(
+        stream,
+        &StreamFrame::BlockStart {
+            id,
+            kind: BlockKind::AssistantText,
+        },
+    )
+    .await?;
+    write_message(stream, &StreamFrame::BlockDelta { id, text }).await?;
+    write_message(stream, &StreamFrame::BlockStop { id }).await?;
+    Ok(())
+}
 
-    #[test]
-    fn slash_alone_is_not_a_command() {
-        assert_eq!(parse("/"), None);
-    }
-
-    #[test]
-    fn slash_with_only_whitespace_name_is_not_a_command() {
-        assert_eq!(parse("/ foo"), None);
-    }
-
-    #[test]
-    fn plain_text_is_not_a_command() {
-        assert_eq!(parse("hello there"), None);
-    }
-
-    #[test]
-    fn leading_whitespace_does_not_strip() {
-        // Match the user's literal input — a leading space means it isn't a
-        // slash command. Don't silently re-interpret.
-        assert_eq!(parse("  /plan"), None);
-    }
+/// Runs one turn through the legacy Rust chat loop. Delegates back to
+/// the [`turn`](crate::server) module so the LLM-loop code stays in one
+/// place; the stack wraps it as the bottom frame.
+async fn run_legacy_llm_turn(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    text: &str,
+) -> Result<()> {
+    crate::server::run_legacy_llm_turn(state, stream, text).await
 }

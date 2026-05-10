@@ -40,6 +40,7 @@ frances-core.workspace = true
 frances-edit.workspace = true
 frances-llm.workspace = true
 frances-shell.workspace = true
+frances-workflow.workspace = true
 
 [dev-dependencies]
 frances-edit = { workspace = true, features = ["test-utils"] }

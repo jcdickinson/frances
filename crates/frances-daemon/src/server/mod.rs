@@ -11,9 +11,10 @@ use crate::edit_session::EditSession;
 use crate::llm::SessionConfigWriter;
 use crate::session::Session;
 use crate::tools::ToolRegistry;
-use crate::workflows::WorkflowConfig;
+use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_shell::Shell;
+use frances_workflow::Runtime as WorkflowRuntime;
 
 mod bootstrap;
 mod client_rpc;
@@ -26,6 +27,7 @@ mod turn;
 pub use bootstrap::run;
 pub use error::ServerError;
 pub use logging::install_logging;
+pub(crate) use turn::run_legacy_llm_turn;
 
 use events::EventsRouter;
 
@@ -50,6 +52,8 @@ pub(crate) struct ServerState {
     /// only one for now; loaded (or created) once at daemon startup.
     pub primary_chat: Arc<ChatSession>,
     pub workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
+    pub workflow_runtime: Arc<WorkflowRuntime>,
+    pub workflow_stack: WorkflowStack,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
     /// session config.

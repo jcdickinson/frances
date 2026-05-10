@@ -1,0 +1,62 @@
+use std::path::Path;
+
+use deno_ast::{MediaType, ModuleSpecifier, ParseParams, SourceMapOption, TranspileOptions};
+
+use crate::WorkflowError;
+
+/// Source kind, derived from the file extension. Anything unknown is
+/// treated as plain JS — QuickJS will surface a parse error if it's not
+/// actually JS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourceKind {
+    JavaScript,
+    TypeScript,
+}
+
+impl SourceKind {
+    pub fn from_path(path: &Path) -> Self {
+        match path.extension().and_then(|s| s.to_str()) {
+            Some("ts") | Some("mts") => Self::TypeScript,
+            _ => Self::JavaScript,
+        }
+    }
+}
+
+/// Strip TypeScript types via deno_ast's swc-backed transpile. No
+/// bundling, no module resolution — single file in, plain JS string out.
+pub(crate) fn ts_to_js(path: &Path, source: &str) -> Result<String, WorkflowError> {
+    // The specifier has to look like a URL; ModuleSpecifier::from_file_path
+    // demands an absolute path, so canonicalize-or-fall-back-to-as-given.
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(WorkflowError::ReadSource)?
+            .join(path)
+    };
+    let specifier = ModuleSpecifier::from_file_path(&absolute)
+        .map_err(|()| WorkflowError::TranspileSpecifier(absolute.clone()))?;
+
+    let parsed = deno_ast::parse_module(ParseParams {
+        specifier,
+        text: source.into(),
+        media_type: MediaType::TypeScript,
+        capture_tokens: false,
+        scope_analysis: false,
+        maybe_syntax: None,
+    })
+    .map_err(|err| WorkflowError::Transpile(err.to_string()))?;
+
+    let transpiled = parsed
+        .transpile(
+            &TranspileOptions::default(),
+            &deno_ast::TranspileModuleOptions::default(),
+            &deno_ast::EmitOptions {
+                source_map: SourceMapOption::None,
+                ..Default::default()
+            },
+        )
+        .map_err(|err| WorkflowError::Transpile(err.to_string()))?;
+
+    Ok(transpiled.into_source().text)
+}

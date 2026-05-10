@@ -47,14 +47,17 @@ async fn run_handler(
     stream: &mut UnixStream,
     text: String,
 ) -> Result<()> {
-    let workflows = state.workflows.get_or_default();
-    if workflows::dispatch_slash_command(&workflows, stream, &text).await? {
-        return Ok(());
-    }
-    run_turn(state, stream, text).await
+    workflows::cycle(state, stream, &text).await
 }
 
-async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: String) -> Result<()> {
+/// The legacy Rust-driven LLM chat turn. Invoked from the workflow
+/// stack's bottom frame (`LegacyLlmTurn`); will go away once the chat
+/// loop is ported into a JS workflow.
+pub(crate) async fn run_legacy_llm_turn(
+    state: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    text: &str,
+) -> Result<()> {
     let (env, cwd) = {
         let guard = state.last_context.lock().expect("last_context poisoned");
         let ctx = guard.as_ref().ok_or(ServerError::NoClientContext)?;
@@ -72,7 +75,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
 
     let mut send_error: Option<TransportError> = None;
 
-    chat.submit_user(&text).await?;
+    chat.submit_user(text).await?;
 
     let user_id = alloc_block();
     for frame in [
@@ -82,7 +85,7 @@ async fn run_turn(state: &Arc<ServerState>, stream: &mut UnixStream, text: Strin
         },
         StreamFrame::BlockDelta {
             id: user_id,
-            text: text.clone(),
+            text: text.to_owned(),
         },
         StreamFrame::BlockStop { id: user_id },
     ] {
