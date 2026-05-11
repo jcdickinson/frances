@@ -10,6 +10,7 @@ sha2 = "0.10"
 
 [dependencies]
 bincode.workspace = true
+dashmap.workspace = true
 libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +28,7 @@ twox-hash.workspace = true
 similar.workspace = true
 async-trait.workspace = true
 arc-swap.workspace = true
+parking_lot.workspace = true
 url.workspace = true
 xdg.workspace = true
 shellexpand.workspace = true

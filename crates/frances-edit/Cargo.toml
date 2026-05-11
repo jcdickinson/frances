@@ -9,6 +9,7 @@ authors.workspace = true
 frances-anchors.workspace = true
 similar.workspace = true
 async-trait.workspace = true
+parking_lot.workspace = true
 thiserror.workspace = true
 twox-hash.workspace = true
 smallvec.workspace = true

@@ -26,19 +26,11 @@ impl Client for ClientServer {
             has_cwd = ctx.process.cwd.is_some(),
             "received attach context"
         );
-        let mut attached = self
-            .state
-            .client_attached
-            .lock()
-            .expect("client_attached poisoned");
+        let mut attached = self.state.client_attached.lock();
         if *attached {
             AttachResponse::Busy
         } else {
-            *self
-                .state
-                .last_context
-                .lock()
-                .expect("last_context poisoned") = Some(ctx);
+            *self.state.last_context.lock() = Some(ctx);
             *attached = true;
             AttachResponse::Attached {
                 session_id: SessionId(self.state.session.id.clone()),
@@ -47,11 +39,7 @@ impl Client for ClientServer {
     }
 
     async fn detach(self, _: context::Context) {
-        let mut attached = self
-            .state
-            .client_attached
-            .lock()
-            .expect("client_attached poisoned");
+        let mut attached = self.state.client_attached.lock();
         *attached = false;
     }
 

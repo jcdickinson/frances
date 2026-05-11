@@ -77,6 +77,11 @@ For Rust documentation lookups, use `rsdoc` (the ferrisfetch MCP CLI) — `rsdoc
 
 ## Conventions
 
+## Unused
+
+If things are kept around for functional reasons (e.g. temp dirs), don't `#[expect(unused..)] foo: ...`,
+the correct thing to do is `_foo: ...`.
+
 ### Deps
 
 We bring in deps using Deps traits that go into a `deps.rs` in their crate. For example:
@@ -95,3 +100,10 @@ architectural hacks. That is what the `frances-models-*` crates are for. `france
 MUST NOT have deps traits - those belong in the assosciated/logic crate. Traits (that do not use
 deps traits themselves) can also be in the `frances-models-*` crate - e.g. `ChatSessionManager`,
 this should be considered an extremely rare scenario.
+
+## Crates
+
+- `parking_lot` - avoid std sync primitives where possible.
+- `dashmap` - avoid `Mutex<HashMap>` unless broad atomicity is needed for some reason.
+- `anyhow` - generally exclusive to `frances` crate.
+- `thiserror` - the mandatory mechanism for lib errors. Do not invent a shitty anyhow with this (e.g. `Msg(String)`). Errors don't have to be super precise, and don't have to carry the original error (`trace` it if is discarded), and obviously can still contain a message if they are more specific than `Msg`.

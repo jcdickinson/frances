@@ -50,9 +50,9 @@ pub use fake::FakeStore;
 mod fake {
     use std::collections::{BTreeMap, HashMap, HashSet};
     use std::path::{Path, PathBuf};
-    use std::sync::Mutex;
 
     use async_trait::async_trait;
+    use parking_lot::Mutex;
 
     use super::{AnchorStore, StoreResult};
     use crate::anchor::Anchor;
@@ -86,7 +86,7 @@ mod fake {
     #[async_trait]
     impl AnchorStore for FakeStore {
         async fn load(&self, path: &Path) -> StoreResult<Option<FileAnchorState>> {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock();
             let meta = match inner.meta.get(path) {
                 Some(m) => *m,
                 None => return Ok(None),
@@ -118,7 +118,7 @@ mod fake {
             size: u64,
             content_digest: u64,
         ) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner
                 .meta
                 .insert(path.to_path_buf(), (mtime_ns, size, content_digest));
@@ -126,7 +126,7 @@ mod fake {
         }
 
         async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             let entry = inner.lines.entry(path.to_path_buf()).or_default();
             for (line_no, hash, anchor) in lines {
                 entry.insert(*line_no, (*hash, anchor.clone()));
@@ -135,7 +135,7 @@ mod fake {
         }
 
         async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             if let Some(m) = inner.lines.get_mut(path) {
                 for n in line_nos {
                     m.remove(n);
@@ -145,13 +145,13 @@ mod fake {
         }
 
         async fn truncate_lines(&self, path: &Path) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.lines.remove(path);
             Ok(())
         }
 
         async fn used_anchors(&self, path: &Path) -> StoreResult<HashSet<Anchor>> {
-            let inner = self.inner.lock().unwrap();
+            let inner = self.inner.lock();
             let mut used = HashSet::new();
             if let Some(m) = inner.lines.get(path) {
                 for (_, anchor) in m.values() {
@@ -165,20 +165,20 @@ mod fake {
         }
 
         async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             let set = inner.tombstones.entry(path.to_path_buf()).or_default();
             set.extend(anchors.iter().cloned());
             Ok(())
         }
 
         async fn clear_tombstones(&self) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.tombstones.clear();
             Ok(())
         }
 
         async fn forget(&self, path: &Path) -> StoreResult<()> {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner.lock();
             inner.meta.remove(path);
             inner.lines.remove(path);
             inner.tombstones.remove(path);

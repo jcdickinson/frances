@@ -123,10 +123,7 @@ async fn handle_control_conn(
 fn daemon_status(state: &ServerState) -> DaemonStatus {
     DaemonStatus {
         session_id: SessionId(state.session.id.clone()),
-        client_attached: *state
-            .client_attached
-            .lock()
-            .expect("client_attached poisoned"),
+        client_attached: *state.client_attached.lock(),
         daemon_pid: DaemonPid(state.daemon_pid),
         control_socket_path: state.session.control_socket_path(),
         client_socket_path: state.session.client_socket_path(),

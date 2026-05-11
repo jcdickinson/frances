@@ -12,15 +12,16 @@
 //! `try_build` (today: a single OpenAI arm). Adding a new provider
 //! is a one-line change here.
 
-use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use dashmap::DashMap;
 use frances_config::{ConfigBindError, ConfigBinding, ConfigHandle, Keys};
 use futures::Stream;
 use futures::StreamExt;
 use futures::task::noop_waker_ref;
+use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::warn;
 
@@ -67,7 +68,7 @@ struct Inner {
     keys: ConfigBinding<Keys>,
     keys_stream: Mutex<KeysStream>,
     last_keys: Mutex<Keys>,
-    entries: RwLock<HashMap<String, Mutex<Entry>>>,
+    entries: DashMap<String, Mutex<Entry>>,
 }
 
 type KeysStream = Pin<Box<dyn Stream<Item = Option<Arc<Keys>>> + Send>>;
@@ -106,7 +107,7 @@ impl ProviderCache {
                 keys,
                 keys_stream: Mutex::new(keys_stream),
                 last_keys: Mutex::new(Keys::default()),
-                entries: RwLock::new(HashMap::new()),
+                entries: DashMap::new(),
             }),
         })
     }
@@ -114,18 +115,15 @@ impl ProviderCache {
     pub fn get(&self, id: &str) -> Option<Arc<ErasedProvider>> {
         self.refresh_id_set();
         let id_lc = id.to_ascii_lowercase();
-        {
-            let entries = self.inner.entries.read().expect("provider cache poisoned");
-            if let Some(em) = entries.get(&id_lc) {
-                return Some(em.lock().expect("provider entry poisoned").current());
-            }
+        if let Some(em) = self.inner.entries.get(&id_lc) {
+            return Some(em.lock().current());
         }
         self.try_build(&id_lc)
     }
 
     fn refresh_id_set(&self) {
         let fired = {
-            let mut s = self.inner.keys_stream.lock().expect("keys stream poisoned");
+            let mut s = self.inner.keys_stream.lock();
             drain_stream(&mut *s)
         };
         if !fired {
@@ -137,16 +135,15 @@ impl ProviderCache {
             .get()
             .map(|g| (*g).clone())
             .unwrap_or_default();
-        let mut last = self.inner.last_keys.lock().expect("last_keys poisoned");
+        let mut last = self.inner.last_keys.lock();
         let diff = new_keys.diff(&last);
         *last = new_keys;
         drop(last);
         if diff.removed.is_empty() {
             return;
         }
-        let mut entries = self.inner.entries.write().expect("provider cache poisoned");
         for id in &diff.removed {
-            entries.remove(&id.to_ascii_lowercase());
+            self.inner.entries.remove(&id.to_ascii_lowercase());
         }
     }
 
@@ -165,8 +162,6 @@ impl ProviderCache {
         let provider = entry.provider.clone();
         self.inner
             .entries
-            .write()
-            .expect("provider cache poisoned")
             .insert(id_lc.to_owned(), Mutex::new(entry));
         Some(provider)
     }

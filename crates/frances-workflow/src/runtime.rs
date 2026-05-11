@@ -17,9 +17,9 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::sync::atomic::AtomicBool;
 
+use parking_lot::Mutex as StdMutex;
 use rquickjs::async_with;
 use rquickjs::context::AsyncContext;
 use rquickjs::module::Module;
@@ -193,20 +193,12 @@ impl<D: WorkflowDeps> Runtime<D> {
 
     fn transpile(&self, path: &Path, source: &str) -> Result<String, WorkflowError> {
         let hash = twox_hash::XxHash3_64::oneshot(source.as_bytes());
-        if let Some(cached) = self
-            .transpile_cache
-            .lock()
-            .expect("transpile cache poisoned")
-            .by_hash
-            .get(&hash)
-            .cloned()
-        {
+        if let Some(cached) = self.transpile_cache.lock().by_hash.get(&hash).cloned() {
             return Ok(cached.to_string());
         }
         let js = ts_to_js(path, source)?;
         self.transpile_cache
             .lock()
-            .expect("transpile cache poisoned")
             .by_hash
             .insert(hash, Arc::<str>::from(js.as_str()));
         Ok(js)
@@ -293,9 +285,10 @@ pub(crate) mod test_deps {
         HistoryError, OwnedHistoryInput,
     };
     use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::ffi::OsString;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     use crate::deps::WorkflowDeps;
 
@@ -348,10 +341,7 @@ pub(crate) mod test_deps {
     #[async_trait]
     impl ChatSession for StubSession {
         fn push(&self, input: OwnedHistoryInput) {
-            self.pending
-                .lock()
-                .expect("stub pending poisoned")
-                .push(input);
+            self.pending.lock().push(input);
         }
 
         async fn run(

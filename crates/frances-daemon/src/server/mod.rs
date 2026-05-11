@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
+use parking_lot::Mutex as StdMutex;
 use tokio::sync::Notify;
 
 use crate::anchor_store::AnchorStoreImpl;
@@ -70,7 +70,6 @@ impl WorkflowDeps for ServerWorkflowDeps {
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
         self.last_context
             .lock()
-            .expect("last_context poisoned")
             .as_ref()
             .map(|ctx| ctx.process.env.clone())
             .unwrap_or_default()
@@ -79,6 +78,7 @@ impl WorkflowDeps for ServerWorkflowDeps {
 
 pub(crate) struct ServerState {
     pub session: Session,
+    // TODO: This smells like a refactor needed
     pub client_attached: StdMutex<bool>,
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
     pub daemon_pid: u32,
@@ -91,8 +91,7 @@ pub(crate) struct ServerState {
     /// daemon's lifetime. The chat manager and provider cache hold their
     /// own bindings, but parking the handle here makes the lifetime
     /// guarantee explicit.
-    #[expect(dead_code, reason = "lifetime anchor for the config event processor")]
-    pub config: ConfigHandle,
+    pub _config: ConfigHandle,
     #[expect(
         dead_code,
         reason = "kept for future direct access; chat manager holds its own clone"

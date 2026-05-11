@@ -1,6 +1,7 @@
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Weak};
 
 use arc_swap::{ArcSwap, Guard};
+use parking_lot::Mutex;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, oneshot};
 
@@ -36,7 +37,7 @@ impl BindingRegistry {
     }
 
     pub(crate) fn register(&self, w: Weak<dyn BindingRefresh>) {
-        let mut g = self.bindings.lock().expect("registry mutex poisoned");
+        let mut g = self.bindings.lock();
         g.push(w);
     }
 
@@ -49,7 +50,7 @@ impl BindingRegistry {
 
     async fn refresh_all(&self, snapshot: &Arc<Configuration>) {
         let alive: Vec<Arc<dyn BindingRefresh>> = {
-            let mut g = self.bindings.lock().expect("registry mutex poisoned");
+            let mut g = self.bindings.lock();
             g.retain(|w| w.strong_count() > 0);
             g.iter().filter_map(|w| w.upgrade()).collect()
         };

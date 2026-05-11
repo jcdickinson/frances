@@ -10,6 +10,7 @@ use frances_config::{
     Value,
 };
 use futures::StreamExt;
+use parking_lot::Mutex;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize, PartialEq, Default)]
@@ -49,15 +50,15 @@ fn ev(path: &str, value: impl Into<Value>) -> ConfigEvent {
 /// optionally emits an initial batch. Tests use `emit` afterwards to
 /// drive runtime events into this provider's layer.
 struct LatchingProvider {
-    initial: std::sync::Mutex<Vec<ConfigEvent>>,
-    sender: std::sync::Mutex<Option<EventSender>>,
+    initial: Mutex<Vec<ConfigEvent>>,
+    sender: Mutex<Option<EventSender>>,
 }
 
 impl LatchingProvider {
     fn new(initial: Vec<ConfigEvent>) -> Arc<Self> {
         Arc::new(Self {
-            initial: std::sync::Mutex::new(initial),
-            sender: std::sync::Mutex::new(None),
+            initial: Mutex::new(initial),
+            sender: Mutex::new(None),
         })
     }
 
@@ -65,7 +66,6 @@ impl LatchingProvider {
         let s = self
             .sender
             .lock()
-            .unwrap()
             .clone()
             .expect("provider must have loaded");
         s.send(events).await.unwrap();
@@ -75,11 +75,11 @@ impl LatchingProvider {
 #[async_trait]
 impl ConfigProvider for LatchingProvider {
     async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
-        let initial = std::mem::take(&mut *self.initial.lock().unwrap());
+        let initial = std::mem::take(&mut *self.initial.lock());
         if !initial.is_empty() {
             events.send(initial).await.unwrap();
         }
-        *self.sender.lock().unwrap() = Some(events);
+        *self.sender.lock() = Some(events);
         Ok(())
     }
 }

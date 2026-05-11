@@ -9,6 +9,7 @@ authors.workspace = true
 arc-swap.workspace = true
 async-trait.workspace = true
 futures.workspace = true
+parking_lot.workspace = true
 serde.workspace = true
 shellexpand.workspace = true
 smallvec.workspace = true

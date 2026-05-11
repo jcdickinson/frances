@@ -1,12 +1,13 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use frances_models_llm::chat::{
     ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryError, OwnedHistoryInput,
 };
 use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
+use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::chat::deps::ChatManagerDeps;
@@ -67,7 +68,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
     }
 
     pub fn id(&self) -> Option<ChatSessionId> {
-        *self.inner.id.lock().expect("chat session id poisoned")
+        *self.inner.id.lock()
     }
 
     pub fn session_id(&self) -> &str {
@@ -103,11 +104,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
     }
 
     fn push_internal(&self, input: OwnedHistoryInput) {
-        self.inner
-            .pending
-            .lock()
-            .expect("chat pending poisoned")
-            .push(input);
+        self.inner.pending.lock().push(input);
     }
 
     /// Ensure the `chat_sessions` row exists. Idempotent. Used by the
@@ -123,7 +120,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
             .history_store()
             .create_chat_session(&self.inner.session_id, &self.inner.model_intents)
             .await?;
-        *self.inner.id.lock().expect("chat session id poisoned") = Some(id);
+        *self.inner.id.lock() = Some(id);
         Ok(id)
     }
 }
@@ -146,8 +143,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         let store = self.inner.manager.deps().history_store().clone();
 
         // Drain pending under the lock, then release it before any await.
-        let drained: Vec<OwnedHistoryInput> =
-            std::mem::take(&mut *self.inner.pending.lock().expect("chat pending poisoned"));
+        let drained: Vec<OwnedHistoryInput> = std::mem::take(&mut *self.inner.pending.lock());
 
         // Write primitives for drained entries first so the history
         // store is consistent before the network call.

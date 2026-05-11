@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
+use parking_lot::Mutex as StdMutex;
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tracing::{debug, info, warn};
@@ -110,7 +110,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         tool_registry: ToolRegistry::builtin(),
         events: EventsRouter::default(),
         shutdown: Notify::new(),
-        config,
+        _config: config,
         history,
         cache,
         chat,

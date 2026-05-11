@@ -62,7 +62,7 @@ pub(crate) async fn run_legacy_llm_turn(
     text: &str,
 ) -> Result<()> {
     let (env, cwd) = {
-        let guard = state.last_context.lock().expect("last_context poisoned");
+        let guard = state.last_context.lock();
         let ctx = guard.as_ref().ok_or(ServerError::NoClientContext)?;
         (ctx.process.env.clone(), ctx.process.cwd.clone())
     };

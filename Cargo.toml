@@ -10,27 +10,6 @@ license = "MIT"
 repository = "https://github.com/jono/frances"
 
 [workspace.dependencies]
-anyhow = "1"
-bincode = { version = "2", features = ["serde"] }
-libc = "0.2"
-serde = { version = "1", features = ["derive"] }
-clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-futures-util = "0.3"
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
-serde_json = "1"
-turso = { version = "0.6.0-pre.26", default-features = false }
-crossterm = { version = "0.29", features = ["event-stream"] }
-unicode-width = "0.2"
-tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "serde-transport-bincode", "unix"] }
-futures = "0.3"
-thiserror = "2"
-twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
-similar = { version = "3.1", default-features = false }
-async-trait = "0.1"
-parking_lot = "0.12"
 frances-anchors = { path = "crates/frances-anchors" }
 frances-config = { path = "crates/frances-config" }
 frances-core = { path = "crates/frances-core" }
@@ -40,16 +19,39 @@ frances-llm = { path = "crates/frances-llm" }
 frances-models-llm = { path = "crates/frances-models-llm" }
 frances-shell = { path = "crates/frances-shell" }
 frances-workflow = { path = "crates/frances-workflow" }
-tempfile = "3"
-smallvec = "1"
-getrandom = "0.2"
+
+anyhow = "1"
 arc-swap = "1"
-toml = "0.8"
-tokio-stream = { version = "0.1", features = ["sync"] }
-url = { version = "2", features = ["serde"] }
-shellexpand = "3"
-xdg = "3"
-shell-words = "1"
-uuid = { version = "1", features = ["serde", "v4"] }
-rquickjs = { version = "0.11", features = ["futures", "loader", "parallel", "macro"] }
+async-trait = "0.1"
+bincode = { version = "2", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+crossterm = { version = "0.29", features = ["event-stream"] }
+dashmap = "6"
 deno_ast = { version = "0.53", features = ["transpiling"] }
+futures = "0.3"
+futures-util = "0.3"
+getrandom = "0.2"
+libc = "0.2"
+parking_lot = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rquickjs = { version = "0.11", features = ["futures", "loader", "parallel", "macro"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+shell-words = "1"
+shellexpand = "3"
+similar = { version = "3.1", default-features = false }
+smallvec = "1"
+tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "serde-transport-bincode", "unix"] }
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+turso = { version = "0.6.0-pre.26", default-features = false }
+twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
+unicode-width = "0.2"
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4"] }
+xdg = "3"

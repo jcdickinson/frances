@@ -1,8 +1,8 @@
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 use std::time::Duration;
 
+use dashmap::DashMap;
+use dashmap::mapref::entry::Entry;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::oneshot;
 use tracing::{trace, warn};
@@ -16,7 +16,7 @@ const EVENTS_PAIRING_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 pub(crate) struct EventsRouter {
-    inner: StdMutex<HashMap<PromptId, EventsSlot>>,
+    inner: DashMap<PromptId, EventsSlot>,
 }
 
 enum EventsSlot {
@@ -26,37 +26,39 @@ enum EventsSlot {
 
 impl EventsRouter {
     fn register(&self, id: PromptId, stream: UnixStream) {
-        let mut inner = self.inner.lock().expect("events router poisoned");
-        match inner.remove(&id) {
-            Some(EventsSlot::Waiting(tx)) => {
-                let _ = tx.send(stream);
-            }
-            Some(EventsSlot::HasStream(_)) | None => {
-                inner.insert(id, EventsSlot::HasStream(stream));
+        match self.inner.entry(id) {
+            Entry::Occupied(mut occ) => match occ.get() {
+                EventsSlot::Waiting(_) => {
+                    if let EventsSlot::Waiting(tx) = occ.remove() {
+                        let _ = tx.send(stream);
+                    }
+                }
+                EventsSlot::HasStream(_) => {
+                    occ.insert(EventsSlot::HasStream(stream));
+                }
+            },
+            Entry::Vacant(vac) => {
+                vac.insert(EventsSlot::HasStream(stream));
             }
         }
     }
 
     pub(super) async fn take(&self, id: PromptId) -> Option<UnixStream> {
-        let rx = {
-            let mut inner = self.inner.lock().expect("events router poisoned");
-            match inner.remove(&id) {
-                Some(EventsSlot::HasStream(s)) => return Some(s),
-                Some(EventsSlot::Waiting(_)) => return None,
-                None => {
-                    let (tx, rx) = oneshot::channel();
-                    inner.insert(id, EventsSlot::Waiting(tx));
-                    rx
-                }
+        let rx = match self.inner.entry(id) {
+            Entry::Occupied(occ) => match occ.remove() {
+                EventsSlot::HasStream(s) => return Some(s),
+                EventsSlot::Waiting(_) => return None,
+            },
+            Entry::Vacant(vac) => {
+                let (tx, rx) = oneshot::channel();
+                vac.insert(EventsSlot::Waiting(tx));
+                rx
             }
         };
         match tokio::time::timeout(EVENTS_PAIRING_TIMEOUT, rx).await {
             Ok(Ok(stream)) => Some(stream),
             _ => {
-                self.inner
-                    .lock()
-                    .expect("events router poisoned")
-                    .remove(&id);
+                self.inner.remove(&id);
                 None
             }
         }
