@@ -9,15 +9,28 @@
 //                                                 other (WHATWG
 //                                                 pipeThrough locks
 //                                                 its source).
-//   - `completed`: Promise<{ text, usage }>    — resolves when the run
-//                                                 settles, regardless of
-//                                                 whether the streams
-//                                                 were read.
+//   - `completed`: Promise<{ text, tool_calls, usage }> — resolves when
+//                                                 the run settles,
+//                                                 regardless of whether
+//                                                 the streams were read.
+//   - `signal`:    AbortSignal | undefined      — passthrough of the
+//                                                 caller's signal so a
+//                                                 tool-dispatch loop can
+//                                                 forward it to
+//                                                 handlers.
 //
 // `signal` is an optional AbortSignal; firing it errors the events
 // stream with the signal's reason. The underlying Rust task keeps
 // draining its channel until the LLM run ends — full cancellation
 // to the provider is a follow-up.
+//
+// `chat.tools` is a plain mutable JS array on every session instance.
+// Push entries shaped `{ name, description, parameters, handler }`;
+// the Rust side reads `name`/`description`/`parameters` at each
+// `stream()` call and forwards them to the provider. `handler` is
+// JS-only and the workflow's own loop is responsible for invoking it
+// and pushing the resulting `{ role: "tool", ... }` message back to
+// the session via `chat.push`.
 //
 // The raw async-iterable returned by the Rust side is captured into
 // closure here (`_innerStream`) and never escapes: the stash entry
@@ -74,6 +87,7 @@ ChatSession.prototype.stream = async function stream({ signal } = {}) {
       return textStream;
     },
     completed: inner.completed,
+    signal,
   };
 };
 

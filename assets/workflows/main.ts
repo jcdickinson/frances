@@ -36,6 +36,7 @@ transcript.push(
       "- `json` — push a JsonFrame\n" +
       "- `supersede` — show that writing into a superseded frame's `.writable` throws\n" +
       "- `chat <prompt>` — run a chat turn and pipe `r.text` into a MarkdownFrame (history persists)\n" +
+      "- `tool <prompt>` — same as `chat`, but expose an `echo` tool and run the dispatch loop\n" +
       "- `quit` — exit\n" +
       "- anything else — echo as JSON",
   }),
@@ -45,6 +46,25 @@ transcript.push(
 // across `chat` invocations.
 const chat = new ChatSession({ model_intents: ["chat"] });
 chat.push({ role: "system", content: "You are a terse, friendly assistant." });
+
+// Demo tool exposed via the `tool <prompt>` command. The handler returns
+// a tool-result message that the loop below pushes back to the session
+// so the LLM sees it in the next round.
+chat.tools.push({
+  name: "echo",
+  description: "Echo back whatever string was passed in as `text`.",
+  parameters: {
+    type: "object",
+    properties: { text: { type: "string" } },
+    required: ["text"],
+  },
+  handler: async (args: { text: string }, ctx: { call_id: string }) => ({
+    role: "tool" as const,
+    call_id: ctx.call_id,
+    content: `echo: ${args.text}`,
+    is_error: false,
+  }),
+});
 
 let n = 0;
 
@@ -106,6 +126,52 @@ for await (const input of inbox) {
     } catch (e) {
       transcript.push(
         new MarkdownFrame({ content: `write on superseded frame threw (expected): \`${e}\`` }),
+      );
+    }
+    continue;
+  }
+
+  if (msg.startsWith("tool")) {
+    const prompt = msg.slice("tool".length).trim();
+    if (!prompt) {
+      transcript.push(
+        new ErrorFrame({ content: "usage: tool <prompt>" }),
+      );
+      continue;
+    }
+    chat.push({ role: "user", content: prompt });
+    const out = new MarkdownFrame({ content: "" });
+    transcript.push(out);
+    try {
+      let finalUsage = null;
+      while (true) {
+        const r = await chat.stream();
+        await r.text.pipeTo(out.writable, { preventClose: true });
+        const { tool_calls, usage } = await r.completed;
+        if (usage) finalUsage = usage;
+        if (!tool_calls || tool_calls.length === 0) break;
+        const results = await Promise.all(
+          tool_calls.map(async (call) => {
+            const tool = chat.tools.find((t) => t.name === call.name);
+            if (!tool) {
+              return { role: "tool" as const, call_id: call.id, content: `tool not found: ${call.name}`, is_error: true };
+            }
+            try {
+              return await tool.handler(call.arguments, { call_id: call.id });
+            } catch (err) {
+              return { role: "tool" as const, call_id: call.id, content: String(err), is_error: true };
+            }
+          }),
+        );
+        for (const result of results) chat.push(result);
+      }
+      await out.writable.close();
+      transcript.push(
+        new JsonFrame({ tag: "tool-usage", value: finalUsage }),
+      );
+    } catch (e) {
+      transcript.push(
+        new ErrorFrame({ content: `tool failed: \`${e}\`` }),
       );
     }
     continue;

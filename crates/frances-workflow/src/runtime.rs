@@ -288,8 +288,10 @@ pub(crate) fn caught<'js>(
 #[cfg(test)]
 pub(crate) mod test_deps {
     //! In-memory `WorkflowDeps` for tests. `push` records to a local
-    //! Vec; `run` errors out (no provider). Sufficient for the JS-shape
-    //! tests; a real backend lands when we wire end-to-end tests.
+    //! Vec; `run` errors out (no provider) by default. Tests that need a
+    //! happy-path provider stub the next `run` with a script via
+    //! `StubDeps::script_next_run` — that call configures the events to
+    //! emit and the `CompletionOutcome` to return.
 
     use async_trait::async_trait;
     use frances_models_llm::chat::{
@@ -321,17 +323,47 @@ pub(crate) mod test_deps {
         }
     }
 
+    impl StubDeps {
+        /// Queue a scripted response for the next session's first `run`
+        /// call. Subsequent calls fall back to the default
+        /// `ProviderUnavailable` error unless re-scripted.
+        pub(crate) fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
+            self.manager
+                .next_script
+                .lock()
+                .push_back(Script { events, outcome });
+        }
+
+        /// All sessions handed out by the manager so tests can inspect
+        /// pending-input history after the run.
+        pub(crate) fn sessions(&self) -> Vec<StubSession> {
+            self.manager.sessions.lock().clone()
+        }
+    }
+
     #[derive(Clone, Default)]
-    pub(crate) struct StubManager;
+    pub(crate) struct StubManager {
+        next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
+        sessions: Arc<Mutex<Vec<StubSession>>>,
+    }
+
+    #[derive(Clone)]
+    struct Script {
+        events: Vec<StreamEvent>,
+        outcome: CompletionOutcome,
+    }
 
     #[async_trait]
     impl ChatSessionManager for StubManager {
         type Session = StubSession;
 
         fn create(&self, _builder: ChatSessionBuilder) -> Self::Session {
-            StubSession {
+            let session = StubSession {
                 pending: Arc::new(Mutex::new(Vec::new())),
-            }
+                next_script: self.next_script.clone(),
+            };
+            self.sessions.lock().push(session.clone());
+            session
         }
 
         async fn load(&self, _id: ChatSessionId) -> Result<Self::Session, ChatError> {
@@ -348,6 +380,13 @@ pub(crate) mod test_deps {
     #[derive(Clone)]
     pub(crate) struct StubSession {
         pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
+        next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
+    }
+
+    impl StubSession {
+        pub(crate) fn pending(&self) -> Vec<OwnedHistoryInput> {
+            self.pending.lock().clone()
+        }
     }
 
     #[async_trait]
@@ -361,11 +400,20 @@ pub(crate) mod test_deps {
             _env: HashMap<OsString, OsString>,
             _tools: Vec<ToolDef>,
             _tool_choice: Option<ToolChoice>,
-            _on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
+            mut on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
         ) -> Result<CompletionOutcome, ChatError> {
-            Err(ChatError::ProviderUnavailable(
-                "stub session: no provider wired in tests".to_owned(),
-            ))
+            let script = self.next_script.lock().pop_front();
+            match script {
+                Some(s) => {
+                    for ev in s.events {
+                        on_event(ev)?;
+                    }
+                    Ok(s.outcome)
+                }
+                None => Err(ChatError::ProviderUnavailable(
+                    "stub session: no provider wired in tests".to_owned(),
+                )),
+            }
         }
     }
 }
@@ -1060,6 +1108,347 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         assert_eq!(text_of(&frames[0]), "user wanted out");
+    }
+
+    #[tokio::test]
+    async fn chat_tools_array_is_per_instance_and_initially_empty() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const a = new ChatSession({ model_intents: ["x"] });
+            const b = new ChatSession({ model_intents: ["x"] });
+            const shape = `a=${Array.isArray(a.tools)} len=${a.tools.length} distinct=${a.tools !== b.tools}`;
+            transcript.push(new MarkdownFrame({ content: shape }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "a=true len=0 distinct=true");
+    }
+
+    #[tokio::test]
+    async fn chat_tools_duplicate_names_throw_on_stream() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
+            s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
+            s.push({ role: "user", content: "hi" });
+            try {
+                await s.stream();
+                transcript.push(new ErrorFrame({ content: "BUG: stream did not throw" }));
+            } catch (e) {
+                transcript.push(new MarkdownFrame({ content: String(e) }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let msg = text_of(&frames[0]);
+        assert!(msg.contains("duplicate tool name `echo`"), "got `{msg}`");
+    }
+
+    #[tokio::test]
+    async fn chat_tools_missing_fields_throw_on_stream() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({ name: "echo" }); // missing description / parameters
+            s.push({ role: "user", content: "hi" });
+            try {
+                await s.stream();
+                transcript.push(new ErrorFrame({ content: "BUG: stream did not throw" }));
+            } catch (e) {
+                transcript.push(new MarkdownFrame({ content: String(e) }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let msg = text_of(&frames[0]);
+        assert!(msg.contains("description"), "got `{msg}`");
+    }
+
+    #[tokio::test]
+    async fn chat_stream_surfaces_tool_calls_in_completed_and_events() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![
+                StreamEvent::TextDelta("Calling tool...".to_owned()),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: json!({ "text": "hi" }),
+                }),
+            ],
+            CompletionOutcome {
+                text: "Calling tool...".to_owned(),
+                tool_calls: vec![ToolCall {
+                    id: "call_1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: json!({ "text": "hi" }),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "echo",
+                description: "echoes the input",
+                parameters: { type: "object", properties: { text: { type: "string" } } },
+                handler: async (args, ctx) => ({
+                    role: "tool", call_id: ctx.call_id, content: args.text, is_error: false,
+                }),
+            });
+            s.push({ role: "user", content: "hi" });
+
+            const r = await s.stream();
+            // Drain events; collect any tool_call events seen on the wire.
+            let toolCallSeen = "no";
+            const reader = r.events.getReader();
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (value.type === "tool_call") toolCallSeen = `${value.name}:${value.arguments.text}`;
+            }
+            const final = await r.completed;
+            const summary = `events=${toolCallSeen} text="${final.text}" calls=${final.tool_calls.length} first=${final.tool_calls[0].name}(${final.tool_calls[0].arguments.text})`;
+            transcript.push(new MarkdownFrame({ content: summary }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(frames.last().expect("at least one frame")),
+            r#"events=echo:hi text="Calling tool..." calls=1 first=echo(hi)"#
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_push_tool_role_queues_result() {
+        let deps = StubDeps::default();
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            s.push({ role: "tool", call_id: "abc", content: "result body", is_error: false });
+            transcript.push(new MarkdownFrame({ content: "ok" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        // Inspect the underlying stub session's pending queue. There
+        // should be exactly two entries — the user message and the
+        // tool result — in that order.
+        let sessions = deps.sessions();
+        assert_eq!(sessions.len(), 1);
+        let pending = sessions[0].pending();
+        assert_eq!(pending.len(), 2);
+        assert!(matches!(
+            &pending[0],
+            frances_models_llm::chat::OwnedHistoryInput::User { text } if text == "hi"
+        ));
+        match &pending[1] {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => {
+                assert_eq!(call_id, "abc");
+                assert_eq!(content, "result body");
+                assert!(!is_error);
+            }
+            other => panic!("expected ToolResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_push_tool_role_validates_fields() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            let caught = "";
+            try {
+                s.push({ role: "tool", call_id: 123, content: "x", is_error: false });
+                caught = "no-throw";
+            } catch (e) {
+                caught = String(e);
+            }
+            transcript.push(new MarkdownFrame({ content: caught }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let msg = text_of(&frames[0]);
+        assert!(msg.contains("call_id"), "got `{msg}`");
+    }
+
+    #[tokio::test]
+    async fn explicit_tool_loop_drives_to_terminal_turn() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        // Round 1: model emits a tool call.
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "echo".to_owned(),
+                arguments: json!({ "text": "from round 1" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: json!({ "text": "from round 1" }),
+                }],
+            },
+        );
+        // Round 2: model finishes with plain text, no tool calls.
+        deps.script_next_run(
+            vec![StreamEvent::TextDelta("done.".to_owned())],
+            CompletionOutcome {
+                text: "done.".to_owned(),
+                tool_calls: vec![],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            let handlerCalls = 0;
+            s.tools.push({
+                name: "echo",
+                description: "echoes the input",
+                parameters: { type: "object" },
+                handler: async (args, ctx) => {
+                    handlerCalls += 1;
+                    return {
+                        role: "tool", call_id: ctx.call_id,
+                        content: `echoed:${args.text}`, is_error: false,
+                    };
+                },
+            });
+            s.push({ role: "user", content: "go" });
+
+            let finalText = "";
+            while (true) {
+                const r = await s.stream();
+                const reader = r.events.getReader();
+                while (true) { const { done } = await reader.read(); if (done) break; }
+                reader.releaseLock();
+                const { text, tool_calls } = await r.completed;
+                finalText = text;
+                if (tool_calls.length === 0) break;
+                for (const call of tool_calls) {
+                    const tool = s.tools.find((t) => t.name === call.name);
+                    s.push(await tool.handler(call.arguments, { call_id: call.id }));
+                }
+            }
+            transcript.push(new MarkdownFrame({
+                content: `text="${finalText}" handlerCalls=${handlerCalls}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(frames.last().expect("at least one frame")),
+            r#"text="done." handlerCalls=1"#
+        );
+
+        // The tool result should have been pushed back to the session
+        // between rounds.
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool_result = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => Some((call_id.clone(), content.clone(), *is_error)),
+            _ => None,
+        });
+        assert_eq!(
+            tool_result,
+            Some(("c1".to_owned(), "echoed:from round 1".to_owned(), false))
+        );
     }
 
     #[tokio::test]
