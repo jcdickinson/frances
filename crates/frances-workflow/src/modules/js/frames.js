@@ -2,12 +2,8 @@
 
 import { WritableStream } from "whatwg:web-streams";
 
-const __s = globalThis.__frances_v1_stash__;
-
-export const transcript = __s.transcript;
-export const MarkdownFrame = __s.MarkdownFrame;
-export const ErrorFrame = __s.ErrorFrame;
-export const JsonFrame = __s.JsonFrame;
+export const { transcript, MarkdownFrame, ErrorFrame, JsonFrame } =
+  globalThis.__frances_v1_stash__;
 
 // MarkdownFrame composes a WHATWG WritableStream rather than subclassing
 // one: a frame is a transcript entry with its own lifecycle (sealed when

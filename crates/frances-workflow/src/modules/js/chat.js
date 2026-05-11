@@ -25,9 +25,8 @@
 
 import { ReadableStream, TransformStream } from "whatwg:web-streams";
 
-const __s = globalThis.__frances_v1_stash__;
-const ChatSession = __s.ChatSession;
-const _innerStream = __s.__chat_inner_stream;
+const { ChatSession, __chat_inner_stream: _innerStream } =
+  globalThis.__frances_v1_stash__;
 
 ChatSession.prototype.stream = async function stream({ signal } = {}) {
   const inner = await _innerStream.call(this);

@@ -224,19 +224,27 @@ async fn run_workflow<D: WorkflowDeps>(
 
     async_with!(context => |ctx| {
         let result: Result<(), WorkflowError> = async {
-            // `frances:v1/*` modules import from `whatwg:*` (frames
-            // uses WritableStream, chat uses Readable/TransformStream),
-            // so the polyfills have to be declared first.
-            modules::install_whatwg(&ctx)?;
-            modules::install_v1(
+            // The install-time stash must be live before either family
+            // of modules evaluates. `whatwg:abortcontroller` captures
+            // `_setSleep` from it (for `AbortSignal.timeout`), and
+            // every `frances:v1/*` module captures its own slots. The
+            // whatwg polyfills are declared before v1 because the v1
+            // modules import from them (frames uses WritableStream,
+            // chat uses Readable/TransformStream).
+            modules::install_stash(
                 &ctx,
-                frames,
-                input_rx,
-                closed.clone(),
-                closed_notify.clone(),
-                parked,
-                deps,
+                modules::V1HostState {
+                    frames_tx: frames,
+                    input_rx,
+                    closed: closed.clone(),
+                    closed_notify: closed_notify.clone(),
+                    parked,
+                    deps,
+                },
             )?;
+            modules::install_whatwg(&ctx)?;
+            modules::install_v1_modules(&ctx)?;
+            modules::remove_stash(&ctx)?;
 
             let user_module = Module::declare(ctx.clone(), USER_MODULE_NAME, js_source.as_bytes())
                 .catch(&ctx)
@@ -261,12 +269,6 @@ async fn run_workflow<D: WorkflowDeps>(
             Ok(())
         }
         .await;
-
-        // Tear down any rquickjs `Persistent` values stashed in
-        // userdata *before* the context drops. Skipping this aborts
-        // the runtime at `JS_FreeRuntime: list_empty`. Runs whether
-        // the body succeeded or errored.
-        modules::cleanup_v1(&ctx);
 
         result
     })
@@ -1179,11 +1181,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timer_reject_with_error_carries_message() {
-        // Identity isn't preserved (we capture a string at reject() time
-        // to avoid leaking a JS value past the runtime lifetime), but
-        // the Error message comes through and the caught value is an
-        // Error instance.
+    async fn timer_reject_preserves_error_identity() {
+        // Rejection identity is now preserved verbatim — the caught
+        // value IS the original Error, not a wrapped copy.
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
@@ -1191,13 +1191,14 @@ mod tests {
             import { Timer } from "frances:v1/io";
             import { transcript, MarkdownFrame } from "frances:v1/frames";
             const t = new Timer(60_000);
-            queueMicrotask(() => t.reject(new Error("nope")));
+            const original = new Error("nope");
+            queueMicrotask(() => t.reject(original));
             try {
                 await t;
                 transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
             } catch (e) {
                 transcript.push(new MarkdownFrame({
-                    content: `caught: error=${e instanceof Error} msg=${e.message}`,
+                    content: `same=${e === original} msg=${e.message}`,
                 }));
             }
             "#,
@@ -1210,7 +1211,7 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-        assert_eq!(text_of(&frames[0]), "caught: error=true msg=nope");
+        assert_eq!(text_of(&frames[0]), "same=true msg=nope");
     }
 
     #[tokio::test]
@@ -1254,7 +1255,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timer_reject_makes_instance_of_timer_error() {
+    async fn timer_reject_with_timer_error_is_instance() {
+        // When the caller explicitly rejects with a TimerError, the
+        // identity is preserved and `instanceof TimerError` holds. We
+        // no longer auto-wrap arbitrary rejections.
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
@@ -1262,7 +1266,7 @@ mod tests {
             import { Timer, TimerError } from "frances:v1/io";
             import { transcript, MarkdownFrame } from "frances:v1/frames";
             const t = new Timer(60_000);
-            queueMicrotask(() => t.reject(new Error("boom")));
+            queueMicrotask(() => t.reject(new TimerError("boom")));
             try {
                 await t;
                 transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
@@ -1644,6 +1648,211 @@ mod tests {
         assert_eq!(text_of(&frames[0]), "after-await");
     }
 
+    #[tokio::test]
+    async fn timer_reject_with_object_preserves_identity() {
+        // Non-Error rejection values are also preserved verbatim — no
+        // string coercion, no auto-wrapping.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer } from "frances:v1/io";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const t = new Timer(60_000);
+            const payload = { kind: "custom", n: 42 };
+            queueMicrotask(() => t.reject(payload));
+            try {
+                await t;
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                transcript.push(new MarkdownFrame({
+                    content: `same=${e === payload} kind=${e.kind} n=${e.n}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "same=true kind=custom n=42");
+    }
+
+    #[tokio::test]
+    async fn timer_signal_already_aborted_rejects_immediately() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer } from "frances:v1/io";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const ac = new AbortController();
+            ac.abort("pre-aborted");
+            const t = new Timer({ delay: 60_000, signal: ac.signal });
+            const start = Date.now();
+            try {
+                await t;
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                const elapsed = Date.now() - start;
+                transcript.push(new MarkdownFrame({
+                    content: `caught=${e} fast=${elapsed < 100}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "caught=pre-aborted fast=true");
+    }
+
+    #[tokio::test]
+    async fn timer_signal_aborts_mid_wait() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer } from "frances:v1/io";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const ac = new AbortController();
+            const t = new Timer({ delay: 60_000, signal: ac.signal });
+            queueMicrotask(() => ac.abort(new Error("user cancelled")));
+            const start = Date.now();
+            try {
+                await t;
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                const elapsed = Date.now() - start;
+                transcript.push(new MarkdownFrame({
+                    content: `err=${e instanceof Error} msg=${e.message} fast=${elapsed < 1000}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "err=true msg=user cancelled fast=true");
+    }
+
+    #[tokio::test]
+    async fn timer_signal_reason_preserved_verbatim() {
+        // The rejection IS signal.reason, by identity — not a wrapped
+        // copy. Mirrors WHATWG fetch semantics.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer } from "frances:v1/io";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const ac = new AbortController();
+            const reason = { kind: "signal-reason", id: 7 };
+            const t = new Timer({ delay: 60_000, signal: ac.signal });
+            queueMicrotask(() => ac.abort(reason));
+            try {
+                await t;
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                transcript.push(new MarkdownFrame({
+                    content: `same=${e === reason} kind=${e.kind} id=${e.id}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "same=true kind=signal-reason id=7");
+    }
+
+    #[tokio::test]
+    async fn timer_signal_listener_removed_on_terminal() {
+        // After the timer settles via reject(), an abort on the
+        // original signal must not double-fire on the timer — the
+        // listener should have been removed at terminal transition.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer, TimerError } from "frances:v1/io";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const ac = new AbortController();
+            const t = new Timer({ delay: 60_000, signal: ac.signal });
+            t.reject(new Error("manual"));
+            // After reject, the timer is terminal. Aborting the signal
+            // should not throw / not mutate anything observable.
+            ac.abort("late");
+            try {
+                await t;
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                // We rejected with our own Error before abort fired —
+                // the late abort must not have replaced the reason.
+                transcript.push(new MarkdownFrame({
+                    content: `msg=${e.message} aborted=${ac.signal.aborted}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "msg=manual aborted=true");
+    }
+
+    #[tokio::test]
+    async fn timer_non_signal_object_rejected_by_constructor() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Timer } from "frances:v1/io";
+            new Timer({ delay: 10, signal: { aborted: false } });  // missing addEventListener
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
+            "got {result:?}"
+        );
+    }
+
     // ---- whatwg:* smoke tests --------------------------------------------
     //
     // These verify the module-library wiring (the import resolves, the
@@ -1740,5 +1949,140 @@ mod tests {
             text_of(&frames[0]),
             "before=false after=true fired=true reason=nope sig=true"
         );
+    }
+
+    #[tokio::test]
+    async fn abortsignal_timeout_fires_after_delay() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { AbortSignal } from "whatwg:abortcontroller";
+            import { DOMException } from "whatwg:dom";
+            import { Timer } from "frances:v1/io";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const start = Date.now();
+            const s = AbortSignal.timeout(15);
+            // Wait long enough for the timeout to fire.
+            await new Timer(60);
+            const elapsed = Date.now() - start;
+            transcript.push(new MarkdownFrame({
+                content: `aborted=${s.aborted} name=${s.reason && s.reason.name} dom=${s.reason instanceof DOMException} fast=${elapsed < 200}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(&frames[0]),
+            "aborted=true name=TimeoutError dom=true fast=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn abortsignal_timeout_composes_with_timer_signal() {
+        // The whole point of the primitive split: an AbortSignal.timeout
+        // signal can be fed directly into a Timer's `signal:` option.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { AbortSignal } from "whatwg:abortcontroller";
+            import { Timer } from "frances:v1/io";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const start = Date.now();
+            try {
+                await new Timer({ delay: 60_000, signal: AbortSignal.timeout(15) });
+                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+            } catch (e) {
+                const elapsed = Date.now() - start;
+                transcript.push(new MarkdownFrame({
+                    content: `name=${e.name} msg=${e.message} fast=${elapsed < 1000}`,
+                }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(&frames[0]),
+            "name=TimeoutError msg=signal timed out fast=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn abortsignal_timeout_rejects_garbage() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { AbortSignal } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const cases = ["nope", -5, NaN, undefined, {}];
+            const threw = cases.map((c) => {
+                try { AbortSignal.timeout(c); return "no-throw"; }
+                catch (_) { return "threw"; }
+            });
+            transcript.push(new MarkdownFrame({ content: threw.join(",") }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "threw,threw,threw,threw,threw");
+    }
+
+    #[tokio::test]
+    async fn abortsignal_any_first_source_wins_and_listener_cleaned_up() {
+        // The combined signal aborts on the first source. The cleanup
+        // path must remove the listener from BOTH sources, so a later
+        // abort on the second source does not overwrite `out.reason`.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { AbortController, AbortSignal } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const a = new AbortController();
+            const b = new AbortController();
+            const out = AbortSignal.any([a.signal, b.signal]);
+            a.abort("first");
+            const reasonAfterFirst = out.reason;
+            // If listeners weren't cleaned up, the second abort would
+            // run propagate again and (no-op since out is already
+            // aborted, but it would still re-fire the listener walk).
+            // The observable signal: out.reason must stay "first".
+            b.abort("second");
+            transcript.push(new MarkdownFrame({
+                content: `first=${reasonAfterFirst} after=${out.reason} aborted=${out.aborted}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "first=first after=first aborted=true");
     }
 }

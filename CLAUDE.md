@@ -2,6 +2,13 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Process
+
+Before starting planning, check `jj show --stat` and determine if the new work is completely unrelated. Query the user if so.
+
+Upon completing work, `jj describe` the changes - including correcting the description if a new commit
+wasn't created.
+
 ## Project
 
 Frances is an agentic coding tool. The `frances` binary is a TUI front-end that talks to a per-TTY background daemon over Unix sockets; the daemon owns the session, persists history to a per-session turso (libsql) database, and streams LLM completions via OpenRouter.

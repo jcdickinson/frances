@@ -6,21 +6,23 @@
 //!   (channels, flags) flow through a transient stash on `globalThis`;
 //!   each module's body captures them into its local scope and the
 //!   stash is then deleted, so user scripts can't reach it.
-//! - `whatwg:*` — vendored polyfills with no per-invocation state.
-//!   Pure JS source under `modules/whatwg/` at the workspace root,
-//!   embedded via `include_str!` and refreshed by `update.sh`.
+//! - `whatwg:*` — vendored polyfills under `modules/whatwg/`,
+//!   embedded via `include_str!` and refreshed by `update.sh`. They
+//!   used to be pure JS with no per-invocation state; today
+//!   `whatwg:abortcontroller` also captures `_setSleep` from the
+//!   stash, so the stash must be live when whatwg modules evaluate.
 //!
-//! `frances:v1/*` install flow: build the per-invocation host values,
-//! stash them on `globalThis`, declare + evaluate each virtual module
-//! (whose body runs `const __s = globalThis.__frances_v1_stash__` and
-//! captures the references it needs), then delete the stash. The two
-//! exceptions are `TimerError` (a JS class declared inside `io.js`,
-//! whose constructor we then stash via `Ctx::store_userdata` for the
-//! Rust reject path) and `cleanup_v1`, which must run before the
-//! context drops or `JS_FreeRuntime` aborts at `list_empty`.
+//! Install flow (orchestrated by the runtime):
 //!
-//! `whatwg:*` install is trivial — just declare and evaluate the
-//! module sources. No stash, no userdata, no cleanup.
+//! 1. `install_stash` — build per-invocation host values, place them on
+//!    `globalThis.__frances_v1_stash__`.
+//! 2. `install_whatwg` — declare + eval `whatwg:*`. The polyfills that
+//!    need stash entries grab them into their module scope here.
+//! 3. `install_v1_modules` — declare + eval `frances:v1/*`. Each module
+//!    body destructures `globalThis.__frances_v1_stash__` to capture the
+//!    slots it needs into module scope.
+//! 4. `remove_stash` — delete the stash from `globalThis` so user
+//!    scripts can't reach it.
 //!
 //! Module source files live as siblings under `js/` (v1) or under
 //! `modules/whatwg/` at the workspace root.
@@ -31,29 +33,29 @@
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
 //! - `frances:v1/frames`         — `transcript`, `MarkdownFrame`, `ErrorFrame`,
 //!   `JsonFrame` (frame-objects-with-history API).
-//! - `frances:v1/chat`           — `ChatSession` (LLM access). Constructor
-//!   currently throws — see `chat.rs`.
-//! - `frances:v1/io`             — `Timer` + `TimerError` (interval + one-shot
-//!   awaitable + the Error subclass it rejects with).
+//! - `frances:v1/chat`           — `ChatSession` (LLM access).
+//! - `frances:v1/io`             — `Timer` + `TimerError`. The user-facing
+//!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
+//!   primitive (`_setSleep` / `_clearSleep`) on the install-time stash
+//!   that the JS wrapper composes against.
 //! - `whatwg:web-streams`        — `ReadableStream`, `WritableStream`,
-//!   `TransformStream` and friends from web-streams-polyfill (the
-//!   ponyfill build — named exports, no globalThis mutation).
+//!   `TransformStream` and friends from web-streams-polyfill.
 //! - `whatwg:abortcontroller`    — `AbortController`, `AbortSignal`
-//!   (hand-rolled, EventTarget-free).
+//!   (hand-rolled, EventTarget-free). `AbortSignal.timeout` builds on
+//!   the stash's sleep primitive.
 //! - `whatwg:dom`                — minimal DOM Standard surface
-//!   (currently just `DOMException`). Grows on a what-we-need basis;
-//!   see `docs/js/whatwg.md`.
+//!   (currently just `DOMException`).
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use rquickjs::function::Constructor;
 use rquickjs::module::Module;
-use rquickjs::{CatchResultExt, Ctx, JsLifetime, Object, Persistent};
+use rquickjs::{CatchResultExt, Ctx, Object};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
+use crate::deps::WorkflowDeps;
 use crate::runtime::{HostFrame, UserInput, caught};
 
 pub mod chat;
@@ -67,31 +69,35 @@ pub mod workflow;
 /// so user scripts can't reach it via `globalThis`.
 const STASH_KEY: &str = "__frances_v1_stash__";
 
-/// Userdata wrapper for the per-invocation `TimerError` constructor.
-/// Stored via `Ctx::store_userdata` so the Timer reject path can
-/// retrieve it without exposing anything to user JS. **Must be
-/// removed via `cleanup_v1` before `AsyncContext` drops** — the
-/// underlying `Persistent` holds a JS value, and dropping it after
-/// the runtime starts tearing down aborts the process.
-pub(crate) struct TimerErrorUserData(pub(crate) Persistent<Constructor<'static>>);
-
-unsafe impl<'js> JsLifetime<'js> for TimerErrorUserData {
-    type Changed<'to> = TimerErrorUserData;
+/// Per-invocation host state that gets stashed for module bodies to
+/// capture. Bundled into a single struct so the install call site
+/// stays readable.
+pub(crate) struct V1HostState<D: WorkflowDeps> {
+    pub frames_tx: UnboundedSender<HostFrame>,
+    pub input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
+    pub closed: Arc<AtomicBool>,
+    pub closed_notify: Arc<Notify>,
+    pub parked: Arc<Notify>,
+    pub deps: D,
 }
 
-/// Wires the `frances:v1/*` virtual modules into `ctx`. Builds the
-/// per-invocation host values (closures over the channels/flags),
-/// stashes them on `globalThis`, declares + evaluates each virtual
-/// module, and finally deletes the stash.
-pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
+/// Builds the install-time stash and places it at
+/// `globalThis.__frances_v1_stash__`. Must run before any virtual
+/// module is evaluated; the matching `remove_stash` must run once
+/// every module has captured its slots.
+pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
-    frames_tx: UnboundedSender<HostFrame>,
-    input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
-    deps: D,
+    host: V1HostState<D>,
 ) -> Result<(), WorkflowError> {
+    let V1HostState {
+        frames_tx,
+        input_rx,
+        closed,
+        closed_notify,
+        parked,
+        deps,
+    } = host;
+
     let stash = Object::new(ctx.clone())?;
 
     let exit_fn = workflow::build_exit(ctx, closed.clone(), closed_notify.clone())?;
@@ -111,62 +117,43 @@ pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
     stash.set("ChatSession", chat_ctor)?;
     stash.set("__chat_inner_stream", chat_inner_stream)?;
 
-    let timer_ctor = io::build_timer_ctor(ctx, closed, closed_notify)?;
-    stash.set("Timer", timer_ctor)?;
+    let (set_sleep, clear_sleep) = io::build_sleep_primitives(ctx, closed, closed_notify)?;
+    stash.set("_setSleep", set_sleep)?;
+    stash.set("_clearSleep", clear_sleep)?;
 
     ctx.globals().set(STASH_KEY, stash)?;
-
-    // Declare and evaluate each virtual module. Evaluation runs the
-    // module body, which captures the stash references into each
-    // module's local `__s` binding. After all modules are evaluated
-    // we delete the stash from globalThis.
-    declare_and_eval(ctx, "frances:v1/workflow", WORKFLOW_SRC)?;
-    declare_and_eval(ctx, "frances:v1/inbox", INBOX_SRC)?;
-    declare_and_eval(ctx, "frances:v1/frames", FRAMES_SRC)?;
-    declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
-    let io_module = declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
-
-    // Stash the `TimerError` constructor on the Ctx so the Timer
-    // reject path can look it up. We use `Ctx::store_userdata`
-    // rather than a JS global so it's invisible to user code; the
-    // matching `cleanup_v1` must run before the context drops so the
-    // underlying `Persistent` is released safely.
-    let io_namespace = io_module
-        .namespace()
-        .catch(ctx)
-        .map_err(caught("frances:v1/io namespace"))?;
-    let timer_error: Constructor<'js> = io_namespace
-        .get("TimerError")
-        .catch(ctx)
-        .map_err(caught("frances:v1/io.TimerError"))?;
-    let _ = ctx.store_userdata(TimerErrorUserData(Persistent::save(ctx, timer_error)));
-
-    ctx.globals().remove(STASH_KEY)?;
-
     Ok(())
 }
 
-/// Declares the `whatwg:*` polyfill modules. No per-invocation state,
-/// so this is just `declare_and_eval` for each source. Independent of
-/// `install_v1`; the runtime calls both before evaluating the user
-/// script.
+/// Declares the `whatwg:*` polyfill modules. Evaluation order matters:
+/// `whatwg:abortcontroller` imports `DOMException` from `whatwg:dom`,
+/// and captures `_setSleep` from the install stash (which must already
+/// be live).
 pub(crate) fn install_whatwg<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
-    // Order matters: `whatwg:abortcontroller` imports DOMException
-    // from `whatwg:dom`, so the dom module must be declared first.
     declare_and_eval(ctx, "whatwg:dom", DOM_SRC)?;
     declare_and_eval(ctx, "whatwg:web-streams", WEB_STREAMS_SRC)?;
     declare_and_eval(ctx, "whatwg:abortcontroller", ABORTCONTROLLER_SRC)?;
     Ok(())
 }
 
-/// Teardown counterpart to `install_v1`. Must be called inside the
-/// same `async_with!` block as `install_v1`, before the closure ends
-/// and the context drops. Dropping the `TimerErrorUserData` from
-/// `userdata` here ensures the contained `Persistent` is released
-/// while the JS context is still alive — if it slipped to runtime
-/// drop, `JS_FreeRuntime` would abort with `list_empty` failing.
-pub(crate) fn cleanup_v1<'js>(ctx: &Ctx<'js>) {
-    let _ = ctx.remove_userdata::<TimerErrorUserData>();
+/// Declares + evaluates the `frances:v1/*` virtual modules. The stash
+/// must already be live so each module body can `const __s =
+/// globalThis.__frances_v1_stash__` and capture its slots.
+pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
+    declare_and_eval(ctx, "frances:v1/workflow", WORKFLOW_SRC)?;
+    declare_and_eval(ctx, "frances:v1/inbox", INBOX_SRC)?;
+    declare_and_eval(ctx, "frances:v1/frames", FRAMES_SRC)?;
+    declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
+    declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
+    Ok(())
+}
+
+/// Removes the install-time stash from `globalThis`. Must run after
+/// every virtual module has been evaluated and captured its slots,
+/// otherwise the bindings inside module scope become stale lookups.
+pub(crate) fn remove_stash<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
+    ctx.globals().remove(STASH_KEY)?;
+    Ok(())
 }
 
 /// Declares and evaluates a virtual module. Our modules are
