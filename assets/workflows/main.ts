@@ -14,6 +14,7 @@ import {
   JsonFrame,
 } from "frances:v1/frames";
 import { ChatSession } from "frances:v1/chat";
+import { Timer } from "frances:v1/io";
 import { exit } from "frances:v1/workflow";
 
 declare global {
@@ -30,7 +31,7 @@ transcript.push(
     content:
       `/main started${argsLine}\n\n` +
       "**Commands**\n" +
-      "- `md` — push a MarkdownFrame and stream into it via `append`\n" +
+      "- `md` — push a MarkdownFrame and stream into it via `append` (250ms ticks)\n" +
       "- `err` — push an ErrorFrame\n" +
       "- `json` — push a JsonFrame\n" +
       "- `supersede` — show that `append` on a superseded frame throws\n" +
@@ -60,9 +61,12 @@ for await (const input of inbox) {
   if (msg === "md") {
     const f = new MarkdownFrame({ content: "streaming markdown:" });
     transcript.push(f);
+    const tick = new Timer({ interval: 250 });
     for (let i = 1; i <= 3; i += 1) {
+      await tick;
       f.append(`\n  - step ${i}`);
     }
+    tick.disable();
     continue;
   }
 

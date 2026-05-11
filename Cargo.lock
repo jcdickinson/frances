@@ -1188,6 +1188,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "deno_ast",
+ "parking_lot",
  "rquickjs",
  "serde",
  "serde_json",

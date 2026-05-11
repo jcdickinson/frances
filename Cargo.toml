@@ -15,7 +15,7 @@ bincode = { version = "2", features = ["serde"] }
 libc = "0.2"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures-util = "0.3"
@@ -30,6 +30,7 @@ thiserror = "2"
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
 similar = { version = "3.1", default-features = false }
 async-trait = "0.1"
+parking_lot = "0.12"
 frances-anchors = { path = "crates/frances-anchors" }
 frances-config = { path = "crates/frances-config" }
 frances-core = { path = "crates/frances-core" }
