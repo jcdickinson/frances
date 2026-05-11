@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::provider::Usage;
+use frances_models_llm::wire::Usage;
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct ToolCallDelta<'a> {

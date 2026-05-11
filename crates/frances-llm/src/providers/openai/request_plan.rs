@@ -7,7 +7,7 @@ use serde_json::Value;
 use thiserror::Error as ThisError;
 use url::Url;
 
-use crate::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
+use frances_models_llm::config::{AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
 
 #[derive(Debug, ThisError)]
 pub enum Error {

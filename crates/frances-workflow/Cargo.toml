@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 async-trait.workspace = true
 deno_ast.workspace = true
+frances-models-llm.workspace = true
 parking_lot.workspace = true
 rquickjs.workspace = true
 serde.workspace = true

@@ -28,9 +28,10 @@ use serde_json::{Value, json};
 use thiserror::Error;
 use tracing::warn;
 
+use frances_llm::{ChatManagerDeps, ChatSessionManager, CompleteRequest};
+use frances_models_llm::wire::{ToolCall, ToolDef, ToolFunction};
+
 use crate::Result;
-use crate::chat::{ChatSessionManager, CompleteRequest};
-use crate::llm::{ToolCall, ToolDef, ToolFunction};
 
 #[derive(Debug, Error)]
 pub enum ShellClassifierError {
@@ -92,8 +93,8 @@ const FALLBACK_DESCRIPTION: &str =
 /// `session_id` is threaded into the underlying provider request for
 /// token caching — pass the parent chat session's id so classifier
 /// calls share its caching scope.
-pub async fn classify_shell(
-    chat: &ChatSessionManager,
+pub async fn classify_shell<D: ChatManagerDeps>(
+    chat: &ChatSessionManager<D>,
     session_id: &str,
     env: &HashMap<OsString, OsString>,
     cmd: &str,
@@ -110,8 +111,8 @@ pub async fn classify_shell(
     }
 }
 
-async fn try_classify(
-    chat: &ChatSessionManager,
+async fn try_classify<D: ChatManagerDeps>(
+    chat: &ChatSessionManager<D>,
     session_id: &str,
     env: &HashMap<OsString, OsString>,
     cmd: &str,

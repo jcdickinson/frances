@@ -1,78 +1,85 @@
 //! `frances:v1/chat` — `ChatSession` for talking to the LLM.
 //!
-//! v1 status: the JS surface is fully present so workflows can be
-//! written against it, but the runtime is not yet wired to the daemon's
-//! `ChatSessionManager`. `stream()` therefore throws a clear "not yet
-//! wired" error. The cross-crate plumbing is a focused follow-up — once
-//! it lands, only this file changes (the JS shape is locked).
-//!
 //! Shape:
 //!
 //! ```js
 //! const s = new ChatSession({ model_intents: ["summarize"] });
 //! s.push({ role: "user", content: "hi" });
 //! const r = await s.stream();
-//! for await (const p of r.chunks) { /* … */ }
-//! // assistant reply is auto-pushed onto `s` once the stream ends
+//! for await (const ev of r.events) { /* … */ }
+//! const final = await r.completed;     // { text, usage }
 //! ```
 //!
 //! Roles in v1: `"system"` and `"user"`. Pushing `"assistant"` throws —
-//! assistant messages come from the model, the workflow doesn't
-//! fabricate them. `"system"` may only be pushed before any `"user"`
-//! message; once user input is in the conversation, the system block
-//! is fixed.
+//! assistant messages come from the model. `"system"` may only be
+//! pushed before any `"user"` message; after the first user push the
+//! system slot is locked.
 
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use rquickjs::atom::PredefinedAtom;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
-use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as JsResult, Value};
+use rquickjs::promise::Promised;
+use rquickjs::{
+    Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
+};
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::oneshot;
 
-pub(crate) fn build_chat_session_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Constructor<'js>> {
-    Constructor::new_class::<ChatSession, _, _>(ctx.clone(), |ctx: Ctx<'js>, arg: Value<'js>| {
-        let intents = parse_intents(&ctx, &arg)?;
-        Class::instance(
-            ctx.clone(),
-            ChatSession {
-                model_intents: intents,
-                messages: Arc::new(StdMutex::new(Vec::new())),
-            },
-        )
-    })
+use frances_models_llm::chat::{
+    ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
+    ChatSessionManager as ChatSessionManagerTrait, OwnedHistoryInput,
+};
+use frances_models_llm::wire::StreamEvent;
+
+use crate::deps::WorkflowDeps;
+
+type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManagerTrait>::Session;
+
+pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
+    ctx: &Ctx<'js>,
+    deps: D,
+) -> JsResult<Constructor<'js>> {
+    Constructor::new_class::<ChatSessionJs<D>, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Value<'js>| {
+            let intents = parse_intents(&ctx, &arg)?;
+            let builder = ChatSessionBuilder::new().with_model_intents(intents);
+            let handle = deps.chat_session_manager().create(builder);
+            Class::instance(
+                ctx.clone(),
+                ChatSessionJs::<D> {
+                    handle,
+                    deps: deps.clone(),
+                    system_locked: AtomicBool::new(false),
+                },
+            )
+        },
+    )
 }
 
-pub struct ChatSession {
-    #[expect(
-        dead_code,
-        reason = "wired to backend by follow-up; kept on the type so the shape is locked"
-    )]
-    model_intents: Vec<String>,
-    messages: Arc<StdMutex<Vec<ChatMessage>>>,
+pub struct ChatSessionJs<D: WorkflowDeps> {
+    handle: Session<D>,
+    /// Captured at construction so each `stream()` call can resolve env
+    /// vars (auth, etc.) against the latest client attach snapshot.
+    deps: D,
+    /// Flipped once the first `user` message is pushed. After that,
+    /// `system` pushes throw.
+    system_locked: AtomicBool,
 }
 
-#[derive(Clone)]
-pub struct ChatMessage {
-    pub role: ChatRole,
-    #[expect(dead_code, reason = "consumed when stream() is wired to the backend")]
-    pub content: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum ChatRole {
-    System,
-    User,
-}
-
-impl<'js> Trace<'js> for ChatSession {
+impl<'js, D: WorkflowDeps> Trace<'js> for ChatSessionJs<D> {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for ChatSession {
-    type Changed<'to> = ChatSession;
+unsafe impl<'js, D: WorkflowDeps> JsLifetime<'js> for ChatSessionJs<D> {
+    type Changed<'to> = ChatSessionJs<D>;
 }
 
-impl<'js> JsClass<'js> for ChatSession {
+impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
     const NAME: &'static str = "ChatSession";
     type Mutable = Readable;
 
@@ -83,8 +90,8 @@ impl<'js> JsClass<'js> for ChatSession {
             "push",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ChatSession>>, msg: Value<'js>| {
-                    push_message(&ctx, &this.0, msg)
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, msg: Value<'js>| {
+                    push_message::<D>(&ctx, &this.0, msg)
                 },
             )?,
         )?;
@@ -93,13 +100,8 @@ impl<'js> JsClass<'js> for ChatSession {
             "stream",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, _this: This<Class<'js, ChatSession>>| -> JsResult<()> {
-                    Err(throw(
-                        &ctx,
-                        "ChatSession.stream: LLM backend is not yet wired into the workflow \
-                         runtime (follow-up). The JS API shape is final; only the host wiring \
-                         is pending.",
-                    ))
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
+                    start_stream::<D>(&ctx, &this.0)
                 },
             )?,
         )?;
@@ -141,9 +143,9 @@ fn parse_intents<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Vec<String>>
     Ok(out)
 }
 
-fn push_message<'js>(
+fn push_message<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
-    session: &Class<'js, ChatSession>,
+    session: &Class<'js, ChatSessionJs<D>>,
     msg: Value<'js>,
 ) -> JsResult<()> {
     let Some(obj) = msg.as_object() else {
@@ -152,9 +154,25 @@ fn push_message<'js>(
     let role_str: String = obj
         .get("role")
         .map_err(|_| throw(ctx, "session.push: missing or non-string `role`"))?;
-    let role = match role_str.as_str() {
-        "user" => ChatRole::User,
-        "system" => ChatRole::System,
+    let content: String = obj
+        .get("content")
+        .map_err(|_| throw(ctx, "session.push: missing or non-string `content`"))?;
+
+    let borrow = session.borrow();
+    let input = match role_str.as_str() {
+        "user" => {
+            borrow.system_locked.store(true, Ordering::Release);
+            OwnedHistoryInput::User { text: content }
+        }
+        "system" => {
+            if borrow.system_locked.load(Ordering::Acquire) {
+                return Err(throw(
+                    ctx,
+                    "session.push: role `system` is only valid before any user message has been pushed",
+                ));
+            }
+            OwnedHistoryInput::System { text: content }
+        }
         "assistant" => {
             return Err(throw(
                 ctx,
@@ -169,25 +187,208 @@ fn push_message<'js>(
             ));
         }
     };
-    let content: String = obj
-        .get("content")
-        .map_err(|_| throw(ctx, "session.push: missing or non-string `content`"))?;
-
-    let borrow = session.borrow();
-    let mut messages = borrow
-        .messages
-        .lock()
-        .expect("chat session messages poisoned");
-    if matches!(role, ChatRole::System)
-        && messages.iter().any(|m| !matches!(m.role, ChatRole::System))
-    {
-        return Err(throw(
-            ctx,
-            "session.push: role `system` is only valid before any user message has been pushed",
-        ));
-    }
-    messages.push(ChatMessage { role, content });
+    borrow.handle.push(input);
     Ok(())
+}
+
+/// Synchronously kicks off a provider stream and returns an object
+/// `{ events, completed }`.
+///
+/// `events` is an async iterable that yields stream events as they
+/// arrive. `completed` is a Promise resolving to `{ text, usage }` once
+/// `ChatSession::run` has settled. The rs-side `run` writes the
+/// assistant primitive to history, so the next `s.stream()` call sees
+/// the prior turn via `loaded_history`.
+fn start_stream<'js, D: WorkflowDeps>(
+    ctx: &Ctx<'js>,
+    session: &Class<'js, ChatSessionJs<D>>,
+) -> JsResult<Value<'js>> {
+    let (handle, env) = {
+        let borrow = session.borrow();
+        (borrow.handle.clone(), borrow.deps.current_env())
+    };
+
+    let (event_tx, event_rx) = mpsc::unbounded_channel::<StreamEvent>();
+    let (completed_tx, completed_rx) = oneshot::channel::<Result<CompletedJs, ChatError>>();
+
+    tokio::spawn(async move {
+        let tx_for_callback = event_tx.clone();
+        let on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send> =
+            Box::new(move |event| {
+                let _ = tx_for_callback.send(event);
+                Ok(())
+            });
+        let result = handle.run(env, Vec::new(), None, on_event).await;
+        drop(event_tx);
+        let mapped = result.map(|outcome| CompletedJs {
+            text: outcome.text,
+            usage: None,
+        });
+        let _ = completed_tx.send(mapped);
+    });
+
+    let events_class = Class::instance(
+        ctx.clone(),
+        JsEventStream {
+            rx: Arc::new(AsyncMutex::new(event_rx)),
+        },
+    )?;
+
+    let completed_promise = Promised::from(async move {
+        match completed_rx.await {
+            Ok(Ok(c)) => CompletionResult(Ok(c)),
+            Ok(Err(e)) => CompletionResult(Err(format!("chat stream failed: {e}"))),
+            Err(_) => CompletionResult(Err("chat stream task aborted".to_owned())),
+        }
+    });
+
+    let obj = Object::new(ctx.clone())?;
+    obj.set("events", events_class)?;
+    obj.set("completed", completed_promise)?;
+    Ok(obj.into_value())
+}
+
+/// Async-iterable wrapper around the stream-event receiver. Lifted from
+/// `Inbox`'s `Symbol.asyncIterator` pattern; yields `StreamEvent`s
+/// converted to discriminated-union JS objects.
+pub struct JsEventStream {
+    rx: Arc<AsyncMutex<UnboundedReceiver<StreamEvent>>>,
+}
+
+impl<'js> Trace<'js> for JsEventStream {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for JsEventStream {
+    type Changed<'to> = JsEventStream;
+}
+
+impl<'js> JsClass<'js> for JsEventStream {
+    const NAME: &'static str = "ChatEvents";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        let proto = Object::new(ctx.clone())?;
+
+        proto.set(
+            PredefinedAtom::SymbolAsyncIterator,
+            Function::new(ctx.clone(), |this: This<Class<'js, JsEventStream>>| {
+                Ok::<_, rquickjs::Error>(this.0.clone())
+            })?,
+        )?;
+
+        proto.set(
+            PredefinedAtom::Next,
+            Function::new(ctx.clone(), |this: This<Class<'js, JsEventStream>>| {
+                let rx = this.0.borrow().rx.clone();
+                Ok::<_, rquickjs::Error>(Promised::from(async move {
+                    let mut guard = rx.lock().await;
+                    match guard.recv().await {
+                        Some(event) => IterResult::value(JsStreamEvent(event)),
+                        None => IterResult::done(),
+                    }
+                }))
+            })?,
+        )?;
+
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+struct JsStreamEvent(StreamEvent);
+
+impl<'js> IntoJs<'js> for JsStreamEvent {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        match self.0 {
+            StreamEvent::TextDelta(delta) => {
+                obj.set("type", "text")?;
+                obj.set("delta", delta)?;
+            }
+            StreamEvent::Usage(usage) => {
+                obj.set("type", "usage")?;
+                let u = Object::new(ctx.clone())?;
+                u.set("promptTokens", usage.prompt_tokens)?;
+                u.set("completionTokens", usage.completion_tokens)?;
+                u.set("totalTokens", usage.total_tokens)?;
+                u.set("cachedInputTokens", usage.cached_input_tokens)?;
+                obj.set("usage", u)?;
+            }
+            // Provider-internal; never surfaces to JS.
+            StreamEvent::History(_) | StreamEvent::ToolCall(_) => {
+                obj.set("type", "ignored")?;
+            }
+        }
+        Ok(obj.into_value())
+    }
+}
+
+struct CompletionResult(Result<CompletedJs, String>);
+
+impl<'js> IntoJs<'js> for CompletionResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self.0 {
+            Ok(c) => c.into_js(ctx),
+            Err(msg) => Err(throw(ctx, &msg)),
+        }
+    }
+}
+
+struct CompletedJs {
+    text: String,
+    usage: Option<frances_models_llm::wire::Usage>,
+}
+
+impl<'js> IntoJs<'js> for CompletedJs {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("text", self.text)?;
+        if let Some(usage) = self.usage {
+            let u = Object::new(ctx.clone())?;
+            u.set("promptTokens", usage.prompt_tokens)?;
+            u.set("completionTokens", usage.completion_tokens)?;
+            u.set("totalTokens", usage.total_tokens)?;
+            u.set("cachedInputTokens", usage.cached_input_tokens)?;
+            obj.set("usage", u)?;
+        }
+        Ok(obj.into_value())
+    }
+}
+
+struct IterResult {
+    value: Option<JsStreamEvent>,
+    done: bool,
+}
+
+impl IterResult {
+    fn value(v: JsStreamEvent) -> Self {
+        Self {
+            value: Some(v),
+            done: false,
+        }
+    }
+
+    fn done() -> Self {
+        Self {
+            value: None,
+            done: true,
+        }
+    }
+}
+
+impl<'js> IntoJs<'js> for IterResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        let obj = Object::new(ctx.clone())?;
+        obj.set("done", self.done)?;
+        if let Some(v) = self.value {
+            obj.set("value", v)?;
+        }
+        Ok(obj.into_value())
+    }
 }
 
 fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {

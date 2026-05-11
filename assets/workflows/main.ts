@@ -35,12 +35,16 @@ transcript.push(
       "- `err` — push an ErrorFrame\n" +
       "- `json` — push a JsonFrame\n" +
       "- `supersede` — show that `append` on a superseded frame throws\n" +
-      "- `chat` — exercise ChatSession (push system + user, then `stream` throws)\n" +
-      "- `assistant` — show that `role: 'assistant'` is rejected\n" +
+      "- `chat <prompt>` — run a chat turn against the shared session (history persists)\n" +
       "- `quit` — exit\n" +
       "- anything else — echo as JSON",
   }),
 );
+
+// One chat session for the lifetime of the workflow — history accumulates
+// across `chat` invocations.
+const chat = new ChatSession({ model_intents: ["chat"] });
+chat.push({ role: "system", content: "You are a terse, friendly assistant." });
 
 let n = 0;
 
@@ -104,43 +108,29 @@ for await (const input of inbox) {
     continue;
   }
 
-  if (msg === "chat") {
-    const s = new ChatSession({ model_intents: ["chat"] });
-    s.push({ role: "system", content: "you are a summariser" });
-    s.push({ role: "user", content: "hello" });
-    try {
-      s.push({ role: "system", content: "too late" });
+  if (msg.startsWith("chat")) {
+    const prompt = msg.slice("chat".length).trim();
+    if (!prompt) {
       transcript.push(
-        new ErrorFrame({ content: "BUG: system-after-user did not throw" }),
+        new ErrorFrame({ content: "usage: chat <prompt>" }),
       );
-    } catch (e) {
-      transcript.push(
-        new MarkdownFrame({ content: `system-after-user threw (expected): \`${e}\`` }),
-      );
+      continue;
+    }
+    chat.push({ role: "user", content: prompt });
+    const r = await chat.stream();
+    const out = new MarkdownFrame({ content: "" });
+    transcript.push(out);
+    for await (const ev of r.events) {
+      if (ev.type === "text") out.append(ev.delta);
     }
     try {
-      s.stream();
+      const final = await r.completed;
       transcript.push(
-        new ErrorFrame({ content: "BUG: stream did not throw" }),
+        new JsonFrame({ tag: "chat-usage", value: final.usage ?? null }),
       );
     } catch (e) {
       transcript.push(
-        new MarkdownFrame({ content: `stream threw (expected, backend pending): \`${e}\`` }),
-      );
-    }
-    continue;
-  }
-
-  if (msg === "assistant") {
-    const s = new ChatSession({ model_intents: ["x"] });
-    try {
-      s.push({ role: "assistant", content: "no" });
-      transcript.push(
-        new ErrorFrame({ content: "BUG: push assistant did not throw" }),
-      );
-    } catch (e) {
-      transcript.push(
-        new MarkdownFrame({ content: `push assistant threw (expected): \`${e}\`` }),
+        new ErrorFrame({ content: `chat failed: \`${e}\`` }),
       );
     }
     continue;

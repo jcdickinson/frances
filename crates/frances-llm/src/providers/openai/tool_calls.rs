@@ -4,7 +4,7 @@ use serde_json::Value;
 use thiserror::Error as ThisError;
 
 use super::sse::{ToolCallDelta, ToolCallEvent};
-use crate::provider::ToolCall;
+use frances_models_llm::wire::ToolCall;
 
 #[derive(Debug, ThisError)]
 pub enum ToolCallError {

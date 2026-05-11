@@ -30,6 +30,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::WorkflowError;
+use crate::deps::WorkflowDeps;
 use crate::modules;
 use crate::transpile::{SourceKind, ts_to_js};
 
@@ -118,9 +119,10 @@ pub struct WorkflowHandle {
 }
 
 /// Workflow script runtime. One per daemon; cheap to share via `Arc`.
-pub struct Runtime {
+pub struct Runtime<D: WorkflowDeps> {
     js: AsyncRuntime,
     transpile_cache: Arc<StdMutex<TranspileCache>>,
+    deps: D,
 }
 
 #[derive(Default)]
@@ -129,12 +131,13 @@ struct TranspileCache {
     by_hash: std::collections::HashMap<u64, Arc<str>>,
 }
 
-impl Runtime {
-    pub fn new() -> Result<Self, WorkflowError> {
+impl<D: WorkflowDeps> Runtime<D> {
+    pub fn new(deps: D) -> Result<Self, WorkflowError> {
         let js = AsyncRuntime::new().map_err(script_err)?;
         Ok(Self {
             js,
             transpile_cache: Arc::new(StdMutex::new(TranspileCache::default())),
+            deps,
         })
     }
 
@@ -161,6 +164,7 @@ impl Runtime {
         let task_frames = frames_tx;
         let task_args = inv.args;
         let task_js = self.js.clone();
+        let task_deps = self.deps.clone();
 
         let join = tokio::spawn(async move {
             let result = run_workflow(
@@ -172,6 +176,7 @@ impl Runtime {
                 task_closed,
                 task_closed_notify,
                 task_parked,
+                task_deps,
             )
             .await;
             let _ = done_tx.send(result);
@@ -212,7 +217,7 @@ impl Runtime {
     clippy::too_many_arguments,
     reason = "shared task-local state, packing buys nothing"
 )]
-async fn run_workflow(
+async fn run_workflow<D: WorkflowDeps>(
     js: AsyncRuntime,
     js_source: String,
     args: Vec<String>,
@@ -221,6 +226,7 @@ async fn run_workflow(
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
+    deps: D,
 ) -> Result<(), WorkflowError> {
     let context = AsyncContext::full(&js).await.map_err(script_err)?;
 
@@ -233,6 +239,7 @@ async fn run_workflow(
                 closed.clone(),
                 closed_notify.clone(),
                 parked,
+                deps,
             )?;
 
             let user_module = Module::declare(ctx.clone(), USER_MODULE_NAME, js_source.as_bytes())
@@ -275,9 +282,98 @@ pub(crate) fn script_err<E: std::fmt::Display>(err: E) -> WorkflowError {
 }
 
 #[cfg(test)]
+pub(crate) mod test_deps {
+    //! In-memory `WorkflowDeps` for tests. `push` records to a local
+    //! Vec; `run` errors out (no provider). Sufficient for the JS-shape
+    //! tests; a real backend lands when we wire end-to-end tests.
+
+    use async_trait::async_trait;
+    use frances_models_llm::chat::{
+        ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
+        HistoryError, OwnedHistoryInput,
+    };
+    use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
+    use std::collections::HashMap;
+    use std::ffi::OsString;
+    use std::sync::{Arc, Mutex};
+
+    use crate::deps::WorkflowDeps;
+
+    #[derive(Clone, Default)]
+    pub(crate) struct StubDeps {
+        manager: StubManager,
+    }
+
+    impl WorkflowDeps for StubDeps {
+        type ChatSessionManager = StubManager;
+
+        fn chat_session_manager(&self) -> &Self::ChatSessionManager {
+            &self.manager
+        }
+
+        fn current_env(&self) -> HashMap<OsString, OsString> {
+            HashMap::new()
+        }
+    }
+
+    #[derive(Clone, Default)]
+    pub(crate) struct StubManager;
+
+    #[async_trait]
+    impl ChatSessionManager for StubManager {
+        type Session = StubSession;
+
+        fn create(&self, _builder: ChatSessionBuilder) -> Self::Session {
+            StubSession {
+                pending: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        async fn load(&self, _id: ChatSessionId) -> Result<Self::Session, ChatError> {
+            Err(ChatError::History(HistoryError::ChatSessionNotFound(
+                ChatSessionId(0),
+            )))
+        }
+
+        async fn primary(&self, builder: ChatSessionBuilder) -> Result<Self::Session, ChatError> {
+            Ok(self.create(builder))
+        }
+    }
+
+    #[derive(Clone)]
+    pub(crate) struct StubSession {
+        pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
+    }
+
+    #[async_trait]
+    impl ChatSession for StubSession {
+        fn push(&self, input: OwnedHistoryInput) {
+            self.pending
+                .lock()
+                .expect("stub pending poisoned")
+                .push(input);
+        }
+
+        async fn run(
+            &self,
+            _env: HashMap<OsString, OsString>,
+            _tools: Vec<ToolDef>,
+            _tool_choice: Option<ToolChoice>,
+            _on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
+        ) -> Result<CompletionOutcome, ChatError> {
+            Err(ChatError::ProviderUnavailable(
+                "stub session: no provider wired in tests".to_owned(),
+            ))
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    use super::test_deps::StubDeps;
 
     fn write_source(ext: &str, body: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::Builder::new()
@@ -345,7 +441,7 @@ mod tests {
 
     #[tokio::test]
     async fn iterator_delivers_messages_in_order() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -402,7 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_returns_terminates_workflow() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -424,7 +520,7 @@ mod tests {
 
     #[tokio::test]
     async fn import_meta_args_populated() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -446,7 +542,7 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_context_per_invocation() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -476,7 +572,7 @@ mod tests {
 
     #[tokio::test]
     async fn exit_unblocks_pending_next() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -503,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn symbol_async_iterator_returns_self() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -528,7 +624,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_next_fifo() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -571,7 +667,7 @@ mod tests {
 
     #[tokio::test]
     async fn ts_transpile_strips_types() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "ts",
             r#"
@@ -593,7 +689,7 @@ mod tests {
 
     #[tokio::test]
     async fn script_throw_surfaces_as_script_error() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source("js", "throw new Error('boom');");
         let mut handle = rt
             .start(Invocation {
@@ -611,7 +707,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_on_active_frame_emits_delta() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -637,7 +733,7 @@ mod tests {
 
     #[tokio::test]
     async fn append_on_superseded_frame_throws() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -664,7 +760,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_v1_module_fails_to_load() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source("js", r#"import { nope } from "frances:v1/nope";"#);
         let mut handle = rt
             .start(Invocation {
@@ -682,7 +778,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_session_accepts_system_and_user_roles() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -707,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_session_rejects_system_after_user() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -733,7 +829,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_session_allows_multiple_consecutive_system_messages() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -759,7 +855,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_session_rejects_assistant_role() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -783,15 +879,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn chat_session_stream_throws_not_yet_wired() {
-        let rt = Runtime::new().unwrap();
+    async fn chat_session_stream_returns_iterable_and_completed() {
+        // StubSession::run errors out (no provider). r.completed should
+        // reject; iterating r.events should still terminate cleanly
+        // because the spawn task drops the sender on error.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
-            s.stream();  // throws
+            const r = await s.stream();
+            if (typeof r.events !== "object") throw new Error("missing events");
+            if (typeof r.completed !== "object") throw new Error("missing completed");
+            // Drain events (will be empty since the stub never sends any).
+            for await (const _ of r.events) { /* never fires */ }
+            try {
+                await r.completed;
+                throw new Error("expected completed to reject");
+            } catch (e) {
+                if (!String(e).includes("stub session")) throw e;
+            }
             "#,
         );
         let mut handle = rt
@@ -802,15 +911,12 @@ mod tests {
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
-        assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
-            "got {result:?}"
-        );
+        assert!(matches!(result, Ok(())), "got {result:?}");
     }
 
     #[tokio::test]
     async fn timer_fires_after_interval() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -835,7 +941,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_fire_resolves_pending_await() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -866,7 +972,7 @@ mod tests {
         // still works — that's the manual-trigger mode the user asked
         // for. Without the fire(), the await would suspend forever
         // (and `drive_one_cycle` would time out).
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -902,7 +1008,7 @@ mod tests {
         // to avoid leaking a JS value past the runtime lifetime), but
         // the Error message comes through and the caught value is an
         // Error instance.
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -935,7 +1041,7 @@ mod tests {
     async fn timer_rejected_is_terminal() {
         // After reject(), every mutating method throws. Only the
         // construction of a fresh Timer can escape it.
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -973,7 +1079,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_reject_makes_instance_of_timer_error() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1004,7 +1110,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_reject_with_no_arg_rejects_with_default_timer_error() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1040,7 +1146,7 @@ mod tests {
     async fn timer_disable_then_enable_revives() {
         // `enable()` re-applies the schedule (clearing `fired_once`),
         // so a disabled timer can be brought back without `set(...)`.
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1066,7 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_getters_reflect_schedule_and_state() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1096,7 +1202,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_repeat_ticks_multiple_times() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1122,7 +1228,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_non_repeat_second_await_resolves_immediately() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1149,7 +1255,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_constructor_rejects_garbage() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1173,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_object_delay_form() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1198,7 +1304,7 @@ mod tests {
     async fn timer_delay_then_interval_combo() {
         // `{ delay, interval }` should wait `delay` before the first
         // fire, then `interval` between subsequent fires.
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1231,7 +1337,7 @@ mod tests {
     #[tokio::test]
     async fn timer_object_needs_delay_or_interval() {
         // Empty object is rejected — must carry at least one field.
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1255,7 +1361,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_set_after_cancel_reuses_timer() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1284,7 +1390,7 @@ mod tests {
     async fn timer_set_changes_schedule_and_resets_fired_once() {
         // One-shot fires, then set() flips it to repeating; subsequent
         // awaits must actually wait (proving fired_once was cleared).
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1313,7 +1419,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_set_rejects_empty_args() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
@@ -1338,7 +1444,7 @@ mod tests {
 
     #[tokio::test]
     async fn timer_exit_unblocks_pending_await() {
-        let rt = Runtime::new().unwrap();
+        let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"

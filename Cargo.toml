@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors", "crates/frances-config", "crates/frances-core", "crates/frances-daemon", "crates/frances-edit", "crates/frances-llm", "crates/frances-shell", "crates/frances-workflow"]
+members = ["crates/frances", "crates/frances-anchors", "crates/frances-config", "crates/frances-core", "crates/frances-daemon", "crates/frances-edit", "crates/frances-llm", "crates/frances-models-llm", "crates/frances-shell", "crates/frances-workflow"]
 resolver = "2"
 
 [workspace.package]
@@ -37,6 +37,7 @@ frances-core = { path = "crates/frances-core" }
 frances-daemon = { path = "crates/frances-daemon" }
 frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
+frances-models-llm = { path = "crates/frances-models-llm" }
 frances-shell = { path = "crates/frances-shell" }
 frances-workflow = { path = "crates/frances-workflow" }
 tempfile = "3"

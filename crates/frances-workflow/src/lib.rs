@@ -14,6 +14,7 @@
 //!   import surface to user scripts.
 
 mod config;
+mod deps;
 mod error;
 mod modules;
 mod runtime;
@@ -21,6 +22,7 @@ mod slash;
 mod transpile;
 
 pub use config::WorkflowConfig;
+pub use deps::WorkflowDeps;
 pub use error::WorkflowError;
 pub use runtime::{
     FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, UserInput, WorkflowHandle,

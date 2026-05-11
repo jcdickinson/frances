@@ -1,5 +1,5 @@
 [package]
-name = "frances-llm"
+name = "frances-models-llm"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,13 +8,9 @@ authors.workspace = true
 [dependencies]
 async-trait.workspace = true
 frances-config.workspace = true
-frances-models-llm.workspace = true
 futures.workspace = true
-futures-util.workspace = true
-reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
-uuid.workspace = true

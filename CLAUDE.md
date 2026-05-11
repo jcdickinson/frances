@@ -74,3 +74,24 @@ For Rust documentation lookups, use `rsdoc` (the ferrisfetch MCP CLI) — `rsdoc
   ```
 
 - **Lib crates MUST use thiserror.** Not anyhow, that is only suitable for bin crates.
+
+## Conventions
+
+### Deps
+
+We bring in deps using Deps traits that go into a `deps.rs` in their crate. For example:
+
+```rs
+// Generally always Send + Sync + Clone + 'static
+pub trait FooDeps : Send + Sync + Clone + 'static {
+    type Frobnicator : Frobnicator;
+
+    fn fronbnicator(&self) -> Frobnicator;
+}
+```
+
+Sometimes these traits will have DTOs that would unavoidably introduce crate cycles or
+architectural hacks. That is what the `frances-models-*` crates are for. `frances-models-*`
+MUST NOT have deps traits - those belong in the assosciated/logic crate. Traits (that do not use
+deps traits themselves) can also be in the `frances-models-*` crate - e.g. `ChatSessionManager`,
+this should be considered an extremely rare scenario.

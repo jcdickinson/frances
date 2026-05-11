@@ -19,8 +19,6 @@ pub struct ProviderConfig {
     /// Applied at request time; wired up after auth lands.
     #[serde(default)]
     pub query_params: BTreeMap<String, EnvString>,
-    #[serde(default)]
-    pub wire_api: WireApi,
     /// WebSocket transport is a follow-up.
     #[serde(default)]
     pub supports_websockets: bool,
@@ -33,16 +31,6 @@ pub struct ProviderConfig {
     /// Per-request stream timeout currently sourced from the model.
     #[serde(default = "default_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
-}
-
-/// Vendor-neutral name for the wire protocol the provider speaks. Today
-/// the only variant is `Responses` (OpenAI-style chat completions); a
-/// future variant will slot in here without breaking existing config.
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum WireApi {
-    #[default]
-    Responses,
 }
 
 /// Untagged: serde walks the variants top-to-bottom and picks the first
@@ -99,9 +87,9 @@ pub struct ModelConfig {
     pub service_tier: Option<u8>,
 }
 
-/// Wire-specific extras for the Responses-API. Bound by the
-/// `ProviderCache` at `model_provider_extensions::<provider_id>` and
-/// passed by value to [`crate::OpenAiProvider::new`] as its associated
+/// Wire-specific extras for the OpenAI chat-completions wire. Bound by
+/// the `ProviderCache` at `model_provider_extensions::<provider_id>` and
+/// passed by value to the provider impl's `new` as its associated
 /// `Extras` type. Other wires' implementations carry their own extras
 /// type; the cache deserialises whichever shape the impl declares.
 #[derive(Debug, Clone, Default, Deserialize)]

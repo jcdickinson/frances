@@ -1,5 +1,5 @@
-/// What a caller hands to [`crate::chat::ChatSessionManager::create`] to
-/// describe a new chat session.
+/// What a caller hands to `ChatSessionManager::create` to describe a new
+/// chat session.
 ///
 /// Today the only knob is `model_intents` — an ordered list of
 /// `models::<intent>` config keys the session walks when picking a model

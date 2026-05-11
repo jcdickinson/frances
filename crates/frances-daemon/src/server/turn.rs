@@ -5,10 +5,13 @@ use std::sync::Arc;
 use tokio::net::UnixStream;
 use tracing::{trace, warn};
 
+use frances_llm::ChatSession;
+use frances_models_llm::chat::ChatSession as ChatSessionTrait;
+use frances_models_llm::wire::StreamEvent;
+
 use crate::Result;
-use crate::chat::ChatSession;
-use crate::llm::StreamEvent;
 use crate::protocol::{BlockId, BlockKind, StreamFrame};
+use crate::server::ServerChatDeps;
 use crate::shell_classifier::{self, ShellClassification};
 use crate::tools;
 use crate::transport::{TransportError, write_message};
@@ -128,7 +131,7 @@ pub(crate) async fn run_legacy_llm_turn(
 async fn run_llm_step(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
-    chat: &Arc<ChatSession>,
+    chat: &ChatSession<ServerChatDeps>,
     env: &HashMap<OsString, OsString>,
     alloc_block: &mut impl FnMut() -> BlockId,
     send_error: &mut Option<TransportError>,
@@ -152,17 +155,17 @@ async fn run_llm_step(
     let env_for_task = env.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
     let llm_task = tokio::spawn(async move {
-        chat_for_task
-            .run(
-                &env_for_task,
-                &tool_defs,
-                None,
-                move |event: StreamEvent| {
-                    let _ = tx.send(event);
-                    Ok(())
-                },
-            )
-            .await
+        ChatSessionTrait::run(
+            &chat_for_task,
+            env_for_task,
+            tool_defs,
+            None,
+            Box::new(move |event: StreamEvent| {
+                let _ = tx.send(event);
+                Ok(())
+            }),
+        )
+        .await
     });
 
     while let Some(event) = rx.recv().await {

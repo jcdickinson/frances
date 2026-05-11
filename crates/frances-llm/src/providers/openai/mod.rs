@@ -7,10 +7,12 @@ use serde_json::Value;
 use thiserror::Error as ThisError;
 use tracing::{debug, trace};
 
-use crate::config::{ProviderConfig, ResponsesModelExtras};
-use crate::provider::{
-    self, CompletionOutcome, ErasedError, HistoryInput, ProviderRequest, StreamEvent, ToolCall,
+use frances_models_llm::config::{ProviderConfig, ResponsesModelExtras};
+use frances_models_llm::wire::{
+    CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolCall,
 };
+
+use crate::provider::{self, ProviderRequest};
 
 mod request_plan;
 mod sse;
@@ -87,6 +89,9 @@ impl provider::Provider for Provider {
         inputs
             .iter()
             .map(|input| match input {
+                HistoryInput::System { text } => {
+                    serde_json::json!({ "role": "system", "content": text })
+                }
                 HistoryInput::User { text } => {
                     serde_json::json!({ "role": "user", "content": text })
                 }

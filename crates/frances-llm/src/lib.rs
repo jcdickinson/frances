@@ -1,13 +1,27 @@
-//! LLM provider abstraction and the OpenAI-shaped wire implementation.
+//! LLM provider implementations + chat session machinery.
+//!
+//! Value types + workflow-facing traits live in `frances-models-llm`.
+//! This crate holds the concrete `Provider` impl(s), the
+//! `ProviderCache`, and the concrete `ChatSession`/`ChatSessionManager`
+//! that workflow and daemon use.
 
-pub mod config;
+pub mod chat;
 pub mod provider;
+pub mod provider_cache;
 pub mod providers;
 
-pub use config::{
-    AuthCommand, AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras, WireApi,
+pub use chat::{ChatManagerDeps, ChatSession, ChatSessionManager, CompleteRequest, HistoryStore};
+pub use provider::{ErasedProvider, Provider, ProviderRequest};
+pub use provider_cache::{ProviderCache, ProviderCacheError};
+
+// Re-export the model-side surface so existing imports
+// (`frances_llm::HistoryInput`, etc.) keep working transitionally
+// where it's still convenient. New code should import from
+// `frances_models_llm::*` directly.
+pub use frances_models_llm::config::{
+    AuthCommand, AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras,
 };
-pub use provider::{
-    ChunkAbort, CompletionOutcome, ErasedError, ErasedProvider, ErasedResult, HistoryInput,
-    Provider, ProviderRequest, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolFunction, Usage,
+pub use frances_models_llm::wire::{
+    ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent, ToolCall,
+    ToolChoice, ToolDef, ToolFunction, Usage,
 };

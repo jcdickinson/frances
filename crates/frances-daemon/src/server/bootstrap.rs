@@ -9,11 +9,10 @@ use tracing::{debug, info, warn};
 
 use crate::Result;
 use crate::anchor_store::AnchorStoreImpl;
-use crate::chat::{ChatSessionBuilder, ChatSessionManager};
 use crate::edit_session::EditSession;
-use crate::history::HistoryStore;
-use crate::llm::provider_cache::ProviderCache;
-use crate::llm::{ModelConfig, SessionConfigProvider};
+use crate::history::TursoHistoryStore;
+use crate::llm::SessionConfigProvider;
+use crate::server::ServerChatDeps;
 use crate::session::Session;
 use crate::store::Database;
 use crate::tools::ToolRegistry;
@@ -21,6 +20,10 @@ use crate::transport::remove_socket_if_present;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
+use frances_llm::{ChatSessionManager, ProviderCache};
+use frances_models_llm::ChatSessionManager as ChatSessionManagerTrait;
+use frances_models_llm::chat::ChatSessionBuilder;
+use frances_models_llm::config::ModelConfig;
 use frances_workflow::Runtime as WorkflowRuntime;
 
 use super::client_rpc::serve_client;
@@ -77,19 +80,30 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         .bind::<ModelConfig>(["models", "default"])?
         .required()
         .map_err(|_| ServerError::DefaultModelMissing)?;
-    let provider_cache = Arc::new(ProviderCache::new(config.clone())?);
+    let cache = ProviderCache::new(config.clone())?;
     let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
 
-    let history = HistoryStore::new(db);
-    let chat = ChatSessionManager::new(provider_cache, config.clone(), default_model, history)?;
-    let primary_chat = chat
-        .primary(ChatSessionBuilder::new().with_model_intents(["chat".to_string()]))
-        .await?;
+    let history = TursoHistoryStore::new(db);
+    let chat_deps = ServerChatDeps {
+        history: history.clone(),
+    };
+    let chat = ChatSessionManager::new(chat_deps, config.clone(), default_model, cache.clone())?;
+    let primary_chat = ChatSessionManagerTrait::primary(
+        &chat,
+        ChatSessionBuilder::new().with_model_intents(["chat".to_string()]),
+    )
+    .await?;
+
+    let last_context = Arc::new(StdMutex::new(None));
+    let workflow_runtime = Arc::new(WorkflowRuntime::new(super::ServerWorkflowDeps {
+        chat: chat.clone(),
+        last_context: last_context.clone(),
+    })?);
 
     let state = Arc::new(ServerState {
         session: session.clone(),
         client_attached: StdMutex::new(false),
-        last_context: StdMutex::new(None),
+        last_context,
         daemon_pid: std::process::id(),
         edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
         shell: tokio::sync::Mutex::new(None),
@@ -97,10 +111,12 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         config,
+        history,
+        cache,
         chat,
         primary_chat,
         workflows,
-        workflow_runtime: Arc::new(WorkflowRuntime::new()?),
+        workflow_runtime,
         workflow_stack: WorkflowStack::new(),
         session_config_writer,
     });

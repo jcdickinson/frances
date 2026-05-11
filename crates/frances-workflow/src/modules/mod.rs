@@ -70,13 +70,14 @@ unsafe impl<'js> JsLifetime<'js> for TimerErrorUserData {
 /// per-invocation host values (closures over the channels/flags),
 /// stashes them on `globalThis`, declares + evaluates each virtual
 /// module, and finally deletes the stash.
-pub(crate) fn install_v1<'js>(
+pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
     ctx: &Ctx<'js>,
     frames_tx: UnboundedSender<HostFrame>,
     input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
+    deps: D,
 ) -> Result<(), WorkflowError> {
     let stash = Object::new(ctx.clone()).map_err(script)?;
 
@@ -96,7 +97,7 @@ pub(crate) fn install_v1<'js>(
     stash.set("ErrorFrame", err_ctor).map_err(script)?;
     stash.set("JsonFrame", json_ctor).map_err(script)?;
 
-    let chat_ctor = chat::build_chat_session_ctor(ctx).map_err(script)?;
+    let chat_ctor = chat::build_chat_session_ctor(ctx, deps).map_err(script)?;
     stash.set("ChatSession", chat_ctor).map_err(script)?;
 
     let timer_ctor = io::build_timer_ctor(ctx, closed, closed_notify).map_err(script)?;

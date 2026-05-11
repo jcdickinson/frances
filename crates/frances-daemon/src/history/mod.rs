@@ -1,14 +1,13 @@
-use thiserror::Error;
+use frances_llm::HistoryStore as HistoryStoreTrait;
+use frances_models_llm::chat::{ChatSessionId, HistoryError, OwnedHistoryInput};
 use uuid::Uuid;
 
 use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
 mod messages;
-mod sessions;
-mod types;
 
-pub use types::{Block, ChatSessionId, ChatSessionRow, OwnedHistoryInput, RowId, RowSeq};
+pub use messages::Block;
 
 /// Owns the conversation history. UUID is permanent — never edit.
 pub static SCHEMA: EntitySchema = EntitySchema {
@@ -19,73 +18,97 @@ pub static SCHEMA: EntitySchema = EntitySchema {
     }],
 };
 
-#[derive(Debug, Error)]
-pub enum HistoryError {
-    #[error("turso: {0}")]
-    Turso(#[from] turso::Error),
-    #[error("encode {what}: {source}")]
-    Encode {
-        what: &'static str,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("decode {what}: {source}")]
-    Decode {
-        what: &'static str,
-        #[source]
-        source: serde_json::Error,
-    },
-    #[error("chat_session {0} not found")]
-    ChatSessionNotFound(ChatSessionId),
-    #[error("expected text in {column}, got {found:?}")]
-    NonTextColumn {
-        column: &'static str,
-        found: turso::Value,
-    },
-    #[error("primitive of type {kind:?} missing field {field:?}")]
-    PrimitiveMissingField {
-        kind: &'static str,
-        field: &'static str,
-    },
-    #[error("unknown primitive type {0:?}")]
-    UnknownPrimitiveType(String),
-}
-
+/// Turso-backed implementation of [`frances_llm::HistoryStore`].
+/// Clone-by-value handle; the underlying `Database` already holds an
+/// Arc-wrapped connection pool.
 #[derive(Debug, Clone)]
-pub struct HistoryStore {
+pub struct TursoHistoryStore {
     db: Database,
 }
 
-impl HistoryStore {
+impl TursoHistoryStore {
     pub fn new(db: Database) -> Self {
         Self { db }
     }
+
+    pub(crate) fn db(&self) -> &Database {
+        &self.db
+    }
+
+    /// Drop the wire-tagged history rows for `session` and re-forge from
+    /// primitives under the supplied provider's wire shape. Currently
+    /// unused — swap detection is future work. Lives as an inherent
+    /// method rather than on the `HistoryStore` trait because it's
+    /// TUI-only and pulls in the `Provider` trait.
+    pub async fn purge_and_reforge<P: frances_llm::Provider + 'static>(
+        &self,
+        session: ChatSessionId,
+        provider: &P,
+        provider_id: &str,
+    ) -> Result<(), HistoryError> {
+        use frances_models_llm::wire::HistoryInput;
+
+        let conn = self.db.connect();
+        conn.execute(
+            "DELETE FROM chat_messages WHERE chat_session_id = ?1 AND type = 'history'",
+            (session.0,),
+        )
+        .await
+        .map_err(turso_err)?;
+
+        let primitives = self.load_primitives(session).await?;
+        let inputs: Vec<HistoryInput<'_>> = primitives
+            .iter()
+            .map(OwnedHistoryInput::as_borrowed)
+            .collect();
+        let payloads = provider.forge_history(&inputs);
+        <Self as HistoryStoreTrait>::append_history(
+            self,
+            session,
+            provider.kind(),
+            provider_id,
+            &payloads,
+        )
+        .await
+    }
 }
+
+pub(crate) fn turso_err(source: turso::Error) -> HistoryError {
+    HistoryError::Backend(Box::new(TursoError(source)))
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("turso: {0}")]
+struct TursoError(#[source] turso::Error);
 
 pub(super) async fn next_seq(
     conn: &turso::Connection,
     session: ChatSessionId,
-) -> std::result::Result<RowSeq, HistoryError> {
+) -> Result<i64, HistoryError> {
     let mut rows = conn
         .query(
             "SELECT COALESCE(MAX(seq), -1) + 1 FROM chat_messages WHERE chat_session_id = ?1",
             (session.0,),
         )
-        .await?;
+        .await
+        .map_err(turso_err)?;
     let row = rows
         .next()
-        .await?
+        .await
+        .map_err(turso_err)?
         .expect("COALESCE(MAX(seq), -1) + 1 always returns one row");
-    Ok(RowSeq(row.get::<i64>(0)?))
+    row.get::<i64>(0).map_err(turso_err)
 }
 
-pub(super) async fn last_insert_rowid(
-    conn: &turso::Connection,
-) -> std::result::Result<i64, HistoryError> {
-    let mut rows = conn.query("SELECT last_insert_rowid()", ()).await?;
+pub(super) async fn last_insert_rowid(conn: &turso::Connection) -> Result<i64, HistoryError> {
+    let mut rows = conn
+        .query("SELECT last_insert_rowid()", ())
+        .await
+        .map_err(turso_err)?;
     let row = rows
         .next()
-        .await?
+        .await
+        .map_err(turso_err)?
         .expect("last_insert_rowid() always returns one row");
-    Ok(row.get::<i64>(0)?)
+    row.get::<i64>(0).map_err(turso_err)
 }

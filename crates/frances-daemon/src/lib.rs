@@ -1,5 +1,4 @@
 pub mod anchor_store;
-pub mod chat;
 pub mod context;
 pub mod edit_session;
 mod error;

@@ -1,8 +1,5 @@
 use thiserror::Error;
 
-use crate::chat::ChatError;
-use crate::history::HistoryError;
-use crate::llm::provider_cache::ProviderCacheError;
 use crate::llm::session_provider::SessionConfigWriteError;
 use crate::server::ServerError;
 use crate::session::SessionError;
@@ -12,6 +9,8 @@ use crate::tools::ToolRegistryError;
 use crate::tools::file::FileToolError;
 use crate::tools::shell::ShellToolError;
 use crate::workflows::WorkflowError;
+use frances_llm::ProviderCacheError;
+use frances_models_llm::chat::{ChatError, HistoryError};
 
 /// All errors raised by the daemon. Each variant `#[from]`s a per-module
 /// typed error so callers and tests can match on the exact failure mode.

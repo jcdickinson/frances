@@ -1110,6 +1110,7 @@ dependencies = [
  "frances-core",
  "frances-edit",
  "frances-llm",
+ "frances-models-llm",
  "frances-shell",
  "frances-workflow",
  "futures",
@@ -1160,9 +1161,25 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "frances-config",
+ "frances-models-llm",
  "futures",
  "futures-util",
  "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "frances-models-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "frances-config",
+ "futures",
  "serde",
  "serde_json",
  "thiserror",
@@ -1188,6 +1205,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "deno_ast",
+ "frances-models-llm",
  "parking_lot",
  "rquickjs",
  "serde",
