@@ -224,6 +224,10 @@ async fn run_workflow<D: WorkflowDeps>(
 
     async_with!(context => |ctx| {
         let result: Result<(), WorkflowError> = async {
+            // `frances:v1/*` modules import from `whatwg:*` (frames
+            // uses WritableStream, chat uses Readable/TransformStream),
+            // so the polyfills have to be declared first.
+            modules::install_whatwg(&ctx)?;
             modules::install_v1(
                 &ctx,
                 frames,
@@ -696,7 +700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_on_active_frame_emits_delta() {
+    async fn write_on_active_frame_emits_delta() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
@@ -704,7 +708,9 @@ mod tests {
             import { transcript, MarkdownFrame } from "frances:v1/frames";
             const f = new MarkdownFrame({ content: "hello" });
             transcript.push(f);
-            f.append(" world");
+            const w = f.writable.getWriter();
+            await w.write(" world");
+            await w.close();
             "#,
         );
         let mut handle = rt
@@ -722,7 +728,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn append_on_superseded_frame_throws() {
+    async fn write_on_superseded_frame_throws() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
@@ -731,7 +737,8 @@ mod tests {
             const a = new MarkdownFrame({ content: "a" });
             transcript.push(a);
             transcript.push(new MarkdownFrame({ content: "b" }));
-            a.append(" extra");  // should throw
+            const w = a.writable.getWriter();
+            await w.write(" extra");  // should reject — a is no longer active
             "#,
         );
         let mut handle = rt
@@ -878,11 +885,12 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
+            import { ReadableStream } from "whatwg:web-streams";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
-            if (typeof r.events !== "object") throw new Error("missing events");
-            if (typeof r.completed !== "object") throw new Error("missing completed");
+            if (!(r.events instanceof ReadableStream)) throw new Error("events not a ReadableStream");
+            if (typeof r.completed?.then !== "function") throw new Error("completed not a Promise");
             // Drain events (will be empty since the stub never sends any).
             for await (const _ of r.events) { /* never fires */ }
             try {
@@ -902,6 +910,178 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(matches!(result, Ok(())), "got {result:?}");
+    }
+
+    #[tokio::test]
+    async fn chat_session_raw_inner_stream_is_not_exposed() {
+        // The Rust-level "start raw stream" function is captured into
+        // closure by `chat.js` from a stash key that the host deletes
+        // before user code runs. After install, neither
+        // `ChatSession.prototype` nor `globalThis` should expose it.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const protoKeys = Object.getOwnPropertyNames(ChatSession.prototype)
+                .filter((k) => k !== "constructor");
+            const stashGone = typeof globalThis.__frances_v1_stash__ === "undefined";
+            transcript.push(new MarkdownFrame({
+                content: `proto=${protoKeys.sort().join(",")} stash=${stashGone}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        // Only `push` and the JS-installed `stream` should be on the
+        // prototype; the inner raw stream function must not appear.
+        assert_eq!(text_of(&frames[0]), "proto=push,stream stash=true");
+    }
+
+    #[tokio::test]
+    async fn chat_session_stream_text_locks_events() {
+        // Per WHATWG, `pipeThrough` locks its source. Touching `r.text`
+        // must therefore prevent any subsequent direct read of
+        // `r.events` — that's how we enforce single-consumer semantics
+        // without exposing the raw async-iterable.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            const _text = r.text;  // locks events via pipeThrough
+            let locked = false;
+            try { r.events.getReader(); }
+            catch (_) { locked = true; }
+            transcript.push(new MarkdownFrame({
+                content: `locked=${locked} stableText=${r.text === _text}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "locked=true stableText=true");
+    }
+
+    #[tokio::test]
+    async fn chat_session_stream_pipes_into_markdown_frame_writable() {
+        // Stub emits zero events, so the pipe completes when the
+        // source closes (Rust drops the sender after the run errors).
+        // We're verifying the wiring: pipeTo from `r.text` into a
+        // MarkdownFrame's `.writable` resolves without throwing.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            const out = new MarkdownFrame({ content: "" });
+            transcript.push(out);
+            await r.text.pipeTo(out.writable);
+            try { await r.completed; } catch (_) { /* stub error — expected */ }
+            transcript.push(new MarkdownFrame({ content: "piped-ok" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        // Second push frame carries the "piped-ok" sentinel; the first
+        // push is the empty `out` frame. No Append frames since stub
+        // emits no text deltas.
+        let last = text_of(frames.last().expect("at least one frame"));
+        assert_eq!(last, "piped-ok");
+    }
+
+    #[tokio::test]
+    async fn chat_session_stream_aborts_with_signal() {
+        // Pre-aborted AbortSignal errors the events stream synchronously
+        // during `stream()`, so the first read sees the reason.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const ac = new AbortController();
+            ac.abort("user wanted out");
+            const r = await s.stream({ signal: ac.signal });
+            let caught;
+            try {
+                for await (const _ of r.events) { /* shouldn't fire */ }
+                caught = "no-throw";
+            } catch (e) {
+                caught = String(e);
+            }
+            transcript.push(new MarkdownFrame({ content: caught }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "user wanted out");
+    }
+
+    #[tokio::test]
+    async fn markdown_frame_writable_is_stable_writable_stream() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { WritableStream } from "whatwg:web-streams";
+            const f = new MarkdownFrame({ content: "hi" });
+            transcript.push(f);
+            const w1 = f.writable;
+            const w2 = f.writable;
+            const shape = `ws=${w1 instanceof WritableStream} stable=${w1 === w2} hasWrite=${typeof MarkdownFrame.prototype.write}`;
+            transcript.push(new MarkdownFrame({ content: shape }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        // The raw `write` is removed from the prototype — only the
+        // WritableStream is the public path.
+        let last = text_of(frames.last().expect("at least one frame"));
+        assert_eq!(last, "ws=true stable=true hasWrite=undefined");
     }
 
     #[tokio::test]
@@ -1456,5 +1636,103 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         assert_eq!(text_of(&frames[0]), "after-await");
+    }
+
+    // ---- whatwg:* smoke tests --------------------------------------------
+    //
+    // These verify the module-library wiring (the import resolves, the
+    // named exports are present), not the polyfill internals. The
+    // polyfill upstreams have their own test suites; we just care that
+    // our virtual-module declaration didn't fumble.
+
+    #[tokio::test]
+    async fn whatwg_dom_exports_dom_exception() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { DOMException } from "whatwg:dom";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const e = new DOMException("nope", "AbortError");
+            transcript.push(new MarkdownFrame({
+                content: `err=${e instanceof Error} name=${e.name} msg=${e.message}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "err=true name=AbortError msg=nope");
+    }
+
+    #[tokio::test]
+    async fn whatwg_web_streams_exports_constructors() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import {
+                ReadableStream,
+                WritableStream,
+                TransformStream,
+            } from "whatwg:web-streams";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const shape = [
+                typeof ReadableStream,
+                typeof WritableStream,
+                typeof TransformStream,
+            ].join(",");
+            transcript.push(new MarkdownFrame({ content: shape }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "function,function,function");
+    }
+
+    #[tokio::test]
+    async fn whatwg_abortcontroller_basic_lifecycle() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { AbortController, AbortSignal } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const ac = new AbortController();
+            const before = ac.signal.aborted;
+            let fired = false;
+            ac.signal.addEventListener("abort", () => { fired = true; });
+            ac.abort("nope");
+            const after = ac.signal.aborted;
+            const reason = ac.signal.reason;
+            const isSignal = ac.signal instanceof AbortSignal;
+            transcript.push(new MarkdownFrame({
+                content: `before=${before} after=${after} fired=${fired} reason=${reason} sig=${isSignal}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(&frames[0]),
+            "before=false after=true fired=true reason=nope sig=true"
+        );
     }
 }

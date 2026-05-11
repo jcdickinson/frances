@@ -2,9 +2,9 @@
 //!
 //! The transcript is an append-only sequence of frames. The user holds a
 //! frame object after `transcript.push(frame)` and may call
-//! `frame.append(text)` to extend its content — **but only while the
+//! `frame.write(text)` to extend its content — **but only while the
 //! frame is the most recently pushed one**. Pushing a new frame seals
-//! the previous frame; appending to a sealed frame throws.
+//! the previous frame; writing to a sealed frame throws.
 //!
 //! For v1 there is exactly one transcript (the live binding behind the
 //! `transcript` import). The `Transcript` class is exported as a type
@@ -32,7 +32,7 @@ pub(crate) struct FramesState {
     /// Monotonically-increasing frame id. Bumped by `transcript.push`.
     next_id: AtomicU64,
     /// Id of the currently-mutable frame. Equal to whatever was assigned
-    /// most recently; older frames compare unequal and reject `append`.
+    /// most recently; older frames compare unequal and reject `write`.
     active_id: AtomicU64,
     /// Where push/append events go.
     tx: UnboundedSender<HostFrame>,
@@ -178,7 +178,7 @@ fn as_frame<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
 }
 
 // ---------------------------------------------------------------------
-// MarkdownFrame / ErrorFrame — appendable text frames
+// MarkdownFrame / ErrorFrame — writeable text frames
 // ---------------------------------------------------------------------
 
 pub struct MarkdownFrame {
@@ -205,7 +205,7 @@ impl<'js> JsClass<'js> for MarkdownFrame {
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
         let proto = Object::new(ctx.clone())?;
         proto.set(
-            "append",
+            "write",
             Function::new(
                 ctx.clone(),
                 |ctx: Ctx<'js>, this: This<Class<'js, MarkdownFrame>>, delta: String| {
@@ -222,13 +222,13 @@ impl<'js> JsClass<'js> for MarkdownFrame {
     }
 }
 
-/// `ErrorFrame` — one-shot error message. No `append` in v1; rendering
+/// `ErrorFrame` — one-shot error message. No `write` in v1; rendering
 /// goes through `StreamFrame::Error` (a non-block message) on the host
-/// side, so streaming-append semantics don't apply.
+/// side, so streaming-write semantics don't apply.
 pub struct ErrorFrame {
     #[expect(
         dead_code,
-        reason = "kept on the type for parity with MarkdownFrame; append support is a follow-up"
+        reason = "kept on the type for parity with MarkdownFrame; write support is a follow-up"
     )]
     state: Arc<FramesState>,
     id: AtomicU64,
@@ -248,7 +248,7 @@ impl<'js> JsClass<'js> for ErrorFrame {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `append` — error frames are one-shot for v1.
+        // No `write` — error frames are one-shot for v1.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -269,13 +269,13 @@ fn append_text<'js>(
     if frame_id == 0 {
         return throw_type(
             ctx,
-            "frame.append: frame has not been pushed onto the transcript yet",
+            "frame.write: frame has not been pushed onto the transcript yet",
         );
     }
     if frame_id != active {
         return throw_type(
             ctx,
-            "frame.append: this frame is no longer the active frame (a newer frame was pushed)",
+            "frame.write: this frame is no longer the active frame (a newer frame was pushed)",
         );
     }
     let _ = state.tx.send(HostFrame::Append {
@@ -286,7 +286,7 @@ fn append_text<'js>(
 }
 
 // ---------------------------------------------------------------------
-// JsonFrame — single tagged value, no append
+// JsonFrame — single tagged value, no write
 // ---------------------------------------------------------------------
 
 pub struct JsonFrame {
@@ -313,7 +313,7 @@ impl<'js> JsClass<'js> for JsonFrame {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // Intentionally empty — no `append` here; JsonFrame is set at
+        // Intentionally empty — no `write` here; JsonFrame is set at
         // construction.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))

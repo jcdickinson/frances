@@ -31,11 +31,11 @@ transcript.push(
     content:
       `/main started${argsLine}\n\n` +
       "**Commands**\n" +
-      "- `md` — push a MarkdownFrame and stream into it via `append` (250ms ticks)\n" +
+      "- `md` — push a MarkdownFrame and stream into its `.writable` (250ms ticks)\n" +
       "- `err` — push an ErrorFrame\n" +
       "- `json` — push a JsonFrame\n" +
-      "- `supersede` — show that `append` on a superseded frame throws\n" +
-      "- `chat <prompt>` — run a chat turn against the shared session (history persists)\n" +
+      "- `supersede` — show that writing into a superseded frame's `.writable` throws\n" +
+      "- `chat <prompt>` — run a chat turn and pipe `r.text` into a MarkdownFrame (history persists)\n" +
       "- `quit` — exit\n" +
       "- anything else — echo as JSON",
   }),
@@ -66,11 +66,13 @@ for await (const input of inbox) {
     const f = new MarkdownFrame({ content: "streaming markdown:" });
     transcript.push(f);
     const tick = new Timer({ interval: 250 });
+    const writer = f.writable.getWriter();
     for (let i = 1; i <= 3; i += 1) {
       await tick;
-      f.append(`\n  - step ${i}`);
+      await writer.write(`\n  - step ${i}`);
     }
     tick.disable();
+    await writer.close();
     continue;
   }
 
@@ -96,13 +98,14 @@ for await (const input of inbox) {
     transcript.push(a);
     transcript.push(new MarkdownFrame({ content: "frame B (now active)" }));
     try {
-      a.append(" tried to append to A");
+      const writer = a.writable.getWriter();
+      await writer.write(" tried to write to A");
       transcript.push(
-        new ErrorFrame({ content: "BUG: append on superseded frame did not throw" }),
+        new ErrorFrame({ content: "BUG: write on superseded frame did not throw" }),
       );
     } catch (e) {
       transcript.push(
-        new MarkdownFrame({ content: `append on superseded frame threw (expected): \`${e}\`` }),
+        new MarkdownFrame({ content: `write on superseded frame threw (expected): \`${e}\`` }),
       );
     }
     continue;
@@ -120,10 +123,8 @@ for await (const input of inbox) {
     const r = await chat.stream();
     const out = new MarkdownFrame({ content: "" });
     transcript.push(out);
-    for await (const ev of r.events) {
-      if (ev.type === "text") out.append(ev.delta);
-    }
     try {
+      await r.text.pipeTo(out.writable);
       const final = await r.completed;
       transcript.push(
         new JsonFrame({ tag: "chat-usage", value: final.usage ?? null }),

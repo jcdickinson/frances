@@ -1,12 +1,15 @@
 //! `frances:v1/chat` — `ChatSession` for talking to the LLM.
 //!
-//! Shape:
+//! The Rust side hands back a thin `{ events, completed }` shape; the
+//! JS wrapper in `js/chat.js` lifts `events` into a WHATWG
+//! `ReadableStream<StreamEvent>`, adds a lazy `text` `ReadableStream<string>`
+//! and accepts an `AbortSignal`. Public shape from JS:
 //!
 //! ```js
 //! const s = new ChatSession({ model_intents: ["summarize"] });
 //! s.push({ role: "user", content: "hi" });
-//! const r = await s.stream();
-//! for await (const ev of r.events) { /* … */ }
+//! const r = await s.stream({ signal });
+//! await r.text.pipeTo(frame.writable);
 //! const final = await r.completed;     // { text, usage }
 //! ```
 //!
@@ -39,11 +42,17 @@ use crate::deps::WorkflowDeps;
 
 type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManagerTrait>::Session;
 
+/// Build the `ChatSession` constructor together with a private
+/// "start raw stream" function. The constructor goes on the stash as
+/// `ChatSession`; the raw-stream function goes on the stash as
+/// `__chat_inner_stream` and is captured into closure by `chat.js`
+/// before the stash is wiped, so the raw async-iterable event source
+/// is never reachable from user code.
 pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
-) -> JsResult<Constructor<'js>> {
-    Constructor::new_class::<ChatSessionJs<D>, _, _>(
+) -> JsResult<(Constructor<'js>, Function<'js>)> {
+    let ctor = Constructor::new_class::<ChatSessionJs<D>, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| {
             let intents = parse_intents(&ctx, &arg)?;
@@ -58,7 +67,16 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
                 },
             )
         },
-    )
+    )?;
+
+    let inner_stream = Function::new(
+        ctx.clone(),
+        |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
+            start_stream::<D>(&ctx, &this.0)
+        },
+    )?;
+
+    Ok((ctor, inner_stream))
 }
 
 pub struct ChatSessionJs<D: WorkflowDeps> {
@@ -84,6 +102,9 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        // `stream` is deliberately NOT on the prototype: the raw
+        // async-iterable event source is private. `chat.js` installs
+        // a WHATWG-wrapped `stream` here from the stash.
         let proto = Object::new(ctx.clone())?;
 
         proto.set(
@@ -92,16 +113,6 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
                 ctx.clone(),
                 |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, msg: Value<'js>| {
                     push_message::<D>(&ctx, &this.0, msg)
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "stream",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
-                    start_stream::<D>(&ctx, &this.0)
                 },
             )?,
         )?;
@@ -211,20 +222,33 @@ fn start_stream<'js, D: WorkflowDeps>(
     let (event_tx, event_rx) = mpsc::unbounded_channel::<StreamEvent>();
     let (completed_tx, completed_rx) = oneshot::channel::<Result<CompletedJs, ChatError>>();
 
-    tokio::spawn(async move {
-        let tx_for_callback = event_tx.clone();
-        let on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send> =
-            Box::new(move |event| {
-                let _ = tx_for_callback.send(event);
-                Ok(())
+    // Mirror the latest `Usage` event into the completion result so
+    // `pipeTo` callers (who don't iterate `r.events`) still see it.
+    let usage_capture: Arc<parking_lot::Mutex<Option<frances_models_llm::wire::Usage>>> =
+        Arc::new(parking_lot::Mutex::new(None));
+
+    tokio::spawn({
+        let usage_capture = usage_capture.clone();
+        async move {
+            let tx_for_callback = event_tx.clone();
+            let usage_for_callback = usage_capture.clone();
+            let on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send> =
+                Box::new(move |event| {
+                    if let StreamEvent::Usage(u) = &event {
+                        *usage_for_callback.lock() = Some(u.clone());
+                    }
+                    let _ = tx_for_callback.send(event);
+                    Ok(())
+                });
+            let result = handle.run(env, Vec::new(), None, on_event).await;
+            let usage = usage_capture.lock().take();
+            drop(event_tx);
+            let mapped = result.map(|outcome| CompletedJs {
+                text: outcome.text,
+                usage,
             });
-        let result = handle.run(env, Vec::new(), None, on_event).await;
-        drop(event_tx);
-        let mapped = result.map(|outcome| CompletedJs {
-            text: outcome.text,
-            usage: None,
-        });
-        let _ = completed_tx.send(mapped);
+            let _ = completed_tx.send(mapped);
+        }
     });
 
     let events_class = Class::instance(

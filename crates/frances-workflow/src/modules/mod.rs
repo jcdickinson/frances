@@ -1,35 +1,48 @@
-//! Virtual modules exposed to workflow scripts under `frances:v1/*`.
+//! Virtual modules exposed to workflow scripts.
 //!
-//! Each invocation gets a fresh QuickJS context (`AsyncContext::full`).
-//! Before evaluating the user script, we build the per-invocation host
-//! values (a `Function` for `exit`, a `Class` instance for `inbox`, the
-//! transcript proxy, the frame-class constructors) and declare a small
-//! virtual module for each one. Those modules just re-export the values
-//! out of a hidden global stash — keeping all the per-invocation state
-//! inside the captured closures, not in any runtime-wide map.
+//! Two families:
 //!
-//! The stash is set on `globalThis` only long enough for each virtual
-//! module's body to evaluate. After we force-eval the modules (so each
-//! module's `const __s = globalThis.__frances_v1_stash__` line runs and
-//! captures references into the module's local scope), we delete the
-//! key. User scripts can no longer reach the stash through
-//! `globalThis`. The exported names are still reachable the proper
-//! way, via `import` statements.
+//! - `frances:v1/*` — the workflow host API. Per-invocation values
+//!   (channels, flags) flow through a transient stash on `globalThis`;
+//!   each module's body captures them into its local scope and the
+//!   stash is then deleted, so user scripts can't reach it.
+//! - `whatwg:*` — vendored polyfills with no per-invocation state.
+//!   Pure JS source under `modules/whatwg/` at the workspace root,
+//!   embedded via `include_str!` and refreshed by `update.sh`.
 //!
-//! Module source files live as siblings under `js/`. They're embedded
-//! via `include_str!` at compile time; the Rust here just orchestrates
-//! the install order and the two-phase TimerError handoff.
+//! `frances:v1/*` install flow: build the per-invocation host values,
+//! stash them on `globalThis`, declare + evaluate each virtual module
+//! (whose body runs `const __s = globalThis.__frances_v1_stash__` and
+//! captures the references it needs), then delete the stash. The two
+//! exceptions are `TimerError` (a JS class declared inside `io.js`,
+//! whose constructor we then stash via `Ctx::store_userdata` for the
+//! Rust reject path) and `cleanup_v1`, which must run before the
+//! context drops or `JS_FreeRuntime` aborts at `list_empty`.
+//!
+//! `whatwg:*` install is trivial — just declare and evaluate the
+//! module sources. No stash, no userdata, no cleanup.
+//!
+//! Module source files live as siblings under `js/` (v1) or under
+//! `modules/whatwg/` at the workspace root.
 //!
 //! Modules:
 //!
-//! - `frances:v1/workflow` — `exit` lifecycle function.
-//! - `frances:v1/inbox`    — `inbox` async-iterable user-input stream.
-//! - `frances:v1/frames`   — `transcript`, `MarkdownFrame`, `ErrorFrame`,
+//! - `frances:v1/workflow`       — `exit` lifecycle function.
+//! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
+//! - `frances:v1/frames`         — `transcript`, `MarkdownFrame`, `ErrorFrame`,
 //!   `JsonFrame` (frame-objects-with-history API).
-//! - `frances:v1/chat`     — `ChatSession` (LLM access). Constructor
+//! - `frances:v1/chat`           — `ChatSession` (LLM access). Constructor
 //!   currently throws — see `chat.rs`.
-//! - `frances:v1/io`       — `Timer` + `TimerError` (interval + one-shot
+//! - `frances:v1/io`             — `Timer` + `TimerError` (interval + one-shot
 //!   awaitable + the Error subclass it rejects with).
+//! - `whatwg:web-streams`        — `ReadableStream`, `WritableStream`,
+//!   `TransformStream` and friends from web-streams-polyfill (the
+//!   ponyfill build — named exports, no globalThis mutation).
+//! - `whatwg:abortcontroller`    — `AbortController`, `AbortSignal`
+//!   (hand-rolled, EventTarget-free).
+//! - `whatwg:dom`                — minimal DOM Standard surface
+//!   (currently just `DOMException`). Grows on a what-we-need basis;
+//!   see `docs/js/whatwg.md`.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -97,8 +110,12 @@ pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
     stash.set("ErrorFrame", err_ctor).map_err(script)?;
     stash.set("JsonFrame", json_ctor).map_err(script)?;
 
-    let chat_ctor = chat::build_chat_session_ctor(ctx, deps).map_err(script)?;
+    let (chat_ctor, chat_inner_stream) =
+        chat::build_chat_session_ctor(ctx, deps).map_err(script)?;
     stash.set("ChatSession", chat_ctor).map_err(script)?;
+    stash
+        .set("__chat_inner_stream", chat_inner_stream)
+        .map_err(script)?;
 
     let timer_ctor = io::build_timer_ctor(ctx, closed, closed_notify).map_err(script)?;
     stash.set("Timer", timer_ctor).map_err(script)?;
@@ -132,6 +149,19 @@ pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
 
     ctx.globals().remove(STASH_KEY).map_err(script)?;
 
+    Ok(())
+}
+
+/// Declares the `whatwg:*` polyfill modules. No per-invocation state,
+/// so this is just `declare_and_eval` for each source. Independent of
+/// `install_v1`; the runtime calls both before evaluating the user
+/// script.
+pub(crate) fn install_whatwg<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
+    // Order matters: `whatwg:abortcontroller` imports DOMException
+    // from `whatwg:dom`, so the dom module must be declared first.
+    declare_and_eval(ctx, "whatwg:dom", DOM_SRC)?;
+    declare_and_eval(ctx, "whatwg:web-streams", WEB_STREAMS_SRC)?;
+    declare_and_eval(ctx, "whatwg:abortcontroller", ABORTCONTROLLER_SRC)?;
     Ok(())
 }
 
@@ -180,3 +210,9 @@ const INBOX_SRC: &str = include_str!("js/inbox.js");
 const FRAMES_SRC: &str = include_str!("js/frames.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
+
+// `whatwg:*` polyfills live at the workspace root so they can be
+// refreshed by `modules/whatwg/update.sh` without touching this crate.
+const DOM_SRC: &str = include_str!("../../../../modules/whatwg/dom.mjs");
+const WEB_STREAMS_SRC: &str = include_str!("../../../../modules/whatwg/web-streams.mjs");
+const ABORTCONTROLLER_SRC: &str = include_str!("../../../../modules/whatwg/abortcontroller.mjs");
