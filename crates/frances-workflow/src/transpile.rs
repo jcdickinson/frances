@@ -44,19 +44,16 @@ pub(crate) fn ts_to_js(path: &Path, source: &str) -> Result<String, WorkflowErro
         capture_tokens: false,
         scope_analysis: false,
         maybe_syntax: None,
-    })
-    .map_err(|err| WorkflowError::Transpile(err.to_string()))?;
+    })?;
 
-    let transpiled = parsed
-        .transpile(
-            &TranspileOptions::default(),
-            &deno_ast::TranspileModuleOptions::default(),
-            &deno_ast::EmitOptions {
-                source_map: SourceMapOption::None,
-                ..Default::default()
-            },
-        )
-        .map_err(|err| WorkflowError::Transpile(err.to_string()))?;
+    let transpiled = parsed.transpile(
+        &TranspileOptions::default(),
+        &deno_ast::TranspileModuleOptions::default(),
+        &deno_ast::EmitOptions {
+            source_map: SourceMapOption::None,
+            ..Default::default()
+        },
+    )?;
 
     Ok(transpiled.into_source().text)
 }

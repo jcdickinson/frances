@@ -133,7 +133,7 @@ struct TranspileCache {
 
 impl<D: WorkflowDeps> Runtime<D> {
     pub fn new(deps: D) -> Result<Self, WorkflowError> {
-        let js = AsyncRuntime::new().map_err(script_err)?;
+        let js = AsyncRuntime::new()?;
         Ok(Self {
             js,
             transpile_cache: Arc::new(StdMutex::new(TranspileCache::default())),
@@ -220,7 +220,7 @@ async fn run_workflow<D: WorkflowDeps>(
     parked: Arc<Notify>,
     deps: D,
 ) -> Result<(), WorkflowError> {
-    let context = AsyncContext::full(&js).await.map_err(script_err)?;
+    let context = AsyncContext::full(&js).await?;
 
     async_with!(context => |ctx| {
         let result: Result<(), WorkflowError> = async {
@@ -240,24 +240,24 @@ async fn run_workflow<D: WorkflowDeps>(
 
             let user_module = Module::declare(ctx.clone(), USER_MODULE_NAME, js_source.as_bytes())
                 .catch(&ctx)
-                .map_err(|e| script_err(format!("{e}")))?;
+                .map_err(caught("declare user-script"))?;
             let meta = user_module
                 .meta()
                 .catch(&ctx)
-                .map_err(|e| script_err(format!("{e}")))?;
+                .map_err(caught("user-script meta"))?;
             meta.set("args", args)
                 .catch(&ctx)
-                .map_err(|e| script_err(format!("{e}")))?;
+                .map_err(caught("set import.meta.args"))?;
 
             let (_module, promise) = user_module
                 .eval()
                 .catch(&ctx)
-                .map_err(|e| script_err(format!("{e}")))?;
+                .map_err(caught("eval user-script"))?;
             promise
                 .into_future::<()>()
                 .await
                 .catch(&ctx)
-                .map_err(|e| script_err(format!("{e}")))?;
+                .map_err(caught("await user-script promise"))?;
             Ok(())
         }
         .await;
@@ -273,8 +273,14 @@ async fn run_workflow<D: WorkflowDeps>(
     .await
 }
 
-pub(crate) fn script_err<E: std::fmt::Display>(err: E) -> WorkflowError {
-    WorkflowError::Script(err.to_string())
+pub(crate) fn caught<'js>(
+    context: impl Into<String>,
+) -> impl FnOnce(rquickjs::CaughtError<'js>) -> WorkflowError {
+    let context = context.into();
+    move |e| WorkflowError::ScriptCaught {
+        context,
+        detail: e.to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -694,7 +700,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -750,7 +756,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -768,7 +774,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -819,7 +825,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -870,7 +876,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -1442,7 +1448,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -1524,7 +1530,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }
@@ -1607,7 +1613,7 @@ mod tests {
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
         assert!(
-            matches!(result, Err(WorkflowError::Script(_))),
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
             "got {result:?}"
         );
     }

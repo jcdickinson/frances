@@ -10,12 +10,18 @@ pub enum WorkflowError {
     #[error("read workflow source: {0}")]
     ReadSource(#[source] std::io::Error),
 
+    #[error("parse workflow source: {0}")]
+    Parse(#[from] deno_ast::ParseDiagnostic),
+
     #[error("transpile workflow source: {0}")]
-    Transpile(String),
+    Transpile(#[from] deno_ast::TranspileError),
 
     #[error("could not derive a file:// specifier for {0}")]
     TranspileSpecifier(PathBuf),
 
-    #[error("script engine: {0}")]
-    Script(String),
+    #[error("script: {0}")]
+    Script(#[from] rquickjs::Error),
+
+    #[error("script ({context}): {detail}")]
+    ScriptCaught { context: String, detail: String },
 }

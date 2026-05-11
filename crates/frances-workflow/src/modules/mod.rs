@@ -54,7 +54,7 @@ use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
-use crate::runtime::{HostFrame, UserInput};
+use crate::runtime::{HostFrame, UserInput, caught};
 
 pub mod chat;
 pub mod frames;
@@ -92,35 +92,29 @@ pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
     parked: Arc<Notify>,
     deps: D,
 ) -> Result<(), WorkflowError> {
-    let stash = Object::new(ctx.clone()).map_err(script)?;
+    let stash = Object::new(ctx.clone())?;
 
-    let exit_fn =
-        workflow::build_exit(ctx, closed.clone(), closed_notify.clone()).map_err(script)?;
-    stash.set("exit", exit_fn).map_err(script)?;
+    let exit_fn = workflow::build_exit(ctx, closed.clone(), closed_notify.clone())?;
+    stash.set("exit", exit_fn)?;
 
     let inbox_instance =
-        inbox::build_inbox(ctx, input_rx, closed.clone(), closed_notify.clone(), parked)
-            .map_err(script)?;
-    stash.set("inbox", inbox_instance).map_err(script)?;
+        inbox::build_inbox(ctx, input_rx, closed.clone(), closed_notify.clone(), parked)?;
+    stash.set("inbox", inbox_instance)?;
 
-    let (transcript_proxy, md_ctor, err_ctor, json_ctor) =
-        frames::build_frames(ctx, frames_tx).map_err(script)?;
-    stash.set("transcript", transcript_proxy).map_err(script)?;
-    stash.set("MarkdownFrame", md_ctor).map_err(script)?;
-    stash.set("ErrorFrame", err_ctor).map_err(script)?;
-    stash.set("JsonFrame", json_ctor).map_err(script)?;
+    let (transcript_proxy, md_ctor, err_ctor, json_ctor) = frames::build_frames(ctx, frames_tx)?;
+    stash.set("transcript", transcript_proxy)?;
+    stash.set("MarkdownFrame", md_ctor)?;
+    stash.set("ErrorFrame", err_ctor)?;
+    stash.set("JsonFrame", json_ctor)?;
 
-    let (chat_ctor, chat_inner_stream) =
-        chat::build_chat_session_ctor(ctx, deps).map_err(script)?;
-    stash.set("ChatSession", chat_ctor).map_err(script)?;
-    stash
-        .set("__chat_inner_stream", chat_inner_stream)
-        .map_err(script)?;
+    let (chat_ctor, chat_inner_stream) = chat::build_chat_session_ctor(ctx, deps)?;
+    stash.set("ChatSession", chat_ctor)?;
+    stash.set("__chat_inner_stream", chat_inner_stream)?;
 
-    let timer_ctor = io::build_timer_ctor(ctx, closed, closed_notify).map_err(script)?;
-    stash.set("Timer", timer_ctor).map_err(script)?;
+    let timer_ctor = io::build_timer_ctor(ctx, closed, closed_notify)?;
+    stash.set("Timer", timer_ctor)?;
 
-    ctx.globals().set(STASH_KEY, stash).map_err(script)?;
+    ctx.globals().set(STASH_KEY, stash)?;
 
     // Declare and evaluate each virtual module. Evaluation runs the
     // module body, which captures the stash references into each
@@ -140,14 +134,14 @@ pub(crate) fn install_v1<'js, D: crate::deps::WorkflowDeps>(
     let io_namespace = io_module
         .namespace()
         .catch(ctx)
-        .map_err(|e| WorkflowError::Script(format!("frances:v1/io namespace: {e}")))?;
+        .map_err(caught("frances:v1/io namespace"))?;
     let timer_error: Constructor<'js> = io_namespace
         .get("TimerError")
         .catch(ctx)
-        .map_err(|e| WorkflowError::Script(format!("frances:v1/io.TimerError: {e}")))?;
+        .map_err(caught("frances:v1/io.TimerError"))?;
     let _ = ctx.store_userdata(TimerErrorUserData(Persistent::save(ctx, timer_error)));
 
-    ctx.globals().remove(STASH_KEY).map_err(script)?;
+    ctx.globals().remove(STASH_KEY)?;
 
     Ok(())
 }
@@ -186,16 +180,12 @@ fn declare_and_eval<'js>(
 ) -> Result<rquickjs::module::Module<'js, rquickjs::module::Evaluated>, WorkflowError> {
     let module = Module::declare(ctx.clone(), name, source)
         .catch(ctx)
-        .map_err(|e| WorkflowError::Script(format!("declare {name}: {e}")))?;
+        .map_err(caught(format!("declare {name}")))?;
     let (evaluated, _promise) = module
         .eval()
         .catch(ctx)
-        .map_err(|e| WorkflowError::Script(format!("eval {name}: {e}")))?;
+        .map_err(caught(format!("eval {name}")))?;
     Ok(evaluated)
-}
-
-fn script<E: std::fmt::Display>(err: E) -> WorkflowError {
-    WorkflowError::Script(err.to_string())
 }
 
 // ---- Module source strings ------------------------------------------------

@@ -35,19 +35,7 @@ use crate::providers::openai;
 pub enum ProviderCacheError {
     #[error("bind {path}: {source}")]
     Bind {
-        path: &'static str,
-        #[source]
-        source: ConfigBindError,
-    },
-    #[error("bind model_providers::{id}: {source}")]
-    BindProvider {
-        id: String,
-        #[source]
-        source: ConfigBindError,
-    },
-    #[error("bind model_provider_extensions::{id}: {source}")]
-    BindExtensions {
-        id: String,
+        path: String,
         #[source]
         source: ConfigBindError,
     },
@@ -95,7 +83,7 @@ impl ProviderCache {
             handle
                 .bind::<Keys>("model_providers")
                 .map_err(|source| ProviderCacheError::Bind {
-                    path: "model_providers",
+                    path: "model_providers".to_string(),
                     source,
                 })?;
         // subscribe_now seeds the stream with the current snapshot so the
@@ -173,14 +161,14 @@ fn build_openai_entry(
 ) -> std::result::Result<Entry, ProviderCacheError> {
     let pc = handle
         .bind::<ProviderConfig>(["model_providers", id])
-        .map_err(|source| ProviderCacheError::BindProvider {
-            id: id.to_owned(),
+        .map_err(|source| ProviderCacheError::Bind {
+            path: format!("model_providers::{id}"),
             source,
         })?;
     let ex = handle
         .bind::<ResponsesModelExtras>(["model_provider_extensions", id])
-        .map_err(|source| ProviderCacheError::BindExtensions {
-            id: id.to_owned(),
+        .map_err(|source| ProviderCacheError::Bind {
+            path: format!("model_provider_extensions::{id}"),
             source,
         })?;
 

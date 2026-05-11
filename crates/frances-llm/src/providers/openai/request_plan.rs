@@ -13,10 +13,11 @@ use frances_models_llm::config::{AuthMethod, ModelConfig, ProviderConfig, Respon
 pub enum Error {
     #[error("invalid base_url: {0}")]
     JoinBaseUrl(#[source] url::ParseError),
-    #[error("env var '{0}' not set in client environment")]
-    MissingEnvVar(String),
-    #[error("env var '{var}' not set in client environment — {hint}")]
-    MissingEnvVarHinted { var: String, hint: String },
+    #[error(
+        "env var '{var}' not set in client environment{}",
+        hint.as_deref().map(|h| format!(" — {h}")).unwrap_or_default()
+    )]
+    MissingEnvVar { var: String, hint: Option<String> },
     #[error("read auth file {path}: {source}")]
     ReadAuthFile {
         path: PathBuf,
@@ -76,12 +77,9 @@ fn resolve_bearer(auth: &AuthMethod, env: &HashMap<OsString, OsString>) -> Resul
         } => env
             .get(std::ffi::OsStr::new(env_key))
             .map(|v| v.to_string_lossy().into_owned())
-            .ok_or_else(|| match env_key_instructions {
-                Some(hint) => Error::MissingEnvVarHinted {
-                    var: env_key.clone(),
-                    hint: hint.clone(),
-                },
-                None => Error::MissingEnvVar(env_key.clone()),
+            .ok_or_else(|| Error::MissingEnvVar {
+                var: env_key.clone(),
+                hint: env_key_instructions.clone(),
             }),
         AuthMethod::Token { token } => Ok(token.clone()),
         AuthMethod::File { file } => std::fs::read_to_string(file)
