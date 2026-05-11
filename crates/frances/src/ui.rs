@@ -254,9 +254,13 @@ fn handle_frame(screen: &mut Screen, state: &mut BlockState, frame: StreamFrame)
             scrollback::emit_text(screen, &[format_usage(&usage)])?;
         }
         StreamFrame::Done => {
-            if let Some(prev) = state.take() {
-                commit_remaining(screen, &prev)?;
-            }
+            // Done is a transport boundary ("this prompt's stream
+            // ended"), not a semantic "close everything". Blocks live
+            // until an explicit BlockStop or until a newer BlockStart
+            // supersedes them — which lets workflow frames span the
+            // gap between user turns. The legacy path always emits its
+            // own BlockStops before Done, so this leaves no block
+            // dangling there.
         }
         StreamFrame::Error(message) => {
             if let Some(prev) = state.take() {

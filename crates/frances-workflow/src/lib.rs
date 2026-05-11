@@ -5,23 +5,24 @@
 //! `workflows.<id>.file = "/path/to/foo.ts"` and invoked from the TUI by
 //! typing `/<id> [args...]`.
 //!
-//! This crate currently owns:
+//! This crate owns:
 //!
 //! - [`WorkflowConfig`] — the config row shape.
 //! - [`parse_slash_command`] — the input parser.
 //! - [`WorkflowError`] — typed errors raised here.
-//!
-//! The script runtime ([`Runtime`]) lives alongside but is wired up across
-//! follow-up commits; today it's a placeholder so callers can take the
-//! type as a dependency without wrapping it in `Option`.
+//! - [`Runtime`] — the script runtime that exposes the `frances:v1/*`
+//!   import surface to user scripts.
 
 mod config;
 mod error;
+mod modules;
 mod runtime;
 mod slash;
 mod transpile;
 
 pub use config::WorkflowConfig;
 pub use error::WorkflowError;
-pub use runtime::{HostFrame, Invocation, Runtime, UserInput, WorkflowHandle};
+pub use runtime::{
+    FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, UserInput, WorkflowHandle,
+};
 pub use slash::parse_slash_command;

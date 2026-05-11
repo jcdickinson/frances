@@ -1,63 +1,92 @@
 //! Script runtime.
 //!
 //! Each call to [`Runtime::start`] creates a fresh [`AsyncContext`],
-//! evaluates the workflow module's top-level body, and tears the context
-//! down when the body settles or `workflow.exit()` is called. Module
-//! state does not persist across invocations.
+//! installs the `frances:v1/*` virtual modules, evaluates the user
+//! script as its own module, and tears the context down when the
+//! script's top-level body settles or `exit()` is called. Module state
+//! does not persist across invocations.
 //!
-//! The JS-side API surfaces under a single `workflow` global, plus
-//! per-invocation args at `import.meta.args`:
+//! The JS-side API is exposed exclusively through standard ES module
+//! imports — no globals:
 //!
-//! - `workflow.frame.{text, error, json}` — emit a [`HostFrame`].
-//! - `workflow.user.input` — async-iterable user-input stream.
-//! - `workflow.exit()` — explicit termination.
+//! - `import { exit } from "frances:v1/workflow"`
+//! - `import { inbox } from "frances:v1/inbox"`
+//! - `import { transcript, MarkdownFrame, ErrorFrame, JsonFrame } from "frances:v1/frames"`
+//! - `import { ChatSession } from "frances:v1/chat"` (LLM backend pending)
+//! - `import.meta.args` — per-invocation slash-command args.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
 use rquickjs::async_with;
-use rquickjs::atom::PredefinedAtom;
-use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::context::AsyncContext;
-use rquickjs::function::{Constructor, This};
 use rquickjs::module::Module;
-use rquickjs::promise::Promised;
 use rquickjs::runtime::AsyncRuntime;
-use rquickjs::{
-    CatchResultExt, Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
-};
+use rquickjs::{CatchResultExt, Ctx, IntoJs, Object, Result as JsResult, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::WorkflowError;
+use crate::modules;
 use crate::transpile::{SourceKind, ts_to_js};
+
+/// Internal name we declare the user script under. Distinct from the
+/// `frances:v1/*` namespace so the two don't visually clash.
+const USER_MODULE_NAME: &str = "frances:user-script";
 
 /// Frames a workflow can emit during a turn. The daemon receiver maps
 /// these onto the wire `StreamFrame` protocol; this enum is the
 /// host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
 pub enum HostFrame {
-    Text(String),
-    Error(String),
+    /// A new frame was pushed onto the transcript. Implicitly seals the
+    /// previously-active frame (the host should close that wire block
+    /// before opening this one).
+    Push(FramePush),
+    /// Append text to the frame with the given id. Only valid while
+    /// that frame is still the active one — the JS side enforces this.
+    Append { id: FrameId, delta: String },
+}
+
+/// Frame identity, scoped to one invocation. Monotonically assigned by
+/// `transcript.push`. Useful for the host to map back to its own block
+/// ids.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+pub struct FrameId(pub u64);
+
+#[derive(Debug, Clone)]
+pub struct FramePush {
+    pub id: FrameId,
+    pub kind: FrameKind,
+}
+
+#[derive(Debug, Clone)]
+pub enum FrameKind {
+    /// `MarkdownFrame` — text content that may be extended with `append`.
+    Markdown { content: String },
+    /// `ErrorFrame` — text content (typically rendered as an error) that
+    /// may be extended with `append`.
+    Error { content: String },
+    /// `JsonFrame` — single tagged JSON value. Immutable after push.
     Json {
         tag: String,
         value: serde_json::Value,
     },
 }
 
-/// A single user input event delivered to `workflow.user.input`.
+/// A single user input event delivered to `inbox`.
 #[derive(Debug, Clone)]
 pub struct UserInput {
-    pub message: String,
+    pub content: String,
 }
 
 impl<'js> IntoJs<'js> for UserInput {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         let obj = Object::new(ctx.clone())?;
-        obj.set("message", self.message)?;
+        obj.set("content", self.content)?;
         Ok(obj.into_value())
     }
 }
@@ -73,13 +102,13 @@ pub struct Invocation {
 /// and learns about lifecycle transitions through [`Self::parked`] and
 /// [`Self::done`].
 pub struct WorkflowHandle {
-    /// Send user input to the workflow's `workflow.user.input` stream.
+    /// Send user input to the workflow's `inbox` stream.
     pub input_tx: UnboundedSender<UserInput>,
     /// Frames the workflow emits.
     pub frames: UnboundedReceiver<HostFrame>,
-    /// Notified each time the body suspends on `workflow.user.input.next()`
-    /// with an empty queue — i.e. the body is parked waiting for input.
-    /// One pulse per park; the daemon uses this to detect end-of-cycle.
+    /// Notified each time the body suspends on `inbox.next()` with an
+    /// empty queue — i.e. the body is parked waiting for input. One
+    /// pulse per park; the daemon uses this to detect end-of-cycle.
     pub parked: Arc<Notify>,
     /// Resolves when the workflow terminates (body settled or `exit()`
     /// called). The inner result mirrors the body's outcome.
@@ -110,8 +139,8 @@ impl Runtime {
     }
 
     /// Start a workflow. Reads + transpiles the source synchronously,
-    /// spawns the body on a Tokio task, and returns a handle the
-    /// daemon uses to drive it.
+    /// spawns the body on a Tokio task, and returns a handle the daemon
+    /// uses to drive it.
     pub fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
         let source =
             std::fs::read_to_string(&inv.source_path).map_err(WorkflowError::ReadSource)?;
@@ -179,9 +208,6 @@ impl Runtime {
     }
 }
 
-/// Internal module name we register every workflow source under.
-const MODULE_NAME: &str = "frances:workflow";
-
 #[expect(
     clippy::too_many_arguments,
     reason = "shared task-local state, packing buys nothing"
@@ -199,21 +225,19 @@ async fn run_workflow(
     let context = AsyncContext::full(&js).await.map_err(script_err)?;
 
     async_with!(context => |ctx| {
-        install_workflow_globals(
+        modules::install_v1(
             &ctx,
             frames,
             input_rx,
             closed.clone(),
             closed_notify.clone(),
             parked,
-        )
-        .catch(&ctx)
-        .map_err(|e| script_err(format!("{e}")))?;
+        )?;
 
-        let module = Module::declare(ctx.clone(), MODULE_NAME, js_source.as_bytes())
+        let user_module = Module::declare(ctx.clone(), USER_MODULE_NAME, js_source.as_bytes())
             .catch(&ctx)
             .map_err(|e| script_err(format!("{e}")))?;
-        let meta = module
+        let meta = user_module
             .meta()
             .catch(&ctx)
             .map_err(|e| script_err(format!("{e}")))?;
@@ -221,7 +245,7 @@ async fn run_workflow(
             .catch(&ctx)
             .map_err(|e| script_err(format!("{e}")))?;
 
-        let (_module, promise) = module
+        let (_module, promise) = user_module
             .eval()
             .catch(&ctx)
             .map_err(|e| script_err(format!("{e}")))?;
@@ -235,222 +259,8 @@ async fn run_workflow(
     .await
 }
 
-fn install_workflow_globals<'js>(
-    ctx: &Ctx<'js>,
-    frames: UnboundedSender<HostFrame>,
-    input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
-) -> JsResult<()> {
-    let frame_obj = build_frame_object(ctx, frames)?;
-    let input_class = Class::instance(
-        ctx.clone(),
-        WorkflowInput {
-            rx: input_rx,
-            closed: closed.clone(),
-            closed_notify: closed_notify.clone(),
-            parked,
-        },
-    )?;
-    let user_obj = Object::new(ctx.clone())?;
-    user_obj.set("input", input_class)?;
-
-    let workflow = Object::new(ctx.clone())?;
-    workflow.set("frame", frame_obj)?;
-    workflow.set("user", user_obj)?;
-    workflow.set("exit", build_exit_fn(ctx, closed, closed_notify)?)?;
-
-    ctx.globals().set("workflow", workflow)?;
-    Ok(())
-}
-
-fn build_frame_object<'js>(
-    ctx: &Ctx<'js>,
-    frames: UnboundedSender<HostFrame>,
-) -> JsResult<Object<'js>> {
-    let obj = Object::new(ctx.clone())?;
-
-    let tx = frames.clone();
-    obj.set(
-        "text",
-        Function::new(ctx.clone(), move |s: String| {
-            let _ = tx.send(HostFrame::Text(s));
-            Ok::<_, rquickjs::Error>(())
-        })?,
-    )?;
-
-    let tx = frames.clone();
-    obj.set(
-        "error",
-        Function::new(ctx.clone(), move |s: String| {
-            let _ = tx.send(HostFrame::Error(s));
-            Ok::<_, rquickjs::Error>(())
-        })?,
-    )?;
-
-    let tx = frames;
-    obj.set(
-        "json",
-        Function::new(ctx.clone(), move |tag: String, value: Value<'js>| {
-            // Round-trip via the JSON stringifier so any JS value becomes
-            // a serde_json::Value. Drop frames where the value isn't
-            // JSON-representable rather than throwing.
-            let value_ctx = value.ctx().clone();
-            let json_str: String = value_ctx
-                .json_stringify(value.clone())?
-                .and_then(|s| s.to_string().ok())
-                .unwrap_or_else(|| "null".to_string());
-            let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&json_str) else {
-                return Ok::<_, rquickjs::Error>(());
-            };
-            let _ = tx.send(HostFrame::Json { tag, value: parsed });
-            Ok(())
-        })?,
-    )?;
-
-    Ok(obj)
-}
-
-fn build_exit_fn<'js>(
-    ctx: &Ctx<'js>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-) -> JsResult<Function<'js>> {
-    Function::new(ctx.clone(), move || {
-        if !closed.swap(true, Ordering::AcqRel) {
-            closed_notify.notify_waiters();
-        }
-        Ok::<_, rquickjs::Error>(())
-    })
-}
-
-fn script_err<E: std::fmt::Display>(err: E) -> WorkflowError {
+pub(crate) fn script_err<E: std::fmt::Display>(err: E) -> WorkflowError {
     WorkflowError::Script(err.to_string())
-}
-
-// ---------------------------------------------------------------------
-// JS class: WorkflowInput
-// ---------------------------------------------------------------------
-
-/// `workflow.user.input` — async-iterable + iterator (returns `this`).
-///
-/// `next()` pulls from the input mpsc; when the buffer is empty it
-/// pulses `parked` before suspending. `return()` and `workflow.exit()`
-/// flip `closed`, breaking any in-flight `next()` with `{done:true}`.
-pub struct WorkflowInput {
-    rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
-}
-
-impl<'js> Trace<'js> for WorkflowInput {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
-unsafe impl<'js> JsLifetime<'js> for WorkflowInput {
-    type Changed<'to> = WorkflowInput;
-}
-
-impl<'js> JsClass<'js> for WorkflowInput {
-    const NAME: &'static str = "WorkflowInput";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-
-        proto.set(
-            PredefinedAtom::SymbolAsyncIterator,
-            Function::new(ctx.clone(), |this: This<Class<'js, WorkflowInput>>| {
-                // Iterable returns itself — same backing channel and
-                // FIFO queue for every `for await` consumer.
-                Ok::<_, rquickjs::Error>(this.0.clone())
-            })?,
-        )?;
-
-        proto.set(
-            PredefinedAtom::Next,
-            Function::new(ctx.clone(), |this: This<Class<'js, WorkflowInput>>| {
-                let borrow = this.0.borrow();
-                let rx = borrow.rx.clone();
-                let closed = borrow.closed.clone();
-                let closed_notify = borrow.closed_notify.clone();
-                let parked = borrow.parked.clone();
-                drop(borrow);
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    if closed.load(Ordering::Acquire) {
-                        return IterResult::done();
-                    }
-                    let mut guard = rx.lock().await;
-                    if closed.load(Ordering::Acquire) {
-                        return IterResult::done();
-                    }
-                    if let Ok(value) = guard.try_recv() {
-                        return IterResult::value(value);
-                    }
-                    parked.notify_one();
-                    tokio::select! {
-                        msg = guard.recv() => match msg {
-                            Some(input) => IterResult::value(input),
-                            None => IterResult::done(),
-                        },
-                        () = closed_notify.notified() => IterResult::done(),
-                    }
-                }))
-            })?,
-        )?;
-
-        proto.set(
-            PredefinedAtom::Return,
-            Function::new(ctx.clone(), |this: This<Class<'js, WorkflowInput>>| {
-                let borrow = this.0.borrow();
-                if !borrow.closed.swap(true, Ordering::AcqRel) {
-                    borrow.closed_notify.notify_waiters();
-                }
-                Ok::<_, rquickjs::Error>(IterResult::done())
-            })?,
-        )?;
-
-        Ok(Some(proto))
-    }
-
-    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
-        Ok(None)
-    }
-}
-
-/// IteratorResult — `{value, done}` for the JS iterator protocol.
-struct IterResult {
-    value: Option<UserInput>,
-    done: bool,
-}
-
-impl IterResult {
-    fn value(v: UserInput) -> Self {
-        Self {
-            value: Some(v),
-            done: false,
-        }
-    }
-
-    fn done() -> Self {
-        Self {
-            value: None,
-            done: true,
-        }
-    }
-}
-
-impl<'js> IntoJs<'js> for IterResult {
-    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
-        let obj = Object::new(ctx.clone())?;
-        obj.set("done", self.done)?;
-        if let Some(v) = self.value {
-            obj.set("value", v)?;
-        }
-        Ok(obj.into_value())
-    }
 }
 
 #[cfg(test)]
@@ -467,9 +277,7 @@ mod tests {
         f
     }
 
-    /// Drains a workflow until it parks on `next()` or terminates.
-    /// Returns the frames collected and, if the body finished, the body's
-    /// result.
+    /// Drives a workflow until it parks on `inbox.next()` or terminates.
     async fn drive_one_cycle(
         handle: &mut WorkflowHandle,
     ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
@@ -498,18 +306,28 @@ mod tests {
         }
     }
 
+    fn text_of(frame: &HostFrame) -> String {
+        match frame {
+            HostFrame::Push(p) => match &p.kind {
+                FrameKind::Markdown { content } | FrameKind::Error { content } => content.clone(),
+                FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
+            },
+            HostFrame::Append { delta, .. } => delta.clone(),
+        }
+    }
+
     #[tokio::test]
     async fn iterator_delivers_messages_in_order() {
         let rt = Runtime::new().unwrap();
         let file = write_source(
             "js",
             r#"
-            for await (const input of workflow.user.input) {
-                workflow.frame.text("got:" + input.message);
-                if (input.message === "stop") {
-                    workflow.exit();
-                    break;
-                }
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { exit } from "frances:v1/workflow";
+            for await (const input of inbox) {
+                transcript.push(new MarkdownFrame({ content: "got:" + input.content }));
+                if (input.content === "stop") { exit(); break; }
             }
             "#,
         );
@@ -520,7 +338,6 @@ mod tests {
             })
             .unwrap();
 
-        // Initial cycle: body reaches the first `next()` and parks.
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(frames.is_empty(), "got {frames:?}");
         assert!(done.is_none());
@@ -528,38 +345,44 @@ mod tests {
         handle
             .input_tx
             .send(UserInput {
-                message: "a".into(),
+                content: "a".into(),
             })
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "got:a"));
+        assert_eq!(text_of(&frames[0]), "got:a");
         assert!(done.is_none());
 
         handle
             .input_tx
             .send(UserInput {
-                message: "b".into(),
+                content: "b".into(),
             })
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "got:b"));
+        assert_eq!(text_of(&frames[0]), "got:b");
         assert!(done.is_none());
 
         handle
             .input_tx
             .send(UserInput {
-                message: "stop".into(),
+                content: "stop".into(),
             })
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "got:stop"));
+        assert_eq!(text_of(&frames[0]), "got:stop");
         assert!(matches!(done, Some(Ok(()))));
     }
 
     #[tokio::test]
     async fn body_returns_terminates_workflow() {
         let rt = Runtime::new().unwrap();
-        let file = write_source("js", "workflow.frame.text('hi');");
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: "hi" }));
+            "#,
+        );
         let mut handle = rt
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
@@ -568,14 +391,20 @@ mod tests {
             .unwrap();
 
         let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "hi"));
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "hi");
     }
 
     #[tokio::test]
     async fn import_meta_args_populated() {
         let rt = Runtime::new().unwrap();
-        let file = write_source("js", "workflow.frame.text(import.meta.args.join('|'));");
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: import.meta.args.join('|') }));
+            "#,
+        );
         let mut handle = rt
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
@@ -585,18 +414,18 @@ mod tests {
 
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "a|b|c"));
+        assert_eq!(text_of(&frames[0]), "a|b|c");
     }
 
     #[tokio::test]
     async fn fresh_context_per_invocation() {
-        // Module-level state must not survive across invocations.
         let rt = Runtime::new().unwrap();
         let file = write_source(
             "js",
             r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
             globalThis.__counter = (globalThis.__counter ?? 0) + 1;
-            workflow.frame.text(String(globalThis.__counter));
+            transcript.push(new MarkdownFrame({ content: String(globalThis.__counter) }));
             "#,
         );
         let path = file.path().to_path_buf();
@@ -610,9 +439,10 @@ mod tests {
                 .unwrap();
             let (frames, done) = drive_one_cycle(&mut handle).await;
             assert!(matches!(done, Some(Ok(()))));
-            assert!(
-                matches!(&frames[0], HostFrame::Text(t) if t == "1"),
-                "expected counter=1 each invocation, got {frames:?}",
+            assert_eq!(
+                text_of(&frames[0]),
+                "1",
+                "expected counter=1 each invocation"
             );
         }
     }
@@ -623,11 +453,14 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            queueMicrotask(() => workflow.exit());
-            for await (const _ of workflow.user.input) {
-                workflow.frame.text("got input");
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { exit } from "frances:v1/workflow";
+            queueMicrotask(() => exit());
+            for await (const _ of inbox) {
+                transcript.push(new MarkdownFrame({ content: "got input" }));
             }
-            workflow.frame.text("after-loop");
+            transcript.push(new MarkdownFrame({ content: "after-loop" }));
             "#,
         );
         let mut handle = rt
@@ -638,7 +471,7 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "after-loop"));
+        assert_eq!(text_of(&frames[0]), "after-loop");
     }
 
     #[tokio::test]
@@ -647,9 +480,12 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            const it = workflow.user.input[Symbol.asyncIterator]();
-            workflow.frame.text(it === workflow.user.input ? "same" : "different");
-            workflow.exit();
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { exit } from "frances:v1/workflow";
+            const it = inbox[Symbol.asyncIterator]();
+            transcript.push(new MarkdownFrame({ content: it === inbox ? "same" : "different" }));
+            exit();
             "#,
         );
         let mut handle = rt
@@ -660,7 +496,7 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "same"));
+        assert_eq!(text_of(&frames[0]), "same");
     }
 
     #[tokio::test]
@@ -669,11 +505,14 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            const a = workflow.user.input.next();
-            const b = workflow.user.input.next();
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { exit } from "frances:v1/workflow";
+            const a = inbox.next();
+            const b = inbox.next();
             const [ra, rb] = await Promise.all([a, b]);
-            workflow.frame.text(`${ra.value.message},${rb.value.message}`);
-            workflow.exit();
+            transcript.push(new MarkdownFrame({ content: `${ra.value.content},${rb.value.content}` }));
+            exit();
             "#,
         );
         let mut handle = rt
@@ -682,7 +521,6 @@ mod tests {
                 args: Vec::new(),
             })
             .unwrap();
-        // Body parks on the first `next()`; deliver two inputs.
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(frames.is_empty());
         assert!(done.is_none());
@@ -690,18 +528,18 @@ mod tests {
         handle
             .input_tx
             .send(UserInput {
-                message: "first".into(),
+                content: "first".into(),
             })
             .unwrap();
         handle
             .input_tx
             .send(UserInput {
-                message: "second".into(),
+                content: "second".into(),
             })
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "first,second"));
+        assert_eq!(text_of(&frames[0]), "first,second");
     }
 
     #[tokio::test]
@@ -710,8 +548,9 @@ mod tests {
         let file = write_source(
             "ts",
             r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
             const args: string[] = import.meta.args;
-            workflow.frame.text(args.length.toString());
+            transcript.push(new MarkdownFrame({ content: args.length.toString() }));
             "#,
         );
         let mut handle = rt
@@ -722,13 +561,212 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        assert!(matches!(&frames[0], HostFrame::Text(t) if t == "3"));
+        assert_eq!(text_of(&frames[0]), "3");
     }
 
     #[tokio::test]
     async fn script_throw_surfaces_as_script_error() {
         let rt = Runtime::new().unwrap();
         let file = write_source("js", "throw new Error('boom');");
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::Script(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_on_active_frame_emits_delta() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const f = new MarkdownFrame({ content: "hello" });
+            transcript.push(f);
+            f.append(" world");
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        assert!(
+            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content } if content == "hello"))
+        );
+        assert!(matches!(&frames[1], HostFrame::Append { delta, .. } if delta == " world"));
+    }
+
+    #[tokio::test]
+    async fn append_on_superseded_frame_throws() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const a = new MarkdownFrame({ content: "a" });
+            transcript.push(a);
+            transcript.push(new MarkdownFrame({ content: "b" }));
+            a.append(" extra");  // should throw
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::Script(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_v1_module_fails_to_load() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source("js", r#"import { nope } from "frances:v1/nope";"#);
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::Script(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_accepts_system_and_user_roles() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["summarize"] });
+            s.push({ role: "system", content: "you are a summariser" });
+            s.push({ role: "user", content: "hi" });
+            transcript.push(new MarkdownFrame({ content: "ok" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        assert_eq!(text_of(&frames[0]), "ok");
+    }
+
+    #[tokio::test]
+    async fn chat_session_rejects_system_after_user() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            s.push({ role: "system", content: "too late" });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::Script(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_allows_multiple_consecutive_system_messages() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "system", content: "be terse" });
+            s.push({ role: "system", content: "answer in english" });
+            s.push({ role: "user", content: "hi" });
+            transcript.push(new MarkdownFrame({ content: "ok" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "ok");
+    }
+
+    #[tokio::test]
+    async fn chat_session_rejects_assistant_role() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "assistant", content: "nope" });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::Script(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_stream_throws_not_yet_wired() {
+        let rt = Runtime::new().unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            s.stream();  // throws
+            "#,
+        );
         let mut handle = rt
             .start(Invocation {
                 source_path: file.path().to_path_buf(),

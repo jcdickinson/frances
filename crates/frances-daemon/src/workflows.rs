@@ -22,7 +22,9 @@ use crate::protocol::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerState;
 use crate::transport::write_message;
 
-use frances_workflow::{HostFrame, Invocation, UserInput, WorkflowHandle, parse_slash_command};
+use frances_workflow::{
+    FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle, parse_slash_command,
+};
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
 /// The session-scoped workflow stack. One per `ServerState`.
@@ -52,7 +54,60 @@ enum Frame {
     /// Never popped.
     LegacyLlmTurn,
     /// A running JS workflow. Popped when the body terminates.
-    Js(WorkflowHandle),
+    Js(JsFrame),
+}
+
+/// A running JS workflow plus the wire-state needed across multiple
+/// `drive()` invocations (block id allocator, currently-open block).
+struct JsFrame {
+    handle: WorkflowHandle,
+    emit: EmitState,
+}
+
+/// Block-tracking state for a single JS workflow's lifetime.
+///
+/// Workflow frames map to wire blocks like this:
+///
+/// - `MarkdownFrame` push: close previous open block (if any), open a
+///   new `AssistantText` block, write initial content; the block stays
+///   open so subsequent `append`s stream into it. A block can outlive
+///   the `Done` of its opening cycle — the UI doesn't auto-finalise on
+///   Done, so the block keeps streaming across user-input turns until
+///   a new push supersedes it or the workflow exits.
+/// - `MarkdownFrame.append`: write a `BlockDelta` on the currently-open
+///   block.
+/// - `ErrorFrame` push: close previous open block, emit a one-shot
+///   `StreamFrame::Error`.
+/// - `JsonFrame` push: close previous open block, open + immediately
+///   close a one-shot `AssistantText` block rendering `[tag] body`.
+///
+/// On workflow termination the open block is closed before `Done` so
+/// the UI's `BlockState` ends up Idle.
+struct EmitState {
+    next_block: u64,
+    open_block: Option<BlockId>,
+}
+
+impl EmitState {
+    fn new() -> Self {
+        Self {
+            next_block: 1,
+            open_block: None,
+        }
+    }
+
+    fn alloc(&mut self) -> BlockId {
+        let id = BlockId(self.next_block);
+        self.next_block += 1;
+        id
+    }
+
+    async fn close_open(&mut self, stream: &mut UnixStream) -> Result<()> {
+        if let Some(id) = self.open_block.take() {
+            write_message(stream, &StreamFrame::BlockStop { id }).await?;
+        }
+        Ok(())
+    }
 }
 
 /// Top-level entry from the prompt RPC. Parses the input and either
@@ -110,7 +165,10 @@ async fn push_and_drive(
         }
     };
 
-    let mut frame = Frame::Js(handle);
+    let mut frame = Frame::Js(JsFrame {
+        handle,
+        emit: EmitState::new(),
+    });
     let exited = drive(&mut frame, stream).await?;
     if !exited {
         state.workflow_stack.frames.lock().await.push(frame);
@@ -136,12 +194,12 @@ async fn dispatch_topmost(
             run_legacy_llm_turn(state, stream, text).await?;
             DriveOutcome::Continue
         }
-        Frame::Js(handle) => {
+        Frame::Js(js) => {
             // Sending to a dropped receiver would mean the body has
             // already exited and we just didn't observe it yet; treat
             // that as "exited" and let the drive loop confirm.
-            let _ = handle.input_tx.send(UserInput {
-                message: text.to_owned(),
+            let _ = js.handle.input_tx.send(UserInput {
+                content: text.to_owned(),
             });
             if drive(&mut top, stream).await? {
                 DriveOutcome::Exited
@@ -165,32 +223,28 @@ enum DriveOutcome {
 /// Drains the frame's host-frame channel until the body either parks
 /// waiting for input or terminates. Returns `true` if the body exited.
 async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
-    let Frame::Js(handle) = frame else {
+    let Frame::Js(js) = frame else {
         // LegacyLlmTurn is driven by `run_legacy_llm_turn` directly;
         // it never reaches this path.
         return Ok(false);
     };
 
-    let mut next_block: u64 = 1;
-    let mut alloc = || {
-        let id = BlockId(next_block);
-        next_block += 1;
-        id
-    };
-
     loop {
-        while let Ok(host_frame) = handle.frames.try_recv() {
-            emit(stream, &mut alloc, host_frame).await?;
+        while let Ok(host_frame) = js.handle.frames.try_recv() {
+            emit(stream, &mut js.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
-            Some(host_frame) = handle.frames.recv() => {
-                emit(stream, &mut alloc, host_frame).await?;
+            Some(host_frame) = js.handle.frames.recv() => {
+                emit(stream, &mut js.emit, host_frame).await?;
             }
-            done = &mut handle.done => {
-                while let Ok(host_frame) = handle.frames.try_recv() {
-                    emit(stream, &mut alloc, host_frame).await?;
+            done = &mut js.handle.done => {
+                while let Ok(host_frame) = js.handle.frames.try_recv() {
+                    emit(stream, &mut js.emit, host_frame).await?;
                 }
+                // Workflow is terminating — make sure any open block is
+                // closed before we surface the result.
+                js.emit.close_open(stream).await?;
                 if let Ok(Err(error)) = done {
                     write_message(
                         stream,
@@ -202,47 +256,80 @@ async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
                 }
                 return Ok(true);
             }
-            () = handle.parked.notified() => {
-                while let Ok(host_frame) = handle.frames.try_recv() {
-                    emit(stream, &mut alloc, host_frame).await?;
+            () = js.handle.parked.notified() => {
+                while let Ok(host_frame) = js.handle.frames.try_recv() {
+                    emit(stream, &mut js.emit, host_frame).await?;
                 }
+                // The open block stays open across the cycle boundary
+                // — the UI doesn't finalise on Done, so the frame keeps
+                // streaming naturally into the next user turn.
                 return Ok(false);
             }
         }
     }
 }
 
-async fn emit(
-    stream: &mut UnixStream,
-    alloc: &mut impl FnMut() -> BlockId,
-    frame: HostFrame,
-) -> Result<()> {
+async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) -> Result<()> {
     match frame {
-        HostFrame::Text(text) => write_text_block(stream, alloc(), text).await?,
-        HostFrame::Error(text) => write_message(stream, &StreamFrame::Error(text)).await?,
-        HostFrame::Json { tag, value } => {
-            // No structured frame variant for tagged JSON yet; render
-            // it as assistant text so it at least surfaces in the UI.
-            // Replace with a typed frame when the gate/recall surfaces
-            // need machine-readable workflow events.
-            let body = serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
-            write_text_block(stream, alloc(), format!("[{tag}] {body}")).await?;
+        HostFrame::Push(FramePush { id: _, kind }) => match kind {
+            FrameKind::Markdown { content } => {
+                state.close_open(stream).await?;
+                let block = state.alloc();
+                write_message(
+                    stream,
+                    &StreamFrame::BlockStart {
+                        id: block,
+                        kind: BlockKind::AssistantText,
+                    },
+                )
+                .await?;
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        text: content,
+                    },
+                )
+                .await?;
+                state.open_block = Some(block);
+            }
+            FrameKind::Error { content } => {
+                state.close_open(stream).await?;
+                write_message(stream, &StreamFrame::Error(content)).await?;
+            }
+            FrameKind::Json { tag, value } => {
+                state.close_open(stream).await?;
+                let body =
+                    serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
+                let block = state.alloc();
+                write_message(
+                    stream,
+                    &StreamFrame::BlockStart {
+                        id: block,
+                        kind: BlockKind::AssistantText,
+                    },
+                )
+                .await?;
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        text: format!("[{tag}] {body}"),
+                    },
+                )
+                .await?;
+                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+            }
+        },
+        HostFrame::Append { delta, .. } => {
+            if let Some(id) = state.open_block {
+                write_message(stream, &StreamFrame::BlockDelta { id, text: delta }).await?;
+            }
+            // else: no appendable block open — JS guarantees this only
+            // happens if push was never called, which would have
+            // thrown before reaching here.
         }
     }
-    Ok(())
-}
-
-async fn write_text_block(stream: &mut UnixStream, id: BlockId, text: String) -> Result<()> {
-    write_message(
-        stream,
-        &StreamFrame::BlockStart {
-            id,
-            kind: BlockKind::AssistantText,
-        },
-    )
-    .await?;
-    write_message(stream, &StreamFrame::BlockDelta { id, text }).await?;
-    write_message(stream, &StreamFrame::BlockStop { id }).await?;
     Ok(())
 }
 
