@@ -11,7 +11,10 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use frances_daemon::llm::Usage;
-use frances_daemon::protocol::{BlockId, BlockKind, DaemonStatus, PromptId, StreamFrame};
+use frances_daemon::protocol::{
+    ApprovalChoice, ApprovalKind, ApprovalRequest, BlockId, BlockKind, DaemonStatus, PromptId,
+    StreamFrame,
+};
 use frances_daemon::session::Session;
 
 use crate::client;
@@ -34,6 +37,8 @@ pub struct App<'a> {
 enum KeyAction {
     Quit,
     Submit,
+    Approve,
+    Reject,
     Edit,
 }
 
@@ -145,6 +150,7 @@ impl App<'_> {
 
         let mut textarea = Textarea::new("type a message…");
         let mut state = BlockState::new();
+        let mut pending_approval: Option<ApprovalRequest> = None;
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
         let mut events = EventStream::new();
 
@@ -157,13 +163,43 @@ impl App<'_> {
                     match event {
                         Event::Key(key) => {
                             if key.kind != KeyEventKind::Press { continue; }
-                            match classify_key(&key) {
+                            match classify_key(&key, pending_approval.is_some()) {
                                 KeyAction::Quit => return Ok(()),
                                 KeyAction::Submit => {
                                     if textarea.is_empty() { continue; }
-                                    let prompt = textarea.text();
+                                    let text = textarea.text();
                                     textarea.clear();
-                                    spawn_stream(self.session.clone(), prompt, frame_tx.clone());
+                                    if let Some(req) = pending_approval.take() {
+                                        textarea.set_placeholder("type a message…");
+                                        spawn_approval(
+                                            self.session.clone(),
+                                            req.id,
+                                            ApprovalChoice::Chat { content: text },
+                                            frame_tx.clone(),
+                                        );
+                                    } else {
+                                        spawn_stream(self.session.clone(), text, frame_tx.clone());
+                                    }
+                                }
+                                KeyAction::Approve | KeyAction::Reject => {
+                                    let Some(req) = pending_approval.take() else { continue; };
+                                    let details = if textarea.is_empty() {
+                                        None
+                                    } else {
+                                        Some(textarea.text())
+                                    };
+                                    textarea.clear();
+                                    textarea.set_placeholder("type a message…");
+                                    let choice = match classify_key(&key, true) {
+                                        KeyAction::Approve => ApprovalChoice::Yes { details },
+                                        _ => ApprovalChoice::No { details },
+                                    };
+                                    spawn_approval(
+                                        self.session.clone(),
+                                        req.id,
+                                        choice,
+                                        frame_tx.clone(),
+                                    );
                                 }
                                 KeyAction::Edit => textarea.input(key),
                             }
@@ -175,7 +211,10 @@ impl App<'_> {
                     }
                 }
                 Some(frame) = frame_rx.recv() => {
-                    handle_frame(screen, &mut state, frame)?;
+                    if let Some(req) = handle_frame(screen, &mut state, frame)? {
+                        textarea.set_placeholder(approval_placeholder(&req.kind));
+                        pending_approval = Some(req);
+                    }
                 }
             }
         }
@@ -236,7 +275,11 @@ fn redraw(screen: &mut Screen, textarea: &Textarea, state: &mut BlockState) -> R
     Ok(())
 }
 
-fn handle_frame(screen: &mut Screen, state: &mut BlockState, frame: StreamFrame) -> Result<()> {
+fn handle_frame(
+    screen: &mut Screen,
+    state: &mut BlockState,
+    frame: StreamFrame,
+) -> Result<Option<ApprovalRequest>> {
     match frame {
         StreamFrame::BlockStart { id, kind } => {
             if let Some(prev) = state.start(id, kind) {
@@ -268,8 +311,21 @@ fn handle_frame(screen: &mut Screen, state: &mut BlockState, frame: StreamFrame)
             }
             scrollback::emit_text(screen, &[format!("frances: error: {message}")])?;
         }
+        StreamFrame::Approval(request) => {
+            if let Some(prev) = state.take() {
+                commit_remaining(screen, &prev)?;
+            }
+            scrollback::emit_text(screen, &[format!("approval: {}", request.prompt)])?;
+            return Ok(Some(request));
+        }
     }
-    Ok(())
+    Ok(None)
+}
+
+fn approval_placeholder(kind: &ApprovalKind) -> &'static str {
+    match kind {
+        ApprovalKind::YesNo => "Alt+Y yes  Alt+N no  Enter chat (text becomes details for yes/no)",
+    }
 }
 
 fn commit_remaining(screen: &mut Screen, active: &ActiveBlock) -> io::Result<()> {
@@ -302,6 +358,19 @@ fn spawn_stream(session: Session, prompt: String, frame_tx: mpsc::UnboundedSende
     });
 }
 
+fn spawn_approval(
+    session: Session,
+    id: frances_daemon::protocol::ApprovalId,
+    choice: ApprovalChoice,
+    frame_tx: mpsc::UnboundedSender<StreamFrame>,
+) {
+    tokio::spawn(async move {
+        if let Err(error) = client::respond_approval(&session, id, choice).await {
+            let _ = frame_tx.send(StreamFrame::Error(format!("approval: {error:#}")));
+        }
+    });
+}
+
 fn format_usage(usage: &Usage) -> String {
     format!(
         "  ↳ tokens: prompt={} (cached={}) completion={} total={}",
@@ -309,13 +378,15 @@ fn format_usage(usage: &Usage) -> String {
     )
 }
 
-fn classify_key(key: &KeyEvent) -> KeyAction {
+fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
         KeyCode::Esc => KeyAction::Quit,
         KeyCode::Char('c' | 'd') if ctrl => KeyAction::Quit,
+        KeyCode::Char('y' | 'Y') if alt && pending_approval => KeyAction::Approve,
+        KeyCode::Char('n' | 'N') if alt && pending_approval => KeyAction::Reject,
         KeyCode::Enter if !alt => KeyAction::Submit,
         _ => {
             let _ = (ctrl, alt);

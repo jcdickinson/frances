@@ -13,6 +13,7 @@
 //! - [`Runtime`] — the script runtime that exposes the `frances:v1/*`
 //!   import surface to user scripts.
 
+pub mod approval;
 mod config;
 mod deps;
 mod error;
@@ -21,6 +22,7 @@ mod runtime;
 mod slash;
 mod transpile;
 
+pub use approval::{ApprovalChoice, ApprovalGateway, ApprovalId, ApprovalKind, ApprovalRequest};
 pub use config::WorkflowConfig;
 pub use deps::{EditorFactory, ShellFactory, WorkflowDeps};
 pub use error::WorkflowError;

@@ -33,6 +33,10 @@ impl Textarea {
         self.cursor = (0, 0);
     }
 
+    pub fn set_placeholder(&mut self, placeholder: impl Into<String>) {
+        self.placeholder = placeholder.into();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lines.iter().all(|l| l.is_empty())
     }

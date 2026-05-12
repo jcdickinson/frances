@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use crate::context::InvocationContext;
 use crate::llm::Usage;
 
+pub use frances_workflow::approval::{ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest};
+
 /// Identifies a single prompt-response cycle within a session. Server-assigned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -79,6 +81,9 @@ pub trait Client {
     async fn attach(context: InvocationContext) -> AttachResponse;
     async fn detach();
     async fn prompt(prompt_id: PromptId, text: String) -> Result<(), String>;
+    /// Submit a user-chosen response to an outstanding `Approval`
+    /// request previously emitted as a `StreamFrame::Approval`.
+    async fn respond_approval(id: ApprovalId, choice: ApprovalChoice) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -89,12 +94,23 @@ pub enum AttachResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamFrame {
-    BlockStart { id: BlockId, kind: BlockKind },
-    BlockDelta { id: BlockId, text: String },
-    BlockStop { id: BlockId },
+    BlockStart {
+        id: BlockId,
+        kind: BlockKind,
+    },
+    BlockDelta {
+        id: BlockId,
+        text: String,
+    },
+    BlockStop {
+        id: BlockId,
+    },
     Usage(Usage),
     Done,
     Error(String),
+    /// Server is asking the user a question; client responds via the
+    /// `Client::respond_approval` RPC.
+    Approval(ApprovalRequest),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -64,6 +64,7 @@ fn text_of(frame: &HostFrame) -> String {
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
+        HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
     }
 }
 

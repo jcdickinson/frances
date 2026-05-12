@@ -1,6 +1,7 @@
 use frances_daemon::context::InvocationContext;
 use frances_daemon::protocol::{
-    AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId, SessionId, StreamFrame,
+    ApprovalChoice, ApprovalId, AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId,
+    SessionId, StreamFrame,
 };
 use frances_daemon::session::Session;
 use frances_daemon::transport::{TransportError, read_message, write_message};
@@ -171,6 +172,19 @@ pub async fn attach(
 pub async fn detach(session: &Session) -> Result<(), ClientError> {
     let client = connect_client(session).await?;
     client.detach(context::current()).await?;
+    Ok(())
+}
+
+pub async fn respond_approval(
+    session: &Session,
+    id: ApprovalId,
+    choice: ApprovalChoice,
+) -> Result<(), ClientError> {
+    let client = connect_client(session).await?;
+    client
+        .respond_approval(context::current(), id, choice)
+        .await?
+        .map_err(ClientError::Server)?;
     Ok(())
 }
 

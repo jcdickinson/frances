@@ -30,6 +30,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::WorkflowError;
+use crate::approval::ApprovalRequest;
 use crate::deps::WorkflowDeps;
 use crate::modules;
 use crate::transpile::{SourceKind, ts_to_js};
@@ -50,6 +51,9 @@ pub enum HostFrame {
     /// Append text to the frame with the given id. Only valid while
     /// that frame is still the active one — the JS side enforces this.
     Append { id: FrameId, delta: String },
+    /// Ask the user a question. The corresponding answer arrives back
+    /// through the `ApprovalGateway`'s response oneshot.
+    Approval(ApprovalRequest),
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -308,14 +312,29 @@ pub mod test_deps {
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
 
+    use crate::approval::{
+        ApprovalChoice, ApprovalGateway, ApprovalId, ApprovalKind, ApprovalRequest,
+    };
     use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::oneshot;
 
     #[derive(Clone, Default)]
     pub struct StubDeps {
         manager: StubManager,
         shell_factory: StubShellFactory,
         editor_factory: StubEditorFactory,
+        approvals: StubApprovalGateway,
         cwd: Arc<Mutex<Option<PathBuf>>>,
+    }
+
+    impl StubDeps {
+        /// Resolve the most-recently-allocated approval slot with the
+        /// given choice. Returns `false` if there's no pending slot or
+        /// it already settled.
+        pub fn answer_approval(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
+            self.approvals.answer(id, choice)
+        }
     }
 
     impl StubDeps {
@@ -331,6 +350,7 @@ pub mod test_deps {
         type ChatSessionManager = StubManager;
         type ShellFactory = StubShellFactory;
         type EditorFactory = StubEditorFactory;
+        type ApprovalGateway = StubApprovalGateway;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -344,12 +364,51 @@ pub mod test_deps {
             &self.editor_factory
         }
 
+        fn approval_gateway(&self) -> &Self::ApprovalGateway {
+            &self.approvals
+        }
+
         fn current_env(&self) -> HashMap<OsString, OsString> {
             HashMap::new()
         }
 
         fn current_cwd(&self) -> Option<PathBuf> {
             self.cwd.lock().clone()
+        }
+    }
+
+    /// In-memory `ApprovalGateway` for tests. Records each allocation
+    /// and lets the test settle the oneshot via `answer`.
+    #[derive(Clone, Default)]
+    pub struct StubApprovalGateway {
+        inner: Arc<StubApprovalInner>,
+    }
+
+    #[derive(Default)]
+    struct StubApprovalInner {
+        next_id: AtomicU64,
+        pending: Mutex<HashMap<ApprovalId, oneshot::Sender<ApprovalChoice>>>,
+    }
+
+    impl ApprovalGateway for StubApprovalGateway {
+        fn allocate(
+            &self,
+            prompt: String,
+            kind: ApprovalKind,
+        ) -> (ApprovalRequest, oneshot::Receiver<ApprovalChoice>) {
+            let id = ApprovalId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+            let (tx, rx) = oneshot::channel();
+            self.inner.pending.lock().insert(id, tx);
+            (ApprovalRequest { id, prompt, kind }, rx)
+        }
+    }
+
+    impl StubApprovalGateway {
+        fn answer(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
+            match self.inner.pending.lock().remove(&id) {
+                Some(tx) => tx.send(choice).is_ok(),
+                None => false,
+            }
         }
     }
 
@@ -386,12 +445,14 @@ pub mod test_deps {
         manager: StubManager,
         shell_factory: RealShellFactory,
         editor_factory: StubEditorFactory,
+        approvals: StubApprovalGateway,
     }
 
     impl WorkflowDeps for StubDepsRealShell {
         type ChatSessionManager = StubManager;
         type ShellFactory = RealShellFactory;
         type EditorFactory = StubEditorFactory;
+        type ApprovalGateway = StubApprovalGateway;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -403,6 +464,10 @@ pub mod test_deps {
 
         fn editor_factory(&self) -> &Self::EditorFactory {
             &self.editor_factory
+        }
+
+        fn approval_gateway(&self) -> &Self::ApprovalGateway {
+            &self.approvals
         }
 
         fn current_env(&self) -> HashMap<OsString, OsString> {
@@ -551,6 +616,7 @@ pub mod test_deps {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::approval::ApprovalChoice;
     use std::io::Write;
 
     use super::test_deps::StubDeps;
@@ -616,6 +682,7 @@ mod tests {
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
             },
             HostFrame::Append { delta, .. } => delta.clone(),
+            HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
         }
     }
 
@@ -3967,5 +4034,102 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         assert_eq!(text_of(&frames[0]), "first=first after=first aborted=true");
+    }
+
+    /// `approve()` emits a HostFrame::Approval and awaits the host's
+    /// response. Unlike `inbox.next()` it does not park, so we drive
+    /// the body inline: wait for the first approval frame, answer it,
+    /// then drain to `done`.
+    #[tokio::test]
+    async fn approve_yes_round_trip() {
+        let deps = StubDeps::default();
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { approve } from "frances:v1/approval";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const choice = await approve("delete /tmp/foo?");
+            transcript.push(new MarkdownFrame({
+                content: `${choice.type}:${choice.details ?? ""}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+
+        let req = tokio::time::timeout(CYCLE_TIMEOUT, async {
+            loop {
+                if let Some(HostFrame::Approval(req)) = handle.frames.recv().await {
+                    return req;
+                }
+            }
+        })
+        .await
+        .expect("approval frame did not arrive in time");
+        assert_eq!(req.prompt, "delete /tmp/foo?");
+
+        assert!(
+            deps.answer_approval(
+                req.id,
+                ApprovalChoice::Yes {
+                    details: Some("scoped to /tmp".into()),
+                },
+            ),
+            "answer should land on the pending slot",
+        );
+
+        let result = tokio::time::timeout(CYCLE_TIMEOUT, &mut handle.done)
+            .await
+            .expect("workflow did not finish in time")
+            .expect("done channel closed without value");
+        assert!(matches!(result, Ok(())), "got {result:?}");
+
+        let mut frames = Vec::new();
+        while let Ok(f) = handle.frames.try_recv() {
+            frames.push(f);
+        }
+        let last = frames
+            .iter()
+            .rev()
+            .find_map(|f| match f {
+                HostFrame::Push(p) => Some(p),
+                _ => None,
+            })
+            .expect("expected a markdown push after approval");
+        assert!(
+            matches!(&last.kind, FrameKind::Markdown { content } if content == "yes:scoped to /tmp"),
+            "got {:?}",
+            last.kind,
+        );
+    }
+
+    /// Non-string prompts throw a TypeError before any frame is emitted.
+    #[tokio::test]
+    async fn approve_rejects_non_string_prompt() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { approve } from "frances:v1/approval";
+            await approve(42);
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
+            "got {result:?}"
+        );
     }
 }

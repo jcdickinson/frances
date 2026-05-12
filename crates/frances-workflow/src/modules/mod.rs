@@ -38,6 +38,10 @@
 //!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
 //!   primitive (`_setSleep` / `_clearSleep`) on the install-time stash
 //!   that the JS wrapper composes against.
+//! - `frances:v1/approval`       — single async `approve(prompt)` that
+//!   asks the user a yes/no/chat question. Backed by a private
+//!   `_approve` primitive on the install stash; the host bridges via
+//!   `HostFrame::Approval` + the `ApprovalGateway` trait.
 //! - `frances:v1/tools/shell`    — `Shell` primitive + `Run`/`Wait`/`Kill`
 //!   tool classes.
 //! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
@@ -64,6 +68,7 @@ use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
 use crate::runtime::{HostFrame, UserInput, caught};
 
+pub mod approval;
 pub mod chat;
 pub mod file;
 pub mod frames;
@@ -107,6 +112,12 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         deps,
     } = host;
 
+    // Clones for the approval primitive — it owns the gateway and a
+    // sender into the frames channel so JS `approve()` can emit a
+    // request without going through `transcript`.
+    let approval_deps = deps.clone();
+    let approval_frames_tx = frames_tx.clone();
+
     let stash = Object::new(ctx.clone())?;
 
     let exit_fn = workflow::build_exit(ctx, closed.clone(), closed_notify.clone())?;
@@ -147,9 +158,19 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let jaq_eval = jaq::build_jaq_eval(ctx)?;
     stash.set("_jaqEval", jaq_eval)?;
 
-    let (set_sleep, clear_sleep) = io::build_sleep_primitives(ctx, closed, closed_notify)?;
+    let (set_sleep, clear_sleep) =
+        io::build_sleep_primitives(ctx, closed.clone(), closed_notify.clone())?;
     stash.set("_setSleep", set_sleep)?;
     stash.set("_clearSleep", clear_sleep)?;
+
+    let approve_fn = approval::build_approve_primitive(
+        ctx,
+        approval_deps,
+        approval_frames_tx,
+        closed,
+        closed_notify,
+    )?;
+    stash.set("_approve", approve_fn)?;
 
     ctx.globals().set(STASH_KEY, stash)?;
     Ok(())
@@ -175,6 +196,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/frames", FRAMES_SRC)?;
     declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
+    declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
@@ -220,6 +242,7 @@ const INBOX_SRC: &str = include_str!("js/inbox.js");
 const FRAMES_SRC: &str = include_str!("js/frames.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
+const APPROVAL_SRC: &str = include_str!("js/approval.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
 const VARIABLE_SRC: &str = include_str!("js/variable.js");

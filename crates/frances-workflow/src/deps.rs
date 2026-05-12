@@ -15,10 +15,13 @@ use frances_models_llm::chat::ChatSessionManager;
 use frances_shell::{Shell, ShellError, ShellOptions};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::approval::ApprovalGateway;
+
 pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     type ChatSessionManager: ChatSessionManager;
     type ShellFactory: ShellFactory;
     type EditorFactory: EditorFactory;
+    type ApprovalGateway: ApprovalGateway;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
 
@@ -32,6 +35,10 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     /// workflow invocations within the same daemon session see the same
     /// anchor cache.
     fn editor_factory(&self) -> &Self::EditorFactory;
+
+    /// Gateway for the `frances:v1/approval` `approve()` function. The
+    /// daemon impl bridges to the TUI; tests stub it.
+    fn approval_gateway(&self) -> &Self::ApprovalGateway;
 
     /// Snapshot of the most recently attached client's environment.
     /// Used by `ChatSession.stream()` so the provider can resolve auth

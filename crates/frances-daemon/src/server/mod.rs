@@ -1,19 +1,23 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use dashmap::DashMap;
 use parking_lot::Mutex as StdMutex;
 use tokio::sync::Notify;
+use tokio::sync::oneshot;
 
 use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
 use crate::history::TursoHistoryStore;
 use crate::llm::SessionConfigWriter;
+use crate::protocol::{ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest};
 use crate::session::Session;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_edit::EditSession;
 use frances_llm::{ChatManagerDeps, ChatSession, ChatSessionManager, ProviderCache};
-use frances_workflow::{EditorFactory, Runtime as WorkflowRuntime, WorkflowDeps};
+use frances_workflow::{ApprovalGateway, EditorFactory, Runtime as WorkflowRuntime, WorkflowDeps};
 use std::path::PathBuf;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -59,12 +63,17 @@ pub struct ServerWorkflowDeps {
     /// env/cwd doesn't carry the user's API keys or project location.
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
     pub editor_factory: DaemonEditorFactory,
+    /// Shared with `ServerState::approvals` so the workflow JS surface
+    /// and the `respond_approval` RPC handler talk to the same registry
+    /// of pending oneshots.
+    pub approvals: DaemonApprovalGateway,
 }
 
 impl WorkflowDeps for ServerWorkflowDeps {
     type ChatSessionManager = ChatSessionManager<ServerChatDeps>;
     type ShellFactory = DaemonShellFactory;
     type EditorFactory = DaemonEditorFactory;
+    type ApprovalGateway = DaemonApprovalGateway;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
@@ -76,6 +85,10 @@ impl WorkflowDeps for ServerWorkflowDeps {
 
     fn editor_factory(&self) -> &Self::EditorFactory {
         &self.editor_factory
+    }
+
+    fn approval_gateway(&self) -> &Self::ApprovalGateway {
+        &self.approvals
     }
 
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
@@ -92,6 +105,60 @@ impl WorkflowDeps for ServerWorkflowDeps {
             .as_ref()
             .and_then(|ctx| ctx.process.cwd.clone())
     }
+}
+
+/// `ApprovalGateway` impl shared between the workflow runtime (which
+/// allocates pending slots) and the client RPC handler (which resolves
+/// them when the TUI sends a response). Cheap to clone — wraps an
+/// `Arc`.
+#[derive(Clone, Default)]
+pub struct DaemonApprovalGateway {
+    inner: Arc<DaemonApprovalInner>,
+}
+
+#[derive(Default)]
+struct DaemonApprovalInner {
+    next_id: AtomicU64,
+    pending: DashMap<ApprovalId, oneshot::Sender<ApprovalChoice>>,
+}
+
+impl ApprovalGateway for DaemonApprovalGateway {
+    fn allocate(
+        &self,
+        prompt: String,
+        kind: ApprovalKind,
+    ) -> (ApprovalRequest, oneshot::Receiver<ApprovalChoice>) {
+        let id = ApprovalId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        let (tx, rx) = oneshot::channel();
+        self.inner.pending.insert(id, tx);
+        (ApprovalRequest { id, prompt, kind }, rx)
+    }
+}
+
+impl DaemonApprovalGateway {
+    /// Settle a pending approval. Returns `Err` if the id is unknown
+    /// (already responded or never allocated) or if the awaiter has
+    /// gone away.
+    pub fn respond(
+        &self,
+        id: ApprovalId,
+        choice: ApprovalChoice,
+    ) -> Result<(), ApprovalResponseError> {
+        let (_, tx) = self
+            .inner
+            .pending
+            .remove(&id)
+            .ok_or(ApprovalResponseError::UnknownId)?;
+        tx.send(choice).map_err(|_| ApprovalResponseError::Dropped)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApprovalResponseError {
+    #[error("no pending approval with that id")]
+    UnknownId,
+    #[error("workflow stopped waiting for this approval")]
+    Dropped,
 }
 
 /// Stateless factory that spawns a fresh bash subprocess for each
@@ -160,6 +227,10 @@ pub(crate) struct ServerState {
     pub workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     pub workflow_runtime: Arc<WorkflowRuntime<ServerWorkflowDeps>>,
     pub workflow_stack: WorkflowStack,
+    /// Registry of pending user-approval round-trips. Cloned into
+    /// `ServerWorkflowDeps` so the workflow JS surface and the RPC
+    /// handler both see the same pending slots.
+    pub approvals: DaemonApprovalGateway,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
     /// session config.

@@ -329,6 +329,14 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
             // happens if push was never called, which would have
             // thrown before reaching here.
         }
+        HostFrame::Approval(request) => {
+            // An approval pauses block streaming visually but doesn't
+            // close the open block — the workflow body owns its own
+            // open block (if any) and continues writing after the
+            // response lands. The UI handles the "waiting for input"
+            // state on its side; the wire layer just forwards.
+            write_message(stream, &StreamFrame::Approval(request)).await?;
+        }
     }
     Ok(())
 }

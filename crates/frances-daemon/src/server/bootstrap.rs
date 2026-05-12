@@ -97,10 +97,12 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let editor_factory = super::DaemonEditorFactory {
         session: Arc::new(tokio::sync::Mutex::new(EditSession::new(edit_engine))),
     };
+    let approvals = super::DaemonApprovalGateway::default();
     let workflow_runtime = Arc::new(WorkflowRuntime::new(super::ServerWorkflowDeps {
         chat: chat.clone(),
         last_context: last_context.clone(),
         editor_factory: editor_factory.clone(),
+        approvals: approvals.clone(),
     })?);
 
     let state = Arc::new(ServerState {
@@ -118,6 +120,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         workflows,
         workflow_runtime,
         workflow_stack: WorkflowStack::new(),
+        approvals,
         session_config_writer,
     });
 

@@ -8,8 +8,9 @@ use tarpc::tokio_serde::formats::Bincode;
 use tracing::{trace, warn};
 
 use crate::context::InvocationContext;
-use crate::protocol::{AttachResponse, Client, PromptId, SessionId};
+use crate::protocol::{ApprovalChoice, ApprovalId, AttachResponse, Client, PromptId, SessionId};
 
+use super::ApprovalResponseError;
 use super::turn::run_prompt;
 use super::{ServerError, ServerState};
 
@@ -61,6 +62,23 @@ impl Client for ClientServer {
             run_prompt(state, stream, text).await;
         });
         Ok(())
+    }
+
+    async fn respond_approval(
+        self,
+        _: context::Context,
+        id: ApprovalId,
+        choice: ApprovalChoice,
+    ) -> std::result::Result<(), String> {
+        match self.state.approvals.respond(id, choice) {
+            Ok(()) => Ok(()),
+            Err(ApprovalResponseError::UnknownId) => {
+                Err(format!("no pending approval with id {id}"))
+            }
+            Err(ApprovalResponseError::Dropped) => Err(format!(
+                "approval {id} was dropped before the response landed"
+            )),
+        }
     }
 }
 
