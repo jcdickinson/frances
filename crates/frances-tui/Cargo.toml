@@ -1,0 +1,19 @@
+[package]
+name = "frances-tui"
+edition.workspace = true
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+slotmap = { workspace = true }
+
+[dev-dependencies]
+alacritty_terminal = "0.26"
+vte = { version = "0.15", features = ["ansi"] }

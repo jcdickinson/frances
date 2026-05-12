@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/frances", "crates/frances-anchors", "crates/frances-config", "crates/frances-core", "crates/frances-daemon", "crates/frances-edit", "crates/frances-llm", "crates/frances-models-llm", "crates/frances-shell", "crates/frances-workflow"]
+members = ["crates/*"]
 resolver = "2"
 
 [workspace.package]
@@ -18,6 +18,7 @@ frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
 frances-models-llm = { path = "crates/frances-models-llm" }
 frances-shell = { path = "crates/frances-shell" }
+frances-tui = { path = "crates/frances-tui" }
 frances-workflow = { path = "crates/frances-workflow" }
 
 anyhow = "1"
@@ -36,6 +37,7 @@ jaq-json = "2"
 jaq-std = "3"
 libc = "0.2"
 parking_lot = "0.12"
+ratatui = { version = "0.30", features = ["unstable-backend-writer", "unstable-rendered-line-info"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
 rquickjs = { version = "0.11", features = ["futures", "loader", "parallel", "macro"] }
 serde = { version = "1", features = ["derive"] }
@@ -43,6 +45,7 @@ serde_json = "1"
 shell-words = "1"
 shellexpand = "3"
 similar = { version = "3.1", default-features = false }
+slotmap = "1"
 smallvec = "1"
 tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "serde-transport-bincode", "unix"] }
 tempfile = "3"

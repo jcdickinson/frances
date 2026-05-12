@@ -1,0 +1,2068 @@
+//! [`ScrollbackContainer`] — inline container that holds a list of
+//! finalised history blocks, a list of in-flight "active" blocks
+//! whose contents the caller can replace by id, and a single footer
+//! block. The container measures everything, decides which finalised
+//! blocks fit above the active stack + footer, spills the oldest of
+//! the rest into native scrollback, and drives the [`InlineBackend`]
+//! to grow / shrink the on-screen container area.
+//!
+//! Layout, top to bottom inside the container area:
+//!
+//! ```text
+//! ┌────────────────────────────┐ ← top_row (sticky)
+//! │ visible safe block 0       │
+//! │ ...                        │ visible_safe_h rows
+//! │ visible safe block N-1     │
+//! │ active block 0 (oldest)    │
+//! │ ...                        │ active_h rows
+//! │ active block M-1 (newest)  │
+//! │ footer block               │ footer_h rows
+//! └────────────────────────────┘ ← top_row + content_h
+//! ```
+//!
+//! Three internal collections, oldest → newest:
+//!
+//! * `committed` — blocks already pushed into native scrollback. Cells
+//!   are owned by the terminal; we retain the block objects so a
+//!   future alt-screen scrollback view can re-render them.
+//! * `safe` — finalised blocks. Immutable from the caller's
+//!   perspective and eligible to spill into native scrollback once
+//!   nothing in `active` precedes them.
+//! * `active` — blocks whose contents the caller may still replace
+//!   via [`ScrollbackContainer::update_active`]. Each entry carries a
+//!   `safe_to_commit` flag.
+//!
+//! Insertion always lands in `active`. [`mark_safe`] flips the flag
+//! on one entry and then drains the contiguous safe-flagged prefix of
+//! `active_order` into the back of `safe`, preserving display order —
+//! a block flagged before its older siblings waits behind them until
+//! they're flagged too. [`push`] is a convenience that wraps
+//! `push_active` + `mark_safe`, so a caller who already has the final
+//! content can just `push` and let the drain run: the block ends up
+//! in `safe` immediately if nothing in `active` is blocking it, or
+//! queues at the back of `active` (already flagged) otherwise.
+//!
+//! The only behavioural differences between `safe` and `active`:
+//! safe entries are immutable, and a prefix of safe entries may
+//! spill into native scrollback on the next draw. Everything else —
+//! render bookkeeping, position in the layout, footer interaction —
+//! is shared.
+//!
+//! Blocks are immutable primitives. There is no `append` API on the
+//! [`Block`] trait — to change an active block's content the caller
+//! constructs a fresh `Box<dyn Block>` representing the new full state
+//! and hands it to `update_active`. That keeps `safe` and `committed`
+//! structurally immutable, which is what makes them safe to spill and
+//! to retain for a later scrollback view.
+
+use std::collections::VecDeque;
+use std::io::{self, Write};
+
+use ratatui::Terminal;
+use ratatui::backend::Backend;
+use ratatui::buffer::{Buffer, Cell};
+use ratatui::layout::{Rect, Size};
+use slotmap::{SlotMap, new_key_type};
+
+use crate::block::Block;
+use crate::inline_backend::{InlineBackend, SyncGuard};
+
+new_key_type! {
+    /// Stable id for an entry in the container's `active` collection.
+    /// Valid until [`ScrollbackContainer::mark_safe`] is called for
+    /// that id (or the entry is promoted to `safe` during a draw),
+    /// after which the id refers to nothing.
+    pub struct BlockId;
+}
+
+/// Bookkeeping captured the last time a block was rendered. Used to
+/// decide whether the block needs to be redrawn this frame and where
+/// to position the cursor to do so without disturbing the rows above
+/// or below.
+struct RenderState {
+    /// Absolute Y of the block's first row at the time of render
+    /// (= screen row + cumulative_scrolls). Stays valid as scrolls
+    /// happen — current screen row = `absolute_y - cumulative_scrolls`.
+    absolute_y: i32,
+    /// Height of the block at the time of render. A new measurement
+    /// mismatch this frame means we must redraw — and cascade the
+    /// damage to everything below us, since their on-screen rows
+    /// will shift.
+    height: u16,
+    /// True when the block's content has changed since its last
+    /// render (set by `update_active`). Cleared at the end of the
+    /// next successful redraw.
+    damaged: bool,
+}
+
+struct ActiveEntry {
+    block: Box<dyn Block>,
+    safe_to_commit: bool,
+    render: Option<RenderState>,
+}
+
+struct SafeEntry {
+    block: Box<dyn Block>,
+    render: Option<RenderState>,
+}
+
+/// Layout mode for the current frame. The render path forks on this:
+/// `Normal` and `SafeOnly` use the natural-scroll path (terminals
+/// scroll old rows into scrollback themselves); `ActiveOverflow`
+/// switches to an explicit top-truncate path that never lets active
+/// cells enter native scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayoutMode {
+    /// Total content height (safe + active + footer) fits inside the
+    /// terminal.
+    Normal,
+    /// Content overflows, but every overflowing entry is `safe` —
+    /// natural scroll commits them to scrollback cleanly.
+    SafeOnly,
+    /// Content overflows AND at least one active entry is partially
+    /// or fully hidden above the visible window. We must NOT let
+    /// active cells flow into native scrollback, so the render path
+    /// reserves a top row for a `•••` ellipsis indicator, paints the
+    /// visible blocks bottom-up, and explicitly emits any hidden safe
+    /// entries into scrollback at the top.
+    ActiveOverflow,
+}
+
+pub struct ScrollbackContainer {
+    committed: VecDeque<Box<dyn Block>>,
+    safe: VecDeque<SafeEntry>,
+    active: SlotMap<BlockId, ActiveEntry>,
+    /// Display order for `active`, oldest at the front. Promotion
+    /// pops from the front while the head entry is `safe_to_commit`.
+    active_order: VecDeque<BlockId>,
+    footer: Box<dyn Block>,
+    /// Where the next frame's render starts. Initially = the cursor
+    /// row at construction (= the row beneath whatever launched
+    /// frances). After each draw it tracks the screen row where the
+    /// footer's first row landed this frame — that's the row we
+    /// overwrite on the next frame to insert new content above the
+    /// footer.
+    next_y: u16,
+    /// Total `\n`-induced scrolls since construction. A rendered
+    /// block's current screen row is `absolute_y - cumulative_scrolls`.
+    /// A block whose first row would be negative has partially
+    /// scrolled into native scrollback and is moved to `committed`.
+    cumulative_scrolls: i32,
+    /// Screen row where the previous frame's footer ended (its last
+    /// row). When the footer shrinks across frames, any rows between
+    /// the new footer's bottom and this one have stale paint from
+    /// the old footer and need to be cleared so the freed rows are
+    /// blank when the terminal takes them back.
+    prev_footer_bottom_y: Option<u16>,
+    /// The footer's previous-frame [`Buffer`] (always anchored at
+    /// `(0, 0)` — its screen anchor is held in [`prev_footer_anchor_y`]
+    /// rather than in [`Buffer::area`]). Used as the diff base for the
+    /// next frame's footer. When the footer's anchor or size changes
+    /// the cache is invalidated and the next paint is a full row
+    /// repaint; otherwise [`Buffer::diff`] picks out only the cells
+    /// that changed and we emit just those — giving cell-level damage
+    /// tracking so selections overlapping unchanged footer cells
+    /// survive across draws.
+    prev_footer_buf: Option<Buffer>,
+    prev_footer_anchor_y: Option<u16>,
+    /// Terminal size as of the previous frame's draw. Used to detect
+    /// resizes: footer pinning (see the slack-pin logic in [`draw`])
+    /// is only valid when the layout coords from the previous frame
+    /// still mean the same thing on screen, so a resize forces a
+    /// fall-back to the natural anchor for the next frame.
+    prev_term_size: Option<Size>,
+    /// Layout mode of the previous frame. Used to detect the only
+    /// problematic transition — `ActiveOverflow` → anything else —
+    /// where leftover ellipsis + truncated paint must be cleared
+    /// before the natural-scroll path takes over with stale
+    /// `RenderState` invalidated.
+    prev_mode: Option<LayoutMode>,
+}
+
+impl ScrollbackContainer {
+    pub fn new(footer: Box<dyn Block>, initial_y: u16) -> Self {
+        Self {
+            committed: VecDeque::new(),
+            safe: VecDeque::new(),
+            active: SlotMap::with_key(),
+            active_order: VecDeque::new(),
+            footer,
+            next_y: initial_y,
+            cumulative_scrolls: 0,
+            prev_footer_bottom_y: None,
+            prev_footer_buf: None,
+            prev_footer_anchor_y: None,
+            prev_term_size: None,
+            prev_mode: None,
+        }
+    }
+
+    pub fn set_footer(&mut self, footer: Box<dyn Block>) {
+        self.footer = footer;
+    }
+
+    /// Append a block whose content is already final. Routes through
+    /// [`push_active`] + [`mark_safe`] so the new entry respects any
+    /// older in-flight blocks ahead of it: with no active block in
+    /// the way it drains straight into `safe`, otherwise it queues at
+    /// the back of `active` (already flagged `safe_to_commit`) and
+    /// drains together with its predecessors when they're flagged.
+    pub fn push(&mut self, block: Box<dyn Block>) {
+        let id = self.push_active(block);
+        self.mark_safe(id);
+    }
+
+    /// Append a block to `active` and return its id. The caller may
+    /// later swap in a fresh block via [`update_active`] or mark the
+    /// entry finalised via [`mark_safe`].
+    pub fn push_active(&mut self, block: Box<dyn Block>) -> BlockId {
+        let id = self.active.insert(ActiveEntry {
+            block,
+            safe_to_commit: false,
+            render: None,
+        });
+        self.active_order.push_back(id);
+        id
+    }
+
+    /// Replace the block at `id` with a freshly constructed one
+    /// representing the new full state. No-op if `id` is unknown
+    /// (already promoted / never existed). Flags the entry as
+    /// damaged so the next [`draw`] re-emits its rows.
+    pub fn update_active(&mut self, id: BlockId, block: Box<dyn Block>) {
+        if let Some(entry) = self.active.get_mut(id) {
+            entry.block = block;
+            if let Some(state) = entry.render.as_mut() {
+                state.damaged = true;
+            }
+        }
+    }
+
+    /// Flag an active entry as ready to leave `active`, then drain
+    /// the contiguous safe-flagged prefix of `active_order` into
+    /// `safe`. Display order is preserved: a block flagged before its
+    /// older siblings waits behind them until they're flagged too.
+    /// No-op if `id` is unknown (already promoted, or never existed).
+    pub fn mark_safe(&mut self, id: BlockId) {
+        let Some(entry) = self.active.get_mut(id) else {
+            return;
+        };
+        entry.safe_to_commit = true;
+        self.promote_ready();
+    }
+
+    /// Absolute screen row where the footer's first row was painted
+    /// on the most recent [`draw`]. Callers driving an inline cursor
+    /// (e.g. a textarea inside the footer) use this to place the
+    /// cursor over the right row.
+    pub fn footer_top_row(&self) -> u16 {
+        self.next_y
+    }
+
+    pub fn committed_count(&self) -> usize {
+        self.committed.len()
+    }
+
+    pub fn safe_count(&self) -> usize {
+        self.safe.len()
+    }
+
+    pub fn active_count(&self) -> usize {
+        self.active_order.len()
+    }
+
+    /// Promote the safe-to-commit prefix of `active_order` into the
+    /// back of `safe`. Stops at the first front entry that isn't yet
+    /// flagged, so display order across active entries is preserved.
+    fn promote_ready(&mut self) {
+        while let Some(&id) = self.active_order.front() {
+            let ready = self
+                .active
+                .get(id)
+                .map(|e| e.safe_to_commit)
+                .unwrap_or(false);
+            if !ready {
+                break;
+            }
+            self.active_order.pop_front();
+            if let Some(entry) = self.active.remove(id) {
+                // Preserve the entry's render state so a previously-
+                // rendered active block doesn't get re-rendered just
+                // because it changed slot.
+                self.safe.push_back(SafeEntry {
+                    block: entry.block,
+                    render: entry.render,
+                });
+            }
+        }
+    }
+
+    /// Classify the current frame's layout. The result decides which
+    /// render path runs:
+    ///
+    /// * [`LayoutMode::Normal`] / [`LayoutMode::SafeOnly`] — the
+    ///   natural-scroll path (terminal scrolls older rows into native
+    ///   scrollback itself). Used when content fits, or when the
+    ///   only overflowing entries are safe and may be evicted via
+    ///   natural scroll without losing recoverability.
+    /// * [`LayoutMode::ActiveOverflow`] — content overflows and at
+    ///   least one row of *active* content would have to be hidden
+    ///   above the visible window. We must not let active cells leak
+    ///   into native scrollback, so the alternate path reserves a top
+    ///   row for a `•••` ellipsis, paints only the visible bottom of
+    ///   the active stack, and explicitly evicts any older safe
+    ///   entries to scrollback.
+    ///
+    /// Trigger: active overflow is active when the total content
+    /// exceeds the terminal AND the cumulative active height is at
+    /// least `available_h` (i.e., active alone would fill the visible
+    /// block area or more). This lets the user keep their actives on
+    /// screen even when partial mark_safe operations have freed some
+    /// safe rows.
+    fn classify_layout(&self, width: u16, terminal_h: u16) -> LayoutMode {
+        let footer_h = self.footer.measure(width);
+        if footer_h >= terminal_h {
+            // Footer alone fills (or overflows) the terminal. No room
+            // for blocks; the natural-scroll path handles footer
+            // overflow with its own pre-scroll logic.
+            return LayoutMode::Normal;
+        }
+        let available_h = (terminal_h - footer_h) as u32;
+        let safe_h: u32 = self
+            .safe
+            .iter()
+            .map(|e| e.block.measure(width) as u32)
+            .sum();
+        let active_h: u32 = self
+            .active_order
+            .iter()
+            .filter_map(|id| self.active.get(*id))
+            .map(|e| e.block.measure(width) as u32)
+            .sum();
+        let total = safe_h + active_h + footer_h as u32;
+        if total <= terminal_h as u32 {
+            LayoutMode::Normal
+        } else if active_h >= available_h {
+            LayoutMode::ActiveOverflow
+        } else {
+            LayoutMode::SafeOnly
+        }
+    }
+
+    /// Drive one frame against a ratatui `Terminal` wrapping an
+    /// [`InlineBackend`].
+    ///
+    /// Three render paths share this entry point, dispatched by
+    /// [`classify_layout`]:
+    ///
+    /// **Normal / SafeOnly** — content fits, or only safe entries
+    /// overflow. The natural-scroll path runs:
+    ///
+    /// 1. Move cursor to `self.next_y` (initialised to the row the
+    ///    cursor was on at construction; updated each frame to where
+    ///    the footer's first row will land).
+    /// 2. For each as-yet-unrendered safe / active block: write its
+    ///    rows + `\n`. Each `\n` at the bottom row scrolls the
+    ///    terminal — that's how old content makes its way into
+    ///    native scrollback. We record each block's `absolute_y` =
+    ///    `screen_y_at_render + cumulative_scrolls` so we can tell
+    ///    later when it has scrolled past the top.
+    /// 3. Re-render the footer at the cursor's current position.
+    ///    The last row of the footer gets no trailing `\n` (cursor
+    ///    sits on it).
+    /// 4. After the writes: any rendered block whose `absolute_y`
+    ///    is now below `cumulative_scrolls` has at least its first
+    ///    row in scrollback; we move it to `committed`. Its
+    ///    remaining still-on-screen rows stay where they are and
+    ///    will scroll off naturally over the next few frames.
+    /// 5. Save `next_y` for the next frame = the row where the
+    ///    footer's first row ended up on screen this time.
+    ///
+    /// **ActiveOverflow** — see [`draw_active_overflow`]. Paints from
+    /// row 0 down with a `•••` indicator on the top row; safe entries
+    /// that need to commit emit at the top so they scroll into
+    /// native scrollback; active rows that don't fit are silently
+    /// not emitted.
+    pub fn draw<B>(&mut self, terminal: &mut Terminal<InlineBackend<B>>) -> io::Result<()>
+    where
+        B: Backend<Error = io::Error> + Write,
+    {
+        let term_size = terminal.backend().terminal_size();
+        let width = term_size.width;
+        let terminal_h = term_size.height;
+        let terminal_resized = self.prev_term_size.is_some_and(|prev| prev != term_size);
+
+        let mode = self.classify_layout(width, terminal_h);
+        let exiting_active_overflow = self.prev_mode == Some(LayoutMode::ActiveOverflow)
+            && mode != LayoutMode::ActiveOverflow;
+
+        // Bracket the whole frame in DEC 2026 synchronised output.
+        let mut guard = SyncGuard::new(terminal)?;
+        let terminal = guard.terminal();
+
+        if exiting_active_overflow {
+            // Wipe the ellipsis + truncated paint left over from the
+            // previous active-overflow frame. The natural-scroll path
+            // below assumes a blank canvas with `next_y` at the top,
+            // and the previous frame's RenderState absolute_y values
+            // no longer reflect on-screen positions (we painted from
+            // row 0 down, ignoring cumulative_scrolls). Reset that
+            // state in lockstep with the clear.
+            terminal.backend_mut().clear_below_home()?;
+            for entry in self.safe.iter_mut() {
+                entry.render = None;
+            }
+            for (_, entry) in self.active.iter_mut() {
+                entry.render = None;
+            }
+            self.next_y = 0;
+            self.cumulative_scrolls = 0;
+            self.prev_footer_buf = None;
+            self.prev_footer_anchor_y = None;
+            self.prev_footer_bottom_y = None;
+        }
+
+        if mode == LayoutMode::ActiveOverflow {
+            let footer_h = self.footer.measure(width);
+            let available_h = terminal_h.saturating_sub(footer_h);
+            self.draw_active_overflow(terminal, width, terminal_h, available_h, footer_h)?;
+            self.prev_term_size = Some(term_size);
+            self.prev_mode = Some(mode);
+            return Ok(());
+        }
+
+        terminal.backend_mut().move_cursor_abs(0, self.next_y)?;
+        let mut cursor = CursorState {
+            cursor_y: self.next_y,
+            scrolls: 0,
+        };
+
+        // Render the safe stack (oldest first). For each entry we
+        // decide between three paths:
+        //   * no render state yet → fresh render at the cursor's
+        //     current position (the "growing edge" of the stack).
+        //   * has render state and height/content is unchanged
+        //     (`damaged=false`, and no force_cascade from an earlier
+        //     geometry mismatch) → skip emitting anything; the cells
+        //     are still on screen, just step the cursor past them.
+        //   * has render state but is damaged or its measurement has
+        //     changed → MoveTo its known screen position and rewrite,
+        //     setting `force_cascade` so everything below redraws.
+        let mut force_cascade = false;
+        for entry in self.safe.iter_mut() {
+            render_or_skip_entry(
+                &mut entry.block,
+                &mut entry.render,
+                width,
+                terminal_h,
+                terminal.backend_mut(),
+                &mut cursor,
+                self.cumulative_scrolls,
+                &mut force_cascade,
+            )?;
+        }
+
+        // Render the active stack (display order).
+        for &id in self.active_order.iter() {
+            let entry = match self.active.get_mut(id) {
+                Some(e) => e,
+                None => continue,
+            };
+            render_or_skip_entry(
+                &mut entry.block,
+                &mut entry.render,
+                width,
+                terminal_h,
+                terminal.backend_mut(),
+                &mut cursor,
+                self.cumulative_scrolls,
+                &mut force_cascade,
+            )?;
+        }
+
+        // Footer: cell-level damage tracking by caching the previous
+        // frame's footer `Buffer` and diffing against this frame's.
+        // If the footer's rect hasn't moved or changed size, we emit
+        // only the cells that actually differ; that keeps a selection
+        // overlapping unchanged footer cells alive across keystrokes.
+        // If the rect did move (footer height changed, or a scroll
+        // shifted its anchor), we fall back to the full row-by-row
+        // paint — the cache no longer matches the on-screen state.
+        //
+        // The footer must fit on screen; if it wouldn't, pre-scroll
+        // with explicit `\n`s first so the diff/paint can use
+        // absolute coords without further scroll bookkeeping.
+        //
+        // Footer-pin on content shrink: when a block above shrank
+        // this frame, the natural footer anchor (= cursor row after
+        // content) sits *above* the previous frame's footer row.
+        // Letting the footer jump up would jitter the eye when
+        // content is alternately growing and shrinking, so we pin
+        // the footer at its previous-frame row and clear the rows
+        // between content bottom and pinned footer top as blank
+        // slack. New content pushed later fills the slack from above
+        // before the footer is allowed to move down again. Terminal
+        // resize, mid-frame scrolls, or a pinned anchor that no
+        // longer fits → fall back to the natural anchor.
+        let footer_h = self.footer.measure(width);
+        if footer_h > 0 {
+            let natural_footer_anchor = cursor.cursor_y;
+            let pin_anchor = self.prev_footer_anchor_y.filter(|&prev| {
+                !terminal_resized
+                    && cursor.scrolls == 0
+                    && natural_footer_anchor < prev
+                    && (prev as u32 + footer_h as u32) <= terminal_h as u32
+            });
+
+            if pin_anchor.is_none() {
+                let bottom_naive = natural_footer_anchor.saturating_add(footer_h);
+                if bottom_naive > terminal_h {
+                    let scrolls_needed = bottom_naive - terminal_h;
+                    for _ in 0..scrolls_needed {
+                        terminal.backend_mut().move_cursor_abs(0, terminal_h - 1)?;
+                        terminal.backend_mut().newline()?;
+                        cursor.scrolls += 1;
+                    }
+                    cursor.cursor_y = terminal_h - footer_h;
+                }
+            }
+
+            let footer_anchor_y = pin_anchor.unwrap_or(cursor.cursor_y);
+
+            // Yield slack rows back to the terminal as blank — the
+            // rows between content and the pinned footer used to
+            // contain bottom rows of the just-shrunken block above
+            // and would otherwise show stale paint.
+            if let Some(pinned) = pin_anchor {
+                for y in natural_footer_anchor..pinned {
+                    terminal.backend_mut().clear_line(y)?;
+                }
+            }
+
+            let local_area = Rect::new(0, 0, width, footer_h);
+            let mut curr_buf = Buffer::empty(local_area);
+            self.footer.render(local_area, &mut curr_buf);
+
+            // The diff cache is only valid if the rows we're about to
+            // paint into are *literally the same rows* the prev footer
+            // was painted into. Any scroll this frame slid the old
+            // footer cells up and overwrote that row range with
+            // scrolled-in block content, so the prev buffer doesn't
+            // match the on-screen state any more — fall back to a
+            // full repaint via the row-by-row path below.
+            let same_layout = cursor.scrolls == 0
+                && self.prev_footer_anchor_y == Some(footer_anchor_y)
+                && self
+                    .prev_footer_buf
+                    .as_ref()
+                    .is_some_and(|b| b.area == local_area);
+            if same_layout {
+                let prev = self.prev_footer_buf.as_ref().unwrap();
+                for (x, y_local, cell) in prev.diff(&curr_buf) {
+                    let screen_y = footer_anchor_y + y_local;
+                    terminal.backend_mut().write_cell(x, screen_y, cell)?;
+                }
+            } else {
+                terminal.backend_mut().move_cursor_abs(0, footer_anchor_y)?;
+                for row_idx in 0..footer_h {
+                    let with_newline = row_idx + 1 < footer_h;
+                    write_row_at_cursor(
+                        terminal.backend_mut(),
+                        &curr_buf,
+                        row_idx,
+                        width,
+                        with_newline,
+                        &mut cursor,
+                        terminal_h,
+                    )?;
+                }
+            }
+            self.prev_footer_buf = Some(curr_buf);
+            self.prev_footer_anchor_y = Some(footer_anchor_y);
+
+            // Pin the bookkeeping cursor to the footer's last row —
+            // the diff path doesn't move it; the full paint may land
+            // one row short depending on the last row's `with_newline`.
+            cursor.cursor_y = footer_anchor_y + footer_h - 1;
+        }
+        // Yield-back: if this frame's footer is shorter than the
+        // previous one, the rows between the new footer's bottom and
+        // the old footer's bottom (adjusted for any scrolls that
+        // happened this frame) still display the old footer's paint.
+        // Clear them so the terminal sees blank rows in their place.
+        let new_footer_bottom = cursor.cursor_y;
+        if let Some(prev_bottom) = self.prev_footer_bottom_y {
+            let adjusted_prev = (prev_bottom as i32 - cursor.scrolls).max(0) as u16;
+            if adjusted_prev > new_footer_bottom {
+                for y in (new_footer_bottom + 1)..=adjusted_prev {
+                    terminal.backend_mut().clear_line(y)?;
+                }
+            }
+        }
+
+        Backend::flush(terminal.backend_mut())?;
+
+        self.cumulative_scrolls = self.cumulative_scrolls.saturating_add(cursor.scrolls);
+        self.prev_footer_bottom_y = Some(new_footer_bottom);
+        self.prev_term_size = Some(term_size);
+
+        // After rendering, the cursor sits on the footer's *last*
+        // row. The next frame's first write goes at the footer's
+        // *first* row so it overwrites the old footer with the new
+        // content; that's `footer_h - 1` rows above the cursor.
+        self.next_y = cursor.cursor_y.saturating_sub(footer_h.saturating_sub(1));
+
+        // Block-level commit: anything whose first row has scrolled
+        // off the top moves to `committed`. The remaining still-on-
+        // screen rows stay where they are; subsequent frames push
+        // them off naturally without us re-emitting the block.
+        let cumulative = self.cumulative_scrolls;
+        let mut remaining = VecDeque::with_capacity(self.safe.len());
+        for entry in self.safe.drain(..) {
+            match entry.render.as_ref() {
+                Some(state) if state.absolute_y < cumulative => {
+                    self.committed.push_back(entry.block);
+                }
+                _ => remaining.push_back(entry),
+            }
+        }
+        self.safe = remaining;
+
+        self.prev_mode = Some(mode);
+        Ok(())
+    }
+
+    /// Active-overflow render path.
+    ///
+    /// Triggered by [`classify_layout`] when total content exceeds the
+    /// terminal *and* the cumulative active height is at least
+    /// `available_h`. In that situation we must not let the terminal's
+    /// natural scroll push active cells into native scrollback (we'd
+    /// lose the ability to replace them via `update_active`).
+    ///
+    /// Layout: the screen rows top-to-bottom are
+    ///
+    /// ```text
+    ///   row 0           : `•••` indicator (active content hidden above)
+    ///   rows 1..(N+1)   : visible active blocks, oldest-visible first
+    ///                     — the oldest-visible may be a *boundary*
+    ///                     block painted only from row `skip` onward
+    ///   rows (N+1)..    : footer
+    /// ```
+    ///
+    /// Emit sequence inside the SyncGuard:
+    ///
+    /// 1. Position cursor at `(0, 0)`.
+    /// 2. For each `safe` entry (oldest first): write its rows with
+    ///    `\n` between. These rows scroll into native scrollback as
+    ///    the subsequent writes push the cursor past the screen
+    ///    bottom — that's how previously-finalised content reaches
+    ///    scrollback in this path.
+    /// 3. Write the `•••` ellipsis row + `\n`.
+    /// 4. For each visible active block (oldest visible to newest):
+    ///    write the rows that fall inside the visible window with
+    ///    `\n` between. The oldest visible block may be a *boundary*
+    ///    block — render to a full-natural-height off-screen Buffer
+    ///    and skip the top `boundary_skip_rows` of cells.
+    /// 5. Write footer rows with `\n` between (no trailing `\n` on
+    ///    the very last footer row — cursor lands there).
+    ///
+    /// After emission: the safe entries we evicted move from `safe`
+    /// into `committed`. RenderStates on all remaining live entries
+    /// are cleared (their on-screen positions follow this path's
+    /// "paint from row 0 every frame" model rather than the natural-
+    /// scroll path's `absolute_y` model). The footer's diff cache is
+    /// invalidated so the next frame re-evaluates from scratch.
+    fn draw_active_overflow<B>(
+        &mut self,
+        terminal: &mut Terminal<InlineBackend<B>>,
+        width: u16,
+        terminal_h: u16,
+        available_h: u16,
+        footer_h: u16,
+    ) -> io::Result<()>
+    where
+        B: Backend<Error = io::Error> + Write,
+    {
+        // Reserve the topmost block row for the `•••` indicator.
+        let block_area_h = available_h.saturating_sub(1);
+
+        // Walk active newest-first to determine which entries are
+        // visible and whether the oldest visible is a boundary block.
+        // We exit as soon as we hit the first non-fully-fitting entry
+        // — anything older is hidden (and silently not emitted).
+        let mut sum: u16 = 0;
+        let mut visible_active_start: usize = self.active_order.len();
+        let mut boundary_skip_rows: u16 = 0;
+        let n_active = self.active_order.len();
+        for (rev_i, &id) in self.active_order.iter().rev().enumerate() {
+            let i_from_oldest = n_active - 1 - rev_i;
+            let h = match self.active.get(id) {
+                Some(e) => e.block.measure(width),
+                None => continue,
+            };
+            let new_sum = sum.saturating_add(h);
+            if new_sum <= block_area_h {
+                sum = new_sum;
+                visible_active_start = i_from_oldest;
+            } else if sum < block_area_h {
+                let visible_rows = block_area_h - sum;
+                boundary_skip_rows = h - visible_rows;
+                visible_active_start = i_from_oldest;
+                sum = block_area_h;
+                break;
+            } else {
+                break;
+            }
+        }
+        let visible_block_rows: u16 = sum;
+
+        // All safe entries are evicted to native scrollback. The
+        // overflow trigger (`active_h >= available_h`) guarantees the
+        // walk above could not have reached safe blocks — every safe
+        // entry is older than the oldest visible active and therefore
+        // hidden in the layout, but unlike hidden active they're safe
+        // to push out.
+        let safe_evict_rows: u16 = self
+            .safe
+            .iter()
+            .map(|e| e.block.measure(width))
+            .fold(0u16, |a, b| a.saturating_add(b));
+
+        let total_rows: u16 = safe_evict_rows
+            .saturating_add(1)
+            .saturating_add(visible_block_rows)
+            .saturating_add(footer_h);
+
+        // Snapshot the visible-active id list before we start touching
+        // the backend, so we can borrow `self.active` immutably while
+        // we render without conflicting with the mutable borrow on
+        // `self` that the terminal traffic implies.
+        let visible_active_ids: Vec<BlockId> = self
+            .active_order
+            .iter()
+            .skip(visible_active_start)
+            .copied()
+            .collect();
+
+        let backend = terminal.backend_mut();
+        backend.move_cursor_abs(0, 0)?;
+
+        let mut emitted: u16 = 0;
+
+        // 1. Evict safe entries (oldest first).
+        for safe_entry in self.safe.iter() {
+            let h = safe_entry.block.measure(width);
+            if h == 0 {
+                continue;
+            }
+            let area = Rect::new(0, 0, width, h);
+            let mut buf = Buffer::empty(area);
+            safe_entry.block.render(area, &mut buf);
+            for row_idx in 0..h {
+                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+                backend.write_row(cells.into_iter())?;
+                emitted = emitted.saturating_add(1);
+                if emitted < total_rows {
+                    backend.newline()?;
+                }
+            }
+        }
+
+        // 2. Ellipsis row.
+        let ellipsis_buf = build_ellipsis_buffer(width);
+        let cells: Vec<&Cell> = (0..width).map(|x| &ellipsis_buf[(x, 0)]).collect();
+        backend.write_row(cells.into_iter())?;
+        emitted = emitted.saturating_add(1);
+        if emitted < total_rows {
+            backend.newline()?;
+        }
+
+        // 3. Visible active blocks (oldest visible to newest).
+        for (i, id) in visible_active_ids.iter().enumerate() {
+            let entry = match self.active.get(*id) {
+                Some(e) => e,
+                None => continue,
+            };
+            let h = entry.block.measure(width);
+            if h == 0 {
+                continue;
+            }
+            let area = Rect::new(0, 0, width, h);
+            let mut buf = Buffer::empty(area);
+            entry.block.render(area, &mut buf);
+            let skip = if i == 0 { boundary_skip_rows } else { 0 };
+            for row_idx in skip..h {
+                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+                backend.write_row(cells.into_iter())?;
+                emitted = emitted.saturating_add(1);
+                if emitted < total_rows {
+                    backend.newline()?;
+                }
+            }
+        }
+
+        // 4. Footer rows.
+        if footer_h > 0 {
+            let area = Rect::new(0, 0, width, footer_h);
+            let mut buf = Buffer::empty(area);
+            self.footer.render(area, &mut buf);
+            for row_idx in 0..footer_h {
+                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+                backend.write_row(cells.into_iter())?;
+                emitted = emitted.saturating_add(1);
+                if emitted < total_rows {
+                    backend.newline()?;
+                }
+            }
+        }
+
+        Backend::flush(backend)?;
+
+        // === Bookkeeping ===
+
+        // Total `\n`s emitted = emitted_rows - 1 (last row has no
+        // trailing newline). Starting from row 0, each `\n` past the
+        // first `terminal_h - 1` triggers a scroll.
+        let total_newlines = i32::from(emitted).saturating_sub(1).max(0);
+        let scrolls = total_newlines
+            .saturating_sub(i32::from(terminal_h).saturating_sub(1))
+            .max(0);
+        self.cumulative_scrolls = self.cumulative_scrolls.saturating_add(scrolls);
+
+        // Move evicted safe entries into `committed`.
+        for _ in 0..self.safe.len() {
+            if let Some(entry) = self.safe.pop_front() {
+                self.committed.push_back(entry.block);
+            }
+        }
+
+        // Reset RenderStates on all surviving entries — their on-
+        // screen positions follow this path's "paint from row 0" model
+        // rather than the natural-scroll path's absolute_y model. The
+        // next frame (whether ActiveOverflow again or a transition
+        // out) renders them fresh.
+        for (_, entry) in self.active.iter_mut() {
+            entry.render = None;
+        }
+
+        // Footer anchor is glued to the bottom in this path. Record
+        // it for `footer_top_row()` callers (e.g. textarea cursors).
+        let footer_anchor_y = if footer_h > 0 {
+            terminal_h.saturating_sub(footer_h)
+        } else {
+            terminal_h.saturating_sub(1)
+        };
+        self.next_y = footer_anchor_y;
+
+        // Invalidate the footer diff cache: the next frame's anchor
+        // / size won't necessarily match what we just painted, and
+        // even if it did, this path doesn't populate prev_footer_buf
+        // consistently with the natural-scroll path.
+        self.prev_footer_buf = None;
+        self.prev_footer_anchor_y = None;
+        self.prev_footer_bottom_y = Some(terminal_h.saturating_sub(1));
+
+        Ok(())
+    }
+}
+
+/// Build a single-row `Buffer` containing `•••` centered in `width`
+/// cells, padded with spaces. The container uses this in the active-
+/// overflow path to paint the top row as a "content hidden above"
+/// indicator.
+fn build_ellipsis_buffer(width: u16) -> Buffer {
+    use ratatui::style::Style;
+    let bullets = "•••";
+    let bullet_cols: u16 = 3;
+    let pad: u16 = width.saturating_sub(bullet_cols) / 2;
+    let mut row = " ".repeat(pad as usize);
+    row.push_str(bullets);
+    let used = pad as usize + bullet_cols as usize;
+    if used < width as usize {
+        row.push_str(&" ".repeat(width as usize - used));
+    }
+    let area = Rect::new(0, 0, width, 1);
+    let mut buf = Buffer::empty(area);
+    buf.set_string(0, 0, &row, Style::default());
+    buf
+}
+
+/// Mutable cursor tracking shared across the safe / active / footer
+/// render passes within a single frame. `cursor_y` is the terminal
+/// row the cursor currently sits on; `scrolls` is the count of
+/// `\n`s that have scrolled the screen so far this frame.
+struct CursorState {
+    cursor_y: u16,
+    scrolls: i32,
+}
+
+/// Render path for a single safe / active entry. Picks between
+/// (a) fresh render at the cursor's current position (no prior
+/// `RenderState`), (b) skip — entry is on screen, unchanged, and
+/// no upstream geometry change has cascaded — or (c) damaged
+/// rewrite at the entry's known screen position. A damaged rewrite
+/// sets `force_cascade` so subsequent entries redraw too (their
+/// screen positions may have shifted if the geometry changed).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "draw-frame state threaded by-ref; bundling into a struct trades param count for an even longer borrow signature."
+)]
+fn render_or_skip_entry<B>(
+    block: &mut Box<dyn Block>,
+    render: &mut Option<RenderState>,
+    width: u16,
+    terminal_h: u16,
+    backend: &mut InlineBackend<B>,
+    cursor: &mut CursorState,
+    cumulative_scrolls: i32,
+    force_cascade: &mut bool,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    let h = block.measure(width);
+
+    // Decide where this entry's first row should sit on screen. When
+    // a block above us already triggered a cascade (it shrank or
+    // grew), the previous-frame absolute_y is stale — pack tight to
+    // the cursor's current position so we slide into the gap (shrink)
+    // or down past the new bottom (growth) instead.
+    let expected_y: u16 = if *force_cascade {
+        cursor.cursor_y
+    } else {
+        match render.as_ref() {
+            Some(state) => {
+                let screen_y = state.absolute_y - cumulative_scrolls - cursor.scrolls;
+                screen_y.max(0) as u16
+            }
+            None => cursor.cursor_y,
+        }
+    };
+    backend.move_cursor_abs(0, expected_y)?;
+    cursor.cursor_y = expected_y;
+
+    let geometry_changed = render.as_ref().is_some_and(|s| s.height != h);
+    let needs_redraw =
+        render.as_ref().is_none_or(|s| s.damaged) || geometry_changed || *force_cascade;
+    if geometry_changed {
+        *force_cascade = true;
+    }
+
+    if needs_redraw {
+        let absolute_y_at_start = cumulative_scrolls + cursor.scrolls + cursor.cursor_y as i32;
+        if h > 0 {
+            let area = Rect::new(0, 0, width, h);
+            let mut buf = Buffer::empty(area);
+            block.render(area, &mut buf);
+            for row_idx in 0..h {
+                write_row_at_cursor(backend, &buf, row_idx, width, true, cursor, terminal_h)?;
+            }
+        }
+        *render = Some(RenderState {
+            absolute_y: absolute_y_at_start,
+            height: h,
+            damaged: false,
+        });
+    } else {
+        // Skip: cells are still on screen and valid. Step the cursor
+        // past the block so the next entry can use its current
+        // position as the growing edge. No `\n` — no scrolls.
+        cursor.cursor_y = cursor.cursor_y.saturating_add(h);
+    }
+    Ok(())
+}
+
+fn write_row_at_cursor<B>(
+    backend: &mut InlineBackend<B>,
+    buf: &Buffer,
+    row_idx: u16,
+    width: u16,
+    with_newline: bool,
+    cursor: &mut CursorState,
+    terminal_h: u16,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+    backend.write_row(cells.into_iter())?;
+    if with_newline {
+        backend.newline()?;
+        if cursor.cursor_y + 1 < terminal_h {
+            cursor.cursor_y += 1;
+        } else {
+            cursor.scrolls += 1;
+            // cursor stays at terminal_h - 1
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::TerminalOptions;
+    use ratatui::Viewport;
+    use ratatui::layout::Size;
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    fn para(text: &str) -> Box<dyn Block> {
+        Box::new(Paragraph::new(Line::raw(text.to_string())))
+    }
+
+    fn multi(lines: u16) -> Box<dyn Block> {
+        let text = (0..lines)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Box::new(Paragraph::new(text))
+    }
+
+    #[test]
+    fn empty_container_is_empty() {
+        let c = ScrollbackContainer::new(para("footer"), 0);
+        assert_eq!(c.committed_count(), 0);
+        assert_eq!(c.safe_count(), 0);
+        assert_eq!(c.active_count(), 0);
+    }
+
+    #[test]
+    fn push_goes_straight_to_safe() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        c.push(para("hello"));
+        assert_eq!(c.safe_count(), 1);
+        assert_eq!(c.active_count(), 0);
+        assert_eq!(c.committed_count(), 0);
+    }
+
+    #[test]
+    fn mark_safe_drains_immediately_when_unblocked() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let id = c.push_active(para("streaming"));
+        assert_eq!(c.active_count(), 1);
+        assert_eq!(c.safe_count(), 0);
+
+        c.mark_safe(id);
+        // With nothing older in active, the front-run drain takes
+        // the flagged entry straight to `safe`.
+        assert_eq!(c.active_count(), 0);
+        assert_eq!(c.safe_count(), 1);
+    }
+
+    #[test]
+    fn update_active_replaces_in_place() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let id = c.push_active(para("first"));
+        c.update_active(id, para("second"));
+        // Still one active; the slot is just updated.
+        assert_eq!(c.active_count(), 1);
+        assert_eq!(c.safe_count(), 0);
+    }
+
+    #[test]
+    fn out_of_order_finalisation_preserves_display_order() {
+        // Two active blocks A then B. Mark B safe first; A must still
+        // gate promotion because it's at the front of active_order.
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let a = c.push_active(para("A"));
+        let b = c.push_active(para("B"));
+
+        c.mark_safe(b);
+        c.promote_ready();
+        // A still un-safe — neither promotes.
+        assert_eq!(c.active_count(), 2);
+        assert_eq!(c.safe_count(), 0);
+
+        c.mark_safe(a);
+        c.promote_ready();
+        // Both promote in order A, B.
+        assert_eq!(c.active_count(), 0);
+        assert_eq!(c.safe_count(), 2);
+    }
+
+    #[test]
+    fn mark_safe_for_unknown_id_is_noop() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let id = c.push_active(para("x"));
+        c.mark_safe(id);
+        c.promote_ready();
+        // Calling again on the now-stale id is harmless.
+        c.mark_safe(id);
+        c.update_active(id, para("new"));
+        assert_eq!(c.active_count(), 0);
+        assert_eq!(c.safe_count(), 1);
+    }
+
+    #[test]
+    fn multi_row_active_block_counts_against_active_h() {
+        // Sanity for the measurement step used during draw.
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        c.push_active(multi(3));
+        let active_h: u16 = c
+            .active_order
+            .iter()
+            .filter_map(|id| c.active.get(*id))
+            .map(|e| e.block.measure(80))
+            .sum();
+        assert_eq!(active_h, 3);
+    }
+
+    // ------------------------------------------------------------------
+    // Alacritty-driven test infra for the line-by-line render path.
+    //
+    // The `Recorder` above ignores cursor positioning and newline-driven
+    // scrolling — it only captures what ratatui sends through
+    // `Backend::draw`. Once the container is emitting rows + `\n` bytes
+    // directly, we need a real terminal emulator to interpret them so
+    // the assertions can talk about visible rows and native scrollback.
+    // `alacritty_terminal` (already a dev-dependency) does the work;
+    // bytes go through `vte::ansi::Processor::advance`, which dispatches
+    // to `Term` via its `Handler` impl.
+    // ------------------------------------------------------------------
+    mod term_backend {
+        use std::io::{self, Write};
+
+        use alacritty_terminal::event::{Event, EventListener};
+        use alacritty_terminal::grid::Dimensions;
+        use alacritty_terminal::index::{Column, Line};
+        use alacritty_terminal::term::{Config, Term};
+        use ratatui::backend::{Backend, ClearType, WindowSize};
+        use ratatui::buffer::Cell;
+        use ratatui::layout::{Position, Size};
+        use vte::ansi::Processor;
+
+        #[derive(Clone, Default)]
+        pub struct NoopListener;
+        impl EventListener for NoopListener {
+            fn send_event(&self, _event: Event) {}
+        }
+
+        pub struct TermDims {
+            pub lines: usize,
+            pub columns: usize,
+        }
+        impl Dimensions for TermDims {
+            fn total_lines(&self) -> usize {
+                // Pad with plenty of history; tests assert against the
+                // resulting visible rows / scrollback explicitly.
+                self.lines + 1024
+            }
+            fn screen_lines(&self) -> usize {
+                self.lines
+            }
+            fn columns(&self) -> usize {
+                self.columns
+            }
+        }
+
+        pub struct TermBackend {
+            term: Term<NoopListener>,
+            processor: Processor,
+            width: u16,
+            height: u16,
+        }
+
+        impl TermBackend {
+            pub fn new(width: u16, height: u16) -> Self {
+                let dims = TermDims {
+                    lines: height as usize,
+                    columns: width as usize,
+                };
+                let term = Term::new(Config::default(), &dims, NoopListener);
+                Self {
+                    term,
+                    processor: Processor::new(),
+                    width,
+                    height,
+                }
+            }
+
+            /// Content of screen row `y` (0 = top), with trailing spaces
+            /// stripped for ergonomic asserts.
+            pub fn screen_row(&self, y: usize) -> String {
+                let mut s = String::new();
+                let line = Line(y as i32);
+                let row = &self.term.grid()[line];
+                for col in 0..self.width as usize {
+                    s.push(row[Column(col)].c);
+                }
+                s.trim_end().to_string()
+            }
+
+            /// Number of rows currently in native scrollback (history).
+            pub fn scrollback_len(&self) -> usize {
+                self.term.grid().history_size()
+            }
+
+            /// Row in scrollback at `depth` rows back from the top of
+            /// the visible screen (depth 1 = the row that scrolled off
+            /// most recently).
+            pub fn scrollback_row(&self, depth: usize) -> String {
+                let mut s = String::new();
+                let line = Line(-(depth as i32));
+                let row = &self.term.grid()[line];
+                for col in 0..self.width as usize {
+                    s.push(row[Column(col)].c);
+                }
+                s.trim_end().to_string()
+            }
+        }
+
+        impl Write for TermBackend {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.processor.advance(&mut self.term, buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl Backend for TermBackend {
+            type Error = io::Error;
+            fn draw<'a, I>(&mut self, _content: I) -> Result<(), Self::Error>
+            where
+                I: Iterator<Item = (u16, u16, &'a Cell)>,
+            {
+                Ok(())
+            }
+            fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn show_cursor(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+                Ok(Position { x: 0, y: 0 })
+            }
+            fn set_cursor_position<P: Into<Position>>(&mut self, _: P) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn clear(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn clear_region(&mut self, _: ClearType) -> Result<(), Self::Error> {
+                Ok(())
+            }
+            fn size(&self) -> Result<Size, Self::Error> {
+                Ok(Size {
+                    width: self.width,
+                    height: self.height,
+                })
+            }
+            fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+                Ok(WindowSize {
+                    columns_rows: self.size()?,
+                    pixels: Size {
+                        width: 0,
+                        height: 0,
+                    },
+                })
+            }
+            fn flush(&mut self) -> Result<(), Self::Error> {
+                Ok(())
+            }
+        }
+    }
+
+    fn multi_text(lines: &[&str]) -> Box<dyn Block> {
+        let lines: Vec<Line<'static>> = lines.iter().map(|s| Line::raw(s.to_string())).collect();
+        Box::new(Paragraph::new(lines))
+    }
+
+    fn mk_term_terminal(
+        width: u16,
+        height: u16,
+    ) -> Terminal<InlineBackend<term_backend::TermBackend>> {
+        let size = Size { width, height };
+        let backend = InlineBackend::new(term_backend::TermBackend::new(width, height), size);
+        Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Fullscreen,
+            },
+        )
+        .unwrap()
+    }
+
+    /// The user's algorithm test: push a 3-row multiline block + 1
+    /// single line + a 1-row footer on a 5-row terminal. Each
+    /// subsequent push of a single line should cause exactly one row
+    /// of the multiline block to slide into native scrollback, with
+    /// no duplication. After 3 more pushes the multiline is fully in
+    /// scrollback and the screen shows 4 single-lines + footer.
+    #[test]
+    fn renders_block_by_block_letting_terminal_scroll_naturally() {
+        let mut terminal = mk_term_terminal(80, 5);
+
+        let mut container = ScrollbackContainer::new(multi_text(&["bottom"]), 0);
+        container.push(multi_text(&["multiline-a", "multiline-b", "multiline-c"]));
+        container.push(multi_text(&["singleline"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(1), "multiline-b");
+            assert_eq!(b.screen_row(2), "multiline-c");
+            assert_eq!(b.screen_row(3), "singleline");
+            assert_eq!(b.screen_row(4), "bottom");
+            assert_eq!(b.scrollback_len(), 0);
+        }
+
+        let expected_scrolled = [
+            (
+                "multiline-a",
+                ["multiline-b", "multiline-c", "singleline", "singleline"],
+            ),
+            (
+                "multiline-b",
+                ["multiline-c", "singleline", "singleline", "singleline"],
+            ),
+            (
+                "multiline-c",
+                ["singleline", "singleline", "singleline", "singleline"],
+            ),
+        ];
+
+        for (step, (newly_committed, screen_top4)) in expected_scrolled.iter().enumerate() {
+            container.push(multi_text(&["singleline"]));
+            container.draw(&mut terminal).unwrap();
+
+            let b = terminal.backend().inner();
+            for (row_idx, expected) in screen_top4.iter().enumerate() {
+                assert_eq!(
+                    &b.screen_row(row_idx),
+                    expected,
+                    "step {step}: row {row_idx} did not match",
+                );
+            }
+            assert_eq!(&b.screen_row(4), "bottom", "step {step}: footer row");
+
+            // After this push, exactly one multiline row should have
+            // newly entered scrollback. Depth 1 is the most recently
+            // scrolled-off row.
+            assert_eq!(
+                &b.scrollback_row(1),
+                newly_committed,
+                "step {step}: most-recent scrollback row should be {newly_committed}",
+            );
+            assert_eq!(
+                b.scrollback_len(),
+                step + 1,
+                "step {step}: exactly one new row in scrollback per push (no duplicates)",
+            );
+        }
+
+        // Final state: scrollback holds exactly multiline-a,
+        // multiline-b, multiline-c in chronological order, no
+        // duplicates. Walking back through scrollback should produce
+        // them in reverse-recency order.
+        let b = terminal.backend().inner();
+        assert_eq!(b.scrollback_row(1), "multiline-c");
+        assert_eq!(b.scrollback_row(2), "multiline-b");
+        assert_eq!(b.scrollback_row(3), "multiline-a");
+        assert_eq!(b.scrollback_len(), 3);
+    }
+
+    /// Each `draw` should only re-emit blocks whose content or
+    /// geometry has changed since their last successful render —
+    /// undamaged blocks must skip without writing, so an external
+    /// clear of the terminal (e.g. another process touching it,
+    /// the user resizing some other window, etc.) is preserved
+    /// for the rows belonging to those blocks.
+    #[test]
+    fn damage_tracking_only_redraws_changed_blocks() {
+        let mut terminal = mk_term_terminal(80, 10);
+        // 0-row footer keeps the bookkeeping simple — the blocks
+        // live at rows 0..n with no trailing footer geometry.
+        let mut container = ScrollbackContainer::new(multi_text(&[]), 0);
+
+        let _id_a = container.push_active(multi_text(&["block-a"]));
+        let id_b = container.push_active(multi_text(&["block-b"]));
+        let _id_c = container.push_active(multi_text(&["block-c"]));
+
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "block-a");
+            assert_eq!(b.screen_row(1), "block-b");
+            assert_eq!(b.screen_row(2), "block-c");
+        }
+
+        // Externally wipe the terminal — the renderer must NOT see
+        // this. `CSI H` homes the cursor; `CSI J` (== `CSI 0 J`)
+        // erases from cursor to end of display, which with the
+        // cursor at home is the whole screen. We deliberately
+        // avoid `CSI 2 J` because alacritty implements that as
+        // "scroll the screen contents into scrollback before
+        // clearing", which would garble the test's assertions
+        // about scrollback state.
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "");
+            assert_eq!(b.screen_row(1), "");
+            assert_eq!(b.screen_row(2), "");
+        }
+
+        // Update only B (same height). Only B should be damaged.
+        container.update_active(id_b, multi_text(&["block-B!"]));
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        assert_eq!(
+            b.screen_row(0),
+            "",
+            "A wasn't damaged — must not be repainted, terminal stays clear",
+        );
+        assert_eq!(
+            b.screen_row(1),
+            "block-B!",
+            "B was damaged — must be repainted with the new content",
+        );
+        assert_eq!(
+            b.screen_row(2),
+            "",
+            "C wasn't damaged — must not be repainted, terminal stays clear",
+        );
+    }
+
+    /// A scroll triggered by appending one more block than fits
+    /// commits the oldest block (its only row goes into native
+    /// scrollback) and shifts everything else up. The remaining
+    /// visible blocks are still in `safe` with valid render
+    /// state — they must NOT be repainted on a subsequent draw,
+    /// because the terminal preserved their cells when it
+    /// scrolled. Externally wiping the screen lets the test see
+    /// whether the renderer respects that: if it tries to repaint
+    /// them, the rows show their content; if it correctly skips,
+    /// the rows stay blank.
+    #[test]
+    fn scroll_commits_oldest_and_remaining_visible_blocks_skip_repaint() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        for label in ["a", "b", "c", "d"] {
+            container.push(multi_text(&[label]));
+        }
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "a");
+            assert_eq!(b.screen_row(1), "b");
+            assert_eq!(b.screen_row(2), "c");
+            assert_eq!(b.screen_row(3), "d");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 0);
+        }
+
+        // One more push than fits. "a" scrolls into native
+        // scrollback and is moved to `committed`.
+        container.push(multi_text(&["e"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "b");
+            assert_eq!(b.screen_row(1), "c");
+            assert_eq!(b.screen_row(2), "d");
+            assert_eq!(b.screen_row(3), "e");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 1);
+            assert_eq!(b.scrollback_row(1), "a");
+            assert_eq!(container.committed_count(), 1);
+            assert_eq!(container.safe_count(), 4);
+        }
+
+        // External clear via `CSI H` + `CSI J` (cursor home,
+        // erase below = whole screen, scrollback preserved).
+        // Re-draw with no changes.
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // b/c/d/e are still in safe with valid render state — they
+        // must be skipped. The footer's cell-level diff against the
+        // previous frame's buffer is empty (no content change), so
+        // it also emits nothing and row 4 stays wiped.
+        assert_eq!(b.screen_row(0), "", "b: still in safe, undamaged");
+        assert_eq!(b.screen_row(1), "", "c: still in safe, undamaged");
+        assert_eq!(b.screen_row(2), "", "d: still in safe, undamaged");
+        assert_eq!(b.screen_row(3), "", "e: still in safe, undamaged");
+        // Scrollback is preserved by `CSI J`.
+        assert_eq!(b.scrollback_row(1), "a");
+        assert_eq!(b.scrollback_len(), 1);
+    }
+
+    /// A multi-row block straddling the top of the screen — its
+    /// first row newly in native scrollback, the rest still
+    /// on-screen — is moved to `committed` on the *first* row
+    /// scrolling off, per the partial-scroll commit rule. The
+    /// block's remaining visible rows are orphaned in our model:
+    /// we no longer track them, so a subsequent draw that doesn't
+    /// push anything new also doesn't repaint them — and after an
+    /// external clear of the screen those rows stay blank.
+    #[test]
+    fn straddling_multi_row_block_commits_and_visible_remnant_is_orphaned() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        container.push(multi_text(&["multi-1", "multi-2", "multi-3"]));
+        container.push(multi_text(&["single1"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multi-1");
+            assert_eq!(b.screen_row(1), "multi-2");
+            assert_eq!(b.screen_row(2), "multi-3");
+            assert_eq!(b.screen_row(3), "single1");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 0);
+        }
+
+        // Push one more — forces exactly one scroll. The multi
+        // block's first row (`multi-1`) goes into native scrollback;
+        // `multi-2` and `multi-3` are still on-screen. The block
+        // is moved to `committed` (partial-scroll commits the
+        // whole block), so the renderer no longer tracks it — its
+        // visible remnant is now "owned by the terminal".
+        container.push(multi_text(&["single2"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multi-2");
+            assert_eq!(b.screen_row(1), "multi-3");
+            assert_eq!(b.screen_row(2), "single1");
+            assert_eq!(b.screen_row(3), "single2");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 1);
+            assert_eq!(b.scrollback_row(1), "multi-1");
+            assert_eq!(
+                container.committed_count(),
+                1,
+                "multi-block committed on partial scroll",
+            );
+            assert_eq!(
+                container.safe_count(),
+                2,
+                "the two single-row blocks still tracked",
+            );
+        }
+
+        // External clear; re-draw with no changes.
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // The multi-block's visible remnants at rows 0..1 stay
+        // blank — the block is committed, we don't know about it.
+        assert_eq!(b.screen_row(0), "");
+        assert_eq!(b.screen_row(1), "");
+        // single1 and single2 are still in `safe`, undamaged.
+        assert_eq!(b.screen_row(2), "");
+        assert_eq!(b.screen_row(3), "");
+        // Footer's cell diff is empty (unchanged content + anchor),
+        // so it also emits nothing and row 4 stays wiped.
+        // Scrollback unchanged.
+        assert_eq!(b.scrollback_row(1), "multi-1");
+        assert_eq!(b.scrollback_len(), 1);
+    }
+
+    /// When the footer shrinks (e.g. an autocomplete panel collapsing
+    /// inside the bottom area, or a multi-line textarea returning to
+    /// a single line), the rows the *previous* footer used to occupy
+    /// below the new footer should be yielded back to the terminal
+    /// as blank — not left displaying stale rows of the old footer.
+    #[test]
+    fn footer_shrink_clears_rows_returned_to_terminal() {
+        let mut terminal = mk_term_terminal(80, 10);
+
+        // Initial 5-row footer. Cursor starts at row 0; container
+        // renders the footer at rows 0-4.
+        let mut container = ScrollbackContainer::new(
+            multi_text(&["footer-1", "footer-2", "footer-3", "footer-4", "footer-5"]),
+            0,
+        );
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "footer-1");
+            assert_eq!(b.screen_row(1), "footer-2");
+            assert_eq!(b.screen_row(2), "footer-3");
+            assert_eq!(b.screen_row(3), "footer-4");
+            assert_eq!(b.screen_row(4), "footer-5");
+            assert_eq!(b.screen_row(5), "");
+        }
+
+        // Shrink to a 3-row footer. The new footer overwrites rows
+        // 0-2; rows 3 and 4 should be cleared, not left displaying
+        // "footer-4" / "footer-5".
+        container.set_footer(multi_text(&["short-1", "short-2", "short-3"]));
+        container.draw(&mut terminal).unwrap();
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), "short-1");
+        assert_eq!(b.screen_row(1), "short-2");
+        assert_eq!(b.screen_row(2), "short-3");
+        assert_eq!(
+            b.screen_row(3),
+            "",
+            "row 3 should be blank after footer shrink, not stale"
+        );
+        assert_eq!(
+            b.screen_row(4),
+            "",
+            "row 4 should be blank after footer shrink, not stale"
+        );
+    }
+
+    /// Cell-level damage tracking on the footer: when neither the
+    /// content nor the anchor changed between two draws, the diff
+    /// against the previous frame's buffer is empty, so an external
+    /// wipe between draws stays visible — nothing gets repainted.
+    #[test]
+    fn unchanged_footer_emits_no_cells() {
+        let mut terminal = mk_term_terminal(20, 3);
+        let mut c = ScrollbackContainer::new(multi_text(&["hello"]), 0);
+        c.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "hello");
+        }
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        c.draw(&mut terminal).unwrap();
+        let b = terminal.backend().inner();
+        assert_eq!(
+            b.screen_row(0),
+            "",
+            "unchanged footer must produce an empty diff — no repaint",
+        );
+    }
+
+    /// Changing only one cell of the footer must emit only the
+    /// cells that actually differ. After an external wipe between
+    /// draws, only the changed leading cell reappears; the rest of
+    /// the row stays blank because it matched the previous buffer.
+    #[test]
+    fn footer_cell_change_emits_only_the_changed_cells() {
+        let mut terminal = mk_term_terminal(20, 3);
+        let mut c = ScrollbackContainer::new(multi_text(&["hello"]), 0);
+        c.draw(&mut terminal).unwrap();
+
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        c.set_footer(multi_text(&["jello"])); // change only x=0
+        c.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Only the diffed cell ("j") reappears; "ello" matched the
+        // previous frame and must stay blank from the external clear.
+        assert_eq!(
+            b.screen_row(0),
+            "j",
+            "only the changed cell repainted; unchanged tail stays wiped",
+        );
+    }
+
+    /// When an active block's content update makes it shorter, the
+    /// footer must stay pinned to its previous-frame row. The freed
+    /// rows surface as blank slack between the (newly-packed) content
+    /// stack and the footer. Subsequent pushes consume the slack from
+    /// above before the footer is allowed to move.
+    ///
+    /// The motivation: when content streams alternately growing and
+    /// shrinking, a footer that tracks the natural anchor would jitter
+    /// up and down. Pinning trades that for transient blank rows that
+    /// fill as new content arrives — a much steadier visual.
+    #[test]
+    fn content_shrink_pins_footer_and_pushes_consume_slack() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        // State 1: 3-row multiline + 1-row other-content + 1-row footer.
+        let multi_id =
+            container.push_active(multi_text(&["multiline-a", "multiline-b", "multiline-c"]));
+        container.push_active(multi_text(&["other-content"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(1), "multiline-b");
+            assert_eq!(b.screen_row(2), "multiline-c");
+            assert_eq!(b.screen_row(3), "other-content");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 0);
+        }
+
+        // State 2: multiline shrinks to 2 rows. other-content packs
+        // up to row 2; row 3 is slack; footer pinned at row 4.
+        container.update_active(multi_id, multi_text(&["multiline-a", "multiline-b"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(1), "multiline-b");
+            assert_eq!(
+                b.screen_row(2),
+                "other-content",
+                "block below shrunken block must pack up to fill the gap",
+            );
+            assert_eq!(
+                b.screen_row(3),
+                "",
+                "freed row surfaces as blank slack above the footer",
+            );
+            assert_eq!(
+                b.screen_row(4),
+                "footer",
+                "footer must stay pinned to its previous-frame row",
+            );
+        }
+
+        // State 3: multiline shrinks again to 1 row. other-content at
+        // row 1; two slack rows (2, 3); footer still at row 4.
+        container.update_active(multi_id, multi_text(&["multiline-a"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(1), "other-content");
+            assert_eq!(b.screen_row(2), "");
+            assert_eq!(b.screen_row(3), "");
+            assert_eq!(b.screen_row(4), "footer");
+        }
+
+        // State 4: push a new content block — fills the topmost slack
+        // row (row 2). Bottom slack and footer unchanged.
+        container.push_active(multi_text(&["other-content"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(1), "other-content");
+            assert_eq!(b.screen_row(2), "other-content");
+            assert_eq!(b.screen_row(3), "", "one slack row left");
+            assert_eq!(b.screen_row(4), "footer");
+        }
+
+        // State 5: another push exhausts the slack — footer still
+        // never moved, no scrollback was generated.
+        container.push_active(multi_text(&["other-content"]));
+        container.draw(&mut terminal).unwrap();
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), "multiline-a");
+        assert_eq!(b.screen_row(1), "other-content");
+        assert_eq!(b.screen_row(2), "other-content");
+        assert_eq!(b.screen_row(3), "other-content");
+        assert_eq!(b.screen_row(4), "footer");
+        assert_eq!(
+            b.scrollback_len(),
+            0,
+            "footer never moved and no row scrolled out — slack absorbed both pushes",
+        );
+    }
+
+    /// `mark_safe` drains only the contiguous safe-flagged prefix of
+    /// `active_order`. A block flagged out of order waits behind its
+    /// older still-mutating siblings until they're flagged too.
+    #[test]
+    fn mark_safe_drains_only_contiguous_front_run() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let a = c.push_active(para("A"));
+        let b = c.push_active(para("B"));
+        let _c = c.push_active(para("C"));
+
+        // Flag B first; A still blocks the drain, C isn't flagged.
+        c.mark_safe(b);
+        assert_eq!(c.active_count(), 3);
+        assert_eq!(c.safe_count(), 0);
+
+        // Now flag A: drain takes A and B (contiguous safe-flagged
+        // prefix), stops at C.
+        c.mark_safe(a);
+        assert_eq!(c.active_count(), 1);
+        assert_eq!(c.safe_count(), 2);
+    }
+
+    /// `push` while older active blocks are still in flight queues
+    /// the new entry at the back of `active` flagged ready-to-promote
+    /// rather than dropping it into `safe` out of order. On the next
+    /// draw it renders below the active stack — not above it.
+    #[test]
+    fn push_with_older_active_queues_behind_them() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        // An active block that's still streaming — not yet safe.
+        let _streaming = container.push_active(multi_text(&["streaming-0", "streaming-1"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), "streaming-0");
+            assert_eq!(b.screen_row(1), "streaming-1");
+            assert_eq!(b.screen_row(2), "footer");
+        }
+
+        // Push a "history" block while the streaming block is still
+        // active. With the unified pipeline, the new entry queues at
+        // the back of `active` (flagged) rather than slotting in
+        // above the streaming block.
+        container.push(multi_text(&["history"]));
+        assert_eq!(
+            container.active_count(),
+            2,
+            "push() must queue in active behind the still-streaming block",
+        );
+        assert_eq!(container.safe_count(), 0);
+
+        container.draw(&mut terminal).unwrap();
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), "streaming-0");
+        assert_eq!(b.screen_row(1), "streaming-1");
+        assert_eq!(
+            b.screen_row(2),
+            "history",
+            "pushed block lands BELOW the still-active streaming block",
+        );
+        assert_eq!(b.screen_row(3), "footer");
+    }
+
+    // ------------------------------------------------------------------
+    // Active-overflow truncation
+    //
+    // When the total height of safe + active + footer exceeds the
+    // terminal and at least some of the overflow is *active* (i.e. a
+    // block whose cells may still be replaced via update_active),
+    // active rows must NOT leak into native scrollback. Instead the
+    // container reserves the topmost block row for a `•••` indicator
+    // and shows only the bottom rows of the boundary block (or, if
+    // there are many small active blocks, only the newest ones that
+    // fit). Safe-block overflow continues to flow into native
+    // scrollback via the existing natural-scroll path.
+    // ------------------------------------------------------------------
+
+    fn centered_ellipsis(width: u16) -> String {
+        // Match `screen_row`'s trim_end semantics: only leading padding
+        // + the bullets matter for the assertion.
+        let pad = (width as usize).saturating_sub(3) / 2;
+        let mut s = " ".repeat(pad);
+        s.push_str("•••");
+        s
+    }
+
+    /// 5-row terminal, 1-row footer. Push one 10-row active block.
+    /// Available block-content area: 4 rows. The ellipsis row eats 1,
+    /// so 3 rows of the block are visible — the bottom 3, top-truncated.
+    /// Crucially, scrollback must remain empty: an active block's cells
+    /// can be replaced, so they cannot be allowed into native scrollback.
+    #[test]
+    fn oversize_active_block_truncates_and_does_not_leak_to_scrollback() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
+        container.push_active(multi_text(&lines));
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), centered_ellipsis(80));
+        assert_eq!(b.screen_row(1), "L7");
+        assert_eq!(b.screen_row(2), "L8");
+        assert_eq!(b.screen_row(3), "L9");
+        assert_eq!(b.screen_row(4), "footer");
+        assert_eq!(
+            b.scrollback_len(),
+            0,
+            "active cells must not enter native scrollback",
+        );
+        assert_eq!(container.active_count(), 1);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.committed_count(), 0);
+    }
+
+    /// Updating an oversize active block re-renders the truncated
+    /// bottom rows in-place. Scrollback must still stay empty —
+    /// updating an active that's already overflowing the screen
+    /// cannot be allowed to evict its cells.
+    #[test]
+    fn oversize_active_block_update_does_not_leak_to_scrollback() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
+        let id = container.push_active(multi_text(&lines));
+        container.draw(&mut terminal).unwrap();
+
+        let new_lines: Vec<&str> = vec!["A0", "A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8", "A9"];
+        container.update_active(id, multi_text(&new_lines));
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), centered_ellipsis(80));
+        assert_eq!(b.screen_row(1), "A7");
+        assert_eq!(b.screen_row(2), "A8");
+        assert_eq!(b.screen_row(3), "A9");
+        assert_eq!(b.screen_row(4), "footer");
+        assert_eq!(
+            b.scrollback_len(),
+            0,
+            "update of a truncated active must not leak rows to scrollback",
+        );
+        assert_eq!(container.committed_count(), 0);
+    }
+
+    /// mark_safe on an oversize active promotes it to `safe`, which is
+    /// no longer subject to the active-truncation rule. The existing
+    /// safe-overflow path runs — natural scroll commits the overflow
+    /// rows to scrollback; the bottom rows of the now-safe block stay
+    /// on screen as an orphaned remnant per the existing model.
+    /// This is the "no additional logic, existing stuff covers it"
+    /// case: marking a previously-truncated active as safe restores
+    /// it to the standard safe-overflow flow.
+    #[test]
+    fn oversize_active_block_mark_safe_uses_natural_scroll_commit() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
+        let id = container.push_active(multi_text(&lines));
+        container.draw(&mut terminal).unwrap();
+
+        container.mark_safe(id);
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Natural-scroll commit: L0..L5 evict into native scrollback;
+        // L6..L9 stay visible as the orphaned remnant.
+        assert_eq!(b.screen_row(0), "L6");
+        assert_eq!(b.screen_row(1), "L7");
+        assert_eq!(b.screen_row(2), "L8");
+        assert_eq!(b.screen_row(3), "L9");
+        assert_eq!(b.screen_row(4), "footer");
+        assert_eq!(b.scrollback_len(), 6);
+        assert_eq!(b.scrollback_row(1), "L5");
+        assert_eq!(b.scrollback_row(2), "L4");
+        assert_eq!(b.scrollback_row(3), "L3");
+        assert_eq!(b.scrollback_row(4), "L2");
+        assert_eq!(b.scrollback_row(5), "L1");
+        assert_eq!(b.scrollback_row(6), "L0");
+        assert_eq!(container.committed_count(), 1);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.active_count(), 0);
+    }
+
+    /// Many small active blocks whose combined height exceeds the
+    /// available area. The oldest active blocks are truncated entirely
+    /// (the ellipsis row is their only on-screen presence); the newest
+    /// remain visible and updatable. Critically, updates to *any*
+    /// active — visible or off-screen — must not push cells into native
+    /// scrollback.
+    #[test]
+    fn long_active_history_truncates_oldest_actives_and_keeps_newest_updatable() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        // 6 single-line active blocks. Available = 4 rows, ellipsis
+        // takes 1, visible block area = 3 → only d, e, f fit.
+        let id_a = container.push_active(multi_text(&["a"]));
+        let _id_b = container.push_active(multi_text(&["b"]));
+        let _id_c = container.push_active(multi_text(&["c"]));
+        let _id_d = container.push_active(multi_text(&["d"]));
+        let _id_e = container.push_active(multi_text(&["e"]));
+        let id_f = container.push_active(multi_text(&["f"]));
+
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), centered_ellipsis(80));
+            assert_eq!(b.screen_row(1), "d");
+            assert_eq!(b.screen_row(2), "e");
+            assert_eq!(b.screen_row(3), "f");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 0);
+            assert_eq!(container.active_count(), 6);
+            assert_eq!(container.committed_count(), 0);
+        }
+
+        // Update an on-screen active.
+        container.update_active(id_f, multi_text(&["F"]));
+        container.draw(&mut terminal).unwrap();
+        {
+            let b = terminal.backend().inner();
+            assert_eq!(b.screen_row(0), centered_ellipsis(80));
+            assert_eq!(b.screen_row(1), "d");
+            assert_eq!(b.screen_row(2), "e");
+            assert_eq!(b.screen_row(3), "F");
+            assert_eq!(b.screen_row(4), "footer");
+            assert_eq!(b.scrollback_len(), 0);
+        }
+
+        // Update an off-screen active. Visible rows unchanged; nothing
+        // can leak to scrollback because the block's cells were never
+        // on screen to begin with.
+        container.update_active(id_a, multi_text(&["A"]));
+        container.draw(&mut terminal).unwrap();
+        let b = terminal.backend().inner();
+        assert_eq!(b.screen_row(0), centered_ellipsis(80));
+        assert_eq!(b.screen_row(1), "d");
+        assert_eq!(b.screen_row(2), "e");
+        assert_eq!(b.screen_row(3), "F");
+        assert_eq!(b.screen_row(4), "footer");
+        assert_eq!(
+            b.scrollback_len(),
+            0,
+            "updating an off-screen active must not commit anything to scrollback",
+        );
+        assert_eq!(container.active_count(), 6);
+    }
+
+    /// Partial commit: mark some of the far-back actives safe so that
+    /// they enter scrollback, but leave enough actives behind that
+    /// overflow persists. The layered story is visible by reading
+    /// scrollback + screen top-to-bottom: committed blocks in
+    /// scrollback (oldest first), then the ellipsis indicator, then
+    /// the truncated visible content above the footer.
+    #[test]
+    fn partial_mark_safe_commits_to_scrollback_then_remaining_overflow_truncates() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        let id_a = container.push_active(multi_text(&["a"]));
+        let id_b = container.push_active(multi_text(&["b"]));
+        let _id_c = container.push_active(multi_text(&["c"]));
+        let _id_d = container.push_active(multi_text(&["d"]));
+        let _id_e = container.push_active(multi_text(&["e"]));
+        let _id_f = container.push_active(multi_text(&["f"]));
+        container.draw(&mut terminal).unwrap();
+
+        // Promote a then b to safe. The contiguous front-run drain in
+        // mark_safe moves both into `safe` in order.
+        container.mark_safe(id_a);
+        container.mark_safe(id_b);
+        assert_eq!(container.safe_count(), 2);
+        assert_eq!(container.active_count(), 4);
+
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Visible: ellipsis row + d, e, f + footer. `c` is the topmost
+        // active and is fully truncated — its absence is signalled by
+        // the ellipsis.
+        assert_eq!(b.screen_row(0), centered_ellipsis(80));
+        assert_eq!(b.screen_row(1), "d");
+        assert_eq!(b.screen_row(2), "e");
+        assert_eq!(b.screen_row(3), "f");
+        assert_eq!(b.screen_row(4), "footer");
+        // Scrollback (newest first): b, a.
+        assert_eq!(b.scrollback_len(), 2);
+        assert_eq!(b.scrollback_row(1), "b");
+        assert_eq!(b.scrollback_row(2), "a");
+        assert_eq!(container.committed_count(), 2);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.active_count(), 4);
+    }
+}
