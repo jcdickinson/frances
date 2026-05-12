@@ -356,4 +356,3 @@ fn read_metadata(path: &Path) -> Result<SessionMeta> {
         .map_err(SessionError::DecodeMetadata)?;
     Ok(meta)
 }
-

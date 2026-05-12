@@ -14,6 +14,10 @@
 //   const kill = new Kill(sh);
 //   chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
 //
+// By default `Run.handler` asks the user to approve each command via
+// `frances:v1/approval` before executing it. Pass `{ approve: false }`
+// to bypass the gate (e.g. for tests or trusted workflows).
+//
 // When `Run` returns a `Done` or `Dead` outcome it just returns a
 // tool_result like a leaf. When the command goes `Quiet`, `Run`:
 //   1. returns a "still running" tool_result for the initial batch, and
@@ -41,6 +45,7 @@
 //   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
 
 import { transcript, MarkdownFrame } from "frances:v1/frames";
+import { approve } from "frances:v1/approval";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
 
@@ -103,10 +108,46 @@ function _errResult(call_id, err) {
   };
 }
 
+// Ask the user to approve a `shell_run` call. Returns `null` if the
+// user said yes and the command should proceed, otherwise a fully
+// formed tool_result the handler should return verbatim.
+async function _askApproval(call) {
+  const cmd = call.arguments.cmd;
+  const prompt =
+    "Allow Frances to run this bash command?\n\n" +
+    "```bash\n" +
+    cmd +
+    "\n```";
+  let choice;
+  try {
+    choice = await approve(prompt);
+  } catch (err) {
+    return _errResult(call.id, err);
+  }
+  if (choice.type === "yes") return null;
+  if (choice.type === "no") {
+    const reason = choice.details ? ` Reason: ${choice.details}` : "";
+    return {
+      role: "tool",
+      call_id: call.id,
+      content: `User denied this shell command.${reason}`,
+      is_error: true,
+    };
+  }
+  // chat — user said something instead of yes/no; surface it back to
+  // the model as a tool_result so it can react in the next round.
+  return {
+    role: "tool",
+    call_id: call.id,
+    content: `User did not approve. They said:\n${choice.content}`,
+    is_error: true,
+  };
+}
+
 class Run {
   static schema = RUN_SCHEMA;
 
-  constructor(shell, { wait, kill, maxScolds = 2 } = {}) {
+  constructor(shell, { wait, kill, maxScolds = 2, approve: approveOpt = true } = {}) {
     this.shell = shell;
     this.wait = wait;
     this.kill = kill;
@@ -115,6 +156,9 @@ class Run {
     // lock turn is free; after that, each non-progress round costs one
     // scold. When the budget hits zero, we SIGKILL the command.
     this.maxScolds = maxScolds;
+    // Whether to gate each command behind `approve()`. Default on;
+    // opt out with `{ approve: false }`.
+    this.requireApproval = approveOpt;
     this.name = "shell_run";
     this.description =
       "Run a bash command. State (cwd, env, functions) persists across calls. " +
@@ -124,6 +168,11 @@ class Run {
   }
 
   handler = async ({ call, scope }) => {
+    if (this.requireApproval) {
+      const gate = await _askApproval(call);
+      if (gate !== null) return gate;
+    }
+
     let outcome;
     try {
       outcome = await this.shell.runOnce(call.arguments.cmd);

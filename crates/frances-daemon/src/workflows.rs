@@ -330,11 +330,14 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
             // thrown before reaching here.
         }
         HostFrame::Approval(request) => {
-            // An approval pauses block streaming visually but doesn't
-            // close the open block — the workflow body owns its own
-            // open block (if any) and continues writing after the
-            // response lands. The UI handles the "waiting for input"
-            // state on its side; the wire layer just forwards.
+            // Close any open block first. The TUI commits its active
+            // block to scrollback when it shows the approval prompt
+            // (state.take() in ui.rs), so leaving the block tracked
+            // here would desync the two: the next BlockStop we emit
+            // (when the workflow body pushes its next frame) would
+            // arrive while the UI is Idle. Closing here keeps the
+            // wire's open_block in lockstep with the UI.
+            state.close_open(stream).await?;
             write_message(stream, &StreamFrame::Approval(request)).await?;
         }
     }

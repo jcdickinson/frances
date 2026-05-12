@@ -9,6 +9,13 @@
 //! Forward-looking: `ApprovalKind` is an enum so multi-choice and
 //! richer prompt shapes can land without breaking callers. `v1` only
 //! emits `YesNo`.
+//!
+//! Serialization note: the daemon ↔ TUI wire is bincode, whose serde
+//! adapter is not self-describing and rejects internally-tagged enums
+//! (`#[serde(tag = "...")]`) with `Serde(AnyNotSupported)`. So the
+//! enums here use externally-tagged form (serde's default). The JS
+//! bridge does not go through serde — it has its own `IntoJs` impls
+//! that emit the `{ type, ... }` shape the JS module expects.
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -38,8 +45,7 @@ pub struct ApprovalRequest {
 
 /// Shape of the choices on offer. v1 has one variant; future variants
 /// (`Choice { options: Vec<String> }`, etc.) get added here.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalKind {
     /// Plain yes/no, with a "chat" escape hatch for free-form text.
     YesNo,
@@ -48,8 +54,7 @@ pub enum ApprovalKind {
 /// The user's answer. `Yes`/`No` carry optional free-form details so
 /// callers can capture reasoning ("yes, but only for this file");
 /// `Chat` collapses approval into a normal chat message instead.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalChoice {
     Yes { details: Option<String> },
     No { details: Option<String> },

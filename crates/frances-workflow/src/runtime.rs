@@ -516,6 +516,13 @@ pub mod test_deps {
         pub fn sessions(&self) -> Vec<StubSession> {
             self.manager.sessions.lock().clone()
         }
+
+        /// Resolve the pending approval slot `id` with `choice`. Mirrors
+        /// `StubDeps::answer_approval` for the real-shell deps variant
+        /// used by `frances:v1/tools/shell` tests.
+        pub fn answer_approval(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
+            self.approvals.answer(id, choice)
+        }
     }
 
     impl StubDeps {
@@ -2109,7 +2116,7 @@ mod tests {
             import { transcript, MarkdownFrame } from "frances:v1/frames";
             const chat = new ChatSession({ model_intents: ["x"] });
             const sh = new Shell();
-            chat.tools.push(new Run(sh), new Wait(sh), new Kill(sh));
+            chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
             chat.push({ role: "user", content: "do it" });
             const r = await chat.stream();
             const reader = r.events.getReader();
@@ -2209,7 +2216,7 @@ mod tests {
             const sh = new Shell();
             const wait = new Wait(sh);
             const kill = new Kill(sh);
-            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.tools.push(new Run(sh, { wait, kill, approve: false }), wait, kill);
             chat.push({ role: "user", content: "run something slow" });
             const r = await chat.stream();
             const reader = r.events.getReader();
@@ -2318,7 +2325,7 @@ mod tests {
             const sh = new Shell();
             const wait = new Wait(sh);
             const kill = new Kill(sh);
-            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.tools.push(new Run(sh, { wait, kill, approve: false }), wait, kill);
             chat.push({ role: "user", content: "run something slow" });
             const r = await chat.stream();
             const reader = r.events.getReader();
@@ -2442,7 +2449,7 @@ mod tests {
             const sh = new Shell();
             const wait = new Wait(sh);
             const kill = new Kill(sh);
-            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.tools.push(new Run(sh, { wait, kill, approve: false }), wait, kill);
             chat.push({ role: "user", content: "run something slow" });
             const r = await chat.stream();
             const reader = r.events.getReader();

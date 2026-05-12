@@ -8,8 +8,8 @@ use std::io::Write;
 use std::time::Duration;
 
 use frances_workflow::{
-    FrameKind, HostFrame, Invocation, Runtime, WorkflowError, WorkflowHandle,
-    test_deps::StubDepsRealShell,
+    ApprovalChoice, ApprovalRequest, FrameKind, HostFrame, Invocation, Runtime, WorkflowError,
+    WorkflowHandle, test_deps::StubDepsRealShell,
 };
 
 fn write_source(body: &str) -> tempfile::NamedTempFile {
@@ -85,7 +85,7 @@ async fn shell_set_set_form_is_not_exported() {
         const kill = new Kill(sh);
         const vars = new Variables();
         const setTool = new ShellSet(sh, vars);
-        const run = new Run(sh, { wait, kill });
+        const run = new Run(sh, { wait, kill, approve: false });
 
         vars.set("v", "abc");
         await setTool.handler({
@@ -142,7 +142,7 @@ async fn shell_set_export_form_visible_to_subprocesses() {
         const kill = new Kill(sh);
         const vars = new Variables();
         const setTool = new ShellSet(sh, vars);
-        const run = new Run(sh, { wait, kill });
+        const run = new Run(sh, { wait, kill, approve: false });
 
         // Multi-line string value to confirm the tmp-file trick preserves
         // newlines.
@@ -190,7 +190,7 @@ async fn shell_set_object_value_is_json_encoded() {
         const kill = new Kill(sh);
         const vars = new Variables();
         const setTool = new ShellSet(sh, vars);
-        const run = new Run(sh, { wait, kill });
+        const run = new Run(sh, { wait, kill, approve: false });
 
         vars.set("obj", { a: 1, b: [2, 3] });
         await setTool.handler({
@@ -298,7 +298,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
         const wait = new Wait(sh);
         const kill = new Kill(sh);
         const vars = new Variables();
-        const run = new Run(sh, { wait, kill });
+        const run = new Run(sh, { wait, kill, approve: false });
         const capture = new ShellCapture(sh, vars);
         const assign = new VarAssign(vars);
 
@@ -379,4 +379,236 @@ async fn shell_capture_unset_var_errors() {
         r.contains("unset") || r.contains("expansion failed"),
         "expected unset-or-expansion-failed marker; got: {r}",
     );
+}
+
+/// Drain frames until an approval request lands, return its request and
+/// any frames seen along the way. Panics on timeout.
+async fn await_approval(handle: &mut WorkflowHandle) -> (ApprovalRequest, Vec<HostFrame>) {
+    let mut buffered = Vec::new();
+    let approval = tokio::time::timeout(CYCLE_TIMEOUT, async {
+        loop {
+            match handle.frames.recv().await {
+                Some(HostFrame::Approval(req)) => return req,
+                Some(other) => buffered.push(other),
+                None => panic!("frames channel closed before approval landed"),
+            }
+        }
+    })
+    .await
+    .expect("approval did not arrive within timeout");
+    (approval, buffered)
+}
+
+#[tokio::test]
+async fn shell_run_approve_yes_executes_command() {
+    let deps = StubDepsRealShell::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        r#"
+        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const sh = new Shell();
+        const wait = new Wait(sh);
+        const kill = new Kill(sh);
+        const run = new Run(sh, { wait, kill });
+
+        const out = await run.handler({
+            call: { id: "r1", name: "shell_run",
+                    arguments: { cmd: "echo approved-and-ran" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: out.content }));
+        await sh.close();
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+        })
+        .unwrap();
+
+    let (req, _seen) = await_approval(&mut handle).await;
+    assert!(
+        req.prompt.contains("echo approved-and-ran"),
+        "prompt should contain the command: {}",
+        req.prompt,
+    );
+    assert!(
+        req.prompt.contains("```bash"),
+        "prompt should be rendered as a bash code block: {}",
+        req.prompt,
+    );
+
+    assert!(
+        deps.answer_approval(req.id, ApprovalChoice::Yes { details: None }),
+        "answer should land on the pending slot",
+    );
+
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let out = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
+            _ => None,
+        })
+        .expect("expected a transcript push after approval");
+    assert!(out.starts_with("Exit 0"), "got `{out}`");
+    assert!(out.contains("approved-and-ran"), "got `{out}`");
+}
+
+#[tokio::test]
+async fn shell_run_approve_no_skips_command_and_returns_error() {
+    let deps = StubDepsRealShell::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        r#"
+        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const sh = new Shell();
+        const wait = new Wait(sh);
+        const kill = new Kill(sh);
+        const run = new Run(sh, { wait, kill });
+
+        const out = await run.handler({
+            call: { id: "r1", name: "shell_run",
+                    arguments: { cmd: "rm -rf /" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(out) }));
+        await sh.close();
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+        })
+        .unwrap();
+
+    let (req, _seen) = await_approval(&mut handle).await;
+    assert!(req.prompt.contains("rm -rf /"));
+
+    assert!(deps.answer_approval(
+        req.id,
+        ApprovalChoice::No {
+            details: Some("too scary".into()),
+        },
+    ));
+
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let out = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
+            _ => None,
+        })
+        .expect("expected a tool result transcript push");
+    assert!(out.contains(r#""is_error":true"#), "got `{out}`");
+    assert!(out.contains("denied"), "got `{out}`");
+    assert!(out.contains("too scary"), "got `{out}`");
+}
+
+#[tokio::test]
+async fn shell_run_approve_chat_skips_command_and_forwards_text() {
+    let deps = StubDepsRealShell::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        r#"
+        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const sh = new Shell();
+        const wait = new Wait(sh);
+        const kill = new Kill(sh);
+        const run = new Run(sh, { wait, kill });
+
+        const out = await run.handler({
+            call: { id: "r1", name: "shell_run",
+                    arguments: { cmd: "ls /tmp" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(out) }));
+        await sh.close();
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+        })
+        .unwrap();
+
+    let (req, _seen) = await_approval(&mut handle).await;
+
+    assert!(deps.answer_approval(
+        req.id,
+        ApprovalChoice::Chat {
+            content: "use a different directory please".into(),
+        },
+    ));
+
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let out = frames
+        .iter()
+        .find_map(|f| match f {
+            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
+            _ => None,
+        })
+        .expect("expected a tool result transcript push");
+    assert!(out.contains(r#""is_error":true"#), "got `{out}`");
+    assert!(
+        out.contains("use a different directory please"),
+        "got `{out}`",
+    );
+}
+
+#[tokio::test]
+async fn shell_run_approve_false_skips_gate() {
+    let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
+    let file = write_source(
+        r#"
+        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const sh = new Shell();
+        const wait = new Wait(sh);
+        const kill = new Kill(sh);
+        const run = new Run(sh, { wait, kill, approve: false });
+
+        const out = await run.handler({
+            call: { id: "r1", name: "shell_run",
+                    arguments: { cmd: "echo no-gate" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: out.content }));
+        await sh.close();
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+        })
+        .unwrap();
+
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    for f in &frames {
+        assert!(
+            !matches!(f, HostFrame::Approval(_)),
+            "approve:false should not emit an approval frame: {f:?}",
+        );
+    }
+    let out = text_of(&frames[0]);
+    assert!(out.starts_with("Exit 0"), "got `{out}`");
+    assert!(out.contains("no-gate"), "got `{out}`");
 }
