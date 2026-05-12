@@ -3,11 +3,9 @@ use thiserror::Error;
 use crate::llm::session_provider::SessionConfigWriteError;
 use crate::server::ServerError;
 use crate::session::SessionError;
-use crate::shell_classifier::ShellClassifierError;
 use crate::store::DatabaseError;
 use crate::tools::ToolRegistryError;
 use crate::tools::file::FileToolError;
-use crate::tools::shell::ShellToolError;
 use crate::workflows::WorkflowError;
 use frances_llm::ProviderCacheError;
 use frances_models_llm::chat::{ChatError, HistoryError};
@@ -50,13 +48,7 @@ pub enum Error {
     Session(#[from] SessionError),
 
     #[error(transparent)]
-    ShellClassifier(#[from] ShellClassifierError),
-
-    #[error(transparent)]
     FileTool(#[from] FileToolError),
-
-    #[error(transparent)]
-    ShellTool(#[from] ShellToolError),
 
     #[error(transparent)]
     ToolRegistry(#[from] ToolRegistryError),

@@ -1226,6 +1226,7 @@ dependencies = [
  "async-trait",
  "deno_ast",
  "frances-models-llm",
+ "frances-shell",
  "parking_lot",
  "rquickjs",
  "serde",

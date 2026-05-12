@@ -299,27 +299,98 @@ pub(crate) mod test_deps {
         HistoryError, OwnedHistoryInput,
     };
     use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
+    use frances_shell::{Shell, ShellError, ShellOptions};
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::sync::Arc;
 
-    use crate::deps::WorkflowDeps;
+    use crate::deps::{ShellFactory, WorkflowDeps};
 
     #[derive(Clone, Default)]
     pub(crate) struct StubDeps {
         manager: StubManager,
+        shell_factory: StubShellFactory,
     }
 
     impl WorkflowDeps for StubDeps {
         type ChatSessionManager = StubManager;
+        type ShellFactory = StubShellFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
         }
 
+        fn shell_factory(&self) -> &Self::ShellFactory {
+            &self.shell_factory
+        }
+
         fn current_env(&self) -> HashMap<OsString, OsString> {
             HashMap::new()
+        }
+    }
+
+    /// Real-bash shell factory for shell-specific tests. Spawns an
+    /// actual bash subprocess. Tests that don't need bash use
+    /// `StubShellFactory` (the default).
+    #[derive(Clone, Default)]
+    pub(crate) struct RealShellFactory;
+
+    impl ShellFactory for RealShellFactory {
+        async fn spawn(&self, opts: ShellOptions) -> Result<Shell, ShellError> {
+            Shell::spawn(opts).await
+        }
+    }
+
+    /// Stub shell factory — errors on spawn unless overridden. Most
+    /// tests don't need real bash; the few that do can construct their
+    /// own factory and inject it.
+    #[derive(Clone, Default)]
+    pub(crate) struct StubShellFactory;
+
+    impl ShellFactory for StubShellFactory {
+        async fn spawn(&self, _opts: ShellOptions) -> Result<Shell, ShellError> {
+            Err(ShellError::Handshake(
+                "stub shell factory: no real bash available in this test".to_owned(),
+            ))
+        }
+    }
+
+    /// Variant of `StubDeps` that uses `RealShellFactory` for tests that
+    /// need to drive a real bash subprocess.
+    #[derive(Clone, Default)]
+    pub(crate) struct StubDepsRealShell {
+        manager: StubManager,
+        shell_factory: RealShellFactory,
+    }
+
+    impl WorkflowDeps for StubDepsRealShell {
+        type ChatSessionManager = StubManager;
+        type ShellFactory = RealShellFactory;
+
+        fn chat_session_manager(&self) -> &Self::ChatSessionManager {
+            &self.manager
+        }
+
+        fn shell_factory(&self) -> &Self::ShellFactory {
+            &self.shell_factory
+        }
+
+        fn current_env(&self) -> HashMap<OsString, OsString> {
+            HashMap::new()
+        }
+    }
+
+    impl StubDepsRealShell {
+        pub(crate) fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
+            self.manager
+                .next_script
+                .lock()
+                .push_back(Script { events, outcome });
+        }
+
+        pub(crate) fn sessions(&self) -> Vec<StubSession> {
+            self.manager.sessions.lock().clone()
         }
     }
 
@@ -1230,13 +1301,18 @@ mod tests {
             import { ChatSession } from "frances:v1/chat";
             import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
             const s = new ChatSession({ model_intents: ["x"] });
+            let handlerCalls = 0;
             s.tools.push({
                 name: "echo",
                 description: "echoes the input",
                 parameters: { type: "object", properties: { text: { type: "string" } } },
-                handler: async (args, ctx) => ({
-                    role: "tool", call_id: ctx.call_id, content: args.text, is_error: false,
-                }),
+                handler: async ({ call }) => {
+                    handlerCalls += 1;
+                    return {
+                        role: "tool", call_id: call.id,
+                        content: call.arguments.text, is_error: false,
+                    };
+                },
             });
             s.push({ role: "user", content: "hi" });
 
@@ -1250,7 +1326,7 @@ mod tests {
                 if (value.type === "tool_call") toolCallSeen = `${value.name}:${value.arguments.text}`;
             }
             const final = await r.completed;
-            const summary = `events=${toolCallSeen} text="${final.text}" calls=${final.tool_calls.length} first=${final.tool_calls[0].name}(${final.tool_calls[0].arguments.text})`;
+            const summary = `events=${toolCallSeen} text="${final.text}" calls=${final.tool_calls.length} first=${final.tool_calls[0].name}(${final.tool_calls[0].arguments.text}) handlerCalls=${handlerCalls}`;
             transcript.push(new MarkdownFrame({ content: summary }));
             "#,
         );
@@ -1264,7 +1340,7 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         assert_eq!(
             text_of(frames.last().expect("at least one frame")),
-            r#"events=echo:hi text="Calling tool..." calls=1 first=echo(hi)"#
+            r#"events=echo:hi text="Calling tool..." calls=1 first=echo(hi) handlerCalls=1"#
         );
     }
 
@@ -1349,7 +1425,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explicit_tool_loop_drives_to_terminal_turn() {
+    async fn stream_dispatches_tool_calls_internally() {
+        // chat.stream() owns dispatch: when the LLM emits tool calls,
+        // their handlers run inside the stream call and their results
+        // get pushed back into the session before the next round.
         use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
@@ -1391,11 +1470,11 @@ mod tests {
                 name: "echo",
                 description: "echoes the input",
                 parameters: { type: "object" },
-                handler: async (args, ctx) => {
+                handler: async ({ call }) => {
                     handlerCalls += 1;
                     return {
-                        role: "tool", call_id: ctx.call_id,
-                        content: `echoed:${args.text}`, is_error: false,
+                        role: "tool", call_id: call.id,
+                        content: `echoed:${call.arguments.text}`, is_error: false,
                     };
                 },
             });
@@ -1410,10 +1489,6 @@ mod tests {
                 const { text, tool_calls } = await r.completed;
                 finalText = text;
                 if (tool_calls.length === 0) break;
-                for (const call of tool_calls) {
-                    const tool = s.tools.find((t) => t.name === call.name);
-                    s.push(await tool.handler(call.arguments, { call_id: call.id }));
-                }
             }
             transcript.push(new MarkdownFrame({
                 content: `text="${finalText}" handlerCalls=${handlerCalls}`,
@@ -1448,6 +1523,1366 @@ mod tests {
         assert_eq!(
             tool_result,
             Some(("c1".to_owned(), "echoed:from round 1".to_owned(), false))
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_call_hook_intercepts_dispatch() {
+        // chat.toolCall is middleware around every dispatch: it can
+        // pre-process, swap in a different result, or `await invoke()`
+        // to fall through to the default behaviour.
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "echo".to_owned(),
+                arguments: json!({ "text": "hi" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: json!({ "text": "hi" }),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            let preCount = 0, postCount = 0;
+            s.tools.push({
+                name: "echo",
+                description: "echoes",
+                parameters: { type: "object" },
+                handler: async ({ call }) => ({
+                    role: "tool", call_id: call.id,
+                    content: `inner:${call.arguments.text}`, is_error: false,
+                }),
+            });
+            s.toolCall = async ({ call, invoke }) => {
+                preCount += 1;
+                const result = await invoke();
+                postCount += 1;
+                return { ...result, content: `wrapped(${result.content})` };
+            };
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({
+                content: `pre=${preCount} post=${postCount}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(frames.last().expect("frame")), "pre=1 post=1");
+
+        // The hook wrapped the inner result before it was pushed.
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool_content = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(tool_content, Some("wrapped(inner:hi)".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn tool_call_hook_throw_becomes_error_result() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "echo".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "echo".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "echo", description: "", parameters: {},
+                handler: async ({ call }) => ({
+                    role: "tool", call_id: call.id, content: "ok", is_error: false,
+                }),
+            });
+            s.toolCall = async () => { throw new Error("gated"); };
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+        assert_eq!(tool, Some(("gated".to_owned(), true)));
+    }
+
+    #[tokio::test]
+    async fn missing_tool_pushes_synthetic_error_result() {
+        // LLM hallucinates a tool name not in chat.tools — dispatch
+        // synthesises an is_error: true result instead of crashing.
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "nonexistent".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "nonexistent".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                content, is_error, ..
+            } => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+        assert_eq!(tool, Some(("tool not found: nonexistent".to_owned(), true)));
+    }
+
+    #[tokio::test]
+    async fn scope_tool_call_hook_isolated_to_nested_stream() {
+        // A handler that sets `scope.toolCall` and calls `scope.stream()`
+        // gets its hook used for the nested round. The outer chat's
+        // `toolCall` is unaffected.
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        // Outer round: LLM calls `outer`.
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "outer1".to_owned(),
+                name: "outer".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "outer1".to_owned(),
+                    name: "outer".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+        // Inner round (driven by outer's handler via scope.stream()):
+        // LLM calls `inner`.
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "inner1".to_owned(),
+                name: "inner".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "inner1".to_owned(),
+                    name: "inner".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            let scopeHookCalls = 0;
+            s.tools.push({
+                name: "outer", description: "", parameters: {},
+                handler: async ({ call, scope }) => {
+                    scope.toolCall = async ({ call: c, invoke }) => {
+                        scopeHookCalls += 1;
+                        return await invoke();
+                    };
+                    const r = await scope.stream();
+                    await r.completed;
+                    return { role: "tool", call_id: call.id,
+                             content: `outer-done; scopeHookCalls=${scopeHookCalls}`,
+                             is_error: false };
+                },
+            });
+            s.tools.push({
+                name: "inner", description: "", parameters: {},
+                handler: async ({ call }) => ({
+                    role: "tool", call_id: call.id,
+                    content: "inner-ran", is_error: false,
+                }),
+            });
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        // Two tool results: outer (after inner ran) and inner.
+        let results: Vec<_> = pending
+            .iter()
+            .filter_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    ..
+                } => Some((call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            results.iter().any(|(_, c)| c == "inner-ran"),
+            "expected inner tool result, got {results:?}"
+        );
+        assert!(
+            results
+                .iter()
+                .any(|(_, c)| c == "outer-done; scopeHookCalls=1"),
+            "expected outer tool result with scopeHookCalls=1, got {results:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_once_returns_done_for_short_command() {
+        use super::test_deps::StubDepsRealShell;
+        let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Shell } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const sh = new Shell();
+            const outcome = await sh.runOnce("echo hello-shell");
+            const summary = `kind=${outcome.kind} exit=${outcome.exit_code} hasOutput=${outcome.output.includes("hello-shell")}`;
+            await sh.close();
+            transcript.push(new MarkdownFrame({ content: summary }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "kind=done exit=0 hasOutput=true");
+    }
+
+    #[tokio::test]
+    async fn shell_busy_errors_on_double_run() {
+        use super::test_deps::StubDepsRealShell;
+        let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Shell } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const sh = new Shell();
+            // First run goes Quiet (sleeps past the default 1s quiet
+            // threshold).
+            const first = await sh.runOnce("sleep 3");
+            let caught = "";
+            try {
+                await sh.runOnce("echo nope");
+                caught = "no-throw";
+            } catch (e) {
+                caught = String(e);
+            }
+            // Kill the in-flight sleep so the shell can be torn down
+            // cleanly.
+            await sh.kill();
+            try { await sh.keepWaiting(); } catch (_) {}
+            await sh.close();
+            transcript.push(new MarkdownFrame({
+                content: `firstKind=${first.kind} caught=${caught.includes("busy") ? "busy" : caught}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "firstKind=quiet caught=busy");
+    }
+
+    #[tokio::test]
+    async fn shell_keep_waiting_resumes_quiet_command() {
+        use super::test_deps::StubDepsRealShell;
+        let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { Shell } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const sh = new Shell();
+            // Background a sleep + then echo. The first runOnce will go
+            // Quiet (because sleep is silent for >1s), and keepWaiting
+            // will catch the final exit + echo output.
+            let first = await sh.runOnce("sleep 2 && echo finished");
+            let final_ = first;
+            let waits = 0;
+            while (final_.kind === "quiet" && waits < 10) {
+                waits += 1;
+                final_ = await sh.keepWaiting();
+            }
+            await sh.close();
+            transcript.push(new MarkdownFrame({
+                content: `firstKind=${first.kind} finalKind=${final_.kind} exit=${final_.exit_code} hasFinished=${final_.output.includes("finished")}`,
+            }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive_one_cycle(&mut handle),
+        )
+        .await
+        .expect("test should finish within 10s");
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(
+            text_of(&frames[0]),
+            "firstKind=quiet finalKind=done exit=0 hasFinished=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_tool_handler_formats_done_outcome() {
+        // Wire the Run tool through chat.tools and dispatch a fake
+        // shell_run tool call via the stubbed provider.
+        use super::test_deps::StubDepsRealShell;
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDepsRealShell::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "shell_run".to_owned(),
+                arguments: json!({ "cmd": "echo from-run-tool" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "shell_run".to_owned(),
+                    arguments: json!({ "cmd": "echo from-run-tool" }),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const chat = new ChatSession({ model_intents: ["x"] });
+            const sh = new Shell();
+            chat.tools.push(new Run(sh), new Wait(sh), new Kill(sh));
+            chat.push({ role: "user", content: "do it" });
+            const r = await chat.stream();
+            const reader = r.events.getReader();
+            while (true) { const { done } = await reader.read(); if (done) break; }
+            reader.releaseLock();
+            await r.completed;
+            await sh.close();
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            drive_one_cycle(&mut handle),
+        )
+        .await
+        .expect("test should finish within 10s");
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let tool_result = sessions[0].pending().iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } if call_id == "c1" => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+        let (content, is_error) = tool_result.expect("tool result present");
+        assert!(content.starts_with("Exit 0"), "got `{content}`");
+        assert!(content.contains("from-run-tool"), "got `{content}`");
+        assert!(!is_error);
+    }
+
+    #[tokio::test]
+    async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
+        // Long-running command goes Quiet → Run.handler registers a
+        // scope.lock turn. The turn streams; scripted LLM emits
+        // shell_wait → Wait.handler runs shell.keepWaiting until Done.
+        //
+        // We script several shell_wait rounds because keepWaiting's
+        // default 1s quiet window can time out before the sentinel
+        // arrives, especially under load — Run's turn will loop until
+        // one of them catches Done.
+        use super::test_deps::StubDepsRealShell;
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDepsRealShell::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "shell_run".to_owned(),
+                arguments: json!({ "cmd": "sleep 3 && echo finished" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "shell_run".to_owned(),
+                    arguments: json!({ "cmd": "sleep 3 && echo finished" }),
+                }],
+            },
+        );
+        for i in 0..5 {
+            let id = format!("w-{i}");
+            deps.script_next_run(
+                vec![StreamEvent::ToolCall(ToolCall {
+                    id: id.clone(),
+                    name: "shell_wait".to_owned(),
+                    arguments: json!({}),
+                })],
+                CompletionOutcome {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id,
+                        name: "shell_wait".to_owned(),
+                        arguments: json!({}),
+                    }],
+                },
+            );
+        }
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const chat = new ChatSession({ model_intents: ["x"] });
+            const sh = new Shell();
+            const wait = new Wait(sh);
+            const kill = new Kill(sh);
+            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.push({ role: "user", content: "run something slow" });
+            const r = await chat.stream();
+            const reader = r.events.getReader();
+            while (true) { const { done } = await reader.read(); if (done) break; }
+            reader.releaseLock();
+            await r.completed;
+            await sh.close();
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            drive_one_cycle(&mut handle),
+        )
+        .await
+        .expect("test should finish within 15s");
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let initial = pending
+            .iter()
+            .find_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    ..
+                } if call_id == "c1" => Some(content.clone()),
+                _ => None,
+            })
+            .expect("initial shell_run result present");
+        assert!(
+            initial.contains("Still running"),
+            "initial result should be quiet: `{initial}`"
+        );
+
+        // At least one shell_wait round should land Done with the
+        // command's final output.
+        let waited_done = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id, content, ..
+            } if call_id.starts_with("w-") && content.starts_with("Exit 0") => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        let waited_done = waited_done.expect("at least one shell_wait should land Done");
+        assert!(
+            waited_done.contains("finished"),
+            "Done result should contain final output: `{waited_done}`"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
+        // Quiet shell + a model that emits no tool calls for multiple
+        // rounds: Run should scold up to `maxScolds` times, then SIGKILL
+        // the in-flight command and push a "killed" notice.
+        use super::test_deps::StubDepsRealShell;
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDepsRealShell::default();
+        // Round 1: shell_run on a long-running command.
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "shell_run".to_owned(),
+                arguments: json!({ "cmd": "sleep 30 && echo done" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "shell_run".to_owned(),
+                    arguments: json!({ "cmd": "sleep 30 && echo done" }),
+                }],
+            },
+        );
+        // Rounds 2-4 (in turn): model emits text but no tool calls.
+        // maxScolds=2 → round 2 scolds, round 3 scolds, round 4 kills.
+        for _ in 0..3 {
+            deps.script_next_run(
+                vec![StreamEvent::TextDelta("I don't want to.".to_owned())],
+                CompletionOutcome {
+                    text: "I don't want to.".to_owned(),
+                    tool_calls: vec![],
+                },
+            );
+        }
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const chat = new ChatSession({ model_intents: ["x"] });
+            const sh = new Shell();
+            const wait = new Wait(sh);
+            const kill = new Kill(sh);
+            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.push({ role: "user", content: "run something slow" });
+            const r = await chat.stream();
+            const reader = r.events.getReader();
+            while (true) { const { done } = await reader.read(); if (done) break; }
+            reader.releaseLock();
+            await r.completed;
+            await sh.close();
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            drive_one_cycle(&mut handle),
+        )
+        .await
+        .expect("test should finish within 15s");
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let scolds: Vec<_> = pending
+            .iter()
+            .filter_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::User { text }
+                    if text.contains("still running") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scolds.len(), 2, "expected exactly 2 scolds, got {scolds:?}");
+
+        let killed = pending.iter().any(|p| {
+            matches!(
+                p,
+                frances_models_llm::chat::OwnedHistoryInput::User { text }
+                    if text.contains("Killed the shell command")
+            )
+        });
+        assert!(killed, "expected 'Killed' message in pending: {pending:?}");
+
+        // Scold and kill notices should also surface to the UI as
+        // transcript frames so the user sees what's happening.
+        let scold_frames = frames
+            .iter()
+            .filter(|f| text_of(f).contains("still running"))
+            .count();
+        assert_eq!(
+            scold_frames, 2,
+            "expected 2 scold frames, got {scold_frames}: {frames:?}"
+        );
+        let kill_frame_present = frames
+            .iter()
+            .any(|f| text_of(f).contains("Killed the shell command"));
+        assert!(
+            kill_frame_present,
+            "expected a kill notice frame: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
+        // Same as the silent case but the model emits off-script tool
+        // calls each round. The gating hook turns them into error
+        // tool_results; the no-progress counter still ticks and the
+        // shell is eventually killed.
+        use super::test_deps::StubDepsRealShell;
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDepsRealShell::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "shell_run".to_owned(),
+                arguments: json!({ "cmd": "sleep 30 && echo done" }),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "shell_run".to_owned(),
+                    arguments: json!({ "cmd": "sleep 30 && echo done" }),
+                }],
+            },
+        );
+        for i in 0..3 {
+            let id = format!("offscript-{i}");
+            deps.script_next_run(
+                vec![StreamEvent::ToolCall(ToolCall {
+                    id: id.clone(),
+                    name: "read_file".to_owned(),
+                    arguments: json!({}),
+                })],
+                CompletionOutcome {
+                    text: String::new(),
+                    tool_calls: vec![ToolCall {
+                        id,
+                        name: "read_file".to_owned(),
+                        arguments: json!({}),
+                    }],
+                },
+            );
+        }
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const chat = new ChatSession({ model_intents: ["x"] });
+            const sh = new Shell();
+            const wait = new Wait(sh);
+            const kill = new Kill(sh);
+            chat.tools.push(new Run(sh, { wait, kill }), wait, kill);
+            chat.push({ role: "user", content: "run something slow" });
+            const r = await chat.stream();
+            const reader = r.events.getReader();
+            while (true) { const { done } = await reader.read(); if (done) break; }
+            reader.releaseLock();
+            await r.completed;
+            await sh.close();
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            drive_one_cycle(&mut handle),
+        )
+        .await
+        .expect("test should finish within 15s");
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+
+        let gated: Vec<_> = pending
+            .iter()
+            .filter_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } if call_id.starts_with("offscript-") => Some((content.clone(), *is_error)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(gated.len(), 3, "expected 3 gated results, got {gated:?}");
+        for (content, is_error) in &gated {
+            assert!(
+                content.contains("'read_file' is disabled"),
+                "got `{content}`"
+            );
+            assert!(*is_error);
+        }
+
+        let scolds: Vec<_> = pending
+            .iter()
+            .filter_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::User { text }
+                    if text.contains("still running") =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(scolds.len(), 2, "expected 2 scolds, got {scolds:?}");
+
+        let killed = pending.iter().any(|p| {
+            matches!(
+                p,
+                frances_models_llm::chat::OwnedHistoryInput::User { text }
+                    if text.contains("Killed the shell command")
+            )
+        });
+        assert!(killed, "expected 'Killed' message in pending: {pending:?}");
+
+        // Scold and kill notices should also be in the transcript.
+        let scold_frames = frames
+            .iter()
+            .filter(|f| text_of(f).contains("still running"))
+            .count();
+        assert_eq!(
+            scold_frames, 2,
+            "expected 2 scold frames, got {scold_frames}: {frames:?}"
+        );
+        let kill_frame_present = frames
+            .iter()
+            .any(|f| text_of(f).contains("Killed the shell command"));
+        assert!(
+            kill_frame_present,
+            "expected a kill notice frame: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_lock_runs_after_batch_push() {
+        // The post-batch turn registered via scope.lock fires AFTER all
+        // initial tool_results have been pushed to chat history.
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "checker".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "checker".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            let turnRan = false;
+            s.tools.push({
+                name: "checker", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => { turnRan = true; });
+                    return { role: "tool", call_id: call.id, content: "initial", is_error: false };
+                },
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: `turnRan=${turnRan}` }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(frames.last().unwrap()), "turnRan=true");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        assert!(pending.iter().any(|p| matches!(
+            p,
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id, content, ..
+            } if call_id == "c1" && content == "initial"
+        )));
+    }
+
+    #[tokio::test]
+    async fn scope_lock_turns_run_in_finish_order() {
+        // Two tools register turns. "fast" finishes before "slow"; turns
+        // run in finish order, not tool_calls order.
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "first".to_owned(),
+                    name: "slow".to_owned(),
+                    arguments: json!({}),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "second".to_owned(),
+                    name: "fast".to_owned(),
+                    arguments: json!({}),
+                }),
+            ],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "first".to_owned(),
+                        name: "slow".to_owned(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "second".to_owned(),
+                        name: "fast".to_owned(),
+                        arguments: json!({}),
+                    },
+                ],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            const turnOrder = [];
+            s.tools.push({
+                name: "slow", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => { turnOrder.push("slow"); });
+                    for (let i = 0; i < 10; i++) await Promise.resolve();
+                    return { role: "tool", call_id: call.id, content: "slow-done", is_error: false };
+                },
+            });
+            s.tools.push({
+                name: "fast", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => { turnOrder.push("fast"); });
+                    return { role: "tool", call_id: call.id, content: "fast-done", is_error: false };
+                },
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: `turns=${turnOrder.join(",")}` }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(frames.last().unwrap()), "turns=fast,slow");
+    }
+
+    #[tokio::test]
+    async fn scope_lock_turn_can_drive_followup_stream() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "starter".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "starter".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c2".to_owned(),
+                name: "followup".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c2".to_owned(),
+                    name: "followup".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "starter", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => {
+                        const r = await scope.stream();
+                        const reader = r.events.getReader();
+                        while (true) { const { done } = await reader.read(); if (done) break; }
+                        reader.releaseLock();
+                        await r.completed;
+                    });
+                    return { role: "tool", call_id: call.id, content: "starter-done", is_error: false };
+                },
+            });
+            s.tools.push({
+                name: "followup", description: "", parameters: { type: "object" },
+                handler: async ({ call }) => ({
+                    role: "tool", call_id: call.id, content: "followup-done", is_error: false,
+                }),
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool_results: Vec<(String, String)> = pending
+            .iter()
+            .filter_map(|p| match p {
+                frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    ..
+                } => Some((call_id.clone(), content.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_results,
+            vec![
+                ("c1".to_owned(), "starter-done".to_owned()),
+                ("c2".to_owned(), "followup-done".to_owned()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn scope_lock_gating_hook_scolds_off_script_calls() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "outer".to_owned(),
+                name: "gated".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "outer".to_owned(),
+                    name: "gated".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "offscript".to_owned(),
+                name: "forbidden".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "offscript".to_owned(),
+                    name: "forbidden".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "gated", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => {
+                        scope.toolCall = async ({ call: c, invoke }) => {
+                            throw new Error(`'${c.name}' is disabled`);
+                        };
+                        const r = await scope.stream();
+                        const reader = r.events.getReader();
+                        while (true) { const { done } = await reader.read(); if (done) break; }
+                        reader.releaseLock();
+                        await r.completed;
+                    });
+                    return { role: "tool", call_id: call.id, content: "ok", is_error: false };
+                },
+            });
+            s.tools.push({
+                name: "forbidden", description: "", parameters: { type: "object" },
+                handler: async ({ call }) => ({
+                    role: "tool", call_id: call.id, content: "should-not-run", is_error: false,
+                }),
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let scolded = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } if call_id == "offscript" => Some((content.clone(), *is_error)),
+            _ => None,
+        });
+        let (content, is_error) = scolded.expect("scolded result present");
+        assert!(
+            content.contains("'forbidden' is disabled"),
+            "got `{content}`"
+        );
+        assert!(is_error);
+    }
+
+    #[tokio::test]
+    async fn scope_lock_double_register_throws() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "double".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "double".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "double", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => {});
+                    let caught = "no-throw";
+                    try {
+                        scope.lock(async () => {});
+                    } catch (e) {
+                        caught = String(e);
+                    }
+                    return {
+                        role: "tool", call_id: call.id,
+                        content: caught.includes("already registered") ? "got-throw" : caught,
+                        is_error: false,
+                    };
+                },
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "done" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let tool = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult { content, .. } => {
+                Some(content.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(tool, Some("got-throw".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn scope_lock_turn_fn_throw_does_not_crash_round() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use serde_json::json;
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::ToolCall(ToolCall {
+                id: "c1".to_owned(),
+                name: "thrower".to_owned(),
+                arguments: json!({}),
+            })],
+            CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: "c1".to_owned(),
+                    name: "thrower".to_owned(),
+                    arguments: json!({}),
+                }],
+            },
+        );
+
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.tools.push({
+                name: "thrower", description: "", parameters: { type: "object" },
+                handler: async ({ call, scope }) => {
+                    scope.lock(async () => { throw new Error("boom"); });
+                    return { role: "tool", call_id: call.id, content: "initial", is_error: false };
+                },
+            });
+            s.push({ role: "user", content: "go" });
+            const r = await s.stream();
+            await r.completed;
+            transcript.push(new MarkdownFrame({ content: "survived" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(frames.last().unwrap()), "survived");
+
+        let sessions = deps.sessions();
+        let pending = sessions[0].pending();
+        let synthetic = pending.iter().find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::User { text }
+                if text.contains("threw") =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        });
+        assert!(
+            synthetic.is_some(),
+            "expected synthetic user message in pending: {pending:?}"
         );
     }
 

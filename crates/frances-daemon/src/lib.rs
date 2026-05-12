@@ -8,7 +8,6 @@ pub mod migrations;
 pub mod protocol;
 pub mod server;
 pub mod session;
-pub mod shell_classifier;
 pub mod store;
 pub mod tools;
 pub mod transport;

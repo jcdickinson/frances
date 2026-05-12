@@ -16,7 +16,6 @@
 //! `docs/arch/anchors.md`.
 
 pub mod file;
-pub mod shell;
 
 use std::collections::HashMap;
 use std::fs;
@@ -27,7 +26,6 @@ use std::time::{SystemTime, SystemTimeError};
 
 use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
-use frances_shell::Shell;
 use thiserror::Error;
 use tokio::sync::Mutex;
 
@@ -38,7 +36,6 @@ use crate::llm::{ToolCall, ToolDef};
 
 pub use file::FileTools;
 pub use file::SCHEMA as FILE_SCHEMA;
-pub use shell::ShellTools;
 
 #[derive(Debug, Error)]
 pub enum ToolRegistryError {
@@ -54,7 +51,6 @@ pub enum ToolRegistryError {
 
 pub struct ToolContext<'a> {
     pub edit_session: &'a Mutex<EditSession<AnchorStoreImpl>>,
-    pub shell: &'a Mutex<Option<Shell>>,
     pub cwd: Option<&'a Path>,
 }
 
@@ -133,10 +129,9 @@ impl ToolRegistry {
         }
     }
 
-    /// The built-in registry: file tools (read + edit family) and the
-    /// shell trio.
+    /// The built-in registry: file tools (read + edit family).
     pub fn builtin() -> Self {
-        Self::new(vec![Box::new(FileTools), Box::new(ShellTools)])
+        Self::new(vec![Box::new(FileTools)])
     }
 
     /// Combined definitions from every registered tool, in order. Cached

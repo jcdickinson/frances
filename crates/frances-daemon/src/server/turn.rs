@@ -12,7 +12,6 @@ use frances_models_llm::wire::StreamEvent;
 use crate::Result;
 use crate::protocol::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerChatDeps;
-use crate::shell_classifier::{self, ShellClassification};
 use crate::tools;
 use crate::transport::{TransportError, write_message};
 use crate::workflows;
@@ -233,25 +232,12 @@ async fn run_llm_step(
     }
 
     for call in &tool_calls {
-        if call.name == "shell_run"
-            && let Some(cmd) = call
-                .arguments
-                .get("cmd")
-                .and_then(serde_json::Value::as_str)
-        {
-            let classification =
-                shell_classifier::classify_shell(&state.chat, chat.session_id(), env, cmd).await;
-            let cls_id = alloc_block();
-            emit_classification_block(stream, send_error, cls_id, &classification).await;
-        }
-
         let outcome = state
             .tool_registry
             .dispatch(
                 call,
                 &tools::ToolContext {
                     edit_session: &state.edit_session,
-                    shell: &state.shell,
                     cwd,
                 },
             )
@@ -291,35 +277,6 @@ async fn run_llm_step(
     }
 
     Ok(true)
-}
-
-/// Surfaces a [`ShellClassification`] to the client as a single
-/// AssistantText block. Permission-asking is out of scope for now — the
-/// classifier's verdict is just informational, displayed in the same
-/// stream as model output. The block is not persisted to history: it's
-/// a runtime annotation, not part of the model conversation.
-async fn emit_classification_block(
-    stream: &mut UnixStream,
-    send_error: &mut Option<TransportError>,
-    id: BlockId,
-    classification: &ShellClassification,
-) {
-    let text = format!(
-        "[shell-classify: {}] {}",
-        classification.kind.as_str(),
-        classification.description,
-    );
-    try_write(
-        stream,
-        &StreamFrame::BlockStart {
-            id,
-            kind: BlockKind::AssistantText,
-        },
-        send_error,
-    )
-    .await;
-    try_write(stream, &StreamFrame::BlockDelta { id, text }, send_error).await;
-    try_write(stream, &StreamFrame::BlockStop { id }, send_error).await;
 }
 
 /// Best-effort frame write that records the first send error and silently

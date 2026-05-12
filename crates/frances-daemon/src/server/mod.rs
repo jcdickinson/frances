@@ -14,7 +14,6 @@ use crate::tools::ToolRegistry;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_llm::{ChatManagerDeps, ChatSession, ChatSessionManager, ProviderCache};
-use frances_shell::Shell;
 use frances_workflow::{Runtime as WorkflowRuntime, WorkflowDeps};
 
 mod bootstrap;
@@ -62,9 +61,14 @@ pub struct ServerWorkflowDeps {
 
 impl WorkflowDeps for ServerWorkflowDeps {
     type ChatSessionManager = ChatSessionManager<ServerChatDeps>;
+    type ShellFactory = DaemonShellFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
+    }
+
+    fn shell_factory(&self) -> &Self::ShellFactory {
+        &DaemonShellFactory
     }
 
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
@@ -76,6 +80,22 @@ impl WorkflowDeps for ServerWorkflowDeps {
     }
 }
 
+/// Stateless factory that spawns a fresh bash subprocess for each
+/// `new Shell()` call from a workflow script. The daemon doesn't carry
+/// per-workflow shell policy yet, so we use `ShellOptions::default()`
+/// (inherits the daemon's cwd / env).
+#[derive(Clone, Copy)]
+pub struct DaemonShellFactory;
+
+impl frances_workflow::ShellFactory for DaemonShellFactory {
+    async fn spawn(
+        &self,
+        opts: frances_shell::ShellOptions,
+    ) -> Result<frances_shell::Shell, frances_shell::ShellError> {
+        frances_shell::Shell::spawn(opts).await
+    }
+}
+
 pub(crate) struct ServerState {
     pub session: Session,
     // TODO: This smells like a refactor needed
@@ -83,7 +103,6 @@ pub(crate) struct ServerState {
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
     pub daemon_pid: u32,
     pub edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
-    pub shell: tokio::sync::Mutex<Option<Shell>>,
     pub tool_registry: ToolRegistry,
     pub events: EventsRouter,
     pub shutdown: Notify,
@@ -102,7 +121,6 @@ pub(crate) struct ServerState {
         reason = "kept for future direct access; chat manager holds its own clone"
     )]
     pub cache: ProviderCache,
-    pub chat: ChatSessionManager<ServerChatDeps>,
     /// The session driving the TUI's hardcoded turn workflow. There's
     /// only one for now; loaded (or created) once at daemon startup.
     pub primary_chat: ChatSession<ServerChatDeps>,

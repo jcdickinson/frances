@@ -22,7 +22,7 @@ mod slash;
 mod transpile;
 
 pub use config::WorkflowConfig;
-pub use deps::WorkflowDeps;
+pub use deps::{ShellFactory, WorkflowDeps};
 pub use error::WorkflowError;
 pub use runtime::{
     FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, UserInput, WorkflowHandle,
