@@ -20,12 +20,24 @@
 //!   Done (with a non-zero exit) or Dead.
 //! - `close()` — drop the bash subprocess. Future calls error.
 //! - `isRunning()` — true while a command is suspended in Quiet state.
+//! - `setVar(name, value, exported)` — bridge a Frances variable into
+//!   bash: write `value` to a temp file and run either
+//!   `<name>=$(cat 'tmp')` (shell var, current shell only) or
+//!   `export <name>=$(cat 'tmp')` (env var, visible to subprocesses).
+//!   Awaits Done; errors on non-zero exit.
+//! - `captureVar(name)` — bridge a bash variable back into Frances:
+//!   run `( set -u; printf '%s' "$<name>" > 'tmp' )`, await Done,
+//!   return the temp file's contents as a string. Errors if the bash
+//!   var is unset (the `set -u` subshell makes that visible instead of
+//!   silently capturing `""`).
 //!
 //! The wait/quiet thresholds aren't exposed yet — `runOnce` /
 //! `keepWaiting` use `frances_shell::WaitOpts::default()` (1s of output
 //! silence, no max ceiling). Workflows that need different pacing can
 //! layer a Timer + Promise.race on top.
 
+use std::fs;
+use std::io::Write;
 use std::sync::Arc;
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
@@ -153,6 +165,43 @@ impl<'js, F: ShellFactory> JsClass<'js> for ShellJs<F> {
             })?,
         )?;
 
+        proto.set(
+            "setVar",
+            Function::new(
+                ctx.clone(),
+                |this: This<Class<'js, ShellJs<F>>>,
+                 name: String,
+                 value: String,
+                 exported: bool| {
+                    let borrow = this.0.borrow();
+                    let state = borrow.state.clone();
+                    let factory = borrow.factory.clone();
+                    drop(borrow);
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        ShellUnitResult(
+                            set_var_inner(&factory, &state, name, value, exported).await,
+                        )
+                    }))
+                },
+            )?,
+        )?;
+
+        proto.set(
+            "captureVar",
+            Function::new(
+                ctx.clone(),
+                |this: This<Class<'js, ShellJs<F>>>, name: String| {
+                    let borrow = this.0.borrow();
+                    let state = borrow.state.clone();
+                    let factory = borrow.factory.clone();
+                    drop(borrow);
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        ShellStringResult(capture_var_inner(&factory, &state, name).await)
+                    }))
+                },
+            )?,
+        )?;
+
         Ok(Some(proto))
     }
 
@@ -226,6 +275,147 @@ async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), String> {
         .as_mut()
         .ok_or_else(|| "shell handle gone".to_owned())?;
     shell.kill_running().await.map_err(|e| format!("kill: {e}"))
+}
+
+/// Bridge a Frances variable into bash via the `name=$(cat tmpfile)`
+/// trick. With `exported=true` the assignment is prefixed `export` so
+/// subprocesses inherit it; otherwise it's a plain shell variable
+/// (current bash session only). The temp file goes through RAII drop
+/// after the bash run settles. Caller must have already coerced
+/// `value` into a string (raw for string values, JSON for everything
+/// else).
+async fn set_var_inner<F: ShellFactory>(
+    factory: &F,
+    state: &Arc<AsyncMutex<ShellState>>,
+    name: String,
+    value: String,
+    exported: bool,
+) -> Result<(), String> {
+    validate_bash_name(&name)?;
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    tmp.write_all(value.as_bytes())
+        .map_err(|e| format!("write tempfile: {e}"))?;
+    tmp.flush().map_err(|e| format!("flush tempfile: {e}"))?;
+    let prefix = if exported { "export " } else { "" };
+    let cmd = format!(
+        "{prefix}{name}=$(cat {})",
+        shell_quote(tmp.path().to_string_lossy().as_ref()),
+    );
+    let (exit, output) = run_to_done(factory, state, &cmd).await?;
+    if exit != 0 {
+        let action = if exported { "export" } else { "set" };
+        return Err(format!("{action} {name}: exit {exit}\n{output}"));
+    }
+    // `tmp` drops here — file is removed.
+    drop(tmp);
+    Ok(())
+}
+
+/// Bridge a bash variable into Frances by having bash `printf` the
+/// value into a temp file we own, then reading it back. Runs inside a
+/// `set -u` subshell so the expansion of `"$name"` fails fast if the
+/// bash var is unset — otherwise bash would silently treat unset as
+/// empty and we'd store `""` indistinguishably from a real empty
+/// value. The subshell scopes the option change so the persistent
+/// shell's settings aren't disturbed.
+async fn capture_var_inner<F: ShellFactory>(
+    factory: &F,
+    state: &Arc<AsyncMutex<ShellState>>,
+    name: String,
+) -> Result<String, String> {
+    validate_bash_name(&name)?;
+    let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    let cmd = format!(
+        "( set -u; printf '%s' \"${name}\" > {} )",
+        shell_quote(tmp.path().to_string_lossy().as_ref()),
+    );
+    let (exit, output) = run_to_done(factory, state, &cmd).await?;
+    if exit != 0 {
+        return Err(format!(
+            "capture {name}: unset or expansion failed (exit {exit})\n{output}"
+        ));
+    }
+    let captured =
+        fs::read_to_string(tmp.path()).map_err(|e| format!("read captured tempfile: {e}"))?;
+    drop(tmp);
+    Ok(captured)
+}
+
+/// Issue a one-shot bash command and require a `Done` outcome. Used
+/// by export/capture, both of which run short deterministic commands
+/// where Quiet would be a tool-side bug (an infinite-output trap or
+/// equivalent). Re-uses the same closed/busy/spawn checks as
+/// `run_once_inner`.
+async fn run_to_done<F: ShellFactory>(
+    factory: &F,
+    state: &Arc<AsyncMutex<ShellState>>,
+    cmd: &str,
+) -> Result<(i32, String), String> {
+    let mut guard = state.lock().await;
+    if guard.closed {
+        return Err("shell is closed".to_owned());
+    }
+    if guard.running {
+        return Err(
+            "shell is busy; call keepWaiting or kill before issuing a new command".to_owned(),
+        );
+    }
+    if guard.shell.is_none() {
+        let shell = factory
+            .spawn(ShellOptions::default())
+            .await
+            .map_err(|e| format!("spawn bash: {e}"))?;
+        guard.shell = Some(shell);
+    }
+    let outcome = {
+        let shell = guard.shell.as_mut().expect("shell is Some");
+        shell
+            .run(cmd, WaitOpts::default())
+            .await
+            .map_err(|e| format!("run: {e}"))?
+    };
+    let absorbed = absorb_outcome(&mut guard, outcome);
+    match absorbed {
+        Outcome::Done { exit_code, output } => Ok((exit_code, output)),
+        Outcome::Quiet { output, .. } => Err(format!(
+            "command went quiet (export/capture expect immediate Done):\n{output}"
+        )),
+        Outcome::Dead { output } => Err(format!("shell died:\n{output}")),
+    }
+}
+
+/// Reject anything that isn't a plain bash identifier. The name lands
+/// inside `export <name>=…` and `"$<name>"` unquoted, so this is the
+/// single trust boundary against shell injection.
+fn validate_bash_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first = chars.next().ok_or_else(|| "empty bash name".to_owned())?;
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return Err(format!("invalid bash name: {name:?}"));
+    }
+    for c in chars {
+        if !(c.is_ascii_alphanumeric() || c == '_') {
+            return Err(format!("invalid bash name: {name:?}"));
+        }
+    }
+    Ok(())
+}
+
+/// Wrap a path in single quotes for bash, doubling any embedded
+/// single-quote via `'\''`. NamedTempFile paths shouldn't contain
+/// quotes in practice, but TMPDIR is user-controlled, so don't trust.
+fn shell_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
 }
 
 fn absorb_outcome(state: &mut ShellState, outcome: RunOutcome) -> Outcome {
@@ -309,6 +499,17 @@ impl<'js> IntoJs<'js> for ShellUnitResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(()) => Ok(Value::new_undefined(ctx.clone())),
+            Err(msg) => Err(throw(ctx, &msg)),
+        }
+    }
+}
+
+struct ShellStringResult(Result<String, String>);
+
+impl<'js> IntoJs<'js> for ShellStringResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self.0 {
+            Ok(s) => s.into_js(ctx),
             Err(msg) => Err(throw(ctx, &msg)),
         }
     }

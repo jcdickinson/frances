@@ -53,6 +53,28 @@ pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     )
 }
 
+/// Builds the `{ file_read, file_replace, ... }` descriptions object
+/// for the stash. JS doesn't have verbatim string literals, so we keep
+/// the LLM-facing markdown next to the module under `desc/` and inline
+/// it via `include_str!` instead of fighting backtick escaping in
+/// template literals.
+pub(crate) fn build_descriptions<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
+    let obj = Object::new(ctx.clone())?;
+    obj.set("file_read", include_str!("desc/file_read.md"))?;
+    obj.set("file_replace", include_str!("desc/file_replace.md"))?;
+    obj.set(
+        "file_insert_after",
+        include_str!("desc/file_insert_after.md"),
+    )?;
+    obj.set(
+        "file_insert_before",
+        include_str!("desc/file_insert_before.md"),
+    )?;
+    obj.set("file_new", include_str!("desc/file_new.md"))?;
+    obj.set("file_overwrite", include_str!("desc/file_overwrite.md"))?;
+    Ok(obj)
+}
+
 pub struct EditorJs<D: WorkflowDeps> {
     deps: D,
 }
@@ -86,6 +108,19 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
         )?;
 
         proto.set(
+            "readRaw",
+            Function::new(
+                ctx.clone(),
+                |this: This<Class<'js, EditorJs<D>>>, path: String| {
+                    let deps = this.0.borrow().deps.clone();
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        EditorStringResult(read_raw_inner(&deps, path))
+                    }))
+                },
+            )?,
+        )?;
+
+        proto.set(
             "edit",
             Function::new(
                 ctx.clone(),
@@ -109,6 +144,16 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
     fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
         Ok(None)
     }
+}
+
+/// Disk-only read. Returns the file as-is, with no `EditSession`
+/// interaction — so the path is *not* registered for editing and the
+/// caller doesn't get anchors. Used by `Read` when the LLM asks for the
+/// content to land in a Frances variable instead of in tool-result
+/// text.
+fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
+    let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
+    fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))
 }
 
 async fn read_file_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {

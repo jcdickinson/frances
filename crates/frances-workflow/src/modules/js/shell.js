@@ -29,10 +29,20 @@
 // also pushed to chat history so the LLM acts on it.
 //
 // The leaf `Wait` and `Kill` tools are unchanged from before.
+//
+// Two more leaf tools — `Set` and `Capture` — bridge Frances variables
+// to/from bash variables. `Set` writes a Frances var into either a
+// shell variable (`set:`) or an exported env var (`export:`); `Capture`
+// reads a bash variable back into a Frances var. They run short
+// deterministic bash commands through the same `Shell` and share its
+// busy/closed state. Both take a `Variables` instance:
+//
+//   const vars = new Variables();
+//   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
 
 import { transcript, MarkdownFrame } from "frances:v1/frames";
 
-const { Shell } = globalThis.__frances_v1_stash__;
+const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
 
 const RUN_SCHEMA = {
   type: "object",
@@ -250,4 +260,125 @@ class Kill {
   };
 }
 
-export { Shell, Run, Wait, Kill };
+// ---- shell↔Frances variable bridges --------------------------------------
+
+const SET_SCHEMA = {
+  type: "object",
+  properties: {
+    set: {
+      type: "string",
+      description:
+        "Bash variable name to assign as a plain shell variable. Visible only inside the current bash session; subprocesses do NOT inherit it. Provide exactly one of `set` or `export`.",
+    },
+    export: {
+      type: "string",
+      description:
+        "Bash variable name to assign AND export. Same as `set` but also exported so subprocesses inherit the value. Provide exactly one of `set` or `export`.",
+    },
+    from: {
+      type: "string",
+      description:
+        "Frances variable name to pull the value from. Strings pass through verbatim; non-strings are JSON-encoded.",
+    },
+  },
+  required: ["from"],
+};
+
+const CAPTURE_SCHEMA = {
+  type: "object",
+  properties: {
+    name: {
+      type: "string",
+      description:
+        "Frances variable name to store the captured value into.",
+    },
+    from: {
+      type: "string",
+      description: "Bash variable name to read.",
+    },
+  },
+  required: ["name", "from"],
+};
+
+function _stringify(value) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+class Set {
+  static schema = SET_SCHEMA;
+
+  constructor(shell, vars) {
+    this.shell = shell;
+    this.vars = vars;
+    this.name = "shell_set";
+    this.description = shellDesc.shell_set;
+    this.parameters = SET_SCHEMA;
+  }
+
+  handler = async ({ call }) => {
+    const args = call.arguments;
+    const hasSet = typeof args.set === "string" && args.set.length > 0;
+    const hasExport = typeof args.export === "string" && args.export.length > 0;
+    if (hasSet && hasExport) {
+      return _errResult(
+        call.id,
+        "provide exactly one of `set` or `export`, not both",
+      );
+    }
+    if (!hasSet && !hasExport) {
+      return _errResult(call.id, "provide exactly one of `set` or `export`");
+    }
+    const from = args.from;
+    if (typeof from !== "string" || from.length === 0) {
+      return _errResult(call.id, "missing `from` (Frances variable name)");
+    }
+    if (!this.vars.has(from)) {
+      return _errResult(call.id, `unknown variable: ${from}`);
+    }
+    const bashName = hasSet ? args.set : args.export;
+    const exported = hasExport;
+    try {
+      await this.shell.setVar(bashName, _stringify(this.vars.get(from)), exported);
+    } catch (err) {
+      return _errResult(call.id, err);
+    }
+    const verb = exported ? "exported" : "set";
+    return {
+      role: "tool",
+      call_id: call.id,
+      content: `${verb} $${bashName} from ${from}`,
+      is_error: false,
+    };
+  };
+}
+
+class Capture {
+  static schema = CAPTURE_SCHEMA;
+
+  constructor(shell, vars) {
+    this.shell = shell;
+    this.vars = vars;
+    this.name = "shell_capture";
+    this.description = shellDesc.shell_capture;
+    this.parameters = CAPTURE_SCHEMA;
+  }
+
+  handler = async ({ call }) => {
+    const { name, from } = call.arguments;
+    let captured;
+    try {
+      captured = await this.shell.captureVar(from);
+    } catch (err) {
+      return _errResult(call.id, err);
+    }
+    this.vars.set(name, captured);
+    return {
+      role: "tool",
+      call_id: call.id,
+      content: `${name} = string`,
+      is_error: false,
+    };
+  };
+}
+
+export { Shell, Run, Wait, Kill, Set, Capture };

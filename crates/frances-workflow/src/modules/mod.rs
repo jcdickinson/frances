@@ -38,6 +38,12 @@
 //!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
 //!   primitive (`_setSleep` / `_clearSleep`) on the install-time stash
 //!   that the JS wrapper composes against.
+//! - `frances:v1/tools/shell`    — `Shell` primitive + `Run`/`Wait`/`Kill`
+//!   tool classes.
+//! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
+//!   `InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
+//! - `frances:v1/tools/variable` — pure-JS `Variables` JSON store +
+//!   `Get`/`Set` tool classes.
 //! - `whatwg:web-streams`        — `ReadableStream`, `WritableStream`,
 //!   `TransformStream` and friends from web-streams-polyfill.
 //! - `whatwg:abortcontroller`    — `AbortController`, `AbortSignal`
@@ -63,6 +69,7 @@ pub mod file;
 pub mod frames;
 pub mod inbox;
 pub mod io;
+pub mod jaq;
 pub mod shell;
 pub mod workflow;
 
@@ -122,8 +129,23 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let shell_ctor = shell::build_shell_ctor(ctx, deps.clone())?;
     stash.set("Shell", shell_ctor)?;
 
+    let shell_desc = Object::new(ctx.clone())?;
+    shell_desc.set("shell_set", include_str!("desc/shell_set.md"))?;
+    shell_desc.set("shell_capture", include_str!("desc/shell_capture.md"))?;
+    stash.set("ShellDescriptions", shell_desc)?;
+
     let editor_ctor = file::build_editor_ctor(ctx, deps)?;
     stash.set("Editor", editor_ctor)?;
+    stash.set("EditorDescriptions", file::build_descriptions(ctx)?)?;
+
+    let variable_desc = Object::new(ctx.clone())?;
+    variable_desc.set("variable_get", include_str!("desc/variable_get.md"))?;
+    variable_desc.set("variable_set", include_str!("desc/variable_set.md"))?;
+    variable_desc.set("variable_assign", include_str!("desc/variable_assign.md"))?;
+    stash.set("VariableDescriptions", variable_desc)?;
+
+    let jaq_eval = jaq::build_jaq_eval(ctx)?;
+    stash.set("_jaqEval", jaq_eval)?;
 
     let (set_sleep, clear_sleep) = io::build_sleep_primitives(ctx, closed, closed_notify)?;
     stash.set("_setSleep", set_sleep)?;
@@ -155,6 +177,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
     Ok(())
 }
 
@@ -199,6 +222,7 @@ const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
+const VARIABLE_SRC: &str = include_str!("js/variable.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be
 // refreshed by `modules/whatwg/update.sh` without touching this crate.

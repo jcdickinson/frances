@@ -11,10 +11,14 @@ deno_ast.workspace = true
 frances-edit.workspace = true
 frances-models-llm.workspace = true
 frances-shell.workspace = true
+jaq-core.workspace = true
+jaq-json.workspace = true
+jaq-std.workspace = true
 parking_lot.workspace = true
 rquickjs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 tokio.workspace = true
 shell-words.workspace = true
 thiserror.workspace = true
@@ -30,5 +34,4 @@ test-utils = ["frances-edit/test-utils"]
 [dev-dependencies]
 frances-workflow = { path = ".", features = ["test-utils"] }
 frances-edit = { workspace = true, features = ["test-utils"] }
-tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }

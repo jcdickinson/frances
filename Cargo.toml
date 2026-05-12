@@ -31,6 +31,9 @@ deno_ast = { version = "0.53", features = ["transpiling"] }
 futures = "0.3"
 futures-util = "0.3"
 getrandom = "0.2"
+jaq-core = "3"
+jaq-json = "2"
+jaq-std = "3"
 libc = "0.2"
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
