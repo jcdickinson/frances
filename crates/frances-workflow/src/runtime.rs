@@ -285,8 +285,8 @@ pub(crate) fn caught<'js>(
     }
 }
 
-#[cfg(test)]
-pub(crate) mod test_deps {
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_deps {
     //! In-memory `WorkflowDeps` for tests. `push` records to a local
     //! Vec; `run` errors out (no provider) by default. Tests that need a
     //! happy-path provider stub the next `run` with a script via
@@ -294,6 +294,7 @@ pub(crate) mod test_deps {
     //! emit and the `CompletionOutcome` to return.
 
     use async_trait::async_trait;
+    use frances_edit::{EditEngine, EditSession, FakeStore};
     use frances_models_llm::chat::{
         ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
         HistoryError, OwnedHistoryInput,
@@ -303,19 +304,33 @@ pub(crate) mod test_deps {
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::ffi::OsString;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use tokio::sync::Mutex as AsyncMutex;
 
-    use crate::deps::{ShellFactory, WorkflowDeps};
+    use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
 
     #[derive(Clone, Default)]
-    pub(crate) struct StubDeps {
+    pub struct StubDeps {
         manager: StubManager,
         shell_factory: StubShellFactory,
+        editor_factory: StubEditorFactory,
+        cwd: Arc<Mutex<Option<PathBuf>>>,
+    }
+
+    impl StubDeps {
+        /// Sets the cwd reported by `current_cwd`. Lets editor tests
+        /// point relative paths at a tempdir without spinning up a full
+        /// `InvocationContext`.
+        pub fn set_cwd(&self, cwd: PathBuf) {
+            *self.cwd.lock() = Some(cwd);
+        }
     }
 
     impl WorkflowDeps for StubDeps {
         type ChatSessionManager = StubManager;
         type ShellFactory = StubShellFactory;
+        type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -325,8 +340,16 @@ pub(crate) mod test_deps {
             &self.shell_factory
         }
 
+        fn editor_factory(&self) -> &Self::EditorFactory {
+            &self.editor_factory
+        }
+
         fn current_env(&self) -> HashMap<OsString, OsString> {
             HashMap::new()
+        }
+
+        fn current_cwd(&self) -> Option<PathBuf> {
+            self.cwd.lock().clone()
         }
     }
 
@@ -334,7 +357,7 @@ pub(crate) mod test_deps {
     /// actual bash subprocess. Tests that don't need bash use
     /// `StubShellFactory` (the default).
     #[derive(Clone, Default)]
-    pub(crate) struct RealShellFactory;
+    pub struct RealShellFactory;
 
     impl ShellFactory for RealShellFactory {
         async fn spawn(&self, opts: ShellOptions) -> Result<Shell, ShellError> {
@@ -346,7 +369,7 @@ pub(crate) mod test_deps {
     /// tests don't need real bash; the few that do can construct their
     /// own factory and inject it.
     #[derive(Clone, Default)]
-    pub(crate) struct StubShellFactory;
+    pub struct StubShellFactory;
 
     impl ShellFactory for StubShellFactory {
         async fn spawn(&self, _opts: ShellOptions) -> Result<Shell, ShellError> {
@@ -359,14 +382,16 @@ pub(crate) mod test_deps {
     /// Variant of `StubDeps` that uses `RealShellFactory` for tests that
     /// need to drive a real bash subprocess.
     #[derive(Clone, Default)]
-    pub(crate) struct StubDepsRealShell {
+    pub struct StubDepsRealShell {
         manager: StubManager,
         shell_factory: RealShellFactory,
+        editor_factory: StubEditorFactory,
     }
 
     impl WorkflowDeps for StubDepsRealShell {
         type ChatSessionManager = StubManager;
         type ShellFactory = RealShellFactory;
+        type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -376,20 +401,54 @@ pub(crate) mod test_deps {
             &self.shell_factory
         }
 
+        fn editor_factory(&self) -> &Self::EditorFactory {
+            &self.editor_factory
+        }
+
         fn current_env(&self) -> HashMap<OsString, OsString> {
             HashMap::new()
+        }
+
+        fn current_cwd(&self) -> Option<PathBuf> {
+            None
+        }
+    }
+
+    /// Test editor factory: hands out a fresh in-memory `EditSession`
+    /// backed by `FakeStore`. Each clone shares the same session, so
+    /// reads and edits in a single test see the same anchor cache.
+    #[derive(Clone)]
+    pub struct StubEditorFactory {
+        session: Arc<AsyncMutex<EditSession<FakeStore>>>,
+    }
+
+    impl Default for StubEditorFactory {
+        fn default() -> Self {
+            Self {
+                session: Arc::new(AsyncMutex::new(EditSession::new(EditEngine::new(
+                    FakeStore::new(),
+                )))),
+            }
+        }
+    }
+
+    impl EditorFactory for StubEditorFactory {
+        type Store = FakeStore;
+
+        fn session(&self) -> Arc<AsyncMutex<EditSession<FakeStore>>> {
+            self.session.clone()
         }
     }
 
     impl StubDepsRealShell {
-        pub(crate) fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
+        pub fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
             self.manager
                 .next_script
                 .lock()
                 .push_back(Script { events, outcome });
         }
 
-        pub(crate) fn sessions(&self) -> Vec<StubSession> {
+        pub fn sessions(&self) -> Vec<StubSession> {
             self.manager.sessions.lock().clone()
         }
     }
@@ -398,7 +457,7 @@ pub(crate) mod test_deps {
         /// Queue a scripted response for the next session's first `run`
         /// call. Subsequent calls fall back to the default
         /// `ProviderUnavailable` error unless re-scripted.
-        pub(crate) fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
+        pub fn script_next_run(&self, events: Vec<StreamEvent>, outcome: CompletionOutcome) {
             self.manager
                 .next_script
                 .lock()
@@ -407,13 +466,13 @@ pub(crate) mod test_deps {
 
         /// All sessions handed out by the manager so tests can inspect
         /// pending-input history after the run.
-        pub(crate) fn sessions(&self) -> Vec<StubSession> {
+        pub fn sessions(&self) -> Vec<StubSession> {
             self.manager.sessions.lock().clone()
         }
     }
 
     #[derive(Clone, Default)]
-    pub(crate) struct StubManager {
+    pub struct StubManager {
         next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
         sessions: Arc<Mutex<Vec<StubSession>>>,
     }
@@ -449,13 +508,13 @@ pub(crate) mod test_deps {
     }
 
     #[derive(Clone)]
-    pub(crate) struct StubSession {
+    pub struct StubSession {
         pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
         next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
     }
 
     impl StubSession {
-        pub(crate) fn pending(&self) -> Vec<OwnedHistoryInput> {
+        pub fn pending(&self) -> Vec<OwnedHistoryInput> {
             self.pending.lock().clone()
         }
     }

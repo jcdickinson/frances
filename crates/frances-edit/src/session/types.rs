@@ -1,19 +1,29 @@
+use std::io;
 use std::path::PathBuf;
 
-use frances_edit::{AnchorParseError, Truncated};
+use serde::Deserialize;
 use thiserror::Error;
 
-/// One structured edit. The dispatcher in `tools::file` deserializes the
-/// per-tool args struct (e.g. `file_replace` → `{ path, anchor, end_anchor,
-/// text }`) and constructs the matching variant. `anchor` and `end_anchor`
-/// are full rendered anchor lines (`Word§content`) — the same string
-/// `file_read` produced for that line; the engine splits on the first `§` to
-/// recover the anchor word and validates the content (trimmed) against the
-/// cached file.
+use crate::{AnchorParseError, StoreError, Truncated};
+
+/// One structured edit. Callers deserialize the matching variant from tool
+/// args. `anchor` and `end_anchor` are full rendered anchor lines
+/// (`Word§content`) — the same string `read_file` produced for that line; the
+/// engine splits on the first `§` to recover the anchor word and validates the
+/// content (trimmed) against the cached file.
 ///
 /// `New` and `Overwrite` are whole-file operations that replace the file's
 /// content with `text` outright.
-#[derive(Debug)]
+///
+/// Tagged JSON shape for cross-runtime deserialization (the JS workflow
+/// side hands a `{ kind, ...fields }` object straight into
+/// `serde_json::from_value`):
+///
+/// ```json
+/// { "kind": "Replace", "path": "...", "anchor": "...", "end_anchor": "...", "text": "..." }
+/// ```
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind")]
 pub enum LlmEdit {
     Replace {
         path: PathBuf,
@@ -75,4 +85,10 @@ pub enum EditError {
     NotCached { path: PathBuf },
     #[error("{path} is not cached; call file_read before 'overwrite'")]
     NotCachedForOverwrite { path: PathBuf },
+    #[error(transparent)]
+    Store(#[from] StoreError),
+    #[error("draft write failed: {0}")]
+    Draft(#[from] io::Error),
 }
+
+pub type EditResult<T> = std::result::Result<T, EditError>;

@@ -7,13 +7,18 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
+use std::path::PathBuf;
+use std::sync::Arc;
 
+use frances_edit::{AnchorStore, EditSession};
 use frances_models_llm::chat::ChatSessionManager;
 use frances_shell::{Shell, ShellError, ShellOptions};
+use tokio::sync::Mutex as AsyncMutex;
 
 pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     type ChatSessionManager: ChatSessionManager;
     type ShellFactory: ShellFactory;
+    type EditorFactory: EditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
 
@@ -22,16 +27,36 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     /// / env / init-script policy it cares about; tests stub it out.
     fn shell_factory(&self) -> &Self::ShellFactory;
 
+    /// Factory for the `frances:v1/tools/file` `Editor` primitive. Hands
+    /// out a clone of the host's session-scoped `EditSession` so all
+    /// workflow invocations within the same daemon session see the same
+    /// anchor cache.
+    fn editor_factory(&self) -> &Self::EditorFactory;
+
     /// Snapshot of the most recently attached client's environment.
     /// Used by `ChatSession.stream()` so the provider can resolve auth
     /// env vars (e.g. `OPENROUTER_API_KEY`) against the client process,
     /// not the daemon process. Returns an empty map if no client has
     /// attached yet.
     fn current_env(&self) -> HashMap<OsString, OsString>;
+
+    /// Snapshot of the most recently attached client's working
+    /// directory. `Editor` resolves relative paths against this on every
+    /// call so re-attach with a different client cwd takes effect
+    /// immediately. `None` when no client has attached yet.
+    fn current_cwd(&self) -> Option<PathBuf>;
 }
 
 /// Spawns bash subprocesses for workflows. Async because
 /// `frances_shell::Shell::spawn` is async.
 pub trait ShellFactory: Clone + Send + Sync + 'static {
     fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send;
+}
+
+/// Hands out the host's session-scoped `EditSession`. The daemon's impl
+/// returns clones of an `Arc` to the singleton stored on `ServerState`;
+/// tests construct fresh sessions with a `FakeStore`.
+pub trait EditorFactory: Clone + Send + Sync + 'static {
+    type Store: AnchorStore + Send + Sync + 'static;
+    fn session(&self) -> Arc<AsyncMutex<EditSession<Self::Store>>>;
 }

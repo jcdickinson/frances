@@ -12,7 +12,6 @@ use frances_models_llm::wire::StreamEvent;
 use crate::Result;
 use crate::protocol::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerChatDeps;
-use crate::tools;
 use crate::transport::{TransportError, write_message};
 use crate::workflows;
 
@@ -38,7 +37,7 @@ async fn stream_prompt(
     text: String,
 ) -> Result<()> {
     let result = run_handler(state, stream, text).await;
-    if let Err(error) = state.edit_session.lock().await.end_turn().await {
+    if let Err(error) = state.editor_factory.session.lock().await.end_turn().await {
         warn!(%error, "edit_session::end_turn failed");
     }
     result
@@ -54,16 +53,19 @@ async fn run_handler(
 
 /// The legacy Rust-driven LLM chat turn. Invoked from the workflow
 /// stack's bottom frame (`LegacyLlmTurn`); will go away once the chat
-/// loop is ported into a JS workflow.
+/// loop is ported into a JS workflow. With no Rust-side tools left,
+/// this is a single LLM call with text streaming — no tool dispatch,
+/// no iteration. Any `ToolCall` events the provider emits are surfaced
+/// as wire blocks for the UI but not resolved.
 pub(crate) async fn run_legacy_llm_turn(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
     text: &str,
 ) -> Result<()> {
-    let (env, cwd) = {
+    let env = {
         let guard = state.last_context.lock();
         let ctx = guard.as_ref().ok_or(ServerError::NoClientContext)?;
-        (ctx.process.env.clone(), ctx.process.cwd.clone())
+        ctx.process.env.clone()
     };
 
     let chat = state.primary_chat.clone();
@@ -94,28 +96,7 @@ pub(crate) async fn run_legacy_llm_turn(
         try_write(stream, &frame, &mut send_error).await;
     }
 
-    let mut iterations: u32 = 0;
-    loop {
-        iterations += 1;
-        if iterations.is_multiple_of(25) {
-            warn!(iterations, "agent loop running long");
-        }
-
-        let made_tool_calls = run_llm_step(
-            state,
-            stream,
-            &chat,
-            &env,
-            &mut alloc_block,
-            &mut send_error,
-            cwd.as_deref(),
-        )
-        .await?;
-
-        if !made_tool_calls {
-            break;
-        }
-    }
+    run_llm_step(stream, &chat, &env, &mut alloc_block, &mut send_error).await?;
 
     if let Some(error) = send_error {
         return Err(ServerError::Send(error).into());
@@ -123,19 +104,16 @@ pub(crate) async fn run_legacy_llm_turn(
     Ok(())
 }
 
-/// Runs one LLM call, streams the result, persists the assistant message,
-/// and dispatches any tool calls (also persisting their results). Returns
-/// `true` if the model emitted tool calls (caller should loop), `false` if
-/// the model's response was terminal.
+/// Runs one LLM call and streams the result. With no tools registered,
+/// the model can't drive a multi-turn loop here — one call, then we're
+/// done.
 async fn run_llm_step(
-    state: &Arc<ServerState>,
     stream: &mut UnixStream,
     chat: &ChatSession<ServerChatDeps>,
     env: &HashMap<OsString, OsString>,
     alloc_block: &mut impl FnMut() -> BlockId,
     send_error: &mut Option<TransportError>,
-    cwd: Option<&std::path::Path>,
-) -> Result<bool> {
+) -> Result<()> {
     let assistant_id = alloc_block();
     let mut wire_active: Option<BlockId> = Some(assistant_id);
     try_write(
@@ -148,8 +126,6 @@ async fn run_llm_step(
     )
     .await;
 
-    let tool_defs = state.tool_registry.definitions().await?;
-
     let chat_for_task = chat.clone();
     let env_for_task = env.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
@@ -157,7 +133,7 @@ async fn run_llm_step(
         ChatSessionTrait::run(
             &chat_for_task,
             env_for_task,
-            tool_defs,
+            Vec::new(),
             None,
             Box::new(move |event: StreamEvent| {
                 let _ = tx.send(event);
@@ -183,6 +159,10 @@ async fn run_llm_step(
                 }
             }
             StreamEvent::ToolCall(call) => {
+                // No Rust-side tools to dispatch against. Surface the
+                // call to the UI as a tool_use block but don't resolve
+                // it — provider responses with empty tool_defs
+                // shouldn't include tool calls in the first place.
                 if let Some(active) = wire_active.take() {
                     try_write(stream, &StreamFrame::BlockStop { id: active }, send_error).await;
                 }
@@ -224,59 +204,8 @@ async fn run_llm_step(
     }
 
     let stream_result = llm_task.await.map_err(ServerError::LlmTaskPanicked)?;
-    let outcome = stream_result?;
-    let tool_calls = outcome.tool_calls;
-
-    if tool_calls.is_empty() {
-        return Ok(false);
-    }
-
-    for call in &tool_calls {
-        let outcome = state
-            .tool_registry
-            .dispatch(
-                call,
-                &tools::ToolContext {
-                    edit_session: &state.edit_session,
-                    cwd,
-                },
-            )
-            .await;
-
-        let result_id = alloc_block();
-        try_write(
-            stream,
-            &StreamFrame::BlockStart {
-                id: result_id,
-                kind: BlockKind::ToolResult {
-                    tool_use_id: call.id.clone(),
-                    is_error: outcome.is_error,
-                },
-            },
-            send_error,
-        )
-        .await;
-        try_write(
-            stream,
-            &StreamFrame::BlockDelta {
-                id: result_id,
-                text: outcome.content.clone(),
-            },
-            send_error,
-        )
-        .await;
-        try_write(
-            stream,
-            &StreamFrame::BlockStop { id: result_id },
-            send_error,
-        )
-        .await;
-
-        chat.submit_tool_result(&call.id, &outcome.content, outcome.is_error)
-            .await?;
-    }
-
-    Ok(true)
+    stream_result?;
+    Ok(())
 }
 
 /// Best-effort frame write that records the first send error and silently

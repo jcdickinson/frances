@@ -52,7 +52,7 @@ impl Database {
         migrations::run_all(
             conn,
             &[
-                &crate::tools::FILE_SCHEMA,
+                &crate::anchor_store::SCHEMA,
                 &crate::history::SCHEMA,
                 &crate::llm::session_provider::SCHEMA,
             ],

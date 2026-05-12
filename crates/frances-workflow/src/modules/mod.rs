@@ -59,6 +59,7 @@ use crate::deps::WorkflowDeps;
 use crate::runtime::{HostFrame, UserInput, caught};
 
 pub mod chat;
+pub mod file;
 pub mod frames;
 pub mod inbox;
 pub mod io;
@@ -118,8 +119,11 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("ChatSession", chat_ctor)?;
     stash.set("__chat_inner_stream", chat_inner_stream)?;
 
-    let shell_ctor = shell::build_shell_ctor(ctx, deps)?;
+    let shell_ctor = shell::build_shell_ctor(ctx, deps.clone())?;
     stash.set("Shell", shell_ctor)?;
+
+    let editor_ctor = file::build_editor_ctor(ctx, deps)?;
+    stash.set("Editor", editor_ctor)?;
 
     let (set_sleep, clear_sleep) = io::build_sleep_primitives(ctx, closed, closed_notify)?;
     stash.set("_setSleep", set_sleep)?;
@@ -150,6 +154,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
     Ok(())
 }
 
@@ -193,6 +198,7 @@ const FRAMES_SRC: &str = include_str!("js/frames.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
+const FILE_SRC: &str = include_str!("js/file.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be
 // refreshed by `modules/whatwg/update.sh` without touching this crate.

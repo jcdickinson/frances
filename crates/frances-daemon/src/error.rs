@@ -4,9 +4,8 @@ use crate::llm::session_provider::SessionConfigWriteError;
 use crate::server::ServerError;
 use crate::session::SessionError;
 use crate::store::DatabaseError;
-use crate::tools::ToolRegistryError;
-use crate::tools::file::FileToolError;
 use crate::workflows::WorkflowError;
+use frances_edit::EditError;
 use frances_llm::ProviderCacheError;
 use frances_models_llm::chat::{ChatError, HistoryError};
 
@@ -24,10 +23,7 @@ pub enum Error {
     Migration(#[from] crate::migrations::MigrationError),
 
     #[error(transparent)]
-    Edit(#[from] crate::edit_session::EditError),
-
-    #[error(transparent)]
-    AnchorStore(#[from] frances_edit::StoreError),
+    Edit(#[from] EditError),
 
     #[error(transparent)]
     ConfigBuild(#[from] frances_config::BuildError),
@@ -46,12 +42,6 @@ pub enum Error {
 
     #[error(transparent)]
     Session(#[from] SessionError),
-
-    #[error(transparent)]
-    FileTool(#[from] FileToolError),
-
-    #[error(transparent)]
-    ToolRegistry(#[from] ToolRegistryError),
 
     #[error(transparent)]
     Workflow(#[from] WorkflowError),

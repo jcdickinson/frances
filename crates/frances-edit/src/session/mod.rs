@@ -1,18 +1,17 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::{Path, PathBuf};
 
-use frances_edit::{AnchorStore, EditEngine, WorkingFile, render_file};
-
-use crate::Result;
+use crate::{AnchorStore, EditEngine, WorkingFile, render_file};
 
 mod anchored;
 mod types;
 mod whole_file;
 
-#[cfg(test)]
-mod test_support;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_support;
 
-pub use types::{EditError, LlmEdit};
+pub use types::{EditError, EditResult, LlmEdit};
 
 const DIFF_CONTEXT: usize = 2;
 
@@ -39,7 +38,7 @@ impl<S: AnchorStore> EditSession<S> {
         lines: Vec<String>,
         mtime_ns: i64,
         size: u64,
-    ) -> Result<String> {
+    ) -> EditResult<String> {
         let working = self
             .engine
             .open(path.clone(), lines, mtime_ns, size)
@@ -59,9 +58,9 @@ impl<S: AnchorStore> EditSession<S> {
     ///
     /// Returns the rendered diff block (or full anchored file in the `New`
     /// case) as plain text.
-    pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> Result<String>
+    pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         match edit {
             LlmEdit::New { path, text } => self.apply_new(&path, &text, &mut on_draft).await,
@@ -90,7 +89,7 @@ impl<S: AnchorStore> EditSession<S> {
 
     /// End-of-turn cleanup. Caller invokes when assistant message's tool
     /// calls are fully processed.
-    pub async fn end_turn(&mut self) -> Result<()> {
+    pub async fn end_turn(&mut self) -> EditResult<()> {
         self.engine.end_turn().await?;
         Ok(())
     }

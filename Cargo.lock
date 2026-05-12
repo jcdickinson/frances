@@ -1225,8 +1225,10 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "deno_ast",
+ "frances-edit",
  "frances-models-llm",
  "frances-shell",
+ "frances-workflow",
  "parking_lot",
  "rquickjs",
  "serde",

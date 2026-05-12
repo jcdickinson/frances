@@ -1,14 +1,14 @@
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
-use frances_edit::{
+use crate::{
     Anchor, AnchorStore, EditHints, EditOp, FileAnchorState, Pool, Truncated, WorkingFile,
     apply_ops, reconcile, render_diff_block,
 };
 
-use super::types::EditError;
+use super::types::{EditError, EditResult};
 use super::{DIFF_CONTEXT, EditSession, split_text_to_lines};
-use crate::Result;
 
 const ANCHOR_SEP: char = '§';
 
@@ -20,9 +20,9 @@ impl<S: AnchorStore> EditSession<S> {
         end_anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let working = self.cached_working(path)?;
         let (from_anchor, from_idx) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
@@ -31,8 +31,7 @@ impl<S: AnchorStore> EditSession<S> {
             return Err(EditError::BackwardsReplaceRange {
                 start: from_idx,
                 end: to_idx,
-            }
-            .into());
+            });
         }
         let new_lines = split_text_to_lines(text);
         let tombstones: Vec<Anchor> = working.state.lines[from_idx as usize..=to_idx as usize]
@@ -54,9 +53,9 @@ impl<S: AnchorStore> EditSession<S> {
         anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let working = self.cached_working(path)?;
         let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
@@ -74,9 +73,9 @@ impl<S: AnchorStore> EditSession<S> {
         anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let working = self.cached_working(path)?;
         let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
@@ -88,13 +87,13 @@ impl<S: AnchorStore> EditSession<S> {
             .await
     }
 
-    fn cached_working(&self, path: &Path) -> Result<WorkingFile> {
-        self.open_files.get(path).cloned().ok_or_else(|| {
-            EditError::NotCached {
+    fn cached_working(&self, path: &Path) -> EditResult<WorkingFile> {
+        self.open_files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| EditError::NotCached {
                 path: path.to_path_buf(),
-            }
-            .into()
-        })
+            })
     }
 
     /// Common pipeline for line-level edits: replay one `EditOp` into a
@@ -108,9 +107,9 @@ impl<S: AnchorStore> EditSession<S> {
         op: EditOp,
         tombstones: Vec<Anchor>,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let ops = [op];
         let draft = apply_ops(&working.state, &working.lines, &ops);
@@ -186,11 +185,11 @@ fn resolve_anchor(
 mod tests {
     use std::path::PathBuf;
 
-    use frances_edit::{AnchorStore, FakeStore};
+    use crate::{AnchorStore, FakeStore};
 
     use super::super::test_support::{fresh_session, lines_of, no_format};
+    use super::super::{EditError, LlmEdit};
     use super::*;
-    use crate::edit_session::LlmEdit;
 
     fn anchor_field(s: &EditSession<FakeStore>, path: &Path, idx: usize) -> String {
         let working = s.open_files.get(path).expect("cached");
@@ -319,10 +318,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Edit(EditError::AnchorNotFound { .. })
-        ));
+        assert!(matches!(err, EditError::AnchorNotFound { .. }));
     }
 
     #[tokio::test]
@@ -371,10 +367,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Edit(EditError::ContentMismatch { .. })
-        ));
+        assert!(matches!(err, EditError::ContentMismatch { .. }));
     }
 
     #[tokio::test]
@@ -397,10 +390,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Edit(EditError::MalformedAnchor { .. })
-        ));
+        assert!(matches!(err, EditError::MalformedAnchor { .. }));
     }
 
     #[tokio::test]
@@ -440,7 +430,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(err, crate::Error::Edit(_)));
+        assert!(matches!(err, EditError::BadAnchorWord { .. }));
 
         // Cache survives. A well-formed retry against the same anchors works.
         let target = anchor_field(&session, &path, 1);

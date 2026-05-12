@@ -1,12 +1,12 @@
+use std::io;
 use std::path::Path;
 
-use frances_edit::{
+use crate::{
     AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile, render_diff_block,
 };
 
-use super::types::EditError;
+use super::types::{EditError, EditResult};
 use super::{DIFF_CONTEXT, EditSession, split_text_to_lines};
-use crate::Result;
 
 impl<S: AnchorStore> EditSession<S> {
     /// Create a brand-new file. Fails if the file already exists on disk —
@@ -19,15 +19,14 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         text: &str,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         if path.exists() {
             return Err(EditError::NewFileExists {
                 path: path.to_path_buf(),
-            }
-            .into());
+            });
         }
         let draft = split_text_to_lines(text);
         let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
@@ -56,9 +55,9 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         text: &str,
         on_draft: &mut F,
-    ) -> Result<String>
+    ) -> EditResult<String>
     where
-        F: FnMut(&Path, &[String]) -> Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let working = self
             .open_files
@@ -119,8 +118,8 @@ mod tests {
     use std::path::PathBuf;
 
     use super::super::test_support::{fresh_session, lines_of, no_format};
+    use super::super::{EditError, LlmEdit};
     use super::*;
-    use crate::edit_session::LlmEdit;
 
     #[tokio::test]
     async fn edit_new_creates_file_and_caches_anchors() {
@@ -166,10 +165,7 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(matches!(
-            err,
-            crate::Error::Edit(EditError::NewFileExists { .. })
-        ));
+        assert!(matches!(err, EditError::NewFileExists { .. }));
     }
 
     #[tokio::test]

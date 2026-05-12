@@ -9,17 +9,16 @@ use tracing::{debug, info, warn};
 
 use crate::Result;
 use crate::anchor_store::AnchorStoreImpl;
-use crate::edit_session::EditSession;
 use crate::history::TursoHistoryStore;
 use crate::llm::SessionConfigProvider;
 use crate::server::ServerChatDeps;
 use crate::session::Session;
 use crate::store::Database;
-use crate::tools::ToolRegistry;
 use crate::transport::remove_socket_if_present;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
+use frances_edit::EditSession;
 use frances_llm::{ChatSessionManager, ProviderCache};
 use frances_models_llm::ChatSessionManager as ChatSessionManagerTrait;
 use frances_models_llm::chat::ChatSessionBuilder;
@@ -95,9 +94,13 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     .await?;
 
     let last_context = Arc::new(StdMutex::new(None));
+    let editor_factory = super::DaemonEditorFactory {
+        session: Arc::new(tokio::sync::Mutex::new(EditSession::new(edit_engine))),
+    };
     let workflow_runtime = Arc::new(WorkflowRuntime::new(super::ServerWorkflowDeps {
         chat: chat.clone(),
         last_context: last_context.clone(),
+        editor_factory: editor_factory.clone(),
     })?);
 
     let state = Arc::new(ServerState {
@@ -105,8 +108,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         client_attached: StdMutex::new(false),
         last_context,
         daemon_pid: std::process::id(),
-        edit_session: tokio::sync::Mutex::new(EditSession::new(edit_engine)),
-        tool_registry: ToolRegistry::builtin(),
+        editor_factory,
         events: EventsRouter::default(),
         shutdown: Notify::new(),
         _config: config,

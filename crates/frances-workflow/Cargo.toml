@@ -8,6 +8,7 @@ authors.workspace = true
 [dependencies]
 async-trait.workspace = true
 deno_ast.workspace = true
+frances-edit.workspace = true
 frances-models-llm.workspace = true
 frances-shell.workspace = true
 parking_lot.workspace = true
@@ -20,6 +21,14 @@ thiserror.workspace = true
 twox-hash.workspace = true
 uuid.workspace = true
 
+[features]
+# Exposes the in-memory test deps (`StubDeps`, `StubManager`,
+# `StubEditorFactory`, ...) for integration tests in downstream crates
+# or in this crate's own `tests/` directory.
+test-utils = ["frances-edit/test-utils"]
+
 [dev-dependencies]
+frances-workflow = { path = ".", features = ["test-utils"] }
+frances-edit = { workspace = true, features = ["test-utils"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }

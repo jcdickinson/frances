@@ -6,15 +6,16 @@ use tokio::sync::Notify;
 
 use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
-use crate::edit_session::EditSession;
 use crate::history::TursoHistoryStore;
 use crate::llm::SessionConfigWriter;
 use crate::session::Session;
-use crate::tools::ToolRegistry;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
+use frances_edit::EditSession;
 use frances_llm::{ChatManagerDeps, ChatSession, ChatSessionManager, ProviderCache};
-use frances_workflow::{Runtime as WorkflowRuntime, WorkflowDeps};
+use frances_workflow::{EditorFactory, Runtime as WorkflowRuntime, WorkflowDeps};
+use std::path::PathBuf;
+use tokio::sync::Mutex as AsyncMutex;
 
 mod bootstrap;
 mod client_rpc;
@@ -53,15 +54,17 @@ impl ChatManagerDeps for ServerChatDeps {
 #[derive(Clone)]
 pub struct ServerWorkflowDeps {
     pub chat: ChatSessionManager<ServerChatDeps>,
-    /// Shared with `ServerState::last_context` so `current_env` reflects
-    /// the latest client attach — the daemon's own env doesn't carry
-    /// the user's API keys.
+    /// Shared with `ServerState::last_context` so `current_env` /
+    /// `current_cwd` reflect the latest client attach — the daemon's own
+    /// env/cwd doesn't carry the user's API keys or project location.
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
+    pub editor_factory: DaemonEditorFactory,
 }
 
 impl WorkflowDeps for ServerWorkflowDeps {
     type ChatSessionManager = ChatSessionManager<ServerChatDeps>;
     type ShellFactory = DaemonShellFactory;
+    type EditorFactory = DaemonEditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
@@ -71,12 +74,23 @@ impl WorkflowDeps for ServerWorkflowDeps {
         &DaemonShellFactory
     }
 
+    fn editor_factory(&self) -> &Self::EditorFactory {
+        &self.editor_factory
+    }
+
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
         self.last_context
             .lock()
             .as_ref()
             .map(|ctx| ctx.process.env.clone())
             .unwrap_or_default()
+    }
+
+    fn current_cwd(&self) -> Option<PathBuf> {
+        self.last_context
+            .lock()
+            .as_ref()
+            .and_then(|ctx| ctx.process.cwd.clone())
     }
 }
 
@@ -96,14 +110,33 @@ impl frances_workflow::ShellFactory for DaemonShellFactory {
     }
 }
 
+/// Hands out the daemon's session-scoped `EditSession` — same `Arc`
+/// every call, so all workflow invocations within the daemon session
+/// share the anchor cache.
+#[derive(Clone)]
+pub struct DaemonEditorFactory {
+    pub session: Arc<AsyncMutex<EditSession<AnchorStoreImpl>>>,
+}
+
+impl EditorFactory for DaemonEditorFactory {
+    type Store = AnchorStoreImpl;
+
+    fn session(&self) -> Arc<AsyncMutex<EditSession<AnchorStoreImpl>>> {
+        self.session.clone()
+    }
+}
+
 pub(crate) struct ServerState {
     pub session: Session,
     // TODO: This smells like a refactor needed
     pub client_attached: StdMutex<bool>,
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
     pub daemon_pid: u32,
-    pub edit_session: tokio::sync::Mutex<EditSession<AnchorStoreImpl>>,
-    pub tool_registry: ToolRegistry,
+    /// Canonical handle to the per-daemon-session editor. The
+    /// workflow runtime holds a clone of this same factory so JS
+    /// `new Editor()` calls share the anchor cache with the host —
+    /// e.g. host-side `end_turn` in `stream_prompt`.
+    pub editor_factory: DaemonEditorFactory,
     pub events: EventsRouter,
     pub shutdown: Notify,
     /// Kept alive so the config-event-processor task stays running for the
