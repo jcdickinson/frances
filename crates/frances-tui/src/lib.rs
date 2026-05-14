@@ -11,14 +11,15 @@
 //!
 //! On top of that, [`ScrollbackContainer`] is the layout primitive
 //! that holds an append-only list of history [`Block`]s plus a single
-//! footer block, decides which rows fit, and drives the backend.
+//! footer block, decides which rows fit, and drives the backend. It
+//! also owns the scrollback inspector — `set_scrollback` +
+//! `scroll_up` / `scroll_down` + `paint_scrollback` render the
+//! container's full block history into an alt-screen view.
 
 pub mod block;
 pub mod inline_backend;
 pub mod scrollback_container;
-pub mod scrollback_view;
 
 pub use block::Block;
 pub use inline_backend::{InlineBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
-pub use scrollback_view::paint_scrollback;

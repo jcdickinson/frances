@@ -5,7 +5,9 @@ use anyhow::{Context, Result};
 use crossterm::QueueableCommand;
 use crossterm::cursor::{self, Show};
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, size};
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+};
 use futures_util::StreamExt;
 use ratatui::Terminal;
 use ratatui::TerminalOptions;
@@ -43,6 +45,15 @@ enum KeyAction {
     Approve,
     Reject,
     Edit,
+    EnterScrollback,
+}
+
+enum ScrollbackAction {
+    Quit,
+    Exit,
+    ScrollUp(u16),
+    ScrollDown(u16),
+    Ignore,
 }
 
 struct ActiveBlock {
@@ -208,10 +219,28 @@ impl App<'_> {
                 Some(event) = events.next() => {
                     let event = event.context("event read")?;
                     match event {
+                        Event::Key(key) if container.scrollback() => {
+                            if key.kind != KeyEventKind::Press { continue; }
+                            let page = scrollback_page(term_size.height);
+                            match classify_scrollback_key(&key, page) {
+                                ScrollbackAction::Quit => return Ok(()),
+                                ScrollbackAction::Exit => {
+                                    container.set_scrollback(false);
+                                    leave_scrollback(&mut terminal)?;
+                                }
+                                ScrollbackAction::ScrollUp(n) => container.scroll_up(n),
+                                ScrollbackAction::ScrollDown(n) => container.scroll_down(n),
+                                ScrollbackAction::Ignore => {}
+                            }
+                        }
                         Event::Key(key) => {
                             if key.kind != KeyEventKind::Press { continue; }
                             match classify_key(&key, pending_approval.is_some()) {
                                 KeyAction::Quit => return Ok(()),
+                                KeyAction::EnterScrollback => {
+                                    container.set_scrollback(true);
+                                    enter_scrollback(&mut terminal)?;
+                                }
                                 KeyAction::Submit => {
                                     if textarea.is_empty() { continue; }
                                     let text = textarea.text();
@@ -295,7 +324,7 @@ impl App<'_> {
                 "  daemon_pid={} protocol=v{:016x}",
                 self.status.daemon_pid, self.status.protocol_version
             ),
-            "  Enter to send. Alt+Enter for newline. Ctrl-C, Ctrl-D, or Esc to exit.".to_string(),
+            "  Enter to send. Alt+Enter for newline. Ctrl-O for history. Ctrl-C, Ctrl-D, or Esc to exit.".to_string(),
         ]
     }
 }
@@ -315,6 +344,14 @@ fn redraw(
             None
         },
     }));
+
+    if container.scrollback() {
+        container.paint_scrollback(terminal)?;
+        let backend = terminal.backend_mut();
+        backend.hide_cursor()?;
+        Backend::flush(backend)?;
+        return Ok(());
+    }
 
     container.draw(terminal)?;
 
@@ -438,6 +475,7 @@ fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     match key.code {
         KeyCode::Esc => KeyAction::Quit,
         KeyCode::Char('c' | 'd') if ctrl => KeyAction::Quit,
+        KeyCode::Char('o' | 'O') if ctrl && !pending_approval => KeyAction::EnterScrollback,
         KeyCode::Char('y' | 'Y') if alt && pending_approval => KeyAction::Approve,
         KeyCode::Char('n' | 'N') if alt && pending_approval => KeyAction::Reject,
         KeyCode::Enter if !alt => KeyAction::Submit,
@@ -446,4 +484,47 @@ fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
             KeyAction::Edit
         }
     }
+}
+
+fn classify_scrollback_key(key: &KeyEvent, page: u16) -> ScrollbackAction {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => ScrollbackAction::Exit,
+        KeyCode::Char('c' | 'd') if ctrl => ScrollbackAction::Quit,
+        KeyCode::Char('o' | 'O') if ctrl => ScrollbackAction::Exit,
+        KeyCode::Up => ScrollbackAction::ScrollUp(1),
+        KeyCode::Down => ScrollbackAction::ScrollDown(1),
+        KeyCode::PageUp => ScrollbackAction::ScrollUp(page),
+        KeyCode::PageDown => ScrollbackAction::ScrollDown(page),
+        KeyCode::Home => ScrollbackAction::ScrollUp(u16::MAX),
+        KeyCode::End => ScrollbackAction::ScrollDown(u16::MAX),
+        _ => ScrollbackAction::Ignore,
+    }
+}
+
+/// Rows to scroll on PageUp / PageDown. Leaves a 1-row anchor of
+/// visible content above/below the new window so the user can see
+/// where they came from.
+fn scrollback_page(terminal_h: u16) -> u16 {
+    // Content area = terminal_h - 2 status bars - footer (typically 3-row textarea).
+    terminal_h.saturating_sub(6).max(1)
+}
+
+fn enter_scrollback(terminal: &mut AppTerminal) -> Result<()> {
+    let backend = terminal.backend_mut();
+    backend
+        .queue(EnterAlternateScreen)
+        .context("enter alt screen")?;
+    backend.hide_cursor()?;
+    Backend::flush(backend)?;
+    Ok(())
+}
+
+fn leave_scrollback(terminal: &mut AppTerminal) -> Result<()> {
+    let backend = terminal.backend_mut();
+    backend
+        .queue(LeaveAlternateScreen)
+        .context("leave alt screen")?;
+    Backend::flush(backend)?;
+    Ok(())
 }

@@ -62,6 +62,9 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Rect, Size};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Paragraph, Widget};
 use slotmap::{SlotMap, new_key_type};
 
 use crate::block::Block;
@@ -177,6 +180,21 @@ pub struct ScrollbackContainer {
     /// before the natural-scroll path takes over with stale
     /// `RenderState` invalidated.
     prev_mode: Option<LayoutMode>,
+    /// Scrollback inspector mode flag. When set, the caller drives
+    /// [`paint_scrollback`] instead of [`draw`] (typically against an
+    /// alt-screen) to render a historical view of all the container's
+    /// blocks. The container does not itself toggle the alt-screen —
+    /// the flag is purely a piece of shared state so the caller can
+    /// branch its render loop and so subsequent live [`draw`] calls
+    /// know to reset their bookkeeping.
+    scrollback_active: bool,
+    /// Inspector scroll position, in wrapped rows measured from the
+    /// bottom of history. `0` = most-recent content sits flush against
+    /// the footer. Clamped against the current maximum inside
+    /// [`paint_scrollback`], so callers may move freely via
+    /// [`scroll_up`] / [`scroll_down`] and let the renderer decide
+    /// what's reachable.
+    scrollback_offset: u16,
 }
 
 impl ScrollbackContainer {
@@ -194,6 +212,8 @@ impl ScrollbackContainer {
             prev_footer_anchor_y: None,
             prev_term_size: None,
             prev_mode: None,
+            scrollback_active: false,
+            scrollback_offset: 0,
         }
     }
 
@@ -269,6 +289,71 @@ impl ScrollbackContainer {
 
     pub fn active_count(&self) -> usize {
         self.active_order.len()
+    }
+
+    /// Toggle scrollback inspector mode. While set, the caller is
+    /// expected to drive [`paint_scrollback`] instead of [`draw`]
+    /// (typically against an alt-screen brought up externally).
+    ///
+    /// A `false → true` transition resets the scroll offset to `0`
+    /// so the inspector opens at the bottom of history. Repeated
+    /// `true` calls are idempotent — the offset is preserved.
+    /// `set_scrollback(false)` does not touch the offset; screen
+    /// state is the caller's concern. The standard pattern is to
+    /// bracket the inspector in alt-screen enter/leave so the main
+    /// screen is restored when [`draw`] resumes.
+    pub fn set_scrollback(&mut self, enabled: bool) {
+        if enabled && !self.scrollback_active {
+            self.scrollback_offset = 0;
+        }
+        self.scrollback_active = enabled;
+    }
+
+    pub fn scrollback(&self) -> bool {
+        self.scrollback_active
+    }
+
+    /// Move the inspector window towards older content by `n` rows.
+    /// Stored unclamped — the renderer pins it against the current
+    /// maximum on the next [`paint_scrollback`], so the typical
+    /// "page up past the top" key still lands cleanly at the top.
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scrollback_offset = self.scrollback_offset.saturating_add(n);
+    }
+
+    /// Move the inspector window towards newer content by `n` rows.
+    pub fn scroll_down(&mut self, n: u16) {
+        self.scrollback_offset = self.scrollback_offset.saturating_sub(n);
+    }
+
+    pub fn scrollback_offset(&self) -> u16 {
+        self.scrollback_offset
+    }
+
+    /// Sum of `block.measure(width)` across every block held by the
+    /// container — `committed` + `safe` + `active`, in display order.
+    /// Inspector callers can use this to compute a max scroll offset
+    /// for their own status text; the renderer also computes it
+    /// internally each frame.
+    pub fn measure_history(&self, width: u16) -> u16 {
+        let mut total: u32 = 0;
+        for block in self.iter_history() {
+            total = total.saturating_add(u32::from(block.measure(width)));
+        }
+        total.min(u32::from(u16::MAX)) as u16
+    }
+
+    /// Iterator over every block tracked by the container, in display
+    /// order: `committed` (oldest first), then `safe`, then `active`.
+    fn iter_history(&self) -> impl Iterator<Item = &dyn Block> + '_ {
+        let committed = self.committed.iter().map(|b| b.as_ref());
+        let safe = self.safe.iter().map(|e| e.block.as_ref());
+        let active = self
+            .active_order
+            .iter()
+            .filter_map(|id| self.active.get(*id))
+            .map(|e| e.block.as_ref());
+        committed.chain(safe).chain(active)
     }
 
     /// Promote the safe-to-commit prefix of `active_order` into the
@@ -864,6 +949,189 @@ impl ScrollbackContainer {
         self.prev_footer_bottom_y = Some(terminal_h.saturating_sub(1));
 
         Ok(())
+    }
+
+    /// Paint the scrollback inspector view into the full terminal.
+    ///
+    /// Layout, top to bottom:
+    ///
+    /// ```text
+    /// row 0          : top status bar — `▲ N more rows above` (blank when at top)
+    /// content rows   : visible window of structured history at `scrollback_offset`
+    /// status row     : bottom — `▼ N more rows below` (or `(bottom)`) + `[Esc] back`
+    /// footer rows    : the container's footer block
+    /// ```
+    ///
+    /// The history is the container's own `committed` + `safe` + `active`
+    /// in display order — no parallel line buffer is maintained. The
+    /// scroll offset is clamped to `[0, max]` on every call so a previous
+    /// over-scroll lands cleanly at the top once new content shifts the
+    /// max.
+    ///
+    /// The function emits a full-screen frame using absolute cursor
+    /// positioning + cell writes — never a `\n` — so cells cannot leak
+    /// into native scrollback. Caller is responsible for switching to /
+    /// from an alt-screen around the inspector loop; the container only
+    /// holds the mode flag (via [`set_scrollback`]) so callers can
+    /// branch their render loop.
+    pub fn paint_scrollback<B>(
+        &mut self,
+        terminal: &mut Terminal<InlineBackend<B>>,
+    ) -> io::Result<()>
+    where
+        B: Backend<Error = io::Error> + Write,
+    {
+        let term_size = terminal.backend().terminal_size();
+        let width = term_size.width;
+        let height = term_size.height;
+        if width == 0 || height < 2 {
+            return Ok(());
+        }
+
+        // Layout chunks. Two status bars are mandatory; the footer
+        // shrinks first if the terminal can't fit its natural height.
+        let footer_h_natural = self.footer.measure(width);
+        let footer_h = footer_h_natural.min(height.saturating_sub(2));
+        let content_h = height - 2 - footer_h;
+        let bottom_bar_y = 1 + content_h;
+        let footer_y = bottom_bar_y + 1;
+
+        let total_h = self.measure_history(width);
+        let max_offset = total_h.saturating_sub(content_h);
+        self.scrollback_offset = self.scrollback_offset.min(max_offset);
+        let scroll = self.scrollback_offset;
+        let y_offset = max_offset - scroll;
+        let above = y_offset;
+        let below = scroll;
+
+        // Compose the full frame into an off-screen buffer, then emit it
+        // row by row. Keeps the cell-level styling intact without
+        // tangling with ratatui's Terminal diff cache.
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+
+        paint_status_bar_top(&mut buf, width, above);
+
+        if content_h > 0 {
+            let (target, src_y) = if total_h < content_h {
+                // History shorter than the content area — bottom-align
+                // so the last block sits against the bottom status bar.
+                let pad = content_h - total_h;
+                (Rect::new(0, 1 + pad, width, total_h), 0u16)
+            } else {
+                (Rect::new(0, 1, width, content_h), y_offset)
+            };
+            self.paint_history_window(target, src_y, &mut buf);
+        }
+
+        paint_status_bar_bottom(&mut buf, width, bottom_bar_y, below);
+
+        if footer_h > 0 {
+            self.footer
+                .render(Rect::new(0, footer_y, width, footer_h), &mut buf);
+        }
+
+        let mut guard = SyncGuard::new(terminal)?;
+        let terminal = guard.terminal();
+        let backend = terminal.backend_mut();
+        for row_idx in 0..height {
+            backend.move_cursor_abs(0, row_idx)?;
+            let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+            backend.write_row(cells.into_iter())?;
+        }
+        Backend::flush(backend)?;
+
+        Ok(())
+    }
+
+    /// Copy the visible slice of structured history into `frame_buf`
+    /// at `area`. Walks blocks in display order, tracking a running
+    /// `block_y` cursor (= logical row index inside history). For each
+    /// block we render a temporary same-width buffer, then copy the
+    /// rows that overlap `[src_y_offset, src_y_offset + area.height)`
+    /// into `frame_buf` at the corresponding offset inside `area`.
+    fn paint_history_window(&self, area: Rect, src_y_offset: u16, frame_buf: &mut Buffer) {
+        if area.height == 0 || area.width == 0 {
+            return;
+        }
+        let window_end = src_y_offset.saturating_add(area.height);
+        let mut block_y: u16 = 0;
+        for block in self.iter_history() {
+            let h = block.measure(area.width);
+            if h == 0 {
+                continue;
+            }
+            let block_end = block_y.saturating_add(h);
+            if block_end <= src_y_offset {
+                block_y = block_end;
+                continue;
+            }
+            if block_y >= window_end {
+                break;
+            }
+
+            let src_start = src_y_offset.saturating_sub(block_y);
+            let dst_start = block_y.saturating_sub(src_y_offset);
+            let copy_rows = (h - src_start).min(area.height - dst_start);
+
+            let block_area = Rect::new(0, 0, area.width, h);
+            let mut block_buf = Buffer::empty(block_area);
+            block.render(block_area, &mut block_buf);
+
+            for row in 0..copy_rows {
+                for col in 0..area.width {
+                    let src = block_buf[(col, src_start + row)].clone();
+                    frame_buf[(area.x + col, area.y + dst_start + row)] = src;
+                }
+            }
+
+            block_y = block_end;
+        }
+    }
+}
+
+/// Paint the inspector's top status bar (`▲ N more rows above`) into
+/// row 0 of `buf`. Suppressed when there's nothing above the visible
+/// window — that row stays blank.
+fn paint_status_bar_top(buf: &mut Buffer, width: u16, above: u16) {
+    if above == 0 || width == 0 {
+        return;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let suffix = if above == 1 { "" } else { "s" };
+    let line = Line::from(vec![
+        Span::raw("  ▲"),
+        Span::styled(format!(" {above} more row{suffix} above"), dim),
+    ]);
+    Paragraph::new(line).render(Rect::new(0, 0, width, 1), buf);
+}
+
+/// Paint the inspector's bottom status bar into row `y` of `buf`.
+/// Left side: `▼ N more rows below` or `(bottom)`. Right side: the
+/// `[Esc] back` hint, right-aligned.
+fn paint_status_bar_bottom(buf: &mut Buffer, width: u16, y: u16, below: u16) {
+    if width == 0 {
+        return;
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let left = if below > 0 {
+        let suffix = if below == 1 { "" } else { "s" };
+        Line::from(vec![
+            Span::raw("  ▼"),
+            Span::styled(format!(" {below} more row{suffix} below"), dim),
+        ])
+    } else {
+        Line::from(Span::styled("  (bottom)", dim))
+    };
+    let hint = "[Esc] back  ";
+    let hint_w = (hint.chars().count() as u16).min(width);
+    let left_w = width - hint_w;
+    if left_w > 0 {
+        Paragraph::new(left).render(Rect::new(0, y, left_w, 1), buf);
+    }
+    if hint_w > 0 {
+        Paragraph::new(Line::from(Span::styled(hint, dim)))
+            .render(Rect::new(left_w, y, hint_w, 1), buf);
     }
 }
 
@@ -2064,5 +2332,277 @@ mod tests {
         assert_eq!(container.committed_count(), 2);
         assert_eq!(container.safe_count(), 0);
         assert_eq!(container.active_count(), 4);
+    }
+
+    // ------------------------------------------------------------------
+    // Scrollback inspector
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn set_scrollback_toggles_flag() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        assert!(!c.scrollback());
+        c.set_scrollback(true);
+        assert!(c.scrollback());
+        c.set_scrollback(false);
+        assert!(!c.scrollback());
+    }
+
+    #[test]
+    fn scroll_up_down_adjust_offset() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        assert_eq!(c.scrollback_offset(), 0);
+        c.scroll_up(5);
+        assert_eq!(c.scrollback_offset(), 5);
+        c.scroll_up(3);
+        assert_eq!(c.scrollback_offset(), 8);
+        c.scroll_down(2);
+        assert_eq!(c.scrollback_offset(), 6);
+        c.scroll_down(100);
+        assert_eq!(c.scrollback_offset(), 0, "saturates at 0");
+        c.scroll_up(u16::MAX);
+        c.scroll_up(1);
+        assert_eq!(c.scrollback_offset(), u16::MAX, "saturates at u16::MAX");
+    }
+
+    #[test]
+    fn set_scrollback_true_on_transition_resets_offset() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        c.scroll_up(10);
+        c.set_scrollback(true);
+        assert_eq!(c.scrollback_offset(), 0, "transition to true resets");
+
+        c.scroll_up(7);
+        c.set_scrollback(true);
+        assert_eq!(
+            c.scrollback_offset(),
+            7,
+            "no-op transition preserves offset",
+        );
+
+        c.set_scrollback(false);
+        assert_eq!(c.scrollback_offset(), 7, "set false leaves offset alone");
+    }
+
+    #[test]
+    fn measure_history_sums_all_collections() {
+        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        c.push(multi(3)); // safe, 3 rows
+        c.push(multi(2)); // safe, 2 rows
+        c.push_active(multi(4)); // active, 4 rows
+        assert_eq!(c.measure_history(80), 9);
+    }
+
+    /// Inspector view with all blocks fitting inside the content area:
+    /// bottom-aligned, no scroll markers, `(bottom)` hint shown.
+    #[test]
+    fn paint_scrollback_short_history_bottom_aligns() {
+        let mut terminal = mk_term_terminal(40, 10);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        c.push(multi_text(&["one"]));
+        c.push(multi_text(&["two"]));
+
+        c.set_scrollback(true);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Layout: row 0 top bar, rows 1..8 content, row 8 bottom bar,
+        // row 9 footer. Content area = 7 rows; history = 2 rows, so
+        // bottom-aligned at rows 6-7.
+        assert_eq!(b.screen_row(0), "", "no above marker when at bottom");
+        assert_eq!(b.screen_row(6), "one");
+        assert_eq!(b.screen_row(7), "two");
+        let bottom = b.screen_row(8);
+        assert!(
+            bottom.contains("(bottom)"),
+            "expected (bottom) marker, got {bottom:?}"
+        );
+        assert!(bottom.contains("[Esc] back"));
+        assert_eq!(b.screen_row(9), "footer");
+    }
+
+    /// Inspector at offset 0 with enough history to scroll: bottom of
+    /// history sits flush against the bottom bar; the top status bar
+    /// shows `▲ N more rows above`.
+    #[test]
+    fn paint_scrollback_long_history_shows_above_marker_at_bottom() {
+        let mut terminal = mk_term_terminal(40, 7);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        // Content area = 7 - 2 - 1 = 4 rows. Push 6 single-row blocks
+        // so total_h = 6 > 4 → 2 rows hidden above.
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            c.push(multi_text(&[label]));
+        }
+
+        c.set_scrollback(true);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Visible at bottom: c, d, e, f.
+        let top = b.screen_row(0);
+        assert!(top.contains("▲"), "expected ▲ marker, got {top:?}");
+        assert!(
+            top.contains("2"),
+            "expected '2 more rows above', got {top:?}"
+        );
+        assert_eq!(b.screen_row(1), "c");
+        assert_eq!(b.screen_row(2), "d");
+        assert_eq!(b.screen_row(3), "e");
+        assert_eq!(b.screen_row(4), "f");
+        let bottom = b.screen_row(5);
+        assert!(
+            bottom.contains("(bottom)"),
+            "still at bottom when offset = 0, got {bottom:?}"
+        );
+        assert_eq!(b.screen_row(6), "footer");
+    }
+
+    /// Scrolling up reveals older content and shows both markers.
+    #[test]
+    fn paint_scrollback_scrolled_shows_both_markers() {
+        let mut terminal = mk_term_terminal(40, 7);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            c.push(multi_text(&[label]));
+        }
+
+        c.set_scrollback(true);
+        c.scroll_up(1);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // max_offset = 6 - 4 = 2, scroll = 1 → y_offset = 1 → b..e visible.
+        let top = b.screen_row(0);
+        assert!(top.contains("▲"));
+        assert!(top.contains("1"));
+        assert_eq!(b.screen_row(1), "b");
+        assert_eq!(b.screen_row(2), "c");
+        assert_eq!(b.screen_row(3), "d");
+        assert_eq!(b.screen_row(4), "e");
+        let bottom = b.screen_row(5);
+        assert!(bottom.contains("▼"), "expected ▼ marker, got {bottom:?}");
+        assert!(bottom.contains("1"));
+        assert_eq!(b.screen_row(6), "footer");
+    }
+
+    /// Scrolling all the way up shows the oldest content with no
+    /// `▲` marker; bottom marker shows the full overflow.
+    #[test]
+    fn paint_scrollback_scrolled_to_top_suppresses_above_marker() {
+        let mut terminal = mk_term_terminal(40, 7);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            c.push(multi_text(&[label]));
+        }
+
+        c.set_scrollback(true);
+        c.scroll_up(u16::MAX); // clamp to max on paint
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        let top = b.screen_row(0);
+        assert!(!top.contains("▲"), "no above marker at top, got {top:?}");
+        assert_eq!(b.screen_row(1), "a");
+        assert_eq!(b.screen_row(2), "b");
+        assert_eq!(b.screen_row(3), "c");
+        assert_eq!(b.screen_row(4), "d");
+        let bottom = b.screen_row(5);
+        assert!(bottom.contains("▼"));
+        assert!(bottom.contains("2"));
+        // Offset clamped on paint.
+        assert_eq!(c.scrollback_offset(), 2);
+    }
+
+    /// Scrollback inspector pulls from `committed` + `safe` + `active`
+    /// in display order — content already pushed into native scrollback
+    /// in the live view is still inspectable.
+    #[test]
+    fn paint_scrollback_includes_committed_blocks() {
+        let mut terminal = mk_term_terminal(40, 5);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        // Push enough to commit some into native scrollback in live mode.
+        for label in ["a", "b", "c", "d", "e", "f"] {
+            c.push(multi_text(&[label]));
+        }
+        c.draw(&mut terminal).unwrap();
+        assert!(
+            c.committed_count() > 0,
+            "live draw must have committed some blocks for this test to be meaningful",
+        );
+
+        // Switch to inspector — a fresh, bigger terminal so the whole
+        // history fits and we can read it back top to bottom.
+        let mut terminal = mk_term_terminal(40, 10);
+        c.set_scrollback(true);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Content area = 7 rows; total_h = 6 → bottom-aligned at rows
+        // 2..7 (pad = 1 above).
+        assert_eq!(b.screen_row(2), "a");
+        assert_eq!(b.screen_row(3), "b");
+        assert_eq!(b.screen_row(4), "c");
+        assert_eq!(b.screen_row(5), "d");
+        assert_eq!(b.screen_row(6), "e");
+        assert_eq!(b.screen_row(7), "f");
+        assert_eq!(b.screen_row(9), "footer");
+    }
+
+    /// Inspector emits no `\n` — nothing should reach the terminal's
+    /// own scrollback during a paint.
+    #[test]
+    fn paint_scrollback_does_not_touch_native_scrollback() {
+        let mut terminal = mk_term_terminal(40, 5);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        for label in ["a", "b", "c", "d", "e", "f", "g", "h"] {
+            c.push(multi_text(&[label]));
+        }
+        // Don't run live draw first — we want this paint in isolation.
+        c.set_scrollback(true);
+        c.paint_scrollback(&mut terminal).unwrap();
+        c.scroll_up(3);
+        c.paint_scrollback(&mut terminal).unwrap();
+        c.scroll_down(100);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        assert_eq!(
+            b.scrollback_len(),
+            0,
+            "inspector must never push rows into native scrollback",
+        );
+    }
+
+    /// `set_scrollback` does not touch live-view bookkeeping — after
+    /// a round trip through inspector mode the live `draw` resumes
+    /// against the same render state and emits no cells for unchanged
+    /// blocks. The caller is expected to bracket the inspector in
+    /// alt-screen, so the main screen is restored exactly when the
+    /// live path resumes.
+    #[test]
+    fn round_trip_through_scrollback_preserves_live_state() {
+        let mut terminal = mk_term_terminal(40, 5);
+        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        c.push(multi_text(&["a"]));
+        c.push(multi_text(&["b"]));
+        c.draw(&mut terminal).unwrap();
+
+        c.set_scrollback(true);
+        c.scroll_up(2);
+        c.set_scrollback(false);
+
+        // External wipe — simulates the alt-screen restoration NOT
+        // happening cleanly (so a redraw would be required). If
+        // render states survive (they should), undamaged blocks
+        // skip the repaint and the rows stay blank.
+        use std::io::Write;
+        write!(terminal.backend_mut(), "\x1b[H\x1b[J").unwrap();
+        c.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // a, b are undamaged — skipped. Footer's diff is empty.
+        assert_eq!(b.screen_row(0), "");
+        assert_eq!(b.screen_row(1), "");
+        assert_eq!(b.screen_row(2), "");
     }
 }
