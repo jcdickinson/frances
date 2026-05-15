@@ -1323,6 +1323,7 @@ dependencies = [
  "frances-llm",
  "frances-models-llm",
  "frances-shell",
+ "frances-storage",
  "frances-workflow",
  "futures",
  "futures-util",
@@ -1412,6 +1413,17 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "frances-storage"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.18",
+ "tokio",
+ "turso",
+ "twox-hash",
+ "uuid",
 ]
 
 [[package]]

@@ -2,11 +2,11 @@ use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use frances_storage::MigrationError;
 use thiserror::Error;
 use tracing::trace;
 use turso::{Builder, Connection};
 
-use crate::migrations::{self, MigrationError};
 use crate::session::Session;
 
 #[derive(Debug, Error)]
@@ -49,7 +49,7 @@ impl Database {
         let conn = database.connect()?;
 
         trace!(path = %path.display(), "running schema migrations");
-        migrations::run_all(
+        frances_storage::run_all(
             conn,
             &[
                 &crate::anchor_store::SCHEMA,

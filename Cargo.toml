@@ -18,6 +18,7 @@ frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
 frances-models-llm = { path = "crates/frances-models-llm" }
 frances-shell = { path = "crates/frances-shell" }
+frances-storage = { path = "crates/frances-storage" }
 frances-tui = { path = "crates/frances-tui" }
 frances-workflow = { path = "crates/frances-workflow" }
 

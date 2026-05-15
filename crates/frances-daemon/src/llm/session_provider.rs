@@ -9,25 +9,26 @@
 //! through `ConfigHandle::build`. The writer persists rows to the same
 //! table and emits the events on this provider's layer in one call.
 
+use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
 use frances_config::{ConfigEvent, ConfigProvider, EventSender, Path, ProviderError, Value};
+use frances_storage::{EntitySchema, Migration};
 use thiserror::Error;
 use tracing::{debug, warn};
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
 
-use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
 /// Owns the `session_config` table. UUID is permanent.
 pub static SCHEMA: EntitySchema = EntitySchema {
     entity: Uuid::from_u128(0x33578ba6_759b_42c5_8c7f_94932a153732),
-    migrations: &[Migration {
-        name: "0001_init.sql",
-        sql: include_str!("session_provider/migrations/0001_init.sql"),
-    }],
+    migrations: Cow::Borrowed(&[Migration {
+        name: Cow::Borrowed("0001_init.sql"),
+        sql: Cow::Borrowed(include_str!("session_provider/migrations/0001_init.sql")),
+    }]),
 };
 
 /// Reads `(path, kind, value)` rows from `session_config` on the

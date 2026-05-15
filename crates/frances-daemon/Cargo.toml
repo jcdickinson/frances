@@ -43,6 +43,7 @@ frances-edit.workspace = true
 frances-llm.workspace = true
 frances-models-llm.workspace = true
 frances-shell.workspace = true
+frances-storage.workspace = true
 frances-workflow.workspace = true
 
 [dev-dependencies]

@@ -1,8 +1,10 @@
+use std::borrow::Cow;
+
 use frances_llm::HistoryStore as HistoryStoreTrait;
 use frances_models_llm::chat::{ChatSessionId, HistoryError, OwnedHistoryInput};
+use frances_storage::{EntitySchema, Migration};
 use uuid::Uuid;
 
-use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
 mod messages;
@@ -12,10 +14,10 @@ pub use messages::Block;
 /// Owns the conversation history. UUID is permanent — never edit.
 pub static SCHEMA: EntitySchema = EntitySchema {
     entity: Uuid::from_u128(0x7ffee42d_48de_4090_8fc6_a25e66f33a02),
-    migrations: &[Migration {
-        name: "0001_init.sql",
-        sql: include_str!("migrations/0001_init.sql"),
-    }],
+    migrations: Cow::Borrowed(&[Migration {
+        name: Cow::Borrowed("0001_init.sql"),
+        sql: Cow::Borrowed(include_str!("migrations/0001_init.sql")),
+    }]),
 };
 
 /// Turso-backed implementation of [`frances_llm::HistoryStore`].

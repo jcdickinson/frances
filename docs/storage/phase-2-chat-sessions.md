@@ -91,6 +91,7 @@ Persisted (default) sessions keep today's behavior verbatim.
   see those via `new_inputs` (the `pending` drain). That's fine, but
   needs a test to lock it in: the second round must include the tool
   result from the first.
+- delete `primary_chat_session`.
 
 ## Definition of done
 

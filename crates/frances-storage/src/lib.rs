@@ -1,9 +1,9 @@
 //! Per-entity SQL migration system.
 //!
 //! Each subsystem ("thing") that owns tables — built-in tools, history,
-//! session config, future workflows — declares an [`EntitySchema`]: a
-//! stable [`Uuid`] plus an ordered slice of [`Migration`]s, each with a
-//! human-readable name and a chunk of SQL.
+//! session config, workflows loaded off disk — declares an
+//! [`EntitySchema`]: a stable [`Uuid`] plus an ordered list of
+//! [`Migration`]s, each with a human-readable name and a chunk of SQL.
 //!
 //! [`run`] enforces a single, strict invariant: the migrations already
 //! recorded in `_migrations` for an entity must match the declared
@@ -19,6 +19,7 @@
 //! without coordinating version numbers. (sqlx wasn't an option — it
 //! doesn't talk to turso directly.)
 
+use std::borrow::Cow;
 use std::hash::Hasher;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -29,18 +30,27 @@ use uuid::Uuid;
 
 /// One forward-only migration. `name` is the filename (or any stable
 /// label) and is shown in error messages; `sql` is its body.
+///
+/// Both fields are [`Cow<'static, str>`] so daemon-side schemas can
+/// stay zero-copy on `include_str!` constants while workflow code
+/// constructs migrations from bytes read at runtime.
+#[derive(Clone)]
 pub struct Migration {
-    pub name: &'static str,
-    pub sql: &'static str,
+    pub name: Cow<'static, str>,
+    pub sql: Cow<'static, str>,
 }
 
 /// Migrations owned by one subsystem, identified by a stable
 /// [`Uuid`]. Generate the UUID once (any v4 will do) and treat it as
 /// part of the public API of the subsystem — changing it orphans the
 /// existing tables.
+///
+/// `migrations` is a [`Cow`] so the daemon's static schemas can stay
+/// const-constructible (`Cow::Borrowed(&[..])`) while workflow code
+/// loaded at runtime can hand in an owned [`Vec`].
 pub struct EntitySchema {
     pub entity: Uuid,
-    pub migrations: &'static [Migration],
+    pub migrations: Cow<'static, [Migration]>,
 }
 
 #[derive(Debug, Error)]
@@ -71,7 +81,7 @@ pub enum MigrationError {
         entity: Uuid,
         index: usize,
         applied: String,
-        declared: &'static str,
+        declared: String,
     },
     #[error(
         "entity {entity}: migration {index} ({name}) checksum mismatch: applied {applied:#018x}, declared {declared:#018x}"
@@ -79,7 +89,7 @@ pub enum MigrationError {
     ChecksumMismatch {
         entity: Uuid,
         index: usize,
-        name: &'static str,
+        name: String,
         applied: u64,
         declared: u64,
     },
@@ -207,20 +217,20 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
                 found: row.version,
             });
         }
-        if row.name != declared.name {
+        if row.name != declared.name.as_ref() {
             return Err(MigrationError::Renamed {
                 entity: schema.entity,
                 index: i,
                 applied: row.name.clone(),
-                declared: declared.name,
+                declared: declared.name.to_string(),
             });
         }
-        let declared_sum = checksum(declared.sql);
+        let declared_sum = checksum(&declared.sql);
         if row.checksum != declared_sum {
             return Err(MigrationError::ChecksumMismatch {
                 entity: schema.entity,
                 index: i,
-                name: declared.name,
+                name: declared.name.to_string(),
                 applied: row.checksum as u64,
                 declared: declared_sum as u64,
             });
@@ -229,7 +239,7 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
 
     for (i, m) in schema.migrations.iter().enumerate().skip(applied.len()) {
         let tx = conn.unchecked_transaction().await?;
-        tx.execute_batch(m.sql).await?;
+        tx.execute_batch(&m.sql).await?;
         tx.execute(
             "INSERT INTO _migrations (entity, version, name, checksum, applied_at) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -237,7 +247,7 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
                 entity_bytes.clone(),
                 i as i64,
                 m.name.to_string(),
-                checksum(m.sql),
+                checksum(&m.sql),
                 now_ns(),
             ),
         )
@@ -274,31 +284,38 @@ mod tests {
 
     const TEST_ENTITY: Uuid = Uuid::from_u128(0x0123_4567_89ab_cdef_0123_4567_89ab_cdef);
 
+    fn mig(name: &'static str, sql: &'static str) -> Migration {
+        Migration {
+            name: Cow::Borrowed(name),
+            sql: Cow::Borrowed(sql),
+        }
+    }
+
     fn schema_v1() -> EntitySchema {
-        static MIGS: &[Migration] = &[Migration {
-            name: "0001_init.sql",
-            sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-        }];
         EntitySchema {
             entity: TEST_ENTITY,
-            migrations: MIGS,
+            migrations: vec![mig(
+                "0001_init.sql",
+                "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )]
+            .into(),
         }
     }
 
     fn schema_v2() -> EntitySchema {
-        static MIGS: &[Migration] = &[
-            Migration {
-                name: "0001_init.sql",
-                sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-            },
-            Migration {
-                name: "0002_color.sql",
-                sql: "ALTER TABLE widgets ADD COLUMN color TEXT;",
-            },
-        ];
         EntitySchema {
             entity: TEST_ENTITY,
-            migrations: MIGS,
+            migrations: vec![
+                mig(
+                    "0001_init.sql",
+                    "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+                ),
+                mig(
+                    "0002_color.sql",
+                    "ALTER TABLE widgets ADD COLUMN color TEXT;",
+                ),
+            ]
+            .into(),
         }
     }
 
@@ -368,13 +385,13 @@ mod tests {
         ensure_table(&conn).await.unwrap();
         run(&conn, &schema_v1()).await.unwrap();
 
-        static RENAMED: &[Migration] = &[Migration {
-            name: "0001_renamed.sql",
-            sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
-        }];
         let renamed = EntitySchema {
             entity: TEST_ENTITY,
-            migrations: RENAMED,
+            migrations: vec![mig(
+                "0001_renamed.sql",
+                "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+            )]
+            .into(),
         };
         let err = run(&conn, &renamed).await.unwrap_err();
         assert!(matches!(err, MigrationError::Renamed { .. }), "{err:#}");
@@ -386,13 +403,13 @@ mod tests {
         ensure_table(&conn).await.unwrap();
         run(&conn, &schema_v1()).await.unwrap();
 
-        static EDITED: &[Migration] = &[Migration {
-            name: "0001_init.sql",
-            sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT, color TEXT);",
-        }];
         let edited = EntitySchema {
             entity: TEST_ENTITY,
-            migrations: EDITED,
+            migrations: vec![mig(
+                "0001_init.sql",
+                "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT, color TEXT);",
+            )]
+            .into(),
         };
         let err = run(&conn, &edited).await.unwrap_err();
         assert!(
@@ -419,13 +436,13 @@ mod tests {
         let conn = fresh_conn().await;
         ensure_table(&conn).await.unwrap();
 
-        static BAD: &[Migration] = &[Migration {
-            name: "0001_bad.sql",
-            sql: "CREATE TABLE widgets (id INTEGER PRIMARY KEY); NOT VALID SQL;",
-        }];
         let bad = EntitySchema {
             entity: TEST_ENTITY,
-            migrations: BAD,
+            migrations: vec![mig(
+                "0001_bad.sql",
+                "CREATE TABLE widgets (id INTEGER PRIMARY KEY); NOT VALID SQL;",
+            )]
+            .into(),
         };
         let _ = run(&conn, &bad).await;
 
@@ -446,13 +463,13 @@ mod tests {
         run(&conn, &schema_v1()).await.unwrap();
 
         const OTHER_ENTITY: Uuid = Uuid::from_u128(0xdead_beef_dead_beef_dead_beef_dead_beef);
-        static OTHER_MIGS: &[Migration] = &[Migration {
-            name: "0001_other.sql",
-            sql: "CREATE TABLE gadgets (id INTEGER PRIMARY KEY);",
-        }];
         let other = EntitySchema {
             entity: OTHER_ENTITY,
-            migrations: OTHER_MIGS,
+            migrations: vec![mig(
+                "0001_other.sql",
+                "CREATE TABLE gadgets (id INTEGER PRIMARY KEY);",
+            )]
+            .into(),
         };
         run(&conn, &other).await.unwrap();
 
@@ -462,5 +479,40 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
         assert!(matches!(row.get_value(0).unwrap(), Value::Integer(2)));
+    }
+
+    /// Workflow migrations are built from bytes loaded at runtime —
+    /// proves an `EntitySchema` made entirely of owned `String`s
+    /// applies identically to the borrowed daemon-side flavor.
+    #[tokio::test]
+    async fn owned_schema_applies() {
+        let conn = fresh_conn().await;
+        ensure_table(&conn).await.unwrap();
+
+        let schema = EntitySchema {
+            entity: TEST_ENTITY,
+            migrations: Cow::Owned(vec![Migration {
+                name: Cow::Owned(String::from("0001_init.sql")),
+                sql: Cow::Owned(String::from(
+                    "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);",
+                )),
+            }]),
+        };
+
+        run(&conn, &schema).await.unwrap();
+        // Re-run the same schema (still owned) — must be a clean no-op,
+        // proving checksums match across the two owned constructions.
+        run(&conn, &schema).await.unwrap();
+
+        conn.execute("INSERT INTO widgets (id, name) VALUES (1, 'a')", ())
+            .await
+            .unwrap();
+
+        let mut rows = conn
+            .query("SELECT COUNT(*) FROM _migrations", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert!(matches!(row.get_value(0).unwrap(), Value::Integer(1)));
     }
 }

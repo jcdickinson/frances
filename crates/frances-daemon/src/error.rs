@@ -20,7 +20,7 @@ pub enum Error {
     Transport(#[from] crate::transport::TransportError),
 
     #[error(transparent)]
-    Migration(#[from] crate::migrations::MigrationError),
+    Migration(#[from] frances_storage::MigrationError),
 
     #[error(transparent)]
     Edit(#[from] EditError),

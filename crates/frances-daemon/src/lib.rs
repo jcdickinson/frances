@@ -3,7 +3,6 @@ pub mod context;
 mod error;
 pub mod history;
 pub mod llm;
-pub mod migrations;
 pub mod protocol;
 pub mod server;
 pub mod session;

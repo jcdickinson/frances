@@ -51,15 +51,10 @@ in `Cow::Borrowed`.
 4. Update `store.rs::Database::open` to call `run_all` with the new
    crate path. Keep the bootstrap order unchanged.
 
-## Open questions
+## Crate name
 
-- Crate name. `frances-storage` is broad and could grow to host the
-  `Database` wrapper too. `frances-migrate` is more specific. Pick when
-  the crate lands; rename is cheap.
-- Whether `Migration::sql` should also accept a `Path` and read on apply
-  to avoid copying large migration bodies into RAM at config-load time.
-  Probably not worth it — workflow migrations are small SQL files and
-  staying with `Cow<'static, str>` keeps the codepath one shape.
+`frances-storage`. Broad enough that the `Database` wrapper can move in
+later without another rename.
 
 ## Definition of done
 

@@ -1,23 +1,24 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use frances_edit::{Anchor, AnchorStore, FileAnchorState, LineEntry, StoreError, StoreResult};
+use frances_storage::{EntitySchema, Migration};
 use thiserror::Error;
 use turso::Value;
 use uuid::Uuid;
 
-use crate::migrations::{EntitySchema, Migration};
 use crate::store::Database;
 
 /// Owns file_meta, file_lines, file_tombstones — the anchor edit
 /// state used by the editor. UUID is permanent.
 pub static SCHEMA: EntitySchema = EntitySchema {
     entity: Uuid::from_u128(0x97acb11c_b9a1_4f71_af62_0368f2ca9913),
-    migrations: &[Migration {
-        name: "0001_init.sql",
-        sql: include_str!("migrations/0001_init.sql"),
-    }],
+    migrations: Cow::Borrowed(&[Migration {
+        name: Cow::Borrowed("0001_init.sql"),
+        sql: Cow::Borrowed(include_str!("migrations/0001_init.sql")),
+    }]),
 };
 
 #[derive(Debug, Error)]
