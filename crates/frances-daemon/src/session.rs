@@ -1,7 +1,5 @@
 use std::env;
 use std::fs;
-#[cfg(test)]
-use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};

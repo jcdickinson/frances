@@ -17,10 +17,6 @@ pub trait HistoryStore: Send + Sync + 'static {
 
     async fn load_chat_session(&self, id: ChatSessionId) -> Result<ChatSessionRow, HistoryError>;
 
-    async fn primary_chat_session(&self) -> Result<Option<ChatSessionId>, HistoryError>;
-
-    async fn insert_primary_chat_session(&self, id: ChatSessionId) -> Result<(), HistoryError>;
-
     async fn loaded_history(&self, session: ChatSessionId) -> Result<Vec<Value>, HistoryError>;
 
     async fn append_history(

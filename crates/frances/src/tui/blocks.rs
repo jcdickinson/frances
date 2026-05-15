@@ -168,8 +168,8 @@ impl Block for FooterBlock {
 
 pub fn prefix_for(kind: &BlockKind) -> String {
     match kind {
-        BlockKind::UserText => "you: ".to_string(),
-        BlockKind::AssistantText => "frances: ".to_string(),
+        BlockKind::Text { sender: Some(s) } => format!("{s}: "),
+        BlockKind::Text { sender: None } => String::new(),
         BlockKind::ToolUse { name } => format!("→ {name}("),
         BlockKind::ToolResult { is_error, .. } => {
             if *is_error {
@@ -183,8 +183,7 @@ pub fn prefix_for(kind: &BlockKind) -> String {
 
 fn prefix_style(kind: &BlockKind) -> Style {
     match kind {
-        BlockKind::UserText => Style::default().fg(Color::Cyan),
-        BlockKind::AssistantText => Style::default().fg(Color::Green),
+        BlockKind::Text { .. } => Style::default(),
         BlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
         BlockKind::ToolResult { is_error: true, .. } => Style::default().fg(Color::Red),
         BlockKind::ToolResult {

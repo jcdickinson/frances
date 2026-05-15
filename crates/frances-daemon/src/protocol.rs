@@ -115,10 +115,21 @@ pub enum StreamFrame {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockKind {
-    UserText,
-    AssistantText,
-    ToolUse { name: String },
-    ToolResult { tool_use_id: String, is_error: bool },
+    /// A free-form text block. `sender` labels the speaker; the TUI
+    /// renders it as a prefix when present, and renders nothing in
+    /// front of the body when `None`. Workflows pick the sender via
+    /// `new MarkdownFrame({ content, sender })` — there is no
+    /// host-side meaning beyond the label.
+    Text {
+        sender: Option<String>,
+    },
+    ToolUse {
+        name: String,
+    },
+    ToolResult {
+        tool_use_id: String,
+        is_error: bool,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

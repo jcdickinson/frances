@@ -34,13 +34,3 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 
 CREATE INDEX IF NOT EXISTS idx_chat_messages_history
     ON chat_messages(chat_session_id, seq) WHERE history IS NOT NULL;
-
--- Append-only log of "primary" chat sessions — the one the TUI's
--- hardcoded turn workflow drives. The latest row wins; older rows are
--- the history of past primaries. There's no UI for starting a fresh
--- primary yet, so today the table holds a single row, but the schema
--- is set up for that to grow.
-CREATE TABLE IF NOT EXISTS primary_chat_session (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_session_id INTEGER NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE
-);

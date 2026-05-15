@@ -3,7 +3,9 @@
 // shell_run/wait/kill against one long-lived bash subprocess, plus the
 // anchor-aware file_read/replace/insert_*/new/overwrite family.
 //
-// Wire up via config:
+// Wire up as the daemon's default workflow via config:
+//   default_workflow = "main"
+//
 //   [workflows.main]
 //   id = "<uuid>"
 //   file = "assets/workflows/main.ts"
@@ -79,8 +81,9 @@ transcript.push(
 try {
   for await (const input of inbox) {
     const msg = input.content.trim();
+    transcript.push(new MarkdownFrame({ content: msg, sender: "you" }));
     if (msg === "quit") {
-      transcript.push(new MarkdownFrame({ content: "bye" }));
+      transcript.push(new MarkdownFrame({ content: "bye", sender: "frances" }));
       exit();
       break;
     }
@@ -88,7 +91,7 @@ try {
     chat.push({ role: "user", content: msg });
     try {
       while (true) {
-        const out = new MarkdownFrame({ content: "" });
+        const out = new MarkdownFrame({ content: "", sender: "frances" });
         transcript.push(out);
         const r = await chat.stream();
         await r.text.pipeTo(out.writable);

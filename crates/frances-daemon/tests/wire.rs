@@ -6,7 +6,7 @@
 //! miss without an explicit round-trip.
 
 use frances_daemon::protocol::{
-    ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest, StreamFrame,
+    ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest, BlockId, BlockKind, StreamFrame,
 };
 
 fn round_trip<T>(value: &T) -> T
@@ -51,6 +51,41 @@ fn approval_choice_round_trips_all_variants() {
     assert_eq!(round_trip(&yes), yes);
     assert_eq!(round_trip(&no), no);
     assert_eq!(round_trip(&chat), chat);
+}
+
+#[test]
+fn block_kind_text_round_trips_with_sender() {
+    let with = StreamFrame::BlockStart {
+        id: BlockId(1),
+        kind: BlockKind::Text {
+            sender: Some("you".to_owned()),
+        },
+    };
+    let bytes = bincode::serde::encode_to_vec(&with, bincode::config::standard()).unwrap();
+    let (decoded, _): (StreamFrame, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    match decoded {
+        StreamFrame::BlockStart {
+            kind: BlockKind::Text { sender: Some(s) },
+            ..
+        } => assert_eq!(s, "you"),
+        other => panic!("expected Text {{ sender: Some(\"you\") }}, got {other:?}"),
+    }
+
+    let without = StreamFrame::BlockStart {
+        id: BlockId(2),
+        kind: BlockKind::Text { sender: None },
+    };
+    let bytes = bincode::serde::encode_to_vec(&without, bincode::config::standard()).unwrap();
+    let (decoded, _): (StreamFrame, _) =
+        bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
+    match decoded {
+        StreamFrame::BlockStart {
+            kind: BlockKind::Text { sender: None },
+            ..
+        } => {}
+        other => panic!("expected Text {{ sender: None }}, got {other:?}"),
+    }
 }
 
 #[test]

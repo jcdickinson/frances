@@ -63,7 +63,7 @@ async fn drive_one_cycle_inner(
 fn text_of(frame: &HostFrame) -> String {
     match frame {
         HostFrame::Push(p) => match &p.kind {
-            FrameKind::Markdown { content } | FrameKind::Error { content } => content.clone(),
+            FrameKind::Markdown { content, .. } | FrameKind::Error { content } => content.clone(),
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
         },
         HostFrame::Append { delta, .. } => delta.clone(),

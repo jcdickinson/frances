@@ -128,10 +128,12 @@ fn push_frame<'js>(
 
     if let Some(md) = as_frame::<MarkdownFrame>(&frame) {
         let new_id = state.assign_id();
-        md.borrow().id.store(new_id, Ordering::Release);
+        let borrow = md.borrow();
+        borrow.id.store(new_id, Ordering::Release);
         state.active_id.store(new_id, Ordering::Release);
         let kind = FrameKind::Markdown {
-            content: md.borrow().content.clone(),
+            content: borrow.content.clone(),
+            sender: borrow.sender.clone(),
         };
         let _ = state.tx.send(HostFrame::Push(FramePush {
             id: FrameId(new_id),
@@ -188,6 +190,8 @@ pub struct MarkdownFrame {
     /// Initial content captured at construction. Appends go straight to
     /// the host channel; we don't reconstruct the full text here.
     content: String,
+    /// Optional speaker label. `None` ⇒ the host renders no prefix.
+    sender: Option<String>,
 }
 
 impl<'js> Trace<'js> for MarkdownFrame {
@@ -337,13 +341,14 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
     Constructor::new_class::<MarkdownFrame, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| {
-            let content = parse_content_arg(&ctx, &arg, "MarkdownFrame")?;
+            let (content, sender) = parse_markdown_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
                 MarkdownFrame {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     content,
+                    sender,
                 },
             )
         },
@@ -410,6 +415,37 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
     };
     obj.get::<_, String>("content")
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
+}
+
+/// Parse `new MarkdownFrame({ content, sender? })`. `sender` is
+/// optional; if present it must be a string. Anything else throws.
+fn parse_markdown_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<(String, Option<String>)> {
+    let Some(obj) = arg.as_object() else {
+        return Err(throw_err(
+            ctx,
+            "new MarkdownFrame: expected { content: string, sender?: string }",
+        ));
+    };
+    let content: String = obj
+        .get("content")
+        .map_err(|_| throw_err(ctx, "new MarkdownFrame: `content` must be a string"))?;
+    let sender_val: Value<'js> = obj
+        .get("sender")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let sender =
+        if sender_val.is_undefined() || sender_val.is_null() {
+            None
+        } else if let Some(s) = sender_val.as_string() {
+            Some(s.to_string().map_err(|_| {
+                throw_err(ctx, "new MarkdownFrame: `sender` must be a UTF-8 string")
+            })?)
+        } else {
+            return Err(throw_err(
+                ctx,
+                "new MarkdownFrame: `sender` must be a string when present",
+            ));
+        };
+    Ok((content, sender))
 }
 
 fn throw_type<'js, T>(ctx: &Ctx<'js>, message: &str) -> JsResult<T> {

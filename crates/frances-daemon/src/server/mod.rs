@@ -16,7 +16,7 @@ use crate::session::Session;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_edit::EditSession;
-use frances_llm::{ChatManagerDeps, ChatSession, ChatSessionManager, ProviderCache};
+use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
 use frances_workflow::{ApprovalGateway, EditorFactory, Runtime as WorkflowRuntime, WorkflowDeps};
 use std::path::PathBuf;
 use tokio::sync::Mutex as AsyncMutex;
@@ -32,7 +32,6 @@ mod turn;
 pub use bootstrap::run;
 pub use error::ServerError;
 pub use logging::install_logging;
-pub(crate) use turn::run_legacy_llm_turn;
 
 use events::EventsRouter;
 
@@ -221,9 +220,6 @@ pub(crate) struct ServerState {
         reason = "kept for future direct access; chat manager holds its own clone"
     )]
     pub cache: ProviderCache,
-    /// The session driving the TUI's hardcoded turn workflow. There's
-    /// only one for now; loaded (or created) once at daemon startup.
-    pub primary_chat: ChatSession<ServerChatDeps>,
     pub workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
     pub workflow_runtime: Arc<WorkflowRuntime<ServerWorkflowDeps>>,
     pub workflow_stack: WorkflowStack,

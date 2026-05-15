@@ -88,32 +88,6 @@ impl HistoryStoreTrait for TursoHistoryStore {
         })
     }
 
-    async fn primary_chat_session(&self) -> Result<Option<ChatSessionId>, HistoryError> {
-        let conn = self.db().connect();
-        let mut rows = conn
-            .query(
-                "SELECT chat_session_id FROM primary_chat_session ORDER BY id DESC LIMIT 1",
-                (),
-            )
-            .await
-            .map_err(turso_err)?;
-        match rows.next().await.map_err(turso_err)? {
-            Some(row) => Ok(Some(ChatSessionId(row.get::<i64>(0).map_err(turso_err)?))),
-            None => Ok(None),
-        }
-    }
-
-    async fn insert_primary_chat_session(&self, id: ChatSessionId) -> Result<(), HistoryError> {
-        let conn = self.db().connect();
-        conn.execute(
-            "INSERT INTO primary_chat_session (chat_session_id) VALUES (?1)",
-            (id.0,),
-        )
-        .await
-        .map_err(turso_err)?;
-        Ok(())
-    }
-
     async fn loaded_history(&self, session: ChatSessionId) -> Result<Vec<Value>, HistoryError> {
         trace!(session = %session, "loading history payloads");
 

@@ -165,28 +165,6 @@ impl<D: ChatManagerDeps> ChatSessionManagerTrait for ChatSessionManager<D> {
             self.clone(),
         ))
     }
-
-    async fn primary(&self, builder: ChatSessionBuilder) -> Result<Self::Session, ChatError> {
-        if let Some(id) = self
-            .inner
-            .deps
-            .history_store()
-            .primary_chat_session()
-            .await?
-        {
-            return ChatSessionManagerTrait::load(self, id).await;
-        }
-        let session = self.create(builder);
-        // Force lazy row creation so we can pin it as primary.
-        session.ensure_row().await?;
-        let id = session.id().expect("ensure_row populates id on success");
-        self.inner
-            .deps
-            .history_store()
-            .insert_primary_chat_session(id)
-            .await?;
-        Ok(session)
-    }
 }
 
 pub(crate) fn log_and_typed(provider_id: &str, source: ErasedError) -> ChatError {

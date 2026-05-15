@@ -20,8 +20,6 @@ use frances_config::{ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::EditEngine;
 use frances_edit::EditSession;
 use frances_llm::{ChatSessionManager, ProviderCache};
-use frances_models_llm::ChatSessionManager as ChatSessionManagerTrait;
-use frances_models_llm::chat::ChatSessionBuilder;
 use frances_models_llm::config::ModelConfig;
 use frances_workflow::Runtime as WorkflowRuntime;
 
@@ -81,17 +79,13 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         .map_err(|_| ServerError::DefaultModelMissing)?;
     let cache = ProviderCache::new(config.clone())?;
     let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
+    let default_workflow = config.bind::<Option<String>>("default_workflow")?;
 
     let history = TursoHistoryStore::new(db);
     let chat_deps = ServerChatDeps {
         history: history.clone(),
     };
     let chat = ChatSessionManager::new(chat_deps, config.clone(), default_model, cache.clone())?;
-    let primary_chat = ChatSessionManagerTrait::primary(
-        &chat,
-        ChatSessionBuilder::new().with_model_intents(["chat".to_string()]),
-    )
-    .await?;
 
     let last_context = Arc::new(StdMutex::new(None));
     let editor_factory = super::DaemonEditorFactory {
@@ -116,7 +110,6 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         _config: config,
         history,
         cache,
-        primary_chat,
         workflows,
         workflow_runtime,
         workflow_stack: WorkflowStack::new(),
@@ -151,6 +144,22 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
             warn!(%error, "client listener exited");
         }
     });
+
+    // Seat the configured default workflow at the bottom of the stack.
+    // Anything the workflow emits during its top-level body buffers in
+    // the handle's frame channel and is flushed on the first prompt
+    // cycle (see `workflows::push_default_workflow`).
+    if let Some(name) = default_workflow
+        .get()
+        .as_deref()
+        .and_then(|opt| opt.as_deref())
+    {
+        match crate::workflows::push_default_workflow(&state, name).await {
+            Ok(true) => debug!(workflow = %name, "pushed default_workflow"),
+            Ok(false) => {}
+            Err(error) => warn!(%error, workflow = %name, "default_workflow start failed"),
+        }
+    }
 
     info!(
         session_id = %session.id,

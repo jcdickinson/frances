@@ -1,11 +1,13 @@
 //! Per-session workflow stack.
 //!
 //! User input always dispatches to whatever's on top of the stack. The
-//! stack is bootstrapped with a single [`Frame::LegacyLlmTurn`] at the
-//! bottom — that frame is the existing Rust-driven chat loop and is
-//! never popped. Slash commands push new [`Frame::Js`] frames on top;
-//! when a JS workflow terminates (top-level body settles or
+//! stack starts empty; bootstrap pushes the configured `default_workflow`
+//! (if any) before accepting input. Slash commands push fresh [`Frame`]s
+//! on top; when a workflow terminates (top-level body settles or
 //! `workflow.exit()`), the frame pops.
+//!
+//! Non-slash input on an empty stack returns a one-shot error frame
+//! — there is no host-side fallback chat loop anymore.
 //!
 //! This module owns the dispatch glue between the daemon's wire
 //! protocol ([`StreamFrame`], the client `UnixStream`) and the workflow
@@ -39,27 +41,20 @@ impl Default for WorkflowStack {
 }
 
 impl WorkflowStack {
-    /// Builds a fresh stack with the legacy chat-loop frame at the
-    /// bottom. That frame stays for the daemon's lifetime.
+    /// Builds an empty stack. Bootstrap pushes the configured
+    /// `default_workflow` (if any) before the daemon starts accepting
+    /// input.
     pub fn new() -> Self {
         Self {
-            frames: AsyncMutex::new(vec![Frame::LegacyLlmTurn]),
+            frames: AsyncMutex::new(Vec::new()),
         }
     }
 }
 
-/// One entry on the stack.
-enum Frame {
-    /// Today's Rust-driven LLM chat turn. Wraps [`run_legacy_llm_turn`].
-    /// Never popped.
-    LegacyLlmTurn,
-    /// A running JS workflow. Popped when the body terminates.
-    Js(JsFrame),
-}
-
-/// A running JS workflow plus the wire-state needed across multiple
-/// `drive()` invocations (block id allocator, currently-open block).
-struct JsFrame {
+/// One entry on the stack: a running JS workflow plus the wire-state
+/// needed across multiple `drive()` invocations (block id allocator,
+/// currently-open block). Popped when the workflow's body terminates.
+struct Frame {
     handle: WorkflowHandle,
     emit: EmitState,
 }
@@ -69,7 +64,7 @@ struct JsFrame {
 /// Workflow frames map to wire blocks like this:
 ///
 /// - `MarkdownFrame` push: close previous open block (if any), open a
-///   new `AssistantText` block, write initial content; the block stays
+///   new `Text { sender }` block, write initial content; the block stays
 ///   open so subsequent `append`s stream into it. A block can outlive
 ///   the `Done` of its opening cycle — the UI doesn't auto-finalise on
 ///   Done, so the block keeps streaming across user-input turns until
@@ -79,7 +74,8 @@ struct JsFrame {
 /// - `ErrorFrame` push: close previous open block, emit a one-shot
 ///   `StreamFrame::Error`.
 /// - `JsonFrame` push: close previous open block, open + immediately
-///   close a one-shot `AssistantText` block rendering `[tag] body`.
+///   close a one-shot `Text { sender: None }` block rendering
+///   `[tag] body`.
 ///
 /// On workflow termination the open block is closed before `Done` so
 /// the UI's `BlockState` ends up Idle.
@@ -136,6 +132,40 @@ pub(crate) async fn cycle(
     }
 }
 
+/// Start the workflow named `name` and push it onto the stack with no
+/// initial drive. Used at daemon bootstrap to seat the configured
+/// `default_workflow` before any client has attached — there is no
+/// `UnixStream` to write to, so anything the workflow emits during its
+/// top-level evaluation (e.g. a welcome `MarkdownFrame`) buffers in the
+/// `WorkflowHandle::frames` channel and is flushed by the first
+/// `dispatch_topmost` call when a client sends input.
+///
+/// Returns `Ok(false)` (and logs a warning) if `name` is not a key
+/// under `[workflows.*]`; in that case the stack is left empty.
+pub(crate) async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<bool> {
+    let workflows = state.workflows.get_or_default();
+    let Some(cfg) = workflows.get(name) else {
+        warn!(
+            workflow = name,
+            "default_workflow is set but no matching [workflows.*] entry exists; \
+             leaving stack empty"
+        );
+        return Ok(false);
+    };
+
+    let invocation = Invocation {
+        source_path: cfg.file.clone(),
+        args: Vec::new(),
+    };
+
+    let handle = state.workflow_runtime.start(invocation)?;
+    state.workflow_stack.frames.lock().await.push(Frame {
+        handle,
+        emit: EmitState::new(),
+    });
+    Ok(true)
+}
+
 async fn push_and_drive(
     state: &Arc<ServerState>,
     stream: &mut UnixStream,
@@ -165,10 +195,10 @@ async fn push_and_drive(
         }
     };
 
-    let mut frame = Frame::Js(JsFrame {
+    let mut frame = Frame {
         handle,
         emit: EmitState::new(),
-    });
+    };
     let exited = drive(&mut frame, stream).await?;
     if !exited {
         state.workflow_stack.frames.lock().await.push(frame);
@@ -183,68 +213,58 @@ async fn dispatch_topmost(
 ) -> Result<()> {
     // Pop the topmost frame so we can hand it to `drive` without
     // holding the stack lock across the drain. If it stays alive we
-    // push it back; the legacy frame is always re-pushed.
+    // push it back. Empty stack ⇒ no default workflow configured.
     let mut top = {
         let mut stack = state.workflow_stack.frames.lock().await;
-        stack.pop().expect("stack is never empty")
-    };
-
-    let outcome = match &mut top {
-        Frame::LegacyLlmTurn => {
-            run_legacy_llm_turn(state, stream, text).await?;
-            DriveOutcome::Continue
-        }
-        Frame::Js(js) => {
-            // Sending to a dropped receiver would mean the body has
-            // already exited and we just didn't observe it yet; treat
-            // that as "exited" and let the drive loop confirm.
-            let _ = js.handle.input_tx.send(UserInput {
-                content: text.to_owned(),
-            });
-            if drive(&mut top, stream).await? {
-                DriveOutcome::Exited
-            } else {
-                DriveOutcome::Continue
+        match stack.pop() {
+            Some(top) => top,
+            None => {
+                write_message(
+                    stream,
+                    &StreamFrame::Error(
+                        "no default workflow configured; use a slash command \
+                         or set `default_workflow` in your config"
+                            .to_owned(),
+                    ),
+                )
+                .await?;
+                return Ok(());
             }
         }
     };
 
-    if matches!(outcome, DriveOutcome::Continue) {
+    // Sending to a dropped receiver would mean the body has already
+    // exited and we just didn't observe it yet; treat that as "exited"
+    // and let the drive loop confirm.
+    let _ = top.handle.input_tx.send(UserInput {
+        content: text.to_owned(),
+    });
+    let exited = drive(&mut top, stream).await?;
+    if !exited {
         state.workflow_stack.frames.lock().await.push(top);
     }
     Ok(())
 }
 
-enum DriveOutcome {
-    Continue,
-    Exited,
-}
-
 /// Drains the frame's host-frame channel until the body either parks
 /// waiting for input or terminates. Returns `true` if the body exited.
 async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
-    let Frame::Js(js) = frame else {
-        // LegacyLlmTurn is driven by `run_legacy_llm_turn` directly;
-        // it never reaches this path.
-        return Ok(false);
-    };
-
     loop {
-        while let Ok(host_frame) = js.handle.frames.try_recv() {
-            emit(stream, &mut js.emit, host_frame).await?;
+        while let Ok(host_frame) = frame.handle.frames.try_recv() {
+            emit(stream, &mut frame.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
-            Some(host_frame) = js.handle.frames.recv() => {
-                emit(stream, &mut js.emit, host_frame).await?;
+            Some(host_frame) = frame.handle.frames.recv() => {
+                emit(stream, &mut frame.emit, host_frame).await?;
             }
-            done = &mut js.handle.done => {
-                while let Ok(host_frame) = js.handle.frames.try_recv() {
-                    emit(stream, &mut js.emit, host_frame).await?;
+            done = &mut frame.handle.done => {
+                while let Ok(host_frame) = frame.handle.frames.try_recv() {
+                    emit(stream, &mut frame.emit, host_frame).await?;
                 }
                 // Workflow is terminating — make sure any open block is
                 // closed before we surface the result.
-                js.emit.close_open(stream).await?;
+                frame.emit.close_open(stream).await?;
                 if let Ok(Err(error)) = done {
                     write_message(
                         stream,
@@ -256,9 +276,9 @@ async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
                 }
                 return Ok(true);
             }
-            () = js.handle.parked.notified() => {
-                while let Ok(host_frame) = js.handle.frames.try_recv() {
-                    emit(stream, &mut js.emit, host_frame).await?;
+            () = frame.handle.parked.notified() => {
+                while let Ok(host_frame) = frame.handle.frames.try_recv() {
+                    emit(stream, &mut frame.emit, host_frame).await?;
                 }
                 // The open block stays open across the cycle boundary
                 // — the UI doesn't finalise on Done, so the frame keeps
@@ -272,14 +292,14 @@ async fn drive(frame: &mut Frame, stream: &mut UnixStream) -> Result<bool> {
 async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) -> Result<()> {
     match frame {
         HostFrame::Push(FramePush { id: _, kind }) => match kind {
-            FrameKind::Markdown { content } => {
+            FrameKind::Markdown { content, sender } => {
                 state.close_open(stream).await?;
                 let block = state.alloc();
                 write_message(
                     stream,
                     &StreamFrame::BlockStart {
                         id: block,
-                        kind: BlockKind::AssistantText,
+                        kind: BlockKind::Text { sender },
                     },
                 )
                 .await?;
@@ -306,7 +326,7 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
                     stream,
                     &StreamFrame::BlockStart {
                         id: block,
-                        kind: BlockKind::AssistantText,
+                        kind: BlockKind::Text { sender: None },
                     },
                 )
                 .await?;
@@ -342,15 +362,4 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
         }
     }
     Ok(())
-}
-
-/// Runs one turn through the legacy Rust chat loop. Delegates back to
-/// the [`turn`](crate::server) module so the LLM-loop code stays in one
-/// place; the stack wraps it as the bottom frame.
-async fn run_legacy_llm_turn(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
-    text: &str,
-) -> Result<()> {
-    crate::server::run_legacy_llm_turn(state, stream, text).await
 }

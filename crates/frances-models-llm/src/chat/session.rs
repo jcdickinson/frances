@@ -42,8 +42,4 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
 
     /// Load a previously-persisted session by id.
     async fn load(&self, id: ChatSessionId) -> Result<Self::Session, ChatError>;
-
-    /// Return the pinned primary chat session, minting it from `builder`
-    /// if no row exists yet.
-    async fn primary(&self, builder: ChatSessionBuilder) -> Result<Self::Session, ChatError>;
 }

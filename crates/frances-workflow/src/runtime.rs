@@ -71,7 +71,12 @@ pub struct FramePush {
 #[derive(Debug, Clone)]
 pub enum FrameKind {
     /// `MarkdownFrame` — text content that may be extended with `append`.
-    Markdown { content: String },
+    /// `sender` labels the speaker (e.g. `"you"`, `"frances"`); the host
+    /// renders it as a block prefix. `None` ⇒ no prefix.
+    Markdown {
+        content: String,
+        sender: Option<String>,
+    },
     /// `ErrorFrame` — text content (typically rendered as an error) that
     /// may be extended with `append`.
     Error { content: String },
@@ -573,10 +578,6 @@ pub mod test_deps {
                 ChatSessionId(0),
             )))
         }
-
-        async fn primary(&self, builder: ChatSessionBuilder) -> Result<Self::Session, ChatError> {
-            Ok(self.create(builder))
-        }
     }
 
     #[derive(Clone)]
@@ -685,7 +686,9 @@ mod tests {
     fn text_of(frame: &HostFrame) -> String {
         match frame {
             HostFrame::Push(p) => match &p.kind {
-                FrameKind::Markdown { content } | FrameKind::Error { content } => content.clone(),
+                FrameKind::Markdown { content, .. } | FrameKind::Error { content } => {
+                    content.clone()
+                }
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
             },
             HostFrame::Append { delta, .. } => delta.clone(),
@@ -982,9 +985,66 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert!(
-            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content } if content == "hello"))
+            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content, .. } if content == "hello"))
         );
         assert!(matches!(&frames[1], HostFrame::Append { delta, .. } if delta == " world"));
+    }
+
+    #[tokio::test]
+    async fn markdown_frame_carries_sender() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: "hi", sender: "you" }));
+            transcript.push(new MarkdownFrame({ content: "ok" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        assert!(matches!(
+            &frames[0],
+            HostFrame::Push(p)
+                if matches!(&p.kind, FrameKind::Markdown { content, sender: Some(s) }
+                    if content == "hi" && s == "you")
+        ));
+        assert!(matches!(
+            &frames[1],
+            HostFrame::Push(p)
+                if matches!(&p.kind, FrameKind::Markdown { content, sender: None }
+                    if content == "ok")
+        ));
+    }
+
+    #[tokio::test]
+    async fn markdown_frame_rejects_non_string_sender() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            new MarkdownFrame({ content: "hi", sender: 42 });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        let err = done.expect("workflow done").expect_err("expected throw");
+        assert!(
+            format!("{err}").contains("sender"),
+            "error should mention sender: {err}"
+        );
     }
 
     #[tokio::test]
@@ -4109,7 +4169,7 @@ mod tests {
             })
             .expect("expected a markdown push after approval");
         assert!(
-            matches!(&last.kind, FrameKind::Markdown { content } if content == "yes:scoped to /tmp"),
+            matches!(&last.kind, FrameKind::Markdown { content, .. } if content == "yes:scoped to /tmp"),
             "got {:?}",
             last.kind,
         );
