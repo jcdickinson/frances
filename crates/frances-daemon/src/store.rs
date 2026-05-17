@@ -49,6 +49,29 @@ impl Database {
         let conn = database.connect()?;
 
         trace!(path = %path.display(), "running schema migrations");
+        Self::apply_migrations(&conn).await?;
+
+        Ok(Self {
+            conn,
+            path: Arc::new(path),
+        })
+    }
+
+    /// Build a fresh in-memory database with all schemas applied. Test
+    /// fixtures want a turso connection with no on-disk state — using
+    /// `":memory:"` keeps everything in-process: no tempdir, no I/O.
+    #[cfg(test)]
+    pub(crate) async fn open_in_memory() -> std::result::Result<Self, DatabaseError> {
+        let database = Builder::new_local(":memory:").build().await?;
+        let conn = database.connect()?;
+        Self::apply_migrations(&conn).await?;
+        Ok(Self {
+            conn,
+            path: Arc::new(PathBuf::from(":memory:")),
+        })
+    }
+
+    async fn apply_migrations(conn: &Connection) -> std::result::Result<(), DatabaseError> {
         frances_storage::run_all(
             conn,
             &[

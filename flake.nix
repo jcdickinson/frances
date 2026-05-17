@@ -53,6 +53,7 @@
             pkgs.rust-analyzer
             pkgs.jq
             pkgs.python3
+            pkgs.cargo-nextest
           ];
         };
       });
