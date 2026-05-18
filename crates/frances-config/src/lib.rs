@@ -30,6 +30,8 @@ pub use error::{BuildError, ConfigBindError, MapError, SourceLoadError};
 pub use event::{ConfigEvent, EventSender, SendError};
 pub use handle::{ConfigHandle, ConfigHandleRef};
 pub use provider::{ConfigProvider, ProviderError};
+#[cfg(feature = "test-util")]
+pub use providers::InMemoryProvider;
 pub use providers::{EnvProvider, TomlProvider};
 pub use util::{Keys, KeysDiff};
 pub use value::{Path, SEPARATOR, Value};

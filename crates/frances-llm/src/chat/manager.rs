@@ -144,7 +144,13 @@ impl<D: ChatManagerDeps> ChatSessionManagerTrait for ChatSessionManager<D> {
 
     fn create(&self, builder: ChatSessionBuilder) -> Self::Session {
         let session_id = uuid::Uuid::new_v4().to_string();
-        ChatSession::new(None, session_id, builder.model_intents, self.clone())
+        ChatSession::new(
+            None,
+            session_id,
+            builder.model_intents,
+            builder.ephemeral,
+            self.clone(),
+        )
     }
 
     async fn load(&self, id: ChatSessionId) -> Result<Self::Session, ChatError> {
@@ -158,10 +164,13 @@ impl<D: ChatManagerDeps> ChatSessionManagerTrait for ChatSessionManager<D> {
             .history_store()
             .load_chat_session(id)
             .await?;
+        // A `load`ed session was once persisted by definition; it can
+        // never be ephemeral.
         Ok(ChatSession::new(
             Some(id),
             session_id,
             model_intents,
+            false,
             self.clone(),
         ))
     }

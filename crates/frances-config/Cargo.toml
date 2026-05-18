@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Exposes `InMemoryProvider` for downstream test suites that need to
+# spin up a `ConfigHandle` without touching the filesystem.
+test-util = []
+
 [dependencies]
 arc-swap.workspace = true
 async-trait.workspace = true

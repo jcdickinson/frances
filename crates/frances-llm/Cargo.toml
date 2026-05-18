@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+# Exposes `test_util::StubProvider` and `ProviderCache::insert_stub` so
+# downstream test suites can drive `ChatSession::run` without standing
+# up a real wire-level provider.
+test-util = []
+
 [dependencies]
 async-trait.workspace = true
 dashmap.workspace = true
@@ -20,3 +26,7 @@ thiserror.workspace = true
 tracing.workspace = true
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+frances-config = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

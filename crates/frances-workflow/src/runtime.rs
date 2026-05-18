@@ -546,12 +546,27 @@ pub mod test_deps {
         pub fn sessions(&self) -> Vec<StubSession> {
             self.manager.sessions.lock().clone()
         }
+
+        /// Every `ChatSessionBuilder` handed to `manager.create`, in
+        /// order. Lets tests assert constructor options round-trip.
+        pub fn chat_builders(&self) -> Vec<ChatSessionBuilder> {
+            self.manager.builders()
+        }
     }
 
     #[derive(Clone, Default)]
     pub struct StubManager {
         next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
         sessions: Arc<Mutex<Vec<StubSession>>>,
+        builders: Arc<Mutex<Vec<ChatSessionBuilder>>>,
+    }
+
+    impl StubManager {
+        /// Every `ChatSessionBuilder` handed to `create`, in order. Lets
+        /// JS-surface tests assert that constructor options round-trip.
+        pub fn builders(&self) -> Vec<ChatSessionBuilder> {
+            self.builders.lock().clone()
+        }
     }
 
     #[derive(Clone)]
@@ -564,7 +579,8 @@ pub mod test_deps {
     impl ChatSessionManager for StubManager {
         type Session = StubSession;
 
-        fn create(&self, _builder: ChatSessionBuilder) -> Self::Session {
+        fn create(&self, builder: ChatSessionBuilder) -> Self::Session {
+            self.builders.lock().push(builder);
             let session = StubSession {
                 pending: Arc::new(Mutex::new(Vec::new())),
                 next_script: self.next_script.clone(),
@@ -1116,6 +1132,86 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert_eq!(text_of(&frames[0]), "ok");
+    }
+
+    #[tokio::test]
+    async fn chat_session_default_is_not_ephemeral() {
+        let deps = StubDeps::default();
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            new ChatSession({ model_intents: ["x"] });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let builders = deps.chat_builders();
+        assert_eq!(builders.len(), 1);
+        assert!(!builders[0].ephemeral, "default should be persisted");
+        assert_eq!(
+            builders[0]
+                .model_intents
+                .iter()
+                .map(|s| s.as_ref())
+                .collect::<Vec<_>>(),
+            vec!["x"]
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_session_ephemeral_flag_threads_to_builder() {
+        let deps = StubDeps::default();
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            new ChatSession({ model_intents: ["classify"], ephemeral: true });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let builders = deps.chat_builders();
+        assert_eq!(builders.len(), 1);
+        assert!(builders[0].ephemeral);
+    }
+
+    #[tokio::test]
+    async fn chat_session_ephemeral_rejects_non_bool() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            new ChatSession({ model_intents: ["x"], ephemeral: "yes" });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+            })
+            .unwrap();
+        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let result = result.expect("workflow should have terminated");
+        assert!(
+            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
+            "got {result:?}"
+        );
     }
 
     #[tokio::test]

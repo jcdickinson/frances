@@ -1,6 +1,10 @@
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use frances_llm::HistoryStore as HistoryStoreTrait;
-use frances_models_llm::chat::{ChatSessionId, HistoryError, OwnedHistoryInput, RowId};
+use frances_models_llm::chat::{
+    ChatSessionId, HistoryError, ModelIntents, OwnedHistoryInput, RowId,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::trace;
@@ -31,7 +35,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
     async fn create_chat_session(
         &self,
         session_id: &str,
-        model_intents: &[String],
+        model_intents: &[Cow<'static, str>],
     ) -> Result<ChatSessionId, HistoryError> {
         let conn = self.db().connect();
         let created_at = i64::try_from(
@@ -76,11 +80,13 @@ impl HistoryStoreTrait for TursoHistoryStore {
             .ok_or(HistoryError::ChatSessionNotFound(id))?;
         let session_id: String = row.get(0).map_err(turso_err)?;
         let intents_text: String = row.get(1).map_err(turso_err)?;
-        let model_intents: Vec<String> =
+        let raw_intents: Vec<String> =
             serde_json::from_str(&intents_text).map_err(|source| HistoryError::Decode {
                 what: "model_intents",
                 source,
             })?;
+        let model_intents: ModelIntents =
+            Cow::Owned(raw_intents.into_iter().map(Cow::Owned).collect());
         Ok(frances_models_llm::chat::ChatSessionRow {
             id,
             session_id,

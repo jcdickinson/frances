@@ -109,6 +109,26 @@ impl ProviderCache {
         self.try_build(&id_lc)
     }
 
+    /// Test-only: shove a pre-built provider into the cache keyed by
+    /// `id`. The next `get(id)` call returns it directly, bypassing the
+    /// hard-coded OpenAI build path. The entry has a no-op refresh
+    /// closure so config churn never replaces it.
+    #[cfg(any(test, feature = "test-util"))]
+    pub fn insert_stub<P>(&self, id: &str, provider: Arc<P>)
+    where
+        P: Provider + 'static,
+        P::Error: Into<ErasedError> + From<ErasedError>,
+    {
+        let erased = crate::provider::erase(provider);
+        self.inner.entries.insert(
+            id.to_ascii_lowercase(),
+            Mutex::new(Entry {
+                provider: erased,
+                refresh: Box::new(|| None),
+            }),
+        );
+    }
+
     fn refresh_id_set(&self) {
         let fired = {
             let mut s = self.inner.keys_stream.lock();

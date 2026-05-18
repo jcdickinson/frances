@@ -5,7 +5,8 @@ Let a workflow persist its own state in the per-session DB:
 - Migrations are declared up-front in `[workflows.<id>]` and applied
   under the workflow's UUID via the migrator from phase 1.
 - A small SQL handle is exposed to JS. Browser-shape (Promises,
-  `AbortSignal`) without slavishly cloning IndexedDB or Web SQL.
+  `AbortSignal`) without slavishly cloning IndexedDB or Web SQL (but heavy
+  inspiration desired).
 - The host doesn't model the workflow's data. Workflows own their
   schema and their queries.
 
@@ -42,6 +43,8 @@ mismatch fails the workflow's start with a clear error surfaced as a
 `StreamFrame::Error` to the client.
 
 ## Desired shape — JS side
+
+May need rework here.
 
 A new virtual module: `frances:v1/storage`. Imported like every other v1
 surface.

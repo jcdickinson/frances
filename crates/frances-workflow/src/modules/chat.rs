@@ -11,7 +11,18 @@
 //! const r = await s.stream({ signal });
 //! await r.text.pipeTo(frame.writable);
 //! const final = await r.completed;     // { text, tool_calls, usage }
+//!
+//! // Transient: never reads or writes chat history.
+//! const scratch = new ChatSession({ model_intents: ["classify"], ephemeral: true });
 //! ```
+//!
+//! Constructor options:
+//! - `model_intents` (required, string[]) — config keys walked when
+//!   resolving a model for each call.
+//! - `ephemeral` (optional, bool, default `false`) — when `true`, the
+//!   session never touches `chat_sessions` / `chat_messages`. The
+//!   provider sees only the in-memory `pending` queue drained since
+//!   the last `stream()` call.
 //!
 //! Roles in v1: `"system"`, `"user"`, `"tool"`. Pushing `"assistant"`
 //! throws — assistant messages come from the model. `"system"` may only
@@ -25,6 +36,7 @@
 //! call and forwards them to the provider; `handler` is JS-only and the
 //! workflow's loop is responsible for invoking it.
 
+use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -43,7 +55,7 @@ use tokio::sync::oneshot;
 
 use frances_models_llm::chat::{
     ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
-    ChatSessionManager as ChatSessionManagerTrait, OwnedHistoryInput,
+    ChatSessionManager as ChatSessionManagerTrait, ModelIntents, OwnedHistoryInput,
 };
 use frances_models_llm::wire::{StreamEvent, ToolCall, ToolDef, ToolFunction};
 
@@ -64,8 +76,10 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     let ctor = Constructor::new_class::<ChatSessionJs<D>, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| -> JsResult<Class<'js, ChatSessionJs<D>>> {
-            let intents = parse_intents(&ctx, &arg)?;
-            let builder = ChatSessionBuilder::new().with_model_intents(intents);
+            let opts = parse_chat_options(&ctx, &arg)?;
+            let builder = ChatSessionBuilder::new()
+                .with_model_intents(opts.intents)
+                .with_ephemeral(opts.ephemeral);
             let handle = deps.chat_session_manager().create(builder);
             let instance = Class::instance(
                 ctx.clone(),
@@ -139,11 +153,16 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
     }
 }
 
-fn parse_intents<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Vec<String>> {
+struct ChatOptions {
+    intents: ModelIntents,
+    ephemeral: bool,
+}
+
+fn parse_chat_options<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<ChatOptions> {
     let Some(obj) = arg.as_object() else {
         return Err(throw(
             ctx,
-            "new ChatSession: expected { model_intents: string[] }",
+            "new ChatSession: expected { model_intents: string[], ephemeral?: bool }",
         ));
     };
     let intents_val: Value<'js> = obj
@@ -155,7 +174,7 @@ fn parse_intents<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Vec<String>>
             "new ChatSession: `model_intents` must be an array of strings",
         ));
     };
-    let mut out = Vec::with_capacity(arr.len());
+    let mut intents: Vec<Cow<'static, str>> = Vec::with_capacity(arr.len());
     for item in arr.iter::<String>() {
         let s = item.map_err(|_| {
             throw(
@@ -163,9 +182,27 @@ fn parse_intents<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Vec<String>>
                 "new ChatSession: every `model_intents` entry must be a string",
             )
         })?;
-        out.push(s);
+        intents.push(Cow::Owned(s));
     }
-    Ok(out)
+
+    // `ephemeral` is optional. Missing and `undefined` both mean
+    // `false`; anything else (`0`, `"true"`, etc.) is rejected so the
+    // caller doesn't get silent truthiness.
+    let ephemeral_val: Value<'js> = obj
+        .get("ephemeral")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let ephemeral = if ephemeral_val.is_undefined() || ephemeral_val.is_null() {
+        false
+    } else {
+        ephemeral_val
+            .as_bool()
+            .ok_or_else(|| throw(ctx, "new ChatSession: `ephemeral` must be a boolean"))?
+    };
+
+    Ok(ChatOptions {
+        intents: Cow::Owned(intents),
+        ephemeral,
+    })
 }
 
 fn push_message<'js, D: WorkflowDeps>(

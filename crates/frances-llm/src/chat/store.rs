@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -12,7 +14,7 @@ pub trait HistoryStore: Send + Sync + 'static {
     async fn create_chat_session(
         &self,
         session_id: &str,
-        model_intents: &[String],
+        model_intents: &[Cow<'static, str>],
     ) -> Result<ChatSessionId, HistoryError>;
 
     async fn load_chat_session(&self, id: ChatSessionId) -> Result<ChatSessionRow, HistoryError>;

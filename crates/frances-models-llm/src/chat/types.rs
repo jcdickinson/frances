@@ -1,3 +1,4 @@
+use crate::chat::builder::ModelIntents;
 use crate::wire::HistoryInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,7 +36,7 @@ pub struct ChatSessionRow {
     pub session_id: String,
     /// Ordered list of `models::<intent>` config keys the session walks
     /// when resolving a model for the next call.
-    pub model_intents: Vec<String>,
+    pub model_intents: ModelIntents,
 }
 
 /// A primitive row read back from storage; mirrors [`HistoryInput`] but

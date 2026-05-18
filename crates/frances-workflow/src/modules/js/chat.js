@@ -1,5 +1,14 @@
 // `frances:v1/chat` — `ChatSession` constructor.
 //
+// Constructor:
+//   new ChatSession({ model_intents, ephemeral? })
+//
+//   - `model_intents` (string[], required): config keys walked in order
+//     when resolving the model for each call.
+//   - `ephemeral` (bool, optional, default false): when true, the
+//     session never reads or writes `chat_sessions`/`chat_messages`.
+//     The provider sees only what was pushed since the last stream().
+//
 // `stream({ signal })` returns a `StreamingResponse`:
 //   - `events`:    ReadableStream<StreamEvent> — raw provider events.
 //   - `text`:      ReadableStream<string>      — text deltas only,
