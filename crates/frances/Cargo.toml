@@ -26,4 +26,5 @@ tarpc.workspace = true
 thiserror.workspace = true
 frances-daemon.workspace = true
 frances-tui.workspace = true
+ratatui-textarea.workspace = true
 ratatui.workspace = true
