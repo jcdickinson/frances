@@ -186,7 +186,7 @@ pub enum SessionConfigWriteError {
 async fn read_rows(
     db: &Database,
 ) -> Result<Vec<Result<RawRow, SessionConfigRowError>>, SessionConfigLoadError> {
-    let conn = db.connect();
+    let conn = db.connect().await;
     let mut rows = conn
         .query("SELECT json(path), kind, value FROM session_config", ())
         .await?;
@@ -202,7 +202,7 @@ async fn read_rows(
 }
 
 async fn write_rows(db: &Database, events: &[ConfigEvent]) -> Result<(), SessionConfigWriteError> {
-    let conn = db.connect();
+    let conn = db.connect().await;
     for event in events {
         let hash = hash_path(&event.path);
         match value_row(&event.value) {
@@ -315,7 +315,7 @@ mod tests {
     use std::sync::Arc;
 
     async fn count_rows(db: &Database, path: &str) -> i64 {
-        let conn = db.connect();
+        let conn = db.connect().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM session_config WHERE path_hash = ?1",
@@ -329,7 +329,7 @@ mod tests {
 
     #[tokio::test]
     async fn writer_persists_and_emits() {
-        let db = Database::open_in_memory().await.unwrap();
+        let db = crate::store::open_in_memory().await.unwrap();
 
         let provider = Arc::new(SessionConfigProvider::new(db.clone()));
         let providers: Vec<Arc<dyn ConfigProvider>> = vec![provider.clone()];

@@ -11,15 +11,23 @@
 //! `BEGIN` / `COMMIT` / `ROLLBACK` statements rather than
 //! [`turso::Transaction`] (whose `'conn` lifetime would force a
 //! self-borrowing wrapper that's painful to ship through JS classes).
-//! All workflows in a session share one [`turso::Connection`], so
-//! exactly one transaction can be open at a time — `BEGIN` from a
-//! second concurrent workflow surfaces a turso error.
+//!
+//! All workflows in a session share a single
+//! [`frances_storage::Database`]; its async mutex guards every SQL
+//! call, so two workflows hitting `exec` from the same session
+//! serialise on the lock rather than racing the underlying turso
+//! connection (which would otherwise return `Misuse("concurrent use
+//! forbidden")`). [`WorkflowTx::begin`] takes the lock and holds it
+//! until commit/rollback, so a second `begin` from another workflow
+//! parks on the lock until the first transaction settles — no
+//! interleaving, no surprise turso errors.
 
 use std::sync::Arc;
 
+use frances_storage::{ActiveDatabase, Database};
 use thiserror::Error;
 use tokio::sync::Mutex as AsyncMutex;
-use turso::{Connection, Value};
+use turso::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Error)]
@@ -53,20 +61,20 @@ pub struct ExecResult {
     pub last_insert_rowid: i64,
 }
 
-/// Workflow's window onto the per-session turso connection.
+/// Workflow's window onto the per-session [`Database`].
 ///
-/// Cheap to clone — wraps a [`turso::Connection`] (itself an [`Arc`]).
-/// Holds the workflow's [`Uuid`] for error reporting only; rows are
-/// not partitioned by entity.
+/// Cheap to clone — `Database` is itself an `Arc` wrapper around the
+/// connection lock. Holds the workflow's [`Uuid`] for error reporting
+/// only; rows are not partitioned by entity.
 #[derive(Clone)]
 pub struct WorkflowDb {
-    conn: Connection,
+    db: Database,
     entity: Uuid,
 }
 
 impl WorkflowDb {
-    pub fn new(conn: Connection, entity: Uuid) -> Self {
-        Self { conn, entity }
+    pub fn new(db: Database, entity: Uuid) -> Self {
+        Self { db, entity }
     }
 
     pub fn entity(&self) -> Uuid {
@@ -74,12 +82,9 @@ impl WorkflowDb {
     }
 
     pub async fn exec(&self, sql: &str, params: Vec<Value>) -> Result<ExecResult, WorkflowDbError> {
-        let rows_affected = self
-            .conn
-            .execute(sql, params)
-            .await
-            .map_err(|e| self.wrap(e))?;
-        let last_insert_rowid = self.conn.last_insert_rowid();
+        let conn = self.db.connect().await;
+        let rows_affected = conn.execute(sql, params).await.map_err(|e| self.wrap(e))?;
+        let last_insert_rowid = conn.last_insert_rowid();
         Ok(ExecResult {
             rows_affected,
             last_insert_rowid,
@@ -100,11 +105,8 @@ impl WorkflowDb {
         sql: &str,
         params: Vec<Value>,
     ) -> Result<RowStream, WorkflowDbError> {
-        let rows = self
-            .conn
-            .query(sql, params)
-            .await
-            .map_err(|e| self.wrap(e))?;
+        let conn = self.db.connect().await;
+        let rows = conn.query(sql, params).await.map_err(|e| self.wrap(e))?;
         let columns: Arc<[String]> = rows.column_names().into();
         Ok(RowStream {
             rows,
@@ -114,17 +116,15 @@ impl WorkflowDb {
         })
     }
 
-    /// Begin a transaction. Subsequent SQL on the returned [`WorkflowTx`]
-    /// runs inside it; the caller decides when to settle.
+    /// Begin a transaction. Acquires the connection lock and holds it
+    /// in the returned [`WorkflowTx`] until the transaction settles —
+    /// any concurrent SQL from other workflows parks until then.
     pub async fn begin(&self) -> Result<WorkflowTx, WorkflowDbError> {
-        self.conn
-            .execute("BEGIN", ())
-            .await
-            .map_err(|e| self.wrap(e))?;
+        let conn = self.db.connect().await;
+        conn.execute("BEGIN", ()).await.map_err(|e| self.wrap(e))?;
         Ok(WorkflowTx {
-            conn: self.conn.clone(),
             entity: self.entity,
-            inner: Arc::new(AsyncMutex::new(WorkflowTxInner { settled: false })),
+            inner: Arc::new(AsyncMutex::new(WorkflowTxInner { conn: Some(conn) })),
         })
     }
 
@@ -138,18 +138,20 @@ impl WorkflowDb {
 
 /// Live transaction bound to a single workflow.
 ///
-/// Cloneable — every clone shares the same underlying `settled` flag
-/// (`Arc<AsyncMutex<_>>`), so the JS-side `Transaction` proxy and the
-/// runtime's default-settle code see the same state.
+/// Cloneable — every clone shares the inner state via
+/// `Arc<AsyncMutex<_>>`, so the JS-side `Transaction` proxy and the
+/// runtime's default-settle code see the same `conn` slot. The
+/// connection guard sits inside that slot, which means the underlying
+/// turso lock is released exactly once — when COMMIT/ROLLBACK takes
+/// `conn` out.
 #[derive(Clone)]
 pub struct WorkflowTx {
-    conn: Connection,
     entity: Uuid,
     inner: Arc<AsyncMutex<WorkflowTxInner>>,
 }
 
 struct WorkflowTxInner {
-    settled: bool,
+    conn: Option<ActiveDatabase>,
 }
 
 impl WorkflowTx {
@@ -158,13 +160,10 @@ impl WorkflowTx {
     }
 
     pub async fn exec(&self, sql: &str, params: Vec<Value>) -> Result<ExecResult, WorkflowDbError> {
-        let _guard = self.acquire().await?;
-        let rows_affected = self
-            .conn
-            .execute(sql, params)
-            .await
-            .map_err(|e| self.wrap(e))?;
-        let last_insert_rowid = self.conn.last_insert_rowid();
+        let guard = self.inner.lock().await;
+        let conn = guard.conn.as_ref().ok_or(WorkflowDbError::TxSettled)?;
+        let rows_affected = conn.execute(sql, params).await.map_err(|e| self.wrap(e))?;
+        let last_insert_rowid = conn.last_insert_rowid();
         Ok(ExecResult {
             rows_affected,
             last_insert_rowid,
@@ -185,12 +184,9 @@ impl WorkflowTx {
         sql: &str,
         params: Vec<Value>,
     ) -> Result<RowStream, WorkflowDbError> {
-        let _guard = self.acquire().await?;
-        let rows = self
-            .conn
-            .query(sql, params)
-            .await
-            .map_err(|e| self.wrap(e))?;
+        let guard = self.inner.lock().await;
+        let conn = guard.conn.as_ref().ok_or(WorkflowDbError::TxSettled)?;
+        let rows = conn.query(sql, params).await.map_err(|e| self.wrap(e))?;
         let columns: Arc<[String]> = rows.column_names().into();
         Ok(RowStream {
             rows,
@@ -215,39 +211,24 @@ impl WorkflowTx {
     /// `false` if the user code already explicitly settled.
     pub async fn settle_default(&self, success: bool) -> Result<bool, WorkflowDbError> {
         let mut inner = self.inner.lock().await;
-        if inner.settled {
+        let Some(conn) = inner.conn.as_ref() else {
             return Ok(false);
-        }
+        };
         let sql = if success { "COMMIT" } else { "ROLLBACK" };
-        self.conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
-        inner.settled = true;
+        conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
+        inner.conn = None;
         Ok(true)
     }
 
     async fn settle(&self, success: bool) -> Result<(), WorkflowDbError> {
         let mut inner = self.inner.lock().await;
-        if inner.settled {
+        let Some(conn) = inner.conn.as_ref() else {
             return Err(WorkflowDbError::TxSettled);
-        }
+        };
         let sql = if success { "COMMIT" } else { "ROLLBACK" };
-        self.conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
-        inner.settled = true;
+        conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
+        inner.conn = None;
         Ok(())
-    }
-
-    /// Acquires the inner guard and verifies the tx hasn't been
-    /// settled. The guard is held across the SQL call to serialise
-    /// exec/query/commit/rollback within the tx — turso processes one
-    /// statement at a time on the underlying connection, and this keeps
-    /// the settled-check and the SQL atomic from JS's perspective.
-    async fn acquire(
-        &self,
-    ) -> Result<tokio::sync::MutexGuard<'_, WorkflowTxInner>, WorkflowDbError> {
-        let guard = self.inner.lock().await;
-        if guard.settled {
-            return Err(WorkflowDbError::TxSettled);
-        }
-        Ok(guard)
     }
 
     fn wrap(&self, source: turso::Error) -> WorkflowDbError {
@@ -275,7 +256,7 @@ impl RowStream {
 
     pub async fn next(&mut self) -> Result<Option<Row>, WorkflowDbError> {
         if let Some(tx) = &self.tx
-            && tx.lock().await.settled
+            && tx.lock().await.conn.is_none()
         {
             return Err(WorkflowDbError::TxSettled);
         }

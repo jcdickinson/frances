@@ -378,7 +378,6 @@ pub mod test_deps {
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
-    use turso::{Builder, Connection};
     use uuid::Uuid;
 
     use crate::approval::{
@@ -483,7 +482,7 @@ pub mod test_deps {
     }
 
     struct StubStorageState {
-        conn: Connection,
+        db: frances_storage::Database,
         entities: DashMap<Uuid, Arc<WorkflowDb>>,
     }
 
@@ -497,16 +496,15 @@ pub mod test_deps {
                 .inner
                 .state
                 .get_or_try_init(|| async {
-                    let database = Builder::new_local(":memory:")
-                        .build()
+                    let db = frances_storage::Database::open_in_memory()
                         .await
                         .map_err(|source| WorkflowDbError::Turso { entity, source })?;
-                    let conn = database
-                        .connect()
-                        .map_err(|source| WorkflowDbError::Turso { entity, source })?;
-                    frances_storage::ensure_table(&conn).await?;
+                    {
+                        let conn = db.connect().await;
+                        frances_storage::ensure_table(&conn).await?;
+                    }
                     Ok::<_, WorkflowDbError>(StubStorageState {
-                        conn,
+                        db,
                         entities: DashMap::new(),
                     })
                 })
@@ -515,8 +513,11 @@ pub mod test_deps {
                 return Ok(existing.clone());
             }
             let schema = EntitySchema { entity, migrations };
-            frances_storage::run(&state.conn, &schema).await?;
-            let db = Arc::new(WorkflowDb::new(state.conn.clone(), entity));
+            {
+                let conn = state.db.connect().await;
+                frances_storage::run(&conn, &schema).await?;
+            }
+            let db = Arc::new(WorkflowDb::new(state.db.clone(), entity));
             state.entities.insert(entity, db.clone());
             Ok(db)
         }

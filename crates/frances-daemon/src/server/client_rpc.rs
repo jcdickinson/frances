@@ -45,7 +45,7 @@ impl Client for ClientServer {
             let mut guard = self.state.events.lock().await;
             if let Some(stream) = guard.stream() {
                 let result =
-                    write_initial_replay(stream, self.state.workflow_stack.conn(), active_instance)
+                    write_initial_replay(stream, self.state.workflow_stack.db(), active_instance)
                         .await;
                 if let Err(error) = result {
                     warn!(%error, "initial scrollback replay failed; events stream may be unusable");
@@ -107,14 +107,14 @@ impl Client for ClientServer {
 /// in-memory scrollback before going live.
 async fn write_initial_replay(
     stream: &mut tokio::net::UnixStream,
-    conn: &turso::Connection,
+    db: &crate::store::Database,
     active_instance: Option<uuid::Uuid>,
 ) -> crate::Result<()> {
     use crate::protocol::StreamFrame;
     use crate::transport::write_message;
 
     match active_instance {
-        Some(instance) => crate::scrollback::replay_to_stream(stream, conn, instance).await,
+        Some(instance) => crate::scrollback::replay_to_stream(stream, db, instance).await,
         None => {
             write_message(
                 stream,

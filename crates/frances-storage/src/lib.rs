@@ -1,4 +1,19 @@
-//! Per-entity SQL migration system.
+//! Per-entity SQL migration system, plus the shared [`Database`]
+//! handle that owns the per-session [`turso::Connection`].
+//!
+//! ## Database
+//!
+//! [`Database`] wraps the underlying connection in an
+//! [`AsyncMutex`](tokio::sync::Mutex) — turso's `Connection` returns
+//! `Misuse("concurrent use forbidden")` if it sees overlapping calls
+//! from cloned handles, so every caller in the daemon, the workflow
+//! runtime, the LLM history store, and so on goes through
+//! [`Database::connect`] to acquire an [`ActiveDatabase`] guard. The
+//! guard dereferences to `&Connection` and releases the lock on drop
+//! (after a best-effort `cacheflush`). No raw `Connection` clones leave
+//! the type — that's the invariant.
+//!
+//! ## Migrations
 //!
 //! Each subsystem ("thing") that owns tables — built-in tools, history,
 //! session config, workflows loaded off disk — declares an
@@ -21,12 +36,94 @@
 
 use std::borrow::Cow;
 use std::hash::Hasher;
+use std::ops::Deref;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use turso::{Connection, Value};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
+use turso::{Builder, Connection, Value};
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
+
+/// Per-session SQL handle. Cheap to clone — the underlying
+/// [`turso::Connection`] sits behind an [`AsyncMutex`] inside an [`Arc`],
+/// so every clone shares the same lock.
+///
+/// All access goes through [`Database::connect`], which yields an
+/// [`ActiveDatabase`] holding the lock for the duration of the
+/// operation. This is the only way to talk to turso from anywhere in
+/// the workspace; the raw `Connection` is private to this type.
+#[derive(Clone)]
+pub struct Database {
+    conn: Arc<AsyncMutex<Connection>>,
+    path: Arc<str>,
+}
+
+impl Database {
+    /// Open (or create) a turso database at `path`. Use `":memory:"`
+    /// for an ephemeral instance.
+    pub async fn open(path: impl Into<Arc<str>>) -> std::result::Result<Self, turso::Error> {
+        let path: Arc<str> = path.into();
+        let database = Builder::new_local(&path).build().await?;
+        let conn = database.connect()?;
+        Ok(Self {
+            conn: Arc::new(AsyncMutex::new(conn)),
+            path,
+        })
+    }
+
+    /// Shortcut for [`Database::open(":memory:")`]. Useful in tests.
+    pub async fn open_in_memory() -> std::result::Result<Self, turso::Error> {
+        Self::open(":memory:").await
+    }
+
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Acquire the connection lock. The returned [`ActiveDatabase`]
+    /// dereferences to `&Connection` and releases the lock (after a
+    /// best-effort `cacheflush`) when dropped. Holding the guard across
+    /// `await` points is the supported pattern — that's how
+    /// multi-statement transactions stay atomic.
+    pub async fn connect(&self) -> ActiveDatabase {
+        ActiveDatabase {
+            guard: self.conn.clone().lock_owned().await,
+        }
+    }
+}
+
+impl std::fmt::Debug for Database {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Database")
+            .field("path", &&*self.path)
+            .finish()
+    }
+}
+
+/// RAII guard returned by [`Database::connect`]. Holds the connection
+/// mutex; drop releases it. Dereferences to `&Connection` so existing
+/// helper functions taking `&Connection` keep working unchanged — they
+/// just need to be called with `&*active`.
+pub struct ActiveDatabase {
+    guard: OwnedMutexGuard<Connection>,
+}
+
+impl Deref for ActiveDatabase {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.guard
+    }
+}
+
+impl Drop for ActiveDatabase {
+    fn drop(&mut self) {
+        if let Err(error) = self.guard.cacheflush() {
+            tracing::warn!(%error, "cacheflush failed");
+        }
+    }
+}
 
 /// One forward-only migration. `name` is the filename (or any stable
 /// label) and is shown in error messages; `sql` is its body.

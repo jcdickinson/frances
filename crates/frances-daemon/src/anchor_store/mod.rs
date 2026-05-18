@@ -70,7 +70,7 @@ fn col_blob(row: &turso::Row, idx: usize, column: &'static str) -> StoreResult<V
 #[async_trait]
 impl AnchorStore for AnchorStoreImpl {
     async fn load(&self, path: &Path) -> StoreResult<Option<FileAnchorState>> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
 
         let mut rows = conn
@@ -120,7 +120,7 @@ impl AnchorStore for AnchorStoreImpl {
         size: u64,
         content_digest: u64,
     ) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         conn.execute(
             "INSERT OR REPLACE INTO file_meta (path, mtime_ns, size, content_digest) VALUES (?1, ?2, ?3, ?4)",
             (path_str(path)?, mtime_ns, size as i64, content_digest as i64),
@@ -131,7 +131,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
         for (line_no, hash, anchor) in lines {
             conn.execute(
@@ -150,7 +150,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
         for n in line_nos {
             conn.execute(
@@ -164,7 +164,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn truncate_lines(&self, path: &Path) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         conn.execute("DELETE FROM file_lines WHERE path = ?1", (path_str(path)?,))
             .await
             .map_err(StoreError::new)?;
@@ -172,7 +172,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn used_anchors(&self, path: &Path) -> StoreResult<HashSet<Anchor>> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
         let mut rows = conn
             .query(
@@ -193,7 +193,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
         for anchor in anchors {
             conn.execute(
@@ -207,7 +207,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn clear_tombstones(&self) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         conn.execute("DELETE FROM file_tombstones", ())
             .await
             .map_err(StoreError::new)?;
@@ -215,7 +215,7 @@ impl AnchorStore for AnchorStoreImpl {
     }
 
     async fn forget(&self, path: &Path) -> StoreResult<()> {
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         let p = path_str(path)?;
         conn.execute("DELETE FROM file_meta WHERE path = ?1", (p.clone(),))
             .await

@@ -17,7 +17,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
         session_id: &str,
         model_intents: &[Cow<'static, str>],
     ) -> Result<ChatSessionId, HistoryError> {
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         let created_at = i64::try_from(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -45,7 +45,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
         &self,
         id: ChatSessionId,
     ) -> Result<frances_models_llm::chat::ChatSessionRow, HistoryError> {
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         let mut rows = conn
             .query(
                 "SELECT session_id, json(model_intents) FROM chat_sessions WHERE id = ?1",
@@ -77,7 +77,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
     async fn loaded_history(&self, session: ChatSessionId) -> Result<Vec<Value>, HistoryError> {
         trace!(session = %session, "loading history payloads");
 
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         let mut rows = conn
             .query(
                 "SELECT json(history) FROM chat_messages \
@@ -128,7 +128,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
             "appending history rows"
         );
 
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         for payload in payloads {
             let seq = next_seq(&conn, session).await?;
             let payload_text =
@@ -218,7 +218,7 @@ impl TursoHistoryStore {
         ty: &str,
         primitive: &Value,
     ) -> Result<RowId, HistoryError> {
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         let seq = next_seq(&conn, session).await?;
         let payload_text =
             serde_json::to_string(primitive).map_err(|source| HistoryError::Encode {
@@ -239,7 +239,7 @@ impl TursoHistoryStore {
         &self,
         session: ChatSessionId,
     ) -> Result<Vec<OwnedHistoryInput>, HistoryError> {
-        let conn = self.db().connect();
+        let conn = self.db().connect().await;
         let mut rows = conn
             .query(
                 "SELECT type, json(primitive) FROM chat_messages \

@@ -48,7 +48,7 @@ impl TursoHistoryStore {
     ) -> Result<(), HistoryError> {
         use frances_models_llm::wire::HistoryInput;
 
-        let conn = self.db.connect();
+        let conn = self.db.connect().await;
         conn.execute(
             "DELETE FROM chat_messages WHERE chat_session_id = ?1 AND type = 'history'",
             (session.0,),

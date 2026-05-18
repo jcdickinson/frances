@@ -17,7 +17,7 @@ use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_edit::EditSession;
 use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
-use frances_storage::Migration;
+use frances_storage::{Database, Migration};
 use frances_workflow::{
     ApprovalGateway, EditorFactory, Runtime as WorkflowRuntime, WorkflowDb, WorkflowDbError,
     WorkflowDeps,
@@ -25,7 +25,6 @@ use frances_workflow::{
 use std::borrow::Cow;
 use std::path::PathBuf;
 use tokio::sync::Mutex as AsyncMutex;
-use turso::Connection;
 use uuid::Uuid;
 
 mod bootstrap;
@@ -73,11 +72,11 @@ pub struct ServerWorkflowDeps {
     /// and the `respond_approval` RPC handler talk to the same registry
     /// of pending oneshots.
     pub approvals: DaemonApprovalGateway,
-    /// Per-session turso connection — same physical handle as the
-    /// daemon's other consumers (history, anchors, session config).
-    /// Cloned in for the workflow storage surface; turso multiplexes
-    /// the underlying connection internally.
-    pub conn: Connection,
+    /// Per-session [`Database`] — same handle as the daemon's other
+    /// consumers (history, anchors, session config). Cloned in for the
+    /// workflow storage surface; the connection lock is shared across
+    /// every caller in the daemon and the workflow runtime.
+    pub db: Database,
     /// Per-workflow `WorkflowDb` cache. First touch under an entity
     /// applies its migrations and inserts; subsequent touches hit the
     /// map. Wrapped in `Arc` so clones of `ServerWorkflowDeps` (one
@@ -131,8 +130,11 @@ impl WorkflowDeps for ServerWorkflowDeps {
             return Ok(existing.clone());
         }
         let schema = frances_storage::EntitySchema { entity, migrations };
-        frances_storage::run(&self.conn, &schema).await?;
-        let db = Arc::new(WorkflowDb::new(self.conn.clone(), entity));
+        {
+            let conn = self.db.connect().await;
+            frances_storage::run(&conn, &schema).await?;
+        }
+        let db = Arc::new(WorkflowDb::new(self.db.clone(), entity));
         self.workflow_dbs.insert(entity, db.clone());
         Ok(db)
     }

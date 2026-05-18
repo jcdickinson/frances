@@ -58,7 +58,7 @@ async fn real_main() -> Result<()> {
         let paths = Paths::discover()?;
         let session = paths.load_session(&session_id)?;
         server::install_logging(&session)?;
-        let db = store::Database::open(&session).await?;
+        let db = store::open(&session).await?;
         return Ok(server::run(session, db).await?);
     }
 

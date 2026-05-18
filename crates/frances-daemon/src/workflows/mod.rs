@@ -39,12 +39,13 @@ use thiserror::Error;
 use tokio::net::UnixStream;
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
-use turso::{Connection, Value};
+use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
 use crate::protocol::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerState;
+use crate::store::Database;
 use crate::transport::write_message;
 
 use frances_storage::{EntitySchema, Migration};
@@ -91,29 +92,29 @@ pub enum WorkflowStackError {
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The session-scoped workflow stack. Holds the currently-hydrated
-/// workflow (if any) plus a connection used for stack persistence.
+/// workflow (if any) plus the per-session [`Database`] used for stack
+/// persistence.
 pub struct WorkflowStack {
     top: AsyncMutex<Option<WorkflowInstance>>,
-    conn: Connection,
+    db: Database,
 }
 
 impl WorkflowStack {
-    /// Builds an empty in-memory stack bound to `conn`. Layering
-    /// across daemon restarts lives entirely in the per-session
-    /// `workflow_stack` table on this connection.
-    pub fn new(conn: Connection) -> Self {
+    /// Builds an empty in-memory stack bound to `db`. Layering across
+    /// daemon restarts lives entirely in the per-session
+    /// `workflow_stack` table on this database.
+    pub fn new(db: Database) -> Self {
         Self {
             top: AsyncMutex::new(None),
-            conn,
+            db,
         }
     }
 
-    /// Read-only view of the per-session connection. The same physical
-    /// turso handle the rest of the daemon uses; cheap clone for
-    /// callers (like scrollback replay) that want to issue SQL against
-    /// it without going through the stack itself.
-    pub fn conn(&self) -> &Connection {
-        &self.conn
+    /// Per-session [`Database`] handle. Same lock the rest of the daemon
+    /// uses; cheap clone for callers (like scrollback replay) that want
+    /// to issue SQL against it without going through the stack itself.
+    pub fn db(&self) -> &Database {
+        &self.db
     }
 
     /// `instance_id` of the currently-hydrated workflow, if any.
@@ -161,9 +162,10 @@ struct WorkflowInstance {
 struct EmitState {
     next_block: u64,
     open: Option<OpenBlock>,
-    /// Shared per-session turso connection used for scrollback writes.
-    /// Cheap clone; turso multiplexes internally.
-    conn: Connection,
+    /// Shared per-session [`Database`] used for scrollback writes. Cheap
+    /// clone; the underlying connection lock serialises overlapping
+    /// writes.
+    db: Database,
     /// Identifies the workflow whose blocks we're emitting. Every
     /// scrollback row written from this state is tagged with it so
     /// replay can scope by workflow.
@@ -180,11 +182,11 @@ struct OpenBlock {
 }
 
 impl EmitState {
-    fn new(conn: Connection, instance_id: Uuid) -> Self {
+    fn new(db: Database, instance_id: Uuid) -> Self {
         Self {
             next_block: 1,
             open: None,
-            conn,
+            db,
             instance_id,
         }
     }
@@ -202,14 +204,8 @@ impl EmitState {
             return Ok(());
         };
         write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
-        crate::scrollback::persist_block(
-            &self.conn,
-            self.instance_id,
-            &open.kind,
-            &open.text,
-            false,
-        )
-        .await?;
+        crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &open.text, false)
+            .await?;
         Ok(())
     }
 
@@ -222,21 +218,15 @@ impl EmitState {
         let Some(open) = self.open.take() else {
             return Ok(());
         };
-        crate::scrollback::persist_block(
-            &self.conn,
-            self.instance_id,
-            &open.kind,
-            &open.text,
-            true,
-        )
-        .await?;
+        crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &open.text, true)
+            .await?;
         Ok(())
     }
 
     /// Persist an error row alongside the in-flight stream's `Error`
     /// frame so it survives daemon restarts and workflow switches.
     async fn persist_error(&self, text: &str) -> Result<()> {
-        crate::scrollback::persist_error(&self.conn, self.instance_id, text).await?;
+        crate::scrollback::persist_error(&self.db, self.instance_id, text).await?;
         Ok(())
     }
 }
@@ -275,9 +265,9 @@ pub(crate) async fn cycle(
 /// hydrates cleanly or the live stack is exhausted. The daemon is
 /// always usable when this returns.
 pub(crate) async fn restore_or_seed(state: &Arc<ServerState>) -> Result<()> {
-    let conn = &state.workflow_stack.conn;
+    let db = &state.workflow_stack.db;
 
-    if row_count(conn).await? == 0 {
+    if row_count(db).await? == 0 {
         let default_workflow = state.default_workflow.get();
         let Some(name) = default_workflow.as_deref().and_then(|opt| opt.as_deref()) else {
             return Ok(());
@@ -327,10 +317,10 @@ async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<(
         migrations,
     };
     let handle = state.workflow_runtime.start(invocation).await?;
-    insert_pushed_row(&state.workflow_stack.conn, name, instance_id, &[]).await?;
+    insert_pushed_row(&state.workflow_stack.db, name, instance_id, &[]).await?;
     *state.workflow_stack.top.lock().await = Some(WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.conn.clone(), instance_id),
+        emit: EmitState::new(state.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
     });
     Ok(())
@@ -394,17 +384,17 @@ async fn push_and_drive(
 
     // Persist the new row. Truncates any non-completed rows above the
     // (now demoted) current top — defensive against crash-mid-pop.
-    insert_pushed_row(&state.workflow_stack.conn, name, instance_id, &args).await?;
+    insert_pushed_row(&state.workflow_stack.db, name, instance_id, &args).await?;
 
     // Tell the TUI to drop the previous workflow's in-memory scrollback
     // and replay the new active instance's (empty on a fresh push, but
     // we run the burst anyway for protocol uniformity — and for the
     // future "resume previously-popped" case which would have rows).
-    crate::scrollback::replay_to_stream(stream, &state.workflow_stack.conn, instance_id).await?;
+    crate::scrollback::replay_to_stream(stream, &state.workflow_stack.db, instance_id).await?;
 
     let mut new_instance = WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.conn.clone(), instance_id),
+        emit: EmitState::new(state.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
     };
     let exited = drive(&mut new_instance, stream).await?;
@@ -672,7 +662,7 @@ async fn drop_active_and_promote(
     stream: &mut UnixStream,
     instance_id: Uuid,
 ) -> Result<()> {
-    mark_completed_and_promote(&state.workflow_stack.conn, instance_id).await?;
+    mark_completed_and_promote(&state.workflow_stack.db, instance_id).await?;
     hydrate_active_or_cascade(state).await?;
     // Tell the TUI to clear scrollback and replay the newly-promoted
     // workflow's history (if any row was promoted). When the stack ran
@@ -686,8 +676,7 @@ async fn drop_active_and_promote(
         .as_ref()
         .map(|i| i.handle.instance);
     if let Some(new_instance) = new_top_instance {
-        crate::scrollback::replay_to_stream(stream, &state.workflow_stack.conn, new_instance)
-            .await?;
+        crate::scrollback::replay_to_stream(stream, &state.workflow_stack.db, new_instance).await?;
     } else {
         write_message(
             stream,
@@ -706,9 +695,9 @@ async fn drop_active_and_promote(
 /// position and promote the next live row; retry. Loops until the
 /// stack hydrates or runs dry.
 async fn hydrate_active_or_cascade(state: &Arc<ServerState>) -> Result<()> {
-    let conn = &state.workflow_stack.conn;
+    let db = &state.workflow_stack.db;
     loop {
-        let Some(row) = read_active_row(conn).await? else {
+        let Some(row) = read_active_row(db).await? else {
             *state.workflow_stack.top.lock().await = None;
             return Ok(());
         };
@@ -725,7 +714,7 @@ async fn hydrate_active_or_cascade(state: &Arc<ServerState>) -> Result<()> {
                     %error,
                     "workflow restore failed; tombstoning and trying next"
                 );
-                truncate_at_or_above(conn, row.position).await?;
+                truncate_at_or_above(db, row.position).await?;
                 // Loop: try to promote next non-completed.
             }
         }
@@ -757,7 +746,7 @@ async fn hydrate(
     let handle = state.workflow_runtime.start(invocation).await?;
     Ok(WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.conn.clone(), row.instance_id),
+        emit: EmitState::new(state.workflow_stack.db.clone(), row.instance_id),
         config_key: row.config_key.clone(),
     })
 }
@@ -774,7 +763,7 @@ struct StackRow {
 /// current top (defensive), demote the current top, insert the new
 /// active row.
 async fn insert_pushed_row(
-    conn: &Connection,
+    db: &Database,
     config_key: &str,
     instance_id: Uuid,
     args: &[String],
@@ -783,6 +772,7 @@ async fn insert_pushed_row(
     let args_json = serde_json::to_string(args)?;
     let instance_bytes = instance_id.as_bytes().to_vec();
 
+    let conn = db.connect().await;
     let tx = conn.unchecked_transaction().await?;
     tx.execute(
         "UPDATE workflow_stack
@@ -812,12 +802,13 @@ async fn insert_pushed_row(
 /// matches the given `instance_id`, tombstone by `instance_id`) and
 /// promote the next live row to active.
 async fn mark_completed_and_promote(
-    conn: &Connection,
+    db: &Database,
     instance_id: Uuid,
 ) -> Result<(), WorkflowStackError> {
     let now = now_ns();
     let instance_bytes = instance_id.as_bytes().to_vec();
 
+    let conn = db.connect().await;
     let tx = conn.unchecked_transaction().await?;
     tx.execute(
         "UPDATE workflow_stack
@@ -844,8 +835,9 @@ async fn mark_completed_and_promote(
 /// Cascade-tombstone helper used on hydrate failure: mark this row
 /// and everything above it as completed, then promote the next live
 /// row.
-async fn truncate_at_or_above(conn: &Connection, position: i64) -> Result<(), WorkflowStackError> {
+async fn truncate_at_or_above(db: &Database, position: i64) -> Result<(), WorkflowStackError> {
     let now = now_ns();
+    let conn = db.connect().await;
     let tx = conn.unchecked_transaction().await?;
     tx.execute(
         "UPDATE workflow_stack
@@ -870,7 +862,8 @@ async fn truncate_at_or_above(conn: &Connection, position: i64) -> Result<(), Wo
     Ok(())
 }
 
-async fn row_count(conn: &Connection) -> Result<i64, WorkflowStackError> {
+async fn row_count(db: &Database) -> Result<i64, WorkflowStackError> {
+    let conn = db.connect().await;
     let mut rows = conn
         .query("SELECT COUNT(*) FROM workflow_stack", ())
         .await?;
@@ -885,7 +878,8 @@ async fn row_count(conn: &Connection) -> Result<i64, WorkflowStackError> {
     }
 }
 
-async fn read_active_row(conn: &Connection) -> Result<Option<StackRow>, WorkflowStackError> {
+async fn read_active_row(db: &Database) -> Result<Option<StackRow>, WorkflowStackError> {
+    let conn = db.connect().await;
     let mut rows = conn
         .query(
             "SELECT position, config_key, instance_id, args
@@ -972,21 +966,19 @@ mod tests {
     //! integration tests indirectly.
     use super::*;
     use frances_storage::run_all;
-    use turso::Builder;
 
-    async fn fresh_conn() -> Connection {
-        let conn = Builder::new_local(":memory:")
-            .build()
-            .await
-            .unwrap()
-            .connect()
-            .unwrap();
-        run_all(&conn, &[&SCHEMA]).await.unwrap();
-        conn
+    async fn fresh_db() -> Database {
+        let db = Database::open_in_memory().await.unwrap();
+        {
+            let conn = db.connect().await;
+            run_all(&conn, &[&SCHEMA]).await.unwrap();
+        }
+        db
     }
 
     /// Count live (non-completed) rows.
-    async fn count_live(conn: &Connection) -> i64 {
+    async fn count_live(db: &Database) -> i64 {
+        let conn = db.connect().await;
         let mut rows = conn
             .query(
                 "SELECT COUNT(*) FROM workflow_stack WHERE completed_at IS NULL",
@@ -1003,7 +995,8 @@ mod tests {
 
     /// Read `(active, completed_at IS NULL)` flags for the given
     /// `instance_id`. Returns `None` if the row does not exist.
-    async fn flags_for(conn: &Connection, instance_id: Uuid) -> Option<(bool, bool)> {
+    async fn flags_for(db: &Database, instance_id: Uuid) -> Option<(bool, bool)> {
+        let conn = db.connect().await;
         let mut rows = conn
             .query(
                 "SELECT active, completed_at FROM workflow_stack WHERE instance_id = ?1",
@@ -1019,21 +1012,21 @@ mod tests {
 
     #[tokio::test]
     async fn fresh_table_is_empty() {
-        let conn = fresh_conn().await;
-        assert_eq!(row_count(&conn).await.unwrap(), 0);
-        assert!(read_active_row(&conn).await.unwrap().is_none());
+        let db = fresh_db().await;
+        assert_eq!(row_count(&db).await.unwrap(), 0);
+        assert!(read_active_row(&db).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn single_push_records_and_reads_back() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let id = Uuid::new_v4();
-        insert_pushed_row(&conn, "main", id, &["arg1".into(), "arg2".into()])
+        insert_pushed_row(&db, "main", id, &["arg1".into(), "arg2".into()])
             .await
             .unwrap();
 
-        assert_eq!(row_count(&conn).await.unwrap(), 1);
-        let row = read_active_row(&conn).await.unwrap().expect("active row");
+        assert_eq!(row_count(&db).await.unwrap(), 1);
+        let row = read_active_row(&db).await.unwrap().expect("active row");
         assert_eq!(row.config_key, "main");
         assert_eq!(row.instance_id, id);
         assert_eq!(row.args, vec!["arg1".to_owned(), "arg2".to_owned()]);
@@ -1041,35 +1034,35 @@ mod tests {
 
     #[tokio::test]
     async fn second_push_demotes_first_and_takes_top() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&conn, "b", b, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
 
         // Both rows alive; B is on top.
-        assert_eq!(count_live(&conn).await, 2);
-        let active = read_active_row(&conn).await.unwrap().expect("top");
+        assert_eq!(count_live(&db).await, 2);
+        let active = read_active_row(&db).await.unwrap().expect("top");
         assert_eq!(active.instance_id, b);
-        assert_eq!(flags_for(&conn, a).await, Some((false, true)));
-        assert_eq!(flags_for(&conn, b).await, Some((true, true)));
+        assert_eq!(flags_for(&db, a).await, Some((false, true)));
+        assert_eq!(flags_for(&db, b).await, Some((true, true)));
     }
 
     #[tokio::test]
     async fn pop_tombstones_and_promotes_previous() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&conn, "b", b, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
 
-        mark_completed_and_promote(&conn, b).await.unwrap();
+        mark_completed_and_promote(&db, b).await.unwrap();
 
         // B is dead, A is back on top.
-        assert_eq!(flags_for(&conn, b).await, Some((false, false)));
-        assert_eq!(flags_for(&conn, a).await, Some((true, true)));
+        assert_eq!(flags_for(&db, b).await, Some((false, false)));
+        assert_eq!(flags_for(&db, a).await, Some((true, true)));
         assert_eq!(
-            read_active_row(&conn)
+            read_active_row(&db)
                 .await
                 .unwrap()
                 .expect("top")
@@ -1080,51 +1073,54 @@ mod tests {
 
     #[tokio::test]
     async fn pop_to_empty_stack_leaves_no_active_row() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
 
-        mark_completed_and_promote(&conn, a).await.unwrap();
+        mark_completed_and_promote(&db, a).await.unwrap();
 
-        assert_eq!(flags_for(&conn, a).await, Some((false, false)));
-        assert!(read_active_row(&conn).await.unwrap().is_none());
+        assert_eq!(flags_for(&db, a).await, Some((false, false)));
+        assert!(read_active_row(&db).await.unwrap().is_none());
         // The row is still in the table — append-only.
-        assert_eq!(row_count(&conn).await.unwrap(), 1);
+        assert_eq!(row_count(&db).await.unwrap(), 1);
     }
 
     #[tokio::test]
     async fn push_truncates_orphans_above_current_top() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&conn, "b", b, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
 
         // Forcibly clear `active` from B without tombstoning it. This
         // simulates a crash where the daemon went down mid-pop after
         // clearing active but before setting completed_at.
-        conn.execute("UPDATE workflow_stack SET active = 0", ())
+        {
+            let conn = db.connect().await;
+            conn.execute("UPDATE workflow_stack SET active = 0", ())
+                .await
+                .unwrap();
+            // Now A is the highest position with completed_at NULL,
+            // but B sits above it. A push (orphan-truncation step)
+            // should tombstone B before inserting C. First make A the
+            // active top again so the truncation rule picks B
+            // (position > A) as the orphan.
+            conn.execute(
+                "UPDATE workflow_stack SET active = 1 WHERE instance_id = ?1",
+                (a.as_bytes().to_vec(),),
+            )
             .await
             .unwrap();
-        // Now A is the highest position with completed_at NULL, but
-        // B sits above it. A push (orphan-truncation step) should
-        // tombstone B before inserting C.
-        // First make A the active top again so the truncation rule
-        // picks B (position > A) as the orphan.
-        conn.execute(
-            "UPDATE workflow_stack SET active = 1 WHERE instance_id = ?1",
-            (a.as_bytes().to_vec(),),
-        )
-        .await
-        .unwrap();
+        }
 
-        insert_pushed_row(&conn, "c", c, &[]).await.unwrap();
+        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
 
         // B is now tombstoned (truncated); A is demoted; C is active.
-        assert_eq!(flags_for(&conn, b).await, Some((false, false)));
-        assert_eq!(flags_for(&conn, a).await, Some((false, true)));
-        assert_eq!(flags_for(&conn, c).await, Some((true, true)));
+        assert_eq!(flags_for(&db, b).await, Some((false, false)));
+        assert_eq!(flags_for(&db, a).await, Some((false, true)));
+        assert_eq!(flags_for(&db, c).await, Some((true, true)));
     }
 
     #[tokio::test]
@@ -1132,14 +1128,14 @@ mod tests {
         // A push above C, then user pops C: B is the active top, C is
         // still alive (resumeable in principle). User pushes D: the
         // C row gets tombstoned (orphan above B). D ends up on top.
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
         let d = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&conn, "b", b, &[]).await.unwrap();
-        insert_pushed_row(&conn, "c", c, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
+        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
 
         // Pop C — but with the "pop doesn't tombstone the previous
         // active" semantics: in our current design we DO tombstone,
@@ -1147,52 +1143,55 @@ mod tests {
         // crash-style setup of the previous test rather than this
         // narrative. Here we follow the implemented contract: C is
         // tombstoned, B is promoted.
-        mark_completed_and_promote(&conn, c).await.unwrap();
-        assert_eq!(flags_for(&conn, c).await, Some((false, false)));
-        assert_eq!(flags_for(&conn, b).await, Some((true, true)));
+        mark_completed_and_promote(&db, c).await.unwrap();
+        assert_eq!(flags_for(&db, c).await, Some((false, false)));
+        assert_eq!(flags_for(&db, b).await, Some((true, true)));
 
-        insert_pushed_row(&conn, "d", d, &[]).await.unwrap();
+        insert_pushed_row(&db, "d", d, &[]).await.unwrap();
         // C stays tombstoned, B demoted, D on top, A demoted.
-        assert_eq!(flags_for(&conn, a).await, Some((false, true)));
-        assert_eq!(flags_for(&conn, b).await, Some((false, true)));
-        assert_eq!(flags_for(&conn, c).await, Some((false, false)));
-        assert_eq!(flags_for(&conn, d).await, Some((true, true)));
+        assert_eq!(flags_for(&db, a).await, Some((false, true)));
+        assert_eq!(flags_for(&db, b).await, Some((false, true)));
+        assert_eq!(flags_for(&db, c).await, Some((false, false)));
+        assert_eq!(flags_for(&db, d).await, Some((true, true)));
     }
 
     #[tokio::test]
     async fn truncate_at_or_above_kills_row_and_everything_higher() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         let c = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&conn, "b", b, &[]).await.unwrap();
-        insert_pushed_row(&conn, "c", c, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
+        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
 
         // Find B's position.
-        let mut rows = conn
-            .query(
-                "SELECT position FROM workflow_stack WHERE instance_id = ?1",
-                (b.as_bytes().to_vec(),),
-            )
-            .await
-            .unwrap();
-        let b_pos = match rows.next().await.unwrap().unwrap().get_value(0).unwrap() {
-            Value::Integer(n) => n,
-            other => panic!("unexpected {other:?}"),
+        let b_pos = {
+            let conn = db.connect().await;
+            let mut rows = conn
+                .query(
+                    "SELECT position FROM workflow_stack WHERE instance_id = ?1",
+                    (b.as_bytes().to_vec(),),
+                )
+                .await
+                .unwrap();
+            match rows.next().await.unwrap().unwrap().get_value(0).unwrap() {
+                Value::Integer(n) => n,
+                other => panic!("unexpected {other:?}"),
+            }
         };
 
-        truncate_at_or_above(&conn, b_pos).await.unwrap();
+        truncate_at_or_above(&db, b_pos).await.unwrap();
 
         // A survives, B and C are tombstoned. A is now the active top.
-        assert_eq!(flags_for(&conn, a).await, Some((true, true)));
-        assert_eq!(flags_for(&conn, b).await, Some((false, false)));
-        assert_eq!(flags_for(&conn, c).await, Some((false, false)));
+        assert_eq!(flags_for(&db, a).await, Some((true, true)));
+        assert_eq!(flags_for(&db, b).await, Some((false, false)));
+        assert_eq!(flags_for(&db, c).await, Some((false, false)));
     }
 
     #[tokio::test]
     async fn args_with_special_chars_round_trip() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let id = Uuid::new_v4();
         let args: Vec<String> = vec![
             "plain".into(),
@@ -1200,8 +1199,8 @@ mod tests {
             "tab\there".into(),
             String::new(),
         ];
-        insert_pushed_row(&conn, "k", id, &args).await.unwrap();
-        let row = read_active_row(&conn).await.unwrap().expect("active");
+        insert_pushed_row(&db, "k", id, &args).await.unwrap();
+        let row = read_active_row(&db).await.unwrap().expect("active");
         assert_eq!(row.args, args);
     }
 
@@ -1212,21 +1211,23 @@ mod tests {
         // inserting the new one, so this never triggers in normal
         // flow; verify the index is in place by attempting a manual
         // conflicting INSERT.
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        insert_pushed_row(&conn, "a", a, &[]).await.unwrap();
+        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
 
         // Manually insert a second active row, bypassing our helper.
-        let err = conn
-            .execute(
+        let err = {
+            let conn = db.connect().await;
+            conn.execute(
                 "INSERT INTO workflow_stack
                  (config_key, instance_id, args, created_at, active)
                  VALUES (?1, ?2, ?3, 0, 1)",
                 ("b".to_string(), b.as_bytes().to_vec(), "[]".to_string()),
             )
             .await
-            .unwrap_err();
+            .unwrap_err()
+        };
         let msg = err.to_string().to_lowercase();
         assert!(
             msg.contains("unique") || msg.contains("constraint"),

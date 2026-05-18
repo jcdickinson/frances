@@ -48,10 +48,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 use tokio::net::UnixStream;
-use turso::Connection;
 use uuid::Uuid;
 
-use frances_storage::{EntitySchema, Migration};
+use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
 use crate::protocol::{BlockId, BlockKind, StreamFrame};
@@ -144,7 +143,7 @@ fn now_ns() -> i64 {
 /// corresponds to a clean `BlockStop`; `truncated = true` corresponds
 /// to a workflow dehydrated mid-stream.
 pub async fn persist_block(
-    conn: &Connection,
+    db: &Database,
     instance: Uuid,
     kind: &BlockKind,
     text: &str,
@@ -154,6 +153,7 @@ pub async fn persist_block(
     let instance_bytes = instance.as_bytes().to_vec();
     let now = now_ns();
     let truncated_i = if truncated { 1 } else { 0 };
+    let conn = db.connect().await;
     conn.execute(
         "INSERT INTO scrollback_blocks (instance_id, kind, payload, truncated, created_at) \
          VALUES (?1, ?2, jsonb(?3), ?4, ?5)",
@@ -166,7 +166,7 @@ pub async fn persist_block(
 /// Insert an error row. The replay path emits a single
 /// [`StreamFrame::Error`] for each such row.
 pub async fn persist_error(
-    conn: &Connection,
+    db: &Database,
     instance: Uuid,
     text: &str,
 ) -> std::result::Result<(), ScrollbackError> {
@@ -176,6 +176,7 @@ pub async fn persist_error(
     let payload_json = serde_json::to_string(&payload).map_err(ScrollbackError::Encode)?;
     let instance_bytes = instance.as_bytes().to_vec();
     let now = now_ns();
+    let conn = db.connect().await;
     conn.execute(
         "INSERT INTO scrollback_blocks (instance_id, kind, payload, truncated, created_at) \
          VALUES (?1, 'error', jsonb(?2), 0, ?3)",
@@ -188,9 +189,10 @@ pub async fn persist_error(
 /// Load every row for an instance in insertion order. The list maps 1:1
 /// onto the replay frame burst.
 pub async fn load_for_instance(
-    conn: &Connection,
+    db: &Database,
     instance: Uuid,
 ) -> std::result::Result<Vec<StoredRow>, ScrollbackError> {
+    let conn = db.connect().await;
     let mut rows = conn
         .query(
             "SELECT kind, json(payload), truncated FROM scrollback_blocks \
@@ -229,10 +231,10 @@ pub async fn load_for_instance(
 /// [`StreamFrame::ScrollbackReplayEnd`].
 pub async fn replay_to_stream(
     stream: &mut UnixStream,
-    conn: &Connection,
+    db: &Database,
     instance: Uuid,
 ) -> Result<()> {
-    let rows = load_for_instance(conn, instance)
+    let rows = load_for_instance(db, instance)
         .await
         .map_err(crate::Error::Scrollback)?;
 
@@ -284,10 +286,10 @@ pub async fn replay_to_stream(
 /// frame sequence as a `Vec<StreamFrame>` so it can be bundled into
 /// an `AttachResponse`. The order matches the wire path exactly.
 pub async fn replay_frames(
-    conn: &Connection,
+    db: &Database,
     instance: Uuid,
 ) -> std::result::Result<Vec<StreamFrame>, ScrollbackError> {
-    let rows = load_for_instance(conn, instance).await?;
+    let rows = load_for_instance(db, instance).await?;
     let mut out = Vec::with_capacity(rows.len() * 2 + 2);
     out.push(StreamFrame::ScrollbackReset {
         instance_id: instance,
@@ -417,32 +419,29 @@ fn decode_row(
 mod tests {
     use super::*;
     use frances_storage::run_all;
-    use turso::Builder;
 
-    async fn fresh_conn() -> Connection {
-        let conn = Builder::new_local(":memory:")
-            .build()
-            .await
-            .unwrap()
-            .connect()
-            .unwrap();
-        run_all(&conn, &[&SCHEMA]).await.unwrap();
-        conn
+    async fn fresh_db() -> Database {
+        let db = Database::open_in_memory().await.unwrap();
+        {
+            let conn = db.connect().await;
+            run_all(&conn, &[&SCHEMA]).await.unwrap();
+        }
+        db
     }
 
     #[tokio::test]
     async fn empty_instance_loads_nothing() {
-        let conn = fresh_conn().await;
-        let rows = load_for_instance(&conn, Uuid::new_v4()).await.unwrap();
+        let db = fresh_db().await;
+        let rows = load_for_instance(&db, Uuid::new_v4()).await.unwrap();
         assert!(rows.is_empty());
     }
 
     #[tokio::test]
     async fn block_round_trips() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let instance = Uuid::new_v4();
         persist_block(
-            &conn,
+            &db,
             instance,
             &BlockKind::Text {
                 sender: Some("user".into()),
@@ -452,7 +451,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let rows = load_for_instance(&conn, instance).await.unwrap();
+        let rows = load_for_instance(&db, instance).await.unwrap();
         assert_eq!(
             rows,
             vec![StoredRow::Block {
@@ -467,10 +466,10 @@ mod tests {
 
     #[tokio::test]
     async fn truncated_block_round_trips() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let instance = Uuid::new_v4();
         persist_block(
-            &conn,
+            &db,
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
@@ -480,7 +479,7 @@ mod tests {
         )
         .await
         .unwrap();
-        let rows = load_for_instance(&conn, instance).await.unwrap();
+        let rows = load_for_instance(&db, instance).await.unwrap();
         assert_eq!(
             rows,
             vec![StoredRow::Block {
@@ -495,10 +494,10 @@ mod tests {
 
     #[tokio::test]
     async fn error_round_trips() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let instance = Uuid::new_v4();
-        persist_error(&conn, instance, "boom").await.unwrap();
-        let rows = load_for_instance(&conn, instance).await.unwrap();
+        persist_error(&db, instance, "boom").await.unwrap();
+        let rows = load_for_instance(&db, instance).await.unwrap();
         assert_eq!(
             rows,
             vec![StoredRow::Error {
@@ -509,17 +508,17 @@ mod tests {
 
     #[tokio::test]
     async fn rows_are_scoped_per_instance() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        persist_block(&conn, a, &BlockKind::Text { sender: None }, "a", false)
+        persist_block(&db, a, &BlockKind::Text { sender: None }, "a", false)
             .await
             .unwrap();
-        persist_block(&conn, b, &BlockKind::Text { sender: None }, "b", false)
+        persist_block(&db, b, &BlockKind::Text { sender: None }, "b", false)
             .await
             .unwrap();
-        let rows_a = load_for_instance(&conn, a).await.unwrap();
-        let rows_b = load_for_instance(&conn, b).await.unwrap();
+        let rows_a = load_for_instance(&db, a).await.unwrap();
+        let rows_b = load_for_instance(&db, b).await.unwrap();
         assert_eq!(rows_a.len(), 1);
         assert_eq!(rows_b.len(), 1);
         match &rows_a[0] {
@@ -534,10 +533,10 @@ mod tests {
 
     #[tokio::test]
     async fn replay_frames_synthesizes_expected_burst() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let instance = Uuid::new_v4();
         persist_block(
-            &conn,
+            &db,
             instance,
             &BlockKind::Text {
                 sender: Some("user".into()),
@@ -547,9 +546,9 @@ mod tests {
         )
         .await
         .unwrap();
-        persist_error(&conn, instance, "boom").await.unwrap();
+        persist_error(&db, instance, "boom").await.unwrap();
         persist_block(
-            &conn,
+            &db,
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
@@ -560,7 +559,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = replay_frames(&conn, instance).await.unwrap();
+        let frames = replay_frames(&db, instance).await.unwrap();
         // Reset + (Delta+Stop) + Error + (Delta+Truncated) + End
         assert_eq!(frames.len(), 1 + 2 + 1 + 2 + 1);
         assert!(matches!(
@@ -600,10 +599,10 @@ mod tests {
     /// No extra frames slip in (no `BlockStart`).
     #[tokio::test]
     async fn replay_frames_for_single_block_is_minimal() {
-        let conn = fresh_conn().await;
+        let db = fresh_db().await;
         let instance = Uuid::new_v4();
         persist_block(
-            &conn,
+            &db,
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
@@ -614,7 +613,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = replay_frames(&conn, instance).await.unwrap();
+        let frames = replay_frames(&db, instance).await.unwrap();
         assert_eq!(frames.len(), 4);
         match &frames[0] {
             StreamFrame::ScrollbackReset { .. } => {}

@@ -12,6 +12,7 @@
 //
 // Type `quit` to exit.
 
+import { WritableStream } from "whatwg:web-streams";
 import { inbox } from "frances:v1/inbox";
 import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
 import { ChatSession } from "frances:v1/chat";
@@ -91,10 +92,27 @@ try {
     chat.push({ role: "user", content: msg });
     try {
       while (true) {
-        const out = new MarkdownFrame({ content: "", sender: "frances" });
-        transcript.push(out);
         const r = await chat.stream();
-        await r.text.pipeTo(out.writable);
+        // Only push a `frances:` frame once the first text delta arrives.
+        // A turn that returns only tool_calls produces no deltas, so it
+        // leaves no empty `frances:` row in the transcript.
+        let out: any = null;
+        let writer: any = null;
+        await r.text.pipeTo(
+          new WritableStream({
+            async write(chunk) {
+              if (out === null) {
+                out = new MarkdownFrame({ content: "", sender: "frances" });
+                transcript.push(out);
+                writer = out.writable.getWriter();
+              }
+              await writer.write(chunk);
+            },
+            async close() {
+              if (writer) await writer.close();
+            },
+          }),
+        );
         const { tool_calls } = await r.completed;
         if (!tool_calls || tool_calls.length === 0) break;
       }

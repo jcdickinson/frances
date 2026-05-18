@@ -1,11 +1,15 @@
-use std::ops::Deref;
-use std::path::PathBuf;
-use std::sync::Arc;
+//! Daemon-side wiring around the workspace-shared [`Database`].
+//!
+//! [`Database`] itself lives in `frances-storage` so that crates
+//! outside the daemon (the workflow runtime, in particular) hold the
+//! same lock when they touch the per-session turso connection. This
+//! module just exposes the daemon's open-and-migrate flow plus an
+//! in-memory variant for tests.
 
 use frances_storage::MigrationError;
+pub use frances_storage::{ActiveDatabase, Database};
 use thiserror::Error;
 use tracing::trace;
-use turso::{Builder, Connection};
 
 use crate::session::Session;
 
@@ -17,92 +21,39 @@ pub enum DatabaseError {
     Migration(#[from] MigrationError),
 }
 
-#[derive(Clone)]
-pub struct Database {
-    conn: Connection,
-    path: Arc<PathBuf>,
+/// Open the per-session database and run every daemon-side schema.
+pub async fn open(session: &Session) -> std::result::Result<Database, DatabaseError> {
+    let path = session.database_path();
+    trace!(path = %path.display(), "opening turso database");
+    let db = Database::open(path.to_string_lossy().into_owned()).await?;
+
+    trace!(path = %path.display(), "running schema migrations");
+    apply_migrations(&db).await?;
+    Ok(db)
 }
 
-pub struct ActiveDatabase(Connection);
-
-impl Deref for ActiveDatabase {
-    type Target = Connection;
-    fn deref(&self) -> &Connection {
-        &self.0
-    }
+/// Build a fresh in-memory database with all daemon schemas applied.
+/// Test fixtures want a turso connection with no on-disk state — using
+/// `":memory:"` keeps everything in-process: no tempdir, no I/O.
+#[cfg(test)]
+pub(crate) async fn open_in_memory() -> std::result::Result<Database, DatabaseError> {
+    let db = Database::open_in_memory().await?;
+    apply_migrations(&db).await?;
+    Ok(db)
 }
 
-impl Drop for ActiveDatabase {
-    fn drop(&mut self) {
-        if let Err(error) = self.0.cacheflush() {
-            tracing::warn!(%error, "cacheflush failed");
-        }
-    }
-}
-
-impl Database {
-    pub async fn open(session: &Session) -> std::result::Result<Self, DatabaseError> {
-        let path = session.database_path();
-        trace!(path = %path.display(), "opening turso database");
-
-        let database = Builder::new_local(&path.to_string_lossy()).build().await?;
-        let conn = database.connect()?;
-
-        trace!(path = %path.display(), "running schema migrations");
-        Self::apply_migrations(&conn).await?;
-
-        Ok(Self {
-            conn,
-            path: Arc::new(path),
-        })
-    }
-
-    /// Build a fresh in-memory database with all schemas applied. Test
-    /// fixtures want a turso connection with no on-disk state — using
-    /// `":memory:"` keeps everything in-process: no tempdir, no I/O.
-    #[cfg(test)]
-    pub(crate) async fn open_in_memory() -> std::result::Result<Self, DatabaseError> {
-        let database = Builder::new_local(":memory:").build().await?;
-        let conn = database.connect()?;
-        Self::apply_migrations(&conn).await?;
-        Ok(Self {
-            conn,
-            path: Arc::new(PathBuf::from(":memory:")),
-        })
-    }
-
-    async fn apply_migrations(conn: &Connection) -> std::result::Result<(), DatabaseError> {
-        frances_storage::run_all(
-            conn,
-            &[
-                &crate::anchor_store::SCHEMA,
-                &crate::history::SCHEMA,
-                &crate::llm::session_provider::SCHEMA,
-                &crate::workflows::SCHEMA,
-                &crate::scrollback::SCHEMA,
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub fn connect(&self) -> ActiveDatabase {
-        ActiveDatabase(self.conn.clone())
-    }
-
-    /// Bare `turso::Connection` clone for callers that need raw access
-    /// (e.g. workflow-owned migrations + storage handles). The
-    /// connection is cloneable and turso handles concurrent use
-    /// internally — same physical connection as `connect()`.
-    pub fn connection(&self) -> Connection {
-        self.conn.clone()
-    }
-}
-
-impl std::fmt::Debug for Database {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Database")
-            .field("path", &*self.path)
-            .finish()
-    }
+async fn apply_migrations(db: &Database) -> std::result::Result<(), DatabaseError> {
+    let conn = db.connect().await;
+    frances_storage::run_all(
+        &conn,
+        &[
+            &crate::anchor_store::SCHEMA,
+            &crate::history::SCHEMA,
+            &crate::llm::session_provider::SCHEMA,
+            &crate::workflows::SCHEMA,
+            &crate::scrollback::SCHEMA,
+        ],
+    )
+    .await?;
+    Ok(())
 }
