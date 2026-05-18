@@ -13,7 +13,7 @@ use crate::store::Database;
 
 /// Owns file_meta, file_lines, file_tombstones — the anchor edit
 /// state used by the editor. UUID is permanent.
-pub static SCHEMA: EntitySchema = EntitySchema {
+pub static SCHEMA: EntitySchema<'static> = EntitySchema {
     entity: Uuid::from_u128(0x97acb11c_b9a1_4f71_af62_0368f2ca9913),
     migrations: Cow::Borrowed(&[Migration {
         name: Cow::Borrowed("0001_init.sql"),

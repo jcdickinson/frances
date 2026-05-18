@@ -7,10 +7,12 @@ authors.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+dashmap.workspace = true
 deno_ast.workspace = true
 frances-edit.workspace = true
 frances-models-llm.workspace = true
 frances-shell.workspace = true
+frances-storage.workspace = true
 jaq-core.workspace = true
 jaq-json.workspace = true
 jaq-std.workspace = true
@@ -22,6 +24,7 @@ tempfile.workspace = true
 tokio.workspace = true
 shell-words.workspace = true
 thiserror.workspace = true
+turso.workspace = true
 twox-hash.workspace = true
 uuid.workspace = true
 

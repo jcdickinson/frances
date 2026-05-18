@@ -24,6 +24,7 @@ use crate::protocol::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerState;
 use crate::transport::write_message;
 
+use frances_storage::Migration;
 use frances_workflow::{
     FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle, parse_slash_command,
 };
@@ -153,17 +154,65 @@ pub(crate) async fn push_default_workflow(state: &Arc<ServerState>, name: &str) 
         return Ok(false);
     };
 
+    let migrations = match load_migrations(cfg).await {
+        Ok(m) => m,
+        Err(error) => {
+            warn!(
+                workflow = name,
+                %error,
+                "default_workflow migration read failed; leaving stack empty"
+            );
+            return Ok(false);
+        }
+    };
     let invocation = Invocation {
         source_path: cfg.file.clone(),
         args: Vec::new(),
+        entity: cfg.id,
+        migrations,
     };
 
-    let handle = state.workflow_runtime.start(invocation)?;
+    let handle = state.workflow_runtime.start(invocation).await?;
     state.workflow_stack.frames.lock().await.push(Frame {
         handle,
         emit: EmitState::new(),
     });
     Ok(true)
+}
+
+/// Read each declared migration file (resolved relative to the
+/// workflow's `cfg.file` directory) into memory. Builds a
+/// [`Migration`] per entry, suitable for handing to the workflow
+/// runtime via [`Invocation::migrations`].
+async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, WorkflowError> {
+    let base = cfg
+        .file
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default();
+    let mut out = Vec::with_capacity(cfg.migrations.len());
+    for path in &cfg.migrations {
+        let resolved = if path.is_absolute() {
+            path.clone()
+        } else {
+            base.join(path)
+        };
+        let sql = tokio::fs::read_to_string(&resolved)
+            .await
+            .map_err(|source| WorkflowError::ReadMigration {
+                path: resolved.clone(),
+                source,
+            })?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned());
+        out.push(Migration {
+            name: std::borrow::Cow::Owned(name),
+            sql: std::borrow::Cow::Owned(sql),
+        });
+    }
+    Ok(out)
 }
 
 async fn push_and_drive(
@@ -182,12 +231,21 @@ async fn push_and_drive(
         return Ok(());
     };
 
+    let migrations = match load_migrations(cfg).await {
+        Ok(m) => m,
+        Err(error) => {
+            write_message(stream, &StreamFrame::Error(format!("workflow: {error}"))).await?;
+            return Ok(());
+        }
+    };
     let invocation = Invocation {
         source_path: cfg.file.clone(),
         args,
+        entity: cfg.id,
+        migrations,
     };
 
-    let handle = match state.workflow_runtime.start(invocation) {
+    let handle = match state.workflow_runtime.start(invocation).await {
         Ok(handle) => handle,
         Err(error) => {
             write_message(stream, &StreamFrame::Error(format!("workflow: {error}"))).await?;

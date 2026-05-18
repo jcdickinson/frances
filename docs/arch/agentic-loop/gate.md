@@ -101,6 +101,11 @@ In full-auto mode, the patch proposal pass still runs, patches are auto-applied 
 
 **Audit trail.** Original step bodies are preserved; patched versions are new revisions. Replan-after-patch and patch-after-replan are both possible; the history records the order. If the user approves a patch and later regrets it, reverting to the prior body is trivial.
 
+## Referee
+
+A model with the `referee` intent determines if the work and proof of work are satisfactory, if not,
+the main model is instructed to do the work correctly.
+
 ## Full-auto mode
 
 Full-auto suppresses the gate UI but does not change the underlying structure:

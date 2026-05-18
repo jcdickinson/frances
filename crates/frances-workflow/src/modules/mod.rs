@@ -42,6 +42,9 @@
 //!   asks the user a yes/no/chat question. Backed by a private
 //!   `_approve` primitive on the install stash; the host bridges via
 //!   `HostFrame::Approval` + the `ApprovalGateway` trait.
+//! - `frances:v1/storage`        — `db` singleton with
+//!   `exec`/`query`/`queryStream`/`transaction`. Backed by a workflow's
+//!   per-entity migrations declared in `[workflows.<id>].migrations`.
 //! - `frances:v1/tools/shell`    — `Shell` primitive + `Run`/`Wait`/`Kill`
 //!   tool classes.
 //! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
@@ -76,6 +79,7 @@ pub mod inbox;
 pub mod io;
 pub mod jaq;
 pub mod shell;
+pub mod storage;
 pub mod workflow;
 
 /// Global key on `globalThis` where the module stash lives during
@@ -93,6 +97,7 @@ pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub closed_notify: Arc<Notify>,
     pub parked: Arc<Notify>,
     pub deps: D,
+    pub workflow_db: Arc<crate::storage::WorkflowDb>,
 }
 
 /// Builds the install-time stash and places it at
@@ -110,6 +115,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         closed_notify,
         parked,
         deps,
+        workflow_db,
     } = host;
 
     // Clones for the approval primitive — it owns the gateway and a
@@ -172,6 +178,9 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     )?;
     stash.set("_approve", approve_fn)?;
 
+    let db_instance = storage::build_storage(ctx, workflow_db)?;
+    stash.set("db", db_instance)?;
+
     ctx.globals().set(STASH_KEY, stash)?;
     Ok(())
 }
@@ -197,6 +206,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
     declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
+    declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
@@ -243,6 +253,7 @@ const FRAMES_SRC: &str = include_str!("js/frames.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
 const APPROVAL_SRC: &str = include_str!("js/approval.js");
+const STORAGE_SRC: &str = include_str!("js/storage.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
 const VARIABLE_SRC: &str = include_str!("js/variable.js");

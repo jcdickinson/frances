@@ -87,6 +87,14 @@ impl Database {
     pub fn connect(&self) -> ActiveDatabase {
         ActiveDatabase(self.conn.clone())
     }
+
+    /// Bare `turso::Connection` clone for callers that need raw access
+    /// (e.g. workflow-owned migrations + storage handles). The
+    /// connection is cloneable and turso handles concurrent use
+    /// internally — same physical connection as `connect()`.
+    pub fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
 }
 
 impl std::fmt::Debug for Database {

@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::storage::WorkflowDbError;
+
 #[derive(Debug, Error)]
 pub enum WorkflowError {
     #[error("split workflow args: {0}")]
@@ -9,6 +11,13 @@ pub enum WorkflowError {
 
     #[error("read workflow source: {0}")]
     ReadSource(#[source] std::io::Error),
+
+    #[error("read workflow migration {path}: {source}")]
+    ReadMigration {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 
     #[error("parse workflow source: {0}")]
     Parse(#[from] deno_ast::ParseDiagnostic),
@@ -24,4 +33,7 @@ pub enum WorkflowError {
 
     #[error("script ({context}): {detail}")]
     ScriptCaught { context: String, detail: String },
+
+    #[error(transparent)]
+    Storage(#[from] WorkflowDbError),
 }

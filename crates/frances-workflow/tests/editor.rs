@@ -97,7 +97,9 @@ async fn editor_read_returns_anchored_lines() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -140,7 +142,9 @@ async fn editor_edit_replace_writes_disk() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -184,7 +188,9 @@ async fn editor_anchor_not_found_throws() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -237,7 +243,9 @@ async fn read_into_var_stores_raw_and_skips_registration() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -289,7 +297,9 @@ async fn write_from_var_pulls_text() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (_frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -345,7 +355,9 @@ async fn write_text_and_from_both_set_errors() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -392,7 +404,9 @@ async fn editor_new_creates_parent_directory() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");

@@ -46,11 +46,13 @@ pub struct Migration {
 /// existing tables.
 ///
 /// `migrations` is a [`Cow`] so the daemon's static schemas can stay
-/// const-constructible (`Cow::Borrowed(&[..])`) while workflow code
-/// loaded at runtime can hand in an owned [`Vec`].
-pub struct EntitySchema {
+/// const-constructible (`Cow::Borrowed(&'static [..])`, instantiated
+/// as `EntitySchema<'static>`) while workflow code loaded at runtime
+/// can hand in either an owned [`Vec`] or a borrowed slice with a
+/// shorter lifetime.
+pub struct EntitySchema<'a> {
     pub entity: Uuid,
-    pub migrations: Cow<'static, [Migration]>,
+    pub migrations: Cow<'a, [Migration]>,
 }
 
 #[derive(Debug, Error)]
@@ -194,7 +196,7 @@ async fn load_applied(conn: &Connection, entity: &[u8]) -> Result<Vec<AppliedRow
 /// checksum, or version. Otherwise applies declared migrations from
 /// `applied.len()..` each inside its own transaction along with the
 /// matching `_migrations` insert.
-pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
+pub async fn run(conn: &Connection, schema: &EntitySchema<'_>) -> Result<()> {
     let entity_bytes = schema.entity.as_bytes().to_vec();
     let applied = load_applied(conn, &entity_bytes).await?;
 
@@ -260,7 +262,7 @@ pub async fn run(conn: &Connection, schema: &EntitySchema) -> Result<()> {
 
 /// Convenience: ensure the tracking table and run every schema in
 /// order. Bails on the first failing entity.
-pub async fn run_all(conn: &Connection, schemas: &[&EntitySchema]) -> Result<()> {
+pub async fn run_all(conn: &Connection, schemas: &[&EntitySchema<'_>]) -> Result<()> {
     ensure_table(conn).await?;
     for schema in schemas {
         run(conn, schema).await?;
@@ -291,7 +293,7 @@ mod tests {
         }
     }
 
-    fn schema_v1() -> EntitySchema {
+    fn schema_v1() -> EntitySchema<'static> {
         EntitySchema {
             entity: TEST_ENTITY,
             migrations: vec![mig(
@@ -302,7 +304,7 @@ mod tests {
         }
     }
 
-    fn schema_v2() -> EntitySchema {
+    fn schema_v2() -> EntitySchema<'static> {
         EntitySchema {
             entity: TEST_ENTITY,
             migrations: vec![

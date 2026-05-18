@@ -20,6 +20,7 @@ mod error;
 mod modules;
 mod runtime;
 mod slash;
+mod storage;
 mod transpile;
 
 pub use approval::{ApprovalChoice, ApprovalGateway, ApprovalId, ApprovalKind, ApprovalRequest};
@@ -30,6 +31,7 @@ pub use runtime::{
     FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, UserInput, WorkflowHandle,
 };
 pub use slash::parse_slash_command;
+pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use runtime::test_deps;

@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::store::Database;
 
 /// Owns the `session_config` table. UUID is permanent.
-pub static SCHEMA: EntitySchema = EntitySchema {
+pub static SCHEMA: EntitySchema<'static> = EntitySchema {
     entity: Uuid::from_u128(0x33578ba6_759b_42c5_8c7f_94932a153732),
     migrations: Cow::Borrowed(&[Migration {
         name: Cow::Borrowed("0001_init.sql"),

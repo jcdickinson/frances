@@ -4,6 +4,7 @@
 //! `Clone + Send + Sync + 'static` so it can be moved across the
 //! tokio-task / async-context boundary cheaply.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::future::Future;
@@ -13,9 +14,12 @@ use std::sync::Arc;
 use frances_edit::{AnchorStore, EditSession};
 use frances_models_llm::chat::ChatSessionManager;
 use frances_shell::{Shell, ShellError, ShellOptions};
+use frances_storage::Migration;
 use tokio::sync::Mutex as AsyncMutex;
+use uuid::Uuid;
 
 use crate::approval::ApprovalGateway;
+use crate::storage::{WorkflowDb, WorkflowDbError};
 
 pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     type ChatSessionManager: ChatSessionManager;
@@ -52,6 +56,21 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     /// call so re-attach with a different client cwd takes effect
     /// immediately. `None` when no client has attached yet.
     fn current_cwd(&self) -> Option<PathBuf>;
+
+    /// Resolve a workflow's per-session SQL handle. On first touch the
+    /// host applies `migrations` under `entity` (via the
+    /// [`frances_storage`] migrator), caches an [`Arc<WorkflowDb>`],
+    /// and returns it. Subsequent touches return the cached handle and
+    /// ignore `migrations`.
+    ///
+    /// `migrations` is borrowed-or-owned so the caller can pass a
+    /// reference into its own `Vec<Migration>` without cloning, or hand
+    /// over ownership if it doesn't need the data again.
+    fn workflow_db<'a>(
+        &'a self,
+        entity: Uuid,
+        migrations: Cow<'a, [Migration]>,
+    ) -> impl Future<Output = Result<Arc<WorkflowDb>, WorkflowDbError>> + Send + 'a;
 }
 
 /// Spawns bash subprocesses for workflows. Async because

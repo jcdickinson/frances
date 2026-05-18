@@ -116,7 +116,9 @@ async fn shell_set_set_form_is_not_exported() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -167,7 +169,9 @@ async fn shell_set_export_form_visible_to_subprocesses() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -212,7 +216,9 @@ async fn shell_set_object_value_is_json_encoded() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -268,7 +274,9 @@ async fn shell_set_validates_xor_and_missing_from() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -332,7 +340,9 @@ async fn shell_capture_round_trip_via_variable_assign() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -368,7 +378,9 @@ async fn shell_capture_unset_var_errors() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -426,7 +438,9 @@ async fn shell_run_approve_yes_executes_command() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
 
     let (req, _seen) = await_approval(&mut handle).await;
@@ -487,7 +501,9 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
 
     let (req, _seen) = await_approval(&mut handle).await;
@@ -542,7 +558,9 @@ async fn shell_run_approve_chat_skips_command_and_forwards_text() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
 
     let (req, _seen) = await_approval(&mut handle).await;
@@ -597,7 +615,9 @@ async fn shell_run_approve_false_skips_gate() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
 
     let (frames, done) = drive_one_cycle(&mut handle).await;

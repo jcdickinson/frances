@@ -87,7 +87,9 @@ async fn variables_round_trip_from_js() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -146,7 +148,9 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -208,7 +212,9 @@ async fn set_and_assign_responses_report_type_summary() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -274,7 +280,9 @@ async fn variable_assign_introspection_and_errors() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -325,7 +333,9 @@ async fn variable_get_and_set_tool_handlers_work() {
         .start(Invocation {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
+            ..Default::default()
         })
+        .await
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");

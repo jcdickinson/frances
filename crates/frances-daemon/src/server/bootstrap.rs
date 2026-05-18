@@ -81,6 +81,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
     let default_workflow = config.bind::<Option<String>>("default_workflow")?;
 
+    let conn = db.connection();
     let history = TursoHistoryStore::new(db);
     let chat_deps = ServerChatDeps {
         history: history.clone(),
@@ -97,6 +98,8 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         last_context: last_context.clone(),
         editor_factory: editor_factory.clone(),
         approvals: approvals.clone(),
+        conn,
+        workflow_dbs: Arc::new(dashmap::DashMap::new()),
     })?);
 
     let state = Arc::new(ServerState {

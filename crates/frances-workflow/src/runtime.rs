@@ -102,9 +102,17 @@ impl<'js> IntoJs<'js> for UserInput {
 }
 
 /// Inputs the daemon supplies for one workflow invocation.
+#[derive(Default)]
 pub struct Invocation {
     pub source_path: PathBuf,
     pub args: Vec<String>,
+    /// Stable entity uuid for the workflow — keys into `_migrations` and
+    /// the per-runtime `WorkflowDb` cache. [`uuid::Uuid::nil`] when
+    /// tests don't care about storage.
+    pub entity: uuid::Uuid,
+    /// Ready-to-apply migrations, read from disk by the caller. Empty
+    /// is fine — workflows without any tables just get an empty handle.
+    pub migrations: Vec<frances_storage::Migration>,
 }
 
 /// Handle to a running workflow. The daemon owns this; it delivers user
@@ -150,16 +158,25 @@ impl<D: WorkflowDeps> Runtime<D> {
         })
     }
 
-    /// Start a workflow. Reads + transpiles the source synchronously,
-    /// spawns the body on a Tokio task, and returns a handle the daemon
-    /// uses to drive it.
-    pub fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
+    /// Start a workflow. Reads + transpiles the source, resolves the
+    /// per-workflow [`WorkflowDb`] handle (applying migrations on first
+    /// touch), then spawns the body on a Tokio task and returns a
+    /// handle the daemon uses to drive it.
+    ///
+    /// Async because [`WorkflowDeps::workflow_db`] is async — both the
+    /// migrator and the cache lookup go through it.
+    pub async fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
         let source =
             std::fs::read_to_string(&inv.source_path).map_err(WorkflowError::ReadSource)?;
         let js_source = match SourceKind::from_path(&inv.source_path) {
             SourceKind::JavaScript => source,
             SourceKind::TypeScript => self.transpile(&inv.source_path, &source)?,
         };
+
+        let workflow_db = self
+            .deps
+            .workflow_db(inv.entity, std::borrow::Cow::Borrowed(&inv.migrations))
+            .await?;
 
         let (input_tx, input_rx) = mpsc::unbounded_channel::<UserInput>();
         let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
@@ -186,6 +203,7 @@ impl<D: WorkflowDeps> Runtime<D> {
                 task_closed_notify,
                 task_parked,
                 task_deps,
+                workflow_db,
             )
             .await;
             let _ = done_tx.send(result);
@@ -228,6 +246,7 @@ async fn run_workflow<D: WorkflowDeps>(
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
     deps: D,
+    workflow_db: Arc<crate::storage::WorkflowDb>,
 ) -> Result<(), WorkflowError> {
     let context = AsyncContext::full(&js).await?;
 
@@ -249,6 +268,7 @@ async fn run_workflow<D: WorkflowDeps>(
                     closed_notify: closed_notify.clone(),
                     parked,
                     deps,
+                    workflow_db,
                 },
             )?;
             modules::install_whatwg(&ctx)?;
@@ -303,6 +323,7 @@ pub mod test_deps {
     //! emit and the `CompletionOutcome` to return.
 
     use async_trait::async_trait;
+    use dashmap::DashMap;
     use frances_edit::{EditEngine, EditSession, FakeStore};
     use frances_models_llm::chat::{
         ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
@@ -310,18 +331,24 @@ pub mod test_deps {
     };
     use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
     use frances_shell::{Shell, ShellError, ShellOptions};
+    use frances_storage::{EntitySchema, Migration};
     use parking_lot::Mutex;
+    use std::borrow::Cow;
     use std::collections::HashMap;
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio::sync::Mutex as AsyncMutex;
+    use turso::{Builder, Connection};
+    use uuid::Uuid;
 
     use crate::approval::{
         ApprovalChoice, ApprovalGateway, ApprovalId, ApprovalKind, ApprovalRequest,
     };
     use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
+    use crate::storage::{WorkflowDb, WorkflowDbError};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use tokio::sync::OnceCell;
     use tokio::sync::oneshot;
 
     #[derive(Clone, Default)]
@@ -331,6 +358,7 @@ pub mod test_deps {
         editor_factory: StubEditorFactory,
         approvals: StubApprovalGateway,
         cwd: Arc<Mutex<Option<PathBuf>>>,
+        storage: StubStorage,
     }
 
     impl StubDeps {
@@ -348,6 +376,17 @@ pub mod test_deps {
         /// `InvocationContext`.
         pub fn set_cwd(&self, cwd: PathBuf) {
             *self.cwd.lock() = Some(cwd);
+        }
+
+        /// Drop the cached `WorkflowDb` for `entity` so the next
+        /// `workflow_db()` call re-applies its migrations. The
+        /// underlying turso connection (and any `_migrations` rows
+        /// already recorded for the entity) is preserved — this is how
+        /// tests exercise the migrator's drift-detection path.
+        pub fn forget_workflow_db(&self, entity: Uuid) {
+            if let Some(state) = self.storage.inner.state.get() {
+                state.entities.remove(&entity);
+            }
         }
     }
 
@@ -379,6 +418,68 @@ pub mod test_deps {
 
         fn current_cwd(&self) -> Option<PathBuf> {
             self.cwd.lock().clone()
+        }
+
+        async fn workflow_db(
+            &self,
+            entity: Uuid,
+            migrations: Cow<'_, [Migration]>,
+        ) -> Result<Arc<WorkflowDb>, WorkflowDbError> {
+            self.storage.workflow_db(entity, migrations).await
+        }
+    }
+
+    /// Shared in-memory turso connection plus per-entity `WorkflowDb`
+    /// cache. Both stub-deps flavours hold a clone; tests can co-opt the
+    /// same connection across stub instances if they construct via
+    /// `StubStorage::shared`.
+    #[derive(Clone, Default)]
+    pub struct StubStorage {
+        inner: Arc<StubStorageInner>,
+    }
+
+    #[derive(Default)]
+    struct StubStorageInner {
+        state: OnceCell<StubStorageState>,
+    }
+
+    struct StubStorageState {
+        conn: Connection,
+        entities: DashMap<Uuid, Arc<WorkflowDb>>,
+    }
+
+    impl StubStorage {
+        async fn workflow_db(
+            &self,
+            entity: Uuid,
+            migrations: Cow<'_, [Migration]>,
+        ) -> Result<Arc<WorkflowDb>, WorkflowDbError> {
+            let state = self
+                .inner
+                .state
+                .get_or_try_init(|| async {
+                    let database = Builder::new_local(":memory:")
+                        .build()
+                        .await
+                        .map_err(|source| WorkflowDbError::Turso { entity, source })?;
+                    let conn = database
+                        .connect()
+                        .map_err(|source| WorkflowDbError::Turso { entity, source })?;
+                    frances_storage::ensure_table(&conn).await?;
+                    Ok::<_, WorkflowDbError>(StubStorageState {
+                        conn,
+                        entities: DashMap::new(),
+                    })
+                })
+                .await?;
+            if let Some(existing) = state.entities.get(&entity) {
+                return Ok(existing.clone());
+            }
+            let schema = EntitySchema { entity, migrations };
+            frances_storage::run(&state.conn, &schema).await?;
+            let db = Arc::new(WorkflowDb::new(state.conn.clone(), entity));
+            state.entities.insert(entity, db.clone());
+            Ok(db)
         }
     }
 
@@ -451,6 +552,7 @@ pub mod test_deps {
         shell_factory: RealShellFactory,
         editor_factory: StubEditorFactory,
         approvals: StubApprovalGateway,
+        storage: StubStorage,
     }
 
     impl WorkflowDeps for StubDepsRealShell {
@@ -481,6 +583,14 @@ pub mod test_deps {
 
         fn current_cwd(&self) -> Option<PathBuf> {
             None
+        }
+
+        async fn workflow_db(
+            &self,
+            entity: Uuid,
+            migrations: Cow<'_, [Migration]>,
+        ) -> Result<Arc<WorkflowDb>, WorkflowDbError> {
+            self.storage.workflow_db(entity, migrations).await
         }
     }
 
@@ -731,7 +841,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
 
         let (frames, done) = drive_one_cycle(&mut handle).await;
@@ -783,7 +895,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
 
         let (frames, done) = drive_one_cycle(&mut handle).await;
@@ -805,7 +919,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: vec!["a".into(), "b".into(), "c".into()],
+                ..Default::default()
             })
+            .await
             .unwrap();
 
         let (frames, done) = drive_one_cycle(&mut handle).await;
@@ -831,7 +947,9 @@ mod tests {
                 .start(Invocation {
                     source_path: path.clone(),
                     args: Vec::new(),
+                    ..Default::default()
                 })
+                .await
                 .unwrap();
             let (frames, done) = drive_one_cycle(&mut handle).await;
             assert!(matches!(done, Some(Ok(()))));
@@ -863,7 +981,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -888,7 +1008,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -915,7 +1037,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(frames.is_empty());
@@ -953,7 +1077,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: vec!["x".into(), "y".into(), "z".into()],
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -968,7 +1094,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -996,7 +1124,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -1021,7 +1151,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -1053,7 +1185,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         let err = done.expect("workflow done").expect_err("expected throw");
@@ -1081,7 +1215,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1099,7 +1235,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1127,7 +1265,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -1149,7 +1289,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1181,7 +1323,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1204,7 +1348,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1230,7 +1376,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1259,7 +1407,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1281,7 +1431,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1321,7 +1473,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -1352,7 +1506,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -1389,7 +1545,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1422,7 +1580,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1463,7 +1623,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1488,7 +1650,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1519,7 +1683,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1550,7 +1716,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1623,7 +1791,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1652,7 +1822,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1705,7 +1877,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1788,7 +1962,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1875,7 +2051,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1939,7 +2117,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -1996,7 +2176,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2094,7 +2276,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2145,7 +2329,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2186,7 +2372,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2223,7 +2411,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2287,7 +2477,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = tokio::time::timeout(
             std::time::Duration::from_secs(10),
@@ -2387,7 +2579,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -2496,7 +2690,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -2620,7 +2816,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -2742,7 +2940,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2829,7 +3029,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -2909,7 +3111,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3012,7 +3216,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3091,7 +3297,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3153,7 +3361,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3195,7 +3405,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3223,7 +3435,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3250,7 +3464,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3286,7 +3502,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3320,7 +3538,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3357,7 +3577,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3394,7 +3616,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3425,7 +3649,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3456,7 +3682,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3482,7 +3710,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3512,7 +3742,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3539,7 +3771,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3560,7 +3794,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -3586,7 +3822,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3620,7 +3858,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3642,7 +3882,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -3672,7 +3914,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3703,7 +3947,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3725,7 +3971,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -3754,7 +4002,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3788,7 +4038,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3823,7 +4075,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3858,7 +4112,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3894,7 +4150,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3935,7 +4193,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -3956,7 +4216,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
@@ -3991,7 +4253,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4022,7 +4286,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4054,7 +4320,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4088,7 +4356,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4125,7 +4395,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4155,7 +4427,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4192,7 +4466,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
@@ -4222,7 +4498,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
 
         let req = tokio::time::timeout(CYCLE_TIMEOUT, async {
@@ -4286,7 +4564,9 @@ mod tests {
             .start(Invocation {
                 source_path: file.path().to_path_buf(),
                 args: Vec::new(),
+                ..Default::default()
             })
+            .await
             .unwrap();
         let (_frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
