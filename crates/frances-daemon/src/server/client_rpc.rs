@@ -8,7 +8,7 @@ use tarpc::tokio_serde::formats::Bincode;
 use tracing::{trace, warn};
 
 use crate::context::InvocationContext;
-use crate::protocol::{ApprovalChoice, ApprovalId, AttachResponse, Client, PromptId, SessionId};
+use crate::protocol::{ApprovalChoice, ApprovalId, AttachResponse, Client, SessionId};
 
 use super::ApprovalResponseError;
 use super::turn::run_prompt;
@@ -27,15 +27,37 @@ impl Client for ClientServer {
             has_cwd = ctx.process.cwd.is_some(),
             "received attach context"
         );
-        let mut attached = self.state.client_attached.lock();
-        if *attached {
-            AttachResponse::Busy
-        } else {
+        {
+            let mut attached = self.state.client_attached.lock();
+            if *attached {
+                return AttachResponse::Busy;
+            }
             *self.state.last_context.lock() = Some(ctx);
             *attached = true;
-            AttachResponse::Attached {
-                session_id: SessionId(self.state.session.id.clone()),
+        }
+
+        // Wait briefly for the TUI's events socket to be installed
+        // (the TUI opens it just before calling attach; in practice
+        // it's already here). If it never arrives we still return
+        // attached — the client just gets no initial replay.
+        if self.state.events.wait_for_stream().await {
+            let active_instance = self.state.workflow_stack.active_instance().await;
+            let mut guard = self.state.events.lock().await;
+            if let Some(stream) = guard.stream() {
+                let result =
+                    write_initial_replay(stream, self.state.workflow_stack.conn(), active_instance)
+                        .await;
+                if let Err(error) = result {
+                    warn!(%error, "initial scrollback replay failed; events stream may be unusable");
+                    guard.drop_stream();
+                }
             }
+        } else {
+            warn!("events socket never arrived; attach returning without initial replay");
+        }
+
+        AttachResponse::Attached {
+            session_id: SessionId(self.state.session.id.clone()),
         }
     }
 
@@ -44,22 +66,18 @@ impl Client for ClientServer {
         *attached = false;
     }
 
-    async fn prompt(
-        self,
-        _: context::Context,
-        prompt_id: PromptId,
-        text: String,
-    ) -> std::result::Result<(), String> {
-        let stream = self
-            .state
-            .events
-            .take(prompt_id)
-            .await
-            .ok_or_else(|| format!("no events socket registered for prompt {prompt_id}"))?;
-
+    async fn prompt(self, _: context::Context, text: String) -> std::result::Result<(), String> {
         let state = self.state.clone();
         tokio::spawn(async move {
-            run_prompt(state, stream, text).await;
+            let mut guard = state.events.lock().await;
+            let stream = match guard.stream() {
+                Some(s) => s,
+                None => {
+                    warn!("prompt arrived with no events stream installed; dropping");
+                    return;
+                }
+            };
+            run_prompt(state.clone(), stream, text).await;
         });
         Ok(())
     }
@@ -78,6 +96,35 @@ impl Client for ClientServer {
             Err(ApprovalResponseError::Dropped) => Err(format!(
                 "approval {id} was dropped before the response landed"
             )),
+        }
+    }
+}
+
+/// Run the attach-time replay path. With an active workflow this is
+/// the same `ScrollbackReset` / replay / `ScrollbackReplayEnd` burst
+/// emitted by `scrollback::replay_to_stream`; with no active workflow
+/// we still emit an empty bracket so the TUI clears any stale
+/// in-memory scrollback before going live.
+async fn write_initial_replay(
+    stream: &mut tokio::net::UnixStream,
+    conn: &turso::Connection,
+    active_instance: Option<uuid::Uuid>,
+) -> crate::Result<()> {
+    use crate::protocol::StreamFrame;
+    use crate::transport::write_message;
+
+    match active_instance {
+        Some(instance) => crate::scrollback::replay_to_stream(stream, conn, instance).await,
+        None => {
+            write_message(
+                stream,
+                &StreamFrame::ScrollbackReset {
+                    instance_id: uuid::Uuid::nil(),
+                },
+            )
+            .await?;
+            write_message(stream, &StreamFrame::ScrollbackReplayEnd).await?;
+            Ok(())
         }
     }
 }

@@ -1,5 +1,4 @@
 use std::io::{Stdout, Write, stdout};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Context, Result};
 use crossterm::QueueableCommand;
@@ -15,28 +14,30 @@ use ratatui::Viewport;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Style};
+use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
 use frances_daemon::llm::Usage;
 use frances_daemon::protocol::{
-    self, ApprovalChoice, ApprovalKind, ApprovalRequest, BlockKind, DaemonStatus, PromptId,
-    StreamFrame,
+    self, ApprovalChoice, ApprovalKind, ApprovalRequest, BlockKind, DaemonStatus, StreamFrame,
 };
 use frances_daemon::session::Session;
-use frances_tui::{BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer};
+use frances_tui::{
+    BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer, TruncatedBlock,
+};
 
 use crate::client;
 use crate::tui::{FooterBlock, INPUT_HEIGHT, LabelledBlock, RawBlock, Textarea};
 
-static NEXT_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
-
-fn next_prompt_id() -> PromptId {
-    PromptId(NEXT_PROMPT_ID.fetch_add(1, Ordering::Relaxed))
-}
-
 pub struct App<'a> {
     pub session: &'a Session,
     pub status: &'a DaemonStatus,
+    /// The single daemon-to-client frame stream opened by
+    /// [`crate::client::attach`]. The run loop spawns one reader task
+    /// that pumps frames off it into the dispatch channel; initial
+    /// scrollback, every prompt's frames, and any workflow-switch
+    /// replays all arrive through this socket.
+    pub events: UnixStream,
 }
 
 enum KeyAction {
@@ -155,6 +156,15 @@ impl BlockState {
             Self::Idle => None,
         }
     }
+
+    /// Drop any in-flight active tracking without writing back to the
+    /// container. Used on `ScrollbackReset`: the container is about
+    /// to be cleared, so the in-memory active entry will go away with
+    /// it; the protocol tracking state on this side just needs to
+    /// reset.
+    fn discard(&mut self) {
+        *self = Self::Idle;
+    }
 }
 
 type AppTerminal = Terminal<InlineBackend<CrosstermBackend<Stdout>>>;
@@ -211,6 +221,29 @@ impl App<'_> {
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
         let mut events = EventStream::new();
         let mut streaming = false;
+        let mut replay_mode = false;
+
+        // Single reader task: pumps frames off the per-attach events
+        // socket into `frame_rx`. The socket carries initial replay,
+        // every prompt's frames, and any mid-cycle workflow-switch
+        // replay. The task ends only when the stream closes (daemon
+        // gone) or errors — at which point the dispatch loop exits
+        // because `frame_rx.recv()` returns `None`.
+        let events_socket = self.events;
+        let reader_tx = frame_tx.clone();
+        tokio::spawn(async move {
+            let mut stream = events_socket;
+            loop {
+                match client::next_event(&mut stream).await {
+                    Ok(frame) => {
+                        if reader_tx.send(frame).is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
 
         loop {
             redraw(&mut terminal, &mut container, &textarea, streaming)?;
@@ -254,7 +287,7 @@ impl App<'_> {
                                             frame_tx.clone(),
                                         );
                                     } else {
-                                        spawn_stream(self.session.clone(), text, frame_tx.clone());
+                                        spawn_prompt(self.session.clone(), text, frame_tx.clone());
                                         streaming = true;
                                     }
                                 }
@@ -296,17 +329,22 @@ impl App<'_> {
                     // terminal frame (`Error`, `Approval`) end the
                     // streaming indicator. `BlockStart` re-enters
                     // streaming so a follow-up stream after an Error
-                    // / Approval lights it back up.
-                    match &frame {
-                        StreamFrame::BlockStart { .. } => streaming = true,
-                        StreamFrame::Done
-                        | StreamFrame::Error(_)
-                        | StreamFrame::Approval(_) => streaming = false,
-                        _ => {}
+                    // / Approval lights it back up. Replay frames
+                    // don't change streaming state.
+                    if !replay_mode {
+                        match &frame {
+                            StreamFrame::BlockStart { .. } => streaming = true,
+                            StreamFrame::Done
+                            | StreamFrame::Error(_)
+                            | StreamFrame::Approval(_) => streaming = false,
+                            _ => {}
+                        }
                     }
                     if let Some(req) = handle_frame(
+                        &mut terminal,
                         &mut container,
                         &mut state,
+                        &mut replay_mode,
                         frame,
                     )? {
                         textarea.set_placeholder(approval_placeholder(&req.kind));
@@ -375,12 +413,42 @@ fn redraw(
     Ok(())
 }
 
+/// Per-replay scratchpad: the same {id, kind, accumulated text}
+/// triple the daemon uses, mirrored on the TUI side. Carried in
+/// `App` state for the lifetime of one replay burst (between
+/// `ScrollbackReset` and `ScrollbackReplayEnd`).
+struct ReplayBlock {
+    id: protocol::BlockId,
+    kind: BlockKind,
+    text: String,
+}
+
 fn handle_frame(
+    terminal: &mut AppTerminal,
     container: &mut ScrollbackContainer,
     state: &mut BlockState,
+    replay_mode: &mut bool,
     frame: StreamFrame,
 ) -> Result<Option<ApprovalRequest>> {
+    if *replay_mode {
+        return handle_replay_frame(terminal, container, replay_mode, frame);
+    }
     match frame {
+        StreamFrame::ScrollbackReset { .. } => {
+            // Drop any in-flight live block tracking, then clear the
+            // container — `clear()` force-spills current screen
+            // content into native scrollback so the user keeps their
+            // view in their terminal's history, and resets the
+            // in-memory deques so the alt-screen inspector only shows
+            // the new workflow's history.
+            state.discard();
+            container.clear(terminal)?;
+            *replay_mode = true;
+        }
+        StreamFrame::ScrollbackReplayEnd => {
+            // Defensive: replay end outside replay mode means a
+            // malformed bracket. Ignore.
+        }
         StreamFrame::BlockStart { id, kind } => {
             if let Some(prev_id) = state.start(container, id, kind) {
                 container.mark_safe(prev_id);
@@ -390,6 +458,13 @@ fn handle_frame(
             state.delta(container, id, &text)?;
         }
         StreamFrame::BlockStop { id } => {
+            let container_id = state.stop(id)?;
+            container.mark_safe(container_id);
+        }
+        StreamFrame::BlockTruncated { id } => {
+            // Live wire shouldn't emit truncated stops — they only
+            // appear during replay. Treat as a clean stop so we don't
+            // get stuck with an open block.
             let container_id = state.stop(id)?;
             container.mark_safe(container_id);
         }
@@ -428,20 +503,110 @@ fn handle_frame(
     Ok(None)
 }
 
+/// Frame handling while inside a replay bracket. Replayed blocks are
+/// built up in a thread-local `ReplayBlock` accumulator and handed to
+/// the container's `push_committed` on stop — they never touch the
+/// live `active` deque.
+fn handle_replay_frame(
+    terminal: &mut AppTerminal,
+    container: &mut ScrollbackContainer,
+    replay_mode: &mut bool,
+    frame: StreamFrame,
+) -> Result<Option<ApprovalRequest>> {
+    // Thread-local accumulator: the replay burst is single-threaded
+    // per frame channel, so a `static mut` would do — but a refcell
+    // in the function scope is uglier than tracking the in-flight
+    // replay block via parameter wouldn't fit existing call sites.
+    // Use a small bespoke shape via `static`:
+    thread_local! {
+        static REPLAY_OPEN: std::cell::RefCell<Option<ReplayBlock>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    match frame {
+        StreamFrame::ScrollbackReset { .. } => {
+            // Nested reset: rare, but treat as a fresh burst — clear
+            // any half-built replay block and reset the container.
+            REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
+            container.clear(terminal)?;
+        }
+        StreamFrame::ScrollbackReplayEnd => {
+            // Any half-built block at end is just dropped; the daemon
+            // is expected to close every block it opens.
+            REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
+            *replay_mode = false;
+        }
+        StreamFrame::BlockStart { id, kind } => {
+            REPLAY_OPEN.with(|cell| {
+                *cell.borrow_mut() = Some(ReplayBlock {
+                    id,
+                    kind,
+                    text: String::new(),
+                });
+            });
+        }
+        StreamFrame::BlockDelta { id, text } => {
+            REPLAY_OPEN.with(|cell| {
+                if let Some(open) = cell.borrow_mut().as_mut()
+                    && open.id == id
+                {
+                    open.text.push_str(&text);
+                }
+            });
+        }
+        StreamFrame::BlockStop { id } => {
+            let finished = REPLAY_OPEN.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                match guard.take() {
+                    Some(open) if open.id == id => Some(open),
+                    other => {
+                        *guard = other;
+                        None
+                    }
+                }
+            });
+            if let Some(open) = finished {
+                container.push_committed(Box::new(LabelledBlock::new(open.kind, open.text)));
+            }
+        }
+        StreamFrame::BlockTruncated { id } => {
+            let finished = REPLAY_OPEN.with(|cell| {
+                let mut guard = cell.borrow_mut();
+                match guard.take() {
+                    Some(open) if open.id == id => Some(open),
+                    other => {
+                        *guard = other;
+                        None
+                    }
+                }
+            });
+            if let Some(open) = finished {
+                let inner: Box<dyn frances_tui::Block> =
+                    Box::new(LabelledBlock::new(open.kind, open.text));
+                container.push_committed(Box::new(TruncatedBlock::new(inner)));
+            }
+        }
+        StreamFrame::Error(message) => {
+            container.push_committed(Box::new(RawBlock::single_styled(
+                format!("frances: error: {message}"),
+                Style::default().fg(Color::Red),
+            )));
+        }
+        // Usage / Done / Approval are not part of the replay burst.
+        // Drop them if they sneak in.
+        StreamFrame::Usage(_) | StreamFrame::Done | StreamFrame::Approval(_) => {}
+    }
+    Ok(None)
+}
+
 fn approval_placeholder(kind: &ApprovalKind) -> &'static str {
     match kind {
         ApprovalKind::YesNo => "Alt+Y yes  Alt+N no  Enter chat (text becomes details for yes/no)",
     }
 }
 
-fn spawn_stream(session: Session, prompt: String, frame_tx: mpsc::UnboundedSender<StreamFrame>) {
-    let prompt_id = next_prompt_id();
+fn spawn_prompt(session: Session, prompt: String, frame_tx: mpsc::UnboundedSender<StreamFrame>) {
     tokio::spawn(async move {
-        let result = client::prompt_stream(&session, prompt_id, prompt, |frame| {
-            let _ = frame_tx.send(frame);
-        })
-        .await;
-        if let Err(error) = result {
+        if let Err(error) = client::prompt(&session, prompt).await {
             let _ = frame_tx.send(StreamFrame::Error(format!("{error:#}")));
             let _ = frame_tx.send(StreamFrame::Done);
         }

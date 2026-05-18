@@ -79,6 +79,7 @@ impl Database {
                 &crate::history::SCHEMA,
                 &crate::llm::session_provider::SCHEMA,
                 &crate::workflows::SCHEMA,
+                &crate::scrollback::SCHEMA,
             ],
         )
         .await?;

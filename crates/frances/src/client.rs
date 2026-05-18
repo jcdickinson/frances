@@ -1,10 +1,10 @@
 use frances_daemon::context::InvocationContext;
 use frances_daemon::protocol::{
-    ApprovalChoice, ApprovalId, AttachResponse, ClientClient, DaemonPid, DaemonStatus, PromptId,
-    SessionId, StreamFrame,
+    ApprovalChoice, ApprovalId, AttachResponse, ClientClient, DaemonPid, DaemonStatus, SessionId,
+    StreamFrame,
 };
 use frances_daemon::session::Session;
-use frances_daemon::transport::{TransportError, read_message, write_message};
+use frances_daemon::transport::{TransportError, read_message};
 use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Bincode;
@@ -160,13 +160,22 @@ async fn request_control(
     Ok((banner_version, lines))
 }
 
+/// Open the per-attach events socket and call the attach RPC. The
+/// returned [`UnixStream`] is the single daemon-to-client frame
+/// channel for the life of the connection — initial scrollback
+/// replay, every prompt's frames, and any workflow-switch replays all
+/// flow through it. Caller spawns a reader task that pulls frames off
+/// the stream.
 pub async fn attach(
     session: &Session,
     invocation: InvocationContext,
-) -> Result<AttachResponse, ClientError> {
+) -> Result<(AttachResponse, UnixStream), ClientError> {
+    trace!(session_id = %session.id, "opening events socket");
+    let events = UnixStream::connect(session.events_socket_path()).await?;
     trace!(session_id = %session.id, "sending attach request");
     let client = connect_client(session).await?;
-    Ok(client.attach(context::current(), invocation).await?)
+    let response = client.attach(context::current(), invocation).await?;
+    Ok((response, events))
 }
 
 pub async fn detach(session: &Session) -> Result<(), ClientError> {
@@ -188,31 +197,20 @@ pub async fn respond_approval(
     Ok(())
 }
 
-pub async fn prompt_stream<F>(
-    session: &Session,
-    prompt_id: PromptId,
-    text: String,
-    mut on_frame: F,
-) -> Result<(), ClientError>
-where
-    F: FnMut(StreamFrame),
-{
-    trace!(session_id = %session.id, prompt_id = %prompt_id, "opening events socket");
-    let mut events = UnixStream::connect(session.events_socket_path()).await?;
-    write_message(&mut events, &prompt_id).await?;
-
+/// Submit a user prompt. The daemon writes the response frames to the
+/// shared events socket opened by [`attach`].
+pub async fn prompt(session: &Session, text: String) -> Result<(), ClientError> {
     let client = connect_client(session).await?;
     client
-        .prompt(context::current(), prompt_id, text)
+        .prompt(context::current(), text)
         .await?
         .map_err(ClientError::Server)?;
+    Ok(())
+}
 
-    loop {
-        let frame: StreamFrame = read_message(&mut events).await?;
-        let stop = matches!(frame, StreamFrame::Done | StreamFrame::Error(_));
-        on_frame(frame);
-        if stop {
-            return Ok(());
-        }
-    }
+/// Read one [`StreamFrame`] from the events socket. The TUI runs a
+/// background task that loops on this and pumps frames into its
+/// frame-dispatch channel.
+pub async fn next_event(events: &mut UnixStream) -> Result<StreamFrame, ClientError> {
+    Ok(read_message(events).await?)
 }

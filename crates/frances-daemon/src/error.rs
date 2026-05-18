@@ -1,6 +1,7 @@
 use thiserror::Error;
 
 use crate::llm::session_provider::SessionConfigWriteError;
+use crate::scrollback::ScrollbackError;
 use crate::server::ServerError;
 use crate::session::SessionError;
 use crate::store::DatabaseError;
@@ -57,6 +58,9 @@ pub enum Error {
 
     #[error(transparent)]
     Database(#[from] DatabaseError),
+
+    #[error(transparent)]
+    Scrollback(#[from] ScrollbackError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;

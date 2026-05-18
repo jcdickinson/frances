@@ -20,6 +20,6 @@ pub mod block;
 pub mod inline_backend;
 pub mod scrollback_container;
 
-pub use block::Block;
+pub use block::{Block, TruncatedBlock};
 pub use inline_backend::{InlineBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};

@@ -10,15 +10,15 @@ use crate::workflows;
 
 use super::ServerState;
 
-pub(super) async fn run_prompt(state: Arc<ServerState>, mut stream: UnixStream, text: String) {
-    if let Err(error) = stream_prompt(&state, &mut stream, text).await {
+pub(super) async fn run_prompt(state: Arc<ServerState>, stream: &mut UnixStream, text: String) {
+    if let Err(error) = stream_prompt(&state, stream, text).await {
         warn!(%error, "prompt handler failed");
-        match write_message(&mut stream, &StreamFrame::Error(format!("{error}"))).await {
+        match write_message(stream, &StreamFrame::Error(format!("{error}"))).await {
             Ok(()) => trace!("wrote error frame"),
             Err(e) => warn!(error = %e, "failed to write error frame"),
         }
     }
-    match write_message(&mut stream, &StreamFrame::Done).await {
+    match write_message(stream, &StreamFrame::Done).await {
         Ok(()) => trace!("wrote done frame"),
         Err(e) => warn!(error = %e, "failed to write done frame"),
     }

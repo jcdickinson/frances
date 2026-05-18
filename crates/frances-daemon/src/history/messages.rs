@@ -5,30 +5,10 @@ use frances_llm::HistoryStore as HistoryStoreTrait;
 use frances_models_llm::chat::{
     ChatSessionId, HistoryError, ModelIntents, OwnedHistoryInput, RowId,
 };
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::trace;
 
 use super::{TursoHistoryStore, last_insert_rowid, next_seq, turso_err};
-
-/// Translation target for the (currently unwired) TUI replay path.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Block {
-    Text {
-        text: String,
-    },
-    ToolUse {
-        id: String,
-        name: String,
-        input: Value,
-    },
-    ToolResult {
-        tool_use_id: String,
-        content: String,
-        is_error: bool,
-    },
-}
 
 #[async_trait]
 impl HistoryStoreTrait for TursoHistoryStore {
@@ -253,37 +233,6 @@ impl TursoHistoryStore {
         .await
         .map_err(turso_err)?;
         Ok(RowId(last_insert_rowid(&conn).await?))
-    }
-
-    /// Translate non-history rows for the (currently unwired) TUI replay path.
-    pub async fn replay_for_tui(&self, session: ChatSessionId) -> Result<Vec<Block>, HistoryError> {
-        let primitives = self.load_primitives(session).await?;
-        Ok(primitives
-            .into_iter()
-            .map(|p| match p {
-                OwnedHistoryInput::System { text }
-                | OwnedHistoryInput::User { text }
-                | OwnedHistoryInput::Assistant { text } => Block::Text { text },
-                OwnedHistoryInput::ToolCall {
-                    id,
-                    name,
-                    arguments,
-                } => Block::ToolUse {
-                    id,
-                    name,
-                    input: arguments,
-                },
-                OwnedHistoryInput::ToolResult {
-                    call_id,
-                    content,
-                    is_error,
-                } => Block::ToolResult {
-                    tool_use_id: call_id,
-                    content,
-                    is_error,
-                },
-            })
-            .collect())
     }
 
     pub(super) async fn load_primitives(

@@ -9,8 +9,6 @@ use crate::store::Database;
 
 mod messages;
 
-pub use messages::Block;
-
 /// Owns the conversation history. UUID is permanent — never edit.
 pub static SCHEMA: EntitySchema<'static> = EntitySchema {
     entity: Uuid::from_u128(0x7ffee42d_48de_4090_8fc6_a25e66f33a02),

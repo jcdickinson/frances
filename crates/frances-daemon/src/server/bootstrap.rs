@@ -25,7 +25,7 @@ use frances_workflow::Runtime as WorkflowRuntime;
 
 use super::client_rpc::serve_client;
 use super::control::serve_control;
-use super::events::{EventsRouter, accept_events};
+use super::events::{EventsSocket, accept_events};
 use super::{ServerError, ServerState};
 
 pub async fn run(session: Session, db: Database) -> Result<()> {
@@ -109,7 +109,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         last_context,
         daemon_pid: std::process::id(),
         editor_factory,
-        events: EventsRouter::default(),
+        events: EventsSocket::default(),
         shutdown: Notify::new(),
         _config: config,
         history,

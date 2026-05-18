@@ -67,7 +67,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use slotmap::{SlotMap, new_key_type};
 
-use crate::block::Block;
+use crate::block::{Block, TruncatedBlock};
 use crate::inline_backend::{InlineBackend, SyncGuard};
 
 new_key_type! {
@@ -283,12 +283,117 @@ impl ScrollbackContainer {
         self.committed.len()
     }
 
+    /// Append a block straight into the `committed` deque. The block
+    /// does NOT pass through the live render path — no measure, no
+    /// `\n`, no spill into native scrollback. The caller is asserting
+    /// that the block's cells either already live in the terminal's
+    /// native scrollback (from a previous session) or are intentionally
+    /// invisible to the live viewport (this is the alt-screen
+    /// inspector's content only).
+    ///
+    /// Used by the daemon-driven scrollback replay path: each restored
+    /// block is built the same way a live one would be, then handed to
+    /// `push_committed` so the inspector shows it without the TUI ever
+    /// painting it on the live screen.
+    pub fn push_committed(&mut self, block: Box<dyn Block>) {
+        self.committed.push_back(block);
+    }
+
     pub fn safe_count(&self) -> usize {
         self.safe.len()
     }
 
     pub fn active_count(&self) -> usize {
         self.active_order.len()
+    }
+
+    /// Drop the in-memory block deques (committed / safe / active),
+    /// pushing whatever is currently visible into the terminal's
+    /// native scrollback first so the user doesn't lose what they were
+    /// just looking at. In-flight `active` entries are wrapped in
+    /// [`TruncatedBlock`] before being scrolled off, so the indicator
+    /// rides along with the cells into native scrollback.
+    ///
+    /// After `clear` the next [`draw`] starts from a blank viewport —
+    /// the y-tracking is reset so freshly-pushed blocks land at the
+    /// top of the screen rather than overwriting the just-evicted
+    /// rows. Used by the TUI on `StreamFrame::ScrollbackReset` so each
+    /// workflow gets its own alt-screen inspector content.
+    ///
+    /// Footer block reference is preserved (the caller's footer is a
+    /// live UI element, not history); its diff caches are flushed so
+    /// the next draw repaints it from scratch.
+    pub fn clear<B>(&mut self, terminal: &mut Terminal<InlineBackend<B>>) -> io::Result<()>
+    where
+        B: Backend<Error = io::Error> + Write,
+    {
+        let term_size = terminal.backend().terminal_size();
+        let terminal_h = term_size.height;
+
+        // Snapshot the footer's previous first-row anchor. We restore
+        // this at the very end so the input box does NOT jump even
+        // though the intermediate draw below (which paints the
+        // truncation indicator) can shift the natural footer anchor.
+        let footer_anchor_before = self.next_y;
+
+        // Wrap each in-flight active entry in a TruncatedBlock so the
+        // indicator paints during the final draw below, then move them
+        // into `safe` so they participate in the natural-scroll spill.
+        let active_ids: Vec<BlockId> = self.active_order.drain(..).collect();
+        for id in active_ids {
+            if let Some(entry) = self.active.remove(id) {
+                let wrapped: Box<dyn Block> = Box::new(TruncatedBlock::new(entry.block));
+                self.safe.push_back(SafeEntry {
+                    block: wrapped,
+                    render: None,
+                });
+            }
+        }
+
+        // One final draw so any newly-wrapped truncations + leftover
+        // safe entries paint into the live area before we scroll
+        // everything off.
+        self.draw(terminal)?;
+
+        // Force-spill: emit terminal_h newlines from the bottom row.
+        // Each \n at the last row scrolls the screen up by one, so
+        // after this loop every visible cell has flowed into native
+        // scrollback and the viewport is blank.
+        if terminal_h > 0 {
+            let mut guard = SyncGuard::new(terminal)?;
+            let terminal = guard.terminal();
+            let backend = terminal.backend_mut();
+            backend.move_cursor_abs(0, terminal_h - 1)?;
+            for _ in 0..terminal_h {
+                backend.newline()?;
+            }
+            Backend::flush(backend)?;
+        }
+
+        // Drop every in-memory deque. The alt-screen inspector will be
+        // re-seeded from the daemon's replay burst that follows.
+        self.committed.clear();
+        self.safe.clear();
+        self.active.clear();
+        self.active_order.clear();
+
+        // Reset render bookkeeping. `next_y` is restored to the
+        // footer's previous anchor so the input box doesn't jump on
+        // workflow switch. `cumulative_scrolls` is reset because no
+        // surviving `RenderState::absolute_y` values depend on it;
+        // subsequent content allocates new absolute_y values starting
+        // from 0. The footer diff caches are flushed so the next
+        // draw fully re-paints.
+        self.next_y = footer_anchor_before;
+        self.cumulative_scrolls = 0;
+        self.prev_footer_buf = None;
+        self.prev_footer_anchor_y = None;
+        self.prev_footer_bottom_y = None;
+        self.prev_mode = None;
+        self.scrollback_offset = 0;
+        self.prev_term_size = Some(term_size);
+
+        Ok(())
     }
 
     /// Toggle scrollback inspector mode. While set, the caller is
@@ -2604,5 +2709,153 @@ mod tests {
         assert_eq!(b.screen_row(0), "");
         assert_eq!(b.screen_row(1), "");
         assert_eq!(b.screen_row(2), "");
+    }
+
+    /// `clear()` is the workflow-switch primitive. It must:
+    ///   1. Push the current screen content into the terminal's
+    ///      native scrollback (so the user doesn't lose the view
+    ///      they had).
+    ///   2. Empty the in-memory `committed` / `safe` / `active`
+    ///      deques (so the alt-screen inspector only shows the
+    ///      replayed-next workflow's history).
+    ///   3. Leave `next_y` at the footer's previous first-row
+    ///      position so the input box does NOT jump on the next
+    ///      draw — the user's eyeline stays put.
+    ///   4. Reset internal diff caches + cumulative_scrolls so the
+    ///      next draw is computed from a clean slate.
+    #[test]
+    fn clear_preserves_footer_position_and_drops_deques() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        // Build up screen content: one safe + one active (in-flight)
+        // block. Draw to land everything in the natural positions and
+        // populate `next_y` / footer-anchor bookkeeping.
+        container.push(multi_text(&["safe-row"]));
+        let _active = container.push_active(multi_text(&["active-row"]));
+        container.draw(&mut terminal).unwrap();
+
+        let footer_anchor_before = container.next_y;
+        assert!(
+            footer_anchor_before > 0,
+            "test precondition: footer must have moved off row 0"
+        );
+        assert_eq!(container.safe_count(), 1);
+        assert_eq!(container.active_count(), 1);
+
+        container.clear(&mut terminal).unwrap();
+
+        // 1 + 2: in-memory deques empty, terminal's native scrollback
+        // grew (the visible content was force-spilled out).
+        assert_eq!(container.committed_count(), 0);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.active_count(), 0);
+        assert!(
+            terminal.backend().inner().scrollback_len() > 0,
+            "clear must spill visible content into native scrollback",
+        );
+
+        // 3: footer's anchor position is preserved across the clear —
+        // the input box stays put.
+        assert_eq!(
+            container.next_y, footer_anchor_before,
+            "clear must NOT reset next_y (input box would jump)",
+        );
+
+        // 4: internal bookkeeping is reset to a clean-slate shape.
+        assert_eq!(container.cumulative_scrolls, 0);
+        assert!(container.prev_footer_buf.is_none());
+        assert!(container.prev_footer_anchor_y.is_none());
+        assert!(container.prev_footer_bottom_y.is_none());
+        assert!(container.prev_mode.is_none());
+        assert_eq!(container.scrollback_offset, 0);
+    }
+
+    /// Drawing after `clear()` repaints the footer at its preserved
+    /// anchor row — proving the y-tracking reset is consistent with
+    /// the natural-scroll path's invariants.
+    #[test]
+    fn draw_after_clear_repaints_footer_at_preserved_anchor() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        container.push(multi_text(&["safe-row"]));
+        container.draw(&mut terminal).unwrap();
+        let footer_anchor_before = container.next_y;
+
+        container.clear(&mut terminal).unwrap();
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        assert_eq!(
+            b.screen_row(footer_anchor_before as usize),
+            "footer",
+            "footer should re-appear at its preserved row after clear+draw",
+        );
+    }
+
+    /// Active (in-flight) entries get wrapped in [`TruncatedBlock`]
+    /// before they're spilled into native scrollback, so the user can
+    /// see the indicator on their terminal's history. The truncation
+    /// marker comes from `block::TruncatedBlock` (one extra row,
+    /// dim "⋯ truncated ⋯").
+    #[test]
+    fn clear_marks_in_flight_active_as_truncated_in_scrollback() {
+        let mut terminal = mk_term_terminal(80, 10);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        container.push_active(multi_text(&["streaming-row"]));
+        container.draw(&mut terminal).unwrap();
+        container.clear(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // The "streaming-row" cells and the truncated marker should
+        // both appear somewhere in native scrollback.
+        let scrollback: Vec<String> = (1..=b.scrollback_len())
+            .map(|d| b.scrollback_row(d))
+            .collect();
+        assert!(
+            scrollback.iter().any(|r| r.contains("streaming-row")),
+            "streaming-row should land in scrollback: {scrollback:?}",
+        );
+        assert!(
+            scrollback.iter().any(|r| r.contains("truncated")),
+            "truncated indicator should land in scrollback: {scrollback:?}",
+        );
+    }
+
+    /// `push_committed` is the replay sink: blocks land directly in
+    /// the `committed` deque, no render, no spill, no impact on the
+    /// live viewport. The next live draw must paint the footer
+    /// normally and nothing else — replayed blocks must not appear
+    /// on screen or in native scrollback.
+    #[test]
+    fn push_committed_does_not_touch_live_viewport() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+
+        container.push_committed(multi_text(&["replayed-A"]));
+        container.push_committed(multi_text(&["replayed-B"]));
+
+        assert_eq!(container.committed_count(), 2);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.active_count(), 0);
+
+        container.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Only the footer renders on the live viewport — replayed
+        // blocks went straight into the committed deque without
+        // touching the screen.
+        assert_eq!(b.screen_row(0), "footer");
+        for y in 1..5 {
+            assert_eq!(
+                b.screen_row(y),
+                "",
+                "row {y} should be blank after push_committed + draw",
+            );
+        }
+        // And nothing leaked into native scrollback either.
+        assert_eq!(b.scrollback_len(), 0);
     }
 }

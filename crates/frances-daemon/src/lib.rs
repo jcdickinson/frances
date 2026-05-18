@@ -4,6 +4,7 @@ mod error;
 pub mod history;
 pub mod llm;
 pub mod protocol;
+pub mod scrollback;
 pub mod server;
 pub mod session;
 pub mod store;

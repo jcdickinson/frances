@@ -107,6 +107,21 @@ impl WorkflowStack {
             conn,
         }
     }
+
+    /// Read-only view of the per-session connection. The same physical
+    /// turso handle the rest of the daemon uses; cheap clone for
+    /// callers (like scrollback replay) that want to issue SQL against
+    /// it without going through the stack itself.
+    pub fn conn(&self) -> &Connection {
+        &self.conn
+    }
+
+    /// `instance_id` of the currently-hydrated workflow, if any.
+    /// Read-only helper for callers (e.g. attach) that need to know
+    /// which workflow to replay scrollback for.
+    pub async fn active_instance(&self) -> Option<Uuid> {
+        self.top.lock().await.as_ref().map(|i| i.handle.instance)
+    }
 }
 
 /// The currently-hydrated workflow plus the wire-state needed across
@@ -133,23 +148,44 @@ struct WorkflowInstance {
 /// - `MarkdownFrame.append`: write a `BlockDelta` on the currently-open
 ///   block.
 /// - `ErrorFrame` push: close previous open block, emit a one-shot
-///   `StreamFrame::Error`.
+///   `StreamFrame::Error` and persist a scrollback row of kind 'error'.
 /// - `JsonFrame` push: close previous open block, open + immediately
 ///   close a one-shot `Text { sender: None }` block rendering
 ///   `[tag] body`.
 ///
 /// On workflow termination the open block is closed before `Done` so
-/// the UI's `BlockState` ends up Idle.
+/// the UI's `BlockState` ends up Idle. `EmitState` also accumulates the
+/// delta text for the open block so we can persist the full body on
+/// close — either clean (a `BlockStop`) or truncated (workflow was
+/// dehydrated while the block was in flight).
 struct EmitState {
     next_block: u64,
-    open_block: Option<BlockId>,
+    open: Option<OpenBlock>,
+    /// Shared per-session turso connection used for scrollback writes.
+    /// Cheap clone; turso multiplexes internally.
+    conn: Connection,
+    /// Identifies the workflow whose blocks we're emitting. Every
+    /// scrollback row written from this state is tagged with it so
+    /// replay can scope by workflow.
+    instance_id: Uuid,
+}
+
+/// The block whose `BlockStart` has been emitted but whose `BlockStop`
+/// has not. We buffer the delta text here so that on close we can write
+/// one scrollback row with the full body.
+struct OpenBlock {
+    id: BlockId,
+    kind: BlockKind,
+    text: String,
 }
 
 impl EmitState {
-    fn new() -> Self {
+    fn new(conn: Connection, instance_id: Uuid) -> Self {
         Self {
             next_block: 1,
-            open_block: None,
+            open: None,
+            conn,
+            instance_id,
         }
     }
 
@@ -159,10 +195,48 @@ impl EmitState {
         id
     }
 
-    async fn close_open(&mut self, stream: &mut UnixStream) -> Result<()> {
-        if let Some(id) = self.open_block.take() {
-            write_message(stream, &StreamFrame::BlockStop { id }).await?;
-        }
+    /// Clean close: emit `BlockStop`, persist a finished row, drop the
+    /// open block.
+    async fn close_open_stop(&mut self, stream: &mut UnixStream) -> Result<()> {
+        let Some(open) = self.open.take() else {
+            return Ok(());
+        };
+        write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
+        crate::scrollback::persist_block(
+            &self.conn,
+            self.instance_id,
+            &open.kind,
+            &open.text,
+            false,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Dehydrate close: the workflow is going away while a block is
+    /// in flight. Persist the row marked truncated and drop the open
+    /// block. No wire frame is emitted — the TUI is about to be told
+    /// to clear and replay via `ScrollbackReset`, and the replay will
+    /// surface this row as a `BlockTruncated`.
+    async fn close_open_truncate(&mut self) -> Result<()> {
+        let Some(open) = self.open.take() else {
+            return Ok(());
+        };
+        crate::scrollback::persist_block(
+            &self.conn,
+            self.instance_id,
+            &open.kind,
+            &open.text,
+            true,
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Persist an error row alongside the in-flight stream's `Error`
+    /// frame so it survives daemon restarts and workflow switches.
+    async fn persist_error(&self, text: &str) -> Result<()> {
+        crate::scrollback::persist_error(&self.conn, self.instance_id, text).await?;
         Ok(())
     }
 }
@@ -256,7 +330,7 @@ async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<(
     insert_pushed_row(&state.workflow_stack.conn, name, instance_id, &[]).await?;
     *state.workflow_stack.top.lock().await = Some(WorkflowInstance {
         handle,
-        emit: EmitState::new(),
+        emit: EmitState::new(state.workflow_stack.conn.clone(), instance_id),
         config_key: name.to_owned(),
     });
     Ok(())
@@ -322,9 +396,15 @@ async fn push_and_drive(
     // (now demoted) current top — defensive against crash-mid-pop.
     insert_pushed_row(&state.workflow_stack.conn, name, instance_id, &args).await?;
 
+    // Tell the TUI to drop the previous workflow's in-memory scrollback
+    // and replay the new active instance's (empty on a fresh push, but
+    // we run the burst anyway for protocol uniformity — and for the
+    // future "resume previously-popped" case which would have rows).
+    crate::scrollback::replay_to_stream(stream, &state.workflow_stack.conn, instance_id).await?;
+
     let mut new_instance = WorkflowInstance {
         handle,
-        emit: EmitState::new(),
+        emit: EmitState::new(state.workflow_stack.conn.clone(), instance_id),
         config_key: name.to_owned(),
     };
     let exited = drive(&mut new_instance, stream).await?;
@@ -441,13 +521,13 @@ async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> R
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
                     emit(stream, &mut instance.emit, host_frame).await?;
                 }
-                instance.emit.close_open(stream).await?;
+                // Body exited cleanly: any open block now gets a clean
+                // BlockStop on the wire and a non-truncated row.
+                instance.emit.close_open_stop(stream).await?;
                 if let Ok(Err(error)) = done {
-                    write_message(
-                        stream,
-                        &StreamFrame::Error(format!("workflow shutdown: {error}")),
-                    )
-                    .await?;
+                    let msg = format!("workflow shutdown: {error}");
+                    instance.emit.persist_error(&msg).await?;
+                    write_message(stream, &StreamFrame::Error(msg)).await?;
                 }
                 return Ok(());
             }
@@ -456,7 +536,10 @@ async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> R
                     instance = %instance.handle.instance,
                     "workflow shutdown timed out; force-dropping handle"
                 );
-                instance.emit.close_open(stream).await?;
+                // Body never settled. Mark the in-flight block (if any)
+                // truncated. No wire BlockStop — the TUI is about to
+                // be told to ScrollbackReset by the caller's push path.
+                instance.emit.close_open_truncate().await?;
                 return Ok(());
             }
         }
@@ -480,13 +563,11 @@ async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Resu
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
                     emit(stream, &mut instance.emit, host_frame).await?;
                 }
-                instance.emit.close_open(stream).await?;
+                instance.emit.close_open_stop(stream).await?;
                 if let Ok(Err(error)) = done {
-                    write_message(
-                        stream,
-                        &StreamFrame::Error(format!("workflow: {error}")),
-                    )
-                    .await?;
+                    let msg = format!("workflow: {error}");
+                    instance.emit.persist_error(&msg).await?;
+                    write_message(stream, &StreamFrame::Error(msg)).await?;
                 } else if let Err(error) = done {
                     warn!(%error, "workflow done channel closed without value");
                 }
@@ -506,13 +587,14 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
     match frame {
         HostFrame::Push(FramePush { id: _, kind }) => match kind {
             FrameKind::Markdown { content, sender } => {
-                state.close_open(stream).await?;
+                state.close_open_stop(stream).await?;
                 let block = state.alloc();
+                let kind = BlockKind::Text { sender };
                 write_message(
                     stream,
                     &StreamFrame::BlockStart {
                         id: block,
-                        kind: BlockKind::Text { sender },
+                        kind: kind.clone(),
                     },
                 )
                 .await?;
@@ -520,26 +602,33 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
                     stream,
                     &StreamFrame::BlockDelta {
                         id: block,
-                        text: content,
+                        text: content.clone(),
                     },
                 )
                 .await?;
-                state.open_block = Some(block);
+                state.open = Some(OpenBlock {
+                    id: block,
+                    kind,
+                    text: content,
+                });
             }
             FrameKind::Error { content } => {
-                state.close_open(stream).await?;
+                state.close_open_stop(stream).await?;
+                state.persist_error(&content).await?;
                 write_message(stream, &StreamFrame::Error(content)).await?;
             }
             FrameKind::Json { tag, value } => {
-                state.close_open(stream).await?;
+                state.close_open_stop(stream).await?;
                 let body =
                     serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
                 let block = state.alloc();
+                let kind = BlockKind::Text { sender: None };
+                let text = format!("[{tag}] {body}");
                 write_message(
                     stream,
                     &StreamFrame::BlockStart {
                         id: block,
-                        kind: BlockKind::Text { sender: None },
+                        kind: kind.clone(),
                     },
                 )
                 .await?;
@@ -547,20 +636,27 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
                     stream,
                     &StreamFrame::BlockDelta {
                         id: block,
-                        text: format!("[{tag}] {body}"),
+                        text: text.clone(),
                     },
                 )
                 .await?;
-                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                state.open = Some(OpenBlock {
+                    id: block,
+                    kind,
+                    text,
+                });
+                state.close_open_stop(stream).await?;
             }
         },
         HostFrame::Append { delta, .. } => {
-            if let Some(id) = state.open_block {
+            if let Some(open) = state.open.as_mut() {
+                open.text.push_str(&delta);
+                let id = open.id;
                 write_message(stream, &StreamFrame::BlockDelta { id, text: delta }).await?;
             }
         }
         HostFrame::Approval(request) => {
-            state.close_open(stream).await?;
+            state.close_open_stop(stream).await?;
             write_message(stream, &StreamFrame::Approval(request)).await?;
         }
     }
@@ -581,7 +677,30 @@ async fn drop_active_and_promote(
 ) -> Result<()> {
     mark_completed_and_promote(&state.workflow_stack.conn, instance_id).await?;
     hydrate_active_or_cascade(state).await?;
-    let _ = stream;
+    // Tell the TUI to clear scrollback and replay the newly-promoted
+    // workflow's history (if any row was promoted). When the stack ran
+    // dry there's no instance to replay — we still emit an empty reset
+    // so the previous workflow's in-memory scrollback is dropped.
+    let new_top_instance = state
+        .workflow_stack
+        .top
+        .lock()
+        .await
+        .as_ref()
+        .map(|i| i.handle.instance);
+    if let Some(new_instance) = new_top_instance {
+        crate::scrollback::replay_to_stream(stream, &state.workflow_stack.conn, new_instance)
+            .await?;
+    } else {
+        write_message(
+            stream,
+            &StreamFrame::ScrollbackReset {
+                instance_id: Uuid::nil(),
+            },
+        )
+        .await?;
+        write_message(stream, &StreamFrame::ScrollbackReplayEnd).await?;
+    }
     Ok(())
 }
 
@@ -641,7 +760,7 @@ async fn hydrate(
     let handle = state.workflow_runtime.start(invocation).await?;
     Ok(WorkflowInstance {
         handle,
-        emit: EmitState::new(),
+        emit: EmitState::new(state.workflow_stack.conn.clone(), row.instance_id),
         config_key: row.config_key.clone(),
     })
 }

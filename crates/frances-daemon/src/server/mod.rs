@@ -40,7 +40,7 @@ pub use bootstrap::run;
 pub use error::ServerError;
 pub use logging::install_logging;
 
-use events::EventsRouter;
+use events::EventsSocket;
 
 /// Implementation-side deps the concrete `ChatSessionManager` reads from.
 /// Cloneable, since `TursoHistoryStore` is a cheap handle.
@@ -235,7 +235,7 @@ pub(crate) struct ServerState {
     /// `new Editor()` calls share the anchor cache with the host —
     /// e.g. host-side `end_turn` in `stream_prompt`.
     pub editor_factory: DaemonEditorFactory,
-    pub events: EventsRouter,
+    pub events: EventsSocket,
     pub shutdown: Notify,
     /// Kept alive so the config-event-processor task stays running for the
     /// daemon's lifetime. The chat manager and provider cache hold their

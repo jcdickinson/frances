@@ -2,25 +2,15 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use uuid::Uuid;
+
 use crate::context::InvocationContext;
 use crate::llm::Usage;
 
 pub use frances_workflow::approval::{ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest};
 
-/// Identifies a single prompt-response cycle within a session. Server-assigned.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct PromptId(pub u64);
-
-impl std::fmt::Display for PromptId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// Identifies a content block (user text, assistant text, etc.) within a
-/// prompt-response cycle. Distinct from `PromptId` to prevent accidental
-/// substitution when both are in scope.
+/// prompt-response cycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BlockId(pub u64);
@@ -80,7 +70,7 @@ include!(concat!(env!("OUT_DIR"), "/protocol_id.rs"));
 pub trait Client {
     async fn attach(context: InvocationContext) -> AttachResponse;
     async fn detach();
-    async fn prompt(prompt_id: PromptId, text: String) -> Result<(), String>;
+    async fn prompt(text: String) -> Result<(), String>;
     /// Submit a user-chosen response to an outstanding `Approval`
     /// request previously emitted as a `StreamFrame::Approval`.
     async fn respond_approval(id: ApprovalId, choice: ApprovalChoice) -> Result<(), String>;
@@ -105,15 +95,36 @@ pub enum StreamFrame {
     BlockStop {
         id: BlockId,
     },
+    /// Replay-only sibling of `BlockStop`: the block was in flight when
+    /// its workflow was dehydrated, so it never received a clean stop.
+    /// The daemon emits this in place of `BlockStop` from
+    /// [`crate::scrollback::replay_to_stream`] (or
+    /// [`crate::scrollback::replay_frames`]) for rows whose `truncated`
+    /// column is set. The TUI renders the block with a visible
+    /// "(truncated)" indicator.
+    BlockTruncated {
+        id: BlockId,
+    },
     Usage(Usage),
     Done,
     Error(String),
     /// Server is asking the user a question; client responds via the
     /// `Client::respond_approval` RPC.
     Approval(ApprovalRequest),
+    /// Replay opener for the currently-active workflow's scrollback.
+    /// The TUI clears its in-memory scrollback container, enters replay
+    /// mode, and routes the subsequent block / error frames straight
+    /// into the alt-screen inspector's committed deque. Live drawing
+    /// to the live viewport is skipped until
+    /// [`StreamFrame::ScrollbackReplayEnd`].
+    ScrollbackReset {
+        instance_id: Uuid,
+    },
+    /// Replay closer. The TUI returns to normal live-mode handling.
+    ScrollbackReplayEnd,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
     /// A free-form text block. `sender` labels the speaker; the TUI
     /// renders it as a prefix when present, and renders nothing in

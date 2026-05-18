@@ -71,12 +71,10 @@ async fn real_main() -> Result<()> {
         }) => {
             let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
             let status = client::status(&session).await?;
-            App {
-                session: &session,
-                status: &status,
-            }
-            .run()
-            .await?;
+            println!("session_id={}", status.session_id);
+            println!("daemon_pid={}", status.daemon_pid);
+            println!("client_attached={}", status.client_attached);
+            println!("protocol_version={:016x}", status.protocol_version);
             return Ok(());
         }
         Some(Command::Daemon {
@@ -104,16 +102,18 @@ async fn real_main() -> Result<()> {
     spawn::ensure_daemon(&session).await?;
 
     debug!(session_id = %session.id, "attaching client to daemon");
-    match client::attach(&session, invocation).await? {
+    let (response, events) = client::attach(&session, invocation).await?;
+    match response {
         protocol::AttachResponse::Attached { session_id: _ } => {
             let status = client::status(&session).await?;
-            let _ = client::detach(&session).await;
             App {
                 session: &session,
                 status: &status,
+                events,
             }
             .run()
             .await?;
+            let _ = client::detach(&session).await;
         }
         protocol::AttachResponse::Busy => {
             println!("frances session busy: {}", session.id);

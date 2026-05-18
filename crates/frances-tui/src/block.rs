@@ -16,6 +16,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::{Color, Style};
 
 pub trait Block {
     /// Total rendered row count if wrapped at `width`. Must be
@@ -28,6 +29,49 @@ pub trait Block {
     /// up to `area.height` rows. The container only passes a partial
     /// area when a block straddles the top edge of the visible window.
     fn render(&self, area: Rect, buf: &mut Buffer);
+}
+
+/// Wraps another [`Block`] with a dim "(truncated)" indicator on the
+/// row below. Used by the container's `clear` path to mark in-flight
+/// active blocks before they're moved into native scrollback, and by
+/// the daemon's replay path for blocks whose workflow was dehydrated
+/// mid-stream (received as `StreamFrame::BlockTruncated`).
+///
+/// The wrapped block keeps its full row count; the indicator adds
+/// exactly one row.
+pub struct TruncatedBlock {
+    inner: Box<dyn Block>,
+}
+
+impl TruncatedBlock {
+    pub fn new(inner: Box<dyn Block>) -> Self {
+        Self { inner }
+    }
+}
+
+impl Block for TruncatedBlock {
+    fn measure(&self, width: u16) -> u16 {
+        self.inner.measure(width).saturating_add(1)
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        if area.height == 0 {
+            return;
+        }
+        let inner_h = area.height.saturating_sub(1);
+        if inner_h > 0 {
+            let inner_area = Rect::new(area.x, area.y, area.width, inner_h);
+            self.inner.render(inner_area, buf);
+        }
+        let indicator_y = area.y + area.height - 1;
+        let marker = "  ⋯ truncated ⋯";
+        buf.set_string(
+            area.x,
+            indicator_y,
+            marker,
+            Style::default().fg(Color::DarkGray),
+        );
+    }
 }
 
 /// Adapter so a `ratatui::widgets::Paragraph` can be used as a `Block`
