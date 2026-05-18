@@ -348,7 +348,9 @@ class Run {
           const killMsg =
             `Killed the shell command from ${call.id} — model did not call ` +
             `${waitName} or ${killName} after ${maxScolds} scold(s).`;
-          transcript.push(new MarkdownFrame({ content: killMsg }));
+          transcript.push(
+            new MarkdownFrame({ content: killMsg, closed: true }),
+          );
           scope.push({ role: "user", content: killMsg });
           break;
         }
@@ -356,7 +358,9 @@ class Run {
         const scoldMsg =
           `Shell from ${call.id} is still running. ` +
           `You MUST call ${waitName} or ${killName} now.`;
-        transcript.push(new MarkdownFrame({ content: scoldMsg }));
+        transcript.push(
+          new MarkdownFrame({ content: scoldMsg, closed: true }),
+        );
         scope.push({ role: "user", content: scoldMsg });
       }
     });

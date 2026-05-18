@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Stdout, Write, stdout};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use crossterm::QueueableCommand;
@@ -17,6 +18,7 @@ use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Style};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
 use frances_daemon::llm::Usage;
@@ -202,6 +204,7 @@ impl App<'_> {
             }),
             cursor_row,
         );
+        container.enable_spinner();
         for (i, line) in self.banner_lines().into_iter().enumerate() {
             let style = if i == 0 {
                 Style::default()
@@ -218,6 +221,8 @@ impl App<'_> {
         let mut events = EventStream::new();
         let mut streaming = false;
         let mut replay_mode = false;
+        let mut spinner_tick = time::interval(Duration::from_millis(120));
+        spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         // Single reader task: pumps frames off the per-attach events
         // socket into `frame_rx`. The socket carries initial replay,
@@ -345,6 +350,11 @@ impl App<'_> {
                             }
                         }
                         _ => {}
+                    }
+                }
+                _ = spinner_tick.tick() => {
+                    if container.active_count() > 0 {
+                        container.bump_spinner();
                     }
                 }
                 Some(frame) = frame_rx.recv() => {

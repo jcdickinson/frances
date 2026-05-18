@@ -62,7 +62,7 @@ use ratatui::Terminal;
 use ratatui::backend::Backend;
 use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Rect, Size};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget};
 use slotmap::{SlotMap, new_key_type};
@@ -195,7 +195,18 @@ pub struct ScrollbackContainer {
     /// [`scroll_up`] / [`scroll_down`] and let the renderer decide
     /// what's reachable.
     scrollback_offset: u16,
+    /// When `Some(frame)`, every entry in `active` gets a spinner glyph
+    /// painted over the rightmost non-blank cell of its last row, so
+    /// users can see at a glance which blocks haven't been committed
+    /// yet. The app drives the animation via [`bump_spinner`]; left
+    /// `None` (the default) the container behaves as if spinners
+    /// didn't exist, which is what the tests rely on.
+    spinner_frame: Option<u8>,
 }
+
+/// Braille-dot frames cycled through by [`bump_spinner`]. Single-cell
+/// glyphs, width 1 — they overlay cleanly on top of any character.
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl ScrollbackContainer {
     pub fn new(footer: Box<dyn Block>, initial_y: u16) -> Self {
@@ -214,6 +225,33 @@ impl ScrollbackContainer {
             prev_mode: None,
             scrollback_active: false,
             scrollback_offset: 0,
+            spinner_frame: None,
+        }
+    }
+
+    /// Turn on the active-block spinner overlay. After this every
+    /// entry in `active` gets a single-cell braille glyph painted over
+    /// the rightmost non-blank cell of its last visible row. Call
+    /// [`bump_spinner`] periodically to advance the glyph.
+    pub fn enable_spinner(&mut self) {
+        if self.spinner_frame.is_none() {
+            self.spinner_frame = Some(0);
+        }
+    }
+
+    /// Advance the spinner one frame and mark every currently-tracked
+    /// active entry damaged so the next [`draw`] repaints them with
+    /// the new glyph. No-op when the spinner hasn't been enabled, or
+    /// when there are no active entries.
+    pub fn bump_spinner(&mut self) {
+        let Some(frame) = self.spinner_frame.as_mut() else {
+            return;
+        };
+        *frame = frame.wrapping_add(1);
+        for (_, entry) in self.active.iter_mut() {
+            if let Some(state) = entry.render.as_mut() {
+                state.damaged = true;
+            }
         }
     }
 
@@ -437,10 +475,18 @@ impl ScrollbackContainer {
             if let Some(entry) = self.active.remove(id) {
                 // Preserve the entry's render state so a previously-
                 // rendered active block doesn't get re-rendered just
-                // because it changed slot.
+                // because it changed slot — but if the spinner was on,
+                // mark damaged so the next draw repaints the cell the
+                // spinner glyph overwrote with its real content.
+                let mut render = entry.render;
+                if self.spinner_frame.is_some()
+                    && let Some(state) = render.as_mut()
+                {
+                    state.damaged = true;
+                }
                 self.safe.push_back(SafeEntry {
                     block: entry.block,
-                    render: entry.render,
+                    render,
                 });
             }
         }
@@ -608,10 +654,14 @@ impl ScrollbackContainer {
                 &mut cursor,
                 self.cumulative_scrolls,
                 &mut force_cascade,
+                None,
             )?;
         }
 
-        // Render the active stack (display order).
+        // Render the active stack (display order). Each entry gets the
+        // spinner overlay (if enabled) so the user can see at a glance
+        // which blocks are still open.
+        let spinner_frame = self.spinner_frame;
         for &id in self.active_order.iter() {
             let entry = match self.active.get_mut(id) {
                 Some(e) => e,
@@ -626,6 +676,7 @@ impl ScrollbackContainer {
                 &mut cursor,
                 self.cumulative_scrolls,
                 &mut force_cascade,
+                spinner_frame,
             )?;
         }
 
@@ -928,6 +979,7 @@ impl ScrollbackContainer {
         }
 
         // 3. Visible active blocks (oldest visible to newest).
+        let spinner_frame = self.spinner_frame;
         for (i, id) in visible_active_ids.iter().enumerate() {
             let entry = match self.active.get(*id) {
                 Some(e) => e,
@@ -940,6 +992,9 @@ impl ScrollbackContainer {
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
             entry.block.render(area, &mut buf);
+            if let Some(frame) = spinner_frame {
+                overlay_spinner(&mut buf, area, frame);
+            }
             let skip = if i == 0 { boundary_skip_rows } else { 0 };
             for row_idx in skip..h {
                 let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
@@ -1249,6 +1304,7 @@ fn render_or_skip_entry<B>(
     cursor: &mut CursorState,
     cumulative_scrolls: i32,
     force_cascade: &mut bool,
+    spinner_frame: Option<u8>,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
@@ -1287,6 +1343,9 @@ where
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
             block.render(area, &mut buf);
+            if let Some(frame) = spinner_frame {
+                overlay_spinner(&mut buf, area, frame);
+            }
             for row_idx in 0..h {
                 write_row_at_cursor(backend, &buf, row_idx, width, true, cursor, terminal_h)?;
             }
@@ -1303,6 +1362,29 @@ where
         cursor.cursor_y = cursor.cursor_y.saturating_add(h);
     }
     Ok(())
+}
+
+/// Paint the active-block spinner glyph over the rightmost non-blank
+/// cell of `area`'s last row. If every cell on the last row is blank
+/// the glyph lands at the leftmost column instead, so an empty block
+/// is still visibly tagged as open.
+fn overlay_spinner(buf: &mut Buffer, area: Rect, frame: u8) {
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+    let last_y = area.y + area.height - 1;
+    let mut glyph_x = area.x;
+    for x in (area.x..area.x + area.width).rev() {
+        let sym = buf[(x, last_y)].symbol();
+        if !sym.is_empty() && sym != " " {
+            glyph_x = x;
+            break;
+        }
+    }
+    let glyph = SPINNER_FRAMES[(frame as usize) % SPINNER_FRAMES.len()];
+    let cell = &mut buf[(glyph_x, last_y)];
+    cell.set_symbol(glyph);
+    cell.set_style(Style::default().fg(Color::Cyan));
 }
 
 fn write_row_at_cursor<B>(
@@ -2841,5 +2923,60 @@ mod tests {
         }
         // And nothing leaked into native scrollback either.
         assert_eq!(b.scrollback_len(), 0);
+    }
+
+    /// With the spinner enabled, every active block gets a single
+    /// braille glyph painted over the rightmost non-blank cell of its
+    /// last row. Once the block is marked safe and promoted out of
+    /// active, the next draw repaints it with its real last char.
+    #[test]
+    fn enabled_spinner_overlays_active_block_and_clears_on_mark_safe() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        container.enable_spinner();
+
+        let id = container.push_active(multi_text(&["hello"]));
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(
+            terminal.backend().inner().screen_row(0),
+            "hell⠋",
+            "active block's last char is replaced by the frame-0 glyph",
+        );
+
+        container.mark_safe(id);
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(
+            terminal.backend().inner().screen_row(0),
+            "hello",
+            "mark_safe promotes out of active; the spinner cell is repainted",
+        );
+    }
+
+    /// `bump_spinner` advances the glyph and marks every active entry
+    /// damaged, so the next draw repaints with the new frame.
+    #[test]
+    fn bump_spinner_advances_glyph_on_next_draw() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        container.enable_spinner();
+        container.push_active(multi_text(&["hi"]));
+
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().inner().screen_row(0), "h⠋");
+
+        container.bump_spinner();
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().inner().screen_row(0), "h⠙");
+    }
+
+    /// Spinner stays off by default — existing callers and tests see
+    /// exactly the same rendering they did before the feature landed.
+    #[test]
+    fn spinner_off_by_default_leaves_active_blocks_untouched() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        container.push_active(multi_text(&["hello"]));
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().inner().screen_row(0), "hello");
     }
 }

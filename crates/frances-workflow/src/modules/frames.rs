@@ -10,10 +10,16 @@
 //! Each writeable frame exposes:
 //!   - `frame.write(text)` — append, throws if `closed`.
 //!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
-//!   - `frame.close()` — emit [`HostFrame::Close`], flip `closed`.
+//!   - `frame.close()` — emit [`HostFrame::Close`], flip `closed`,
+//!     return `this` so `new MarkdownFrame(...).close()` chains.
 //!   - `frame.autoclose` (default `true`) — when truthy, the writable's
 //!     `close`/`abort` hook calls `frame.close()` so a finished pipe
 //!     seals the frame automatically.
+//!
+//! Constructors also accept `{ ..., closed: true }` to pre-seal a
+//! frame: `transcript.push` then emits a `Close` immediately after the
+//! `Push`, which is the convenient way to write one-shot frames like
+//! a greeting or an echoed user message.
 //!
 //! For v1 there is exactly one transcript (the live binding behind the
 //! `transcript` import). The `Transcript` class is exported as a type
@@ -145,6 +151,16 @@ fn push_frame<'js>(
             id: FrameId(new_id),
             kind,
         }));
+        // Pre-closed frame (either `{ ..., closed: true }` at
+        // construction or `frame.close()` called before push) — seal
+        // it on the wire now that it has an id. The TUI sees Push +
+        // Close in the same batch and never paints the spinner over
+        // it.
+        if borrow.closed.load(Ordering::Acquire) {
+            let _ = state.tx.send(HostFrame::Close {
+                id: FrameId(new_id),
+            });
+        }
         return Ok(());
     }
     if let Some(err) = as_frame::<ErrorFrame>(&frame) {
@@ -185,6 +201,11 @@ fn push_frame<'js>(
             id: FrameId(new_id),
             kind,
         }));
+        if borrow.closed.load(Ordering::Acquire) {
+            let _ = state.tx.send(HostFrame::Close {
+                id: FrameId(new_id),
+            });
+        }
         return Ok(());
     }
     throw_type(
@@ -248,9 +269,14 @@ impl<'js> JsClass<'js> for MarkdownFrame {
             "close",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, MarkdownFrame>>| {
-                    let b = this.0.borrow();
-                    close_frame(&ctx, &b.state, &b.id, &b.closed)
+                |ctx: Ctx<'js>,
+                 this: This<Class<'js, MarkdownFrame>>|
+                 -> JsResult<Class<'js, MarkdownFrame>> {
+                    {
+                        let b = this.0.borrow();
+                        close_frame(&ctx, &b.state, &b.id, &b.closed)?;
+                    }
+                    Ok(this.0.clone())
                 },
             )?,
         )?;
@@ -322,21 +348,23 @@ fn append_text<'js>(
     Ok(())
 }
 
-/// Mark the frame closed and emit [`HostFrame::Close`] exactly once.
-/// Idempotent: a second call is a silent no-op. Throws if called
-/// before the frame has been pushed.
+/// Mark the frame closed and (if it has been pushed) emit
+/// [`HostFrame::Close`] exactly once. Idempotent: a second call is a
+/// silent no-op. When called before `transcript.push`, just records
+/// the intent — `transcript.push` notices the pre-set flag and emits
+/// the close right after the push so `new MarkdownFrame(...).close()`
+/// chains the same way `new MarkdownFrame({ ..., closed: true })`
+/// does.
 fn close_frame<'js>(
-    ctx: &Ctx<'js>,
+    _ctx: &Ctx<'js>,
     state: &Arc<FramesState>,
     id: &AtomicU64,
     closed: &AtomicBool,
 ) -> JsResult<()> {
     let frame_id = id.load(Ordering::Acquire);
     if frame_id == 0 {
-        return throw_type(
-            ctx,
-            "frame.close: frame has not been pushed onto the transcript yet",
-        );
+        closed.store(true, Ordering::Release);
+        return Ok(());
     }
     if !closed.swap(true, Ordering::AcqRel) {
         let _ = state.tx.send(HostFrame::Close {
@@ -459,9 +487,14 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             "close",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>| {
-                    let b = this.0.borrow();
-                    close_frame(&ctx, &b.state, &b.id, &b.closed)
+                |ctx: Ctx<'js>,
+                 this: This<Class<'js, ShellOutputFrame>>|
+                 -> JsResult<Class<'js, ShellOutputFrame>> {
+                    {
+                        let b = this.0.borrow();
+                        close_frame(&ctx, &b.state, &b.id, &b.closed)?;
+                    }
+                    Ok(this.0.clone())
                 },
             )?,
         )?;
@@ -554,7 +587,7 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
     Constructor::new_class::<MarkdownFrame, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| {
-            let (content, sender) = parse_markdown_arg(&ctx, &arg)?;
+            let (content, sender, closed) = parse_markdown_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
                 MarkdownFrame {
@@ -562,7 +595,7 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
                     id: AtomicU64::new(0),
                     content,
                     sender,
-                    closed: AtomicBool::new(false),
+                    closed: AtomicBool::new(closed),
                 },
             )
         },
@@ -624,7 +657,7 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
     Constructor::new_class::<ShellOutputFrame, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| {
-            let content = parse_shell_output_arg(&ctx, &arg)?;
+            let (content, closed) = parse_shell_output_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
                 ShellOutputFrame {
@@ -632,41 +665,45 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
                     id: AtomicU64::new(0),
                     content,
                     state_atom: AtomicU64::new(SHELL_STATE_RUNNING),
-                    closed: AtomicBool::new(false),
+                    closed: AtomicBool::new(closed),
                 },
             )
         },
     )
 }
 
-/// Parse `new ShellOutputFrame({ content? })`. `content` is optional;
-/// if absent it defaults to an empty string (workflows usually push
-/// the frame first, then stream output via `.writable`).
-fn parse_shell_output_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<String> {
+/// Parse `new ShellOutputFrame({ content?, closed? })`. `content` is
+/// optional; if absent it defaults to an empty string (workflows
+/// usually push the frame first, then stream output via `.writable`).
+/// `closed` mirrors the MarkdownFrame option: setting it to `true`
+/// pre-seals the frame so `transcript.push` emits a `Close` right
+/// after the `Push`.
+fn parse_shell_output_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<(String, bool)> {
     if arg.is_undefined() || arg.is_null() {
-        return Ok(String::new());
+        return Ok((String::new(), false));
     }
     let Some(obj) = arg.as_object() else {
         return throw_type(
             ctx,
-            "new ShellOutputFrame: expected { content?: string } or no argument",
+            "new ShellOutputFrame: expected { content?: string, closed?: bool } or no argument",
         );
     };
     let content_val: Value<'js> = obj
         .get("content")
         .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
-    if content_val.is_undefined() || content_val.is_null() {
-        return Ok(String::new());
-    }
-    if let Some(s) = content_val.as_string() {
+    let content = if content_val.is_undefined() || content_val.is_null() {
+        String::new()
+    } else if let Some(s) = content_val.as_string() {
         s.to_string()
-            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `content` must be UTF-8"))
+            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `content` must be UTF-8"))?
     } else {
-        Err(throw_err(
+        return Err(throw_err(
             ctx,
             "new ShellOutputFrame: `content` must be a string when present",
-        ))
-    }
+        ));
+    };
+    let closed = parse_optional_bool(ctx, obj, "closed", "new ShellOutputFrame: `closed`")?;
+    Ok((content, closed))
 }
 
 fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsResult<String> {
@@ -680,15 +717,19 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
 }
 
-/// Parse `new MarkdownFrame({ content?, sender? })`. `content` and
-/// `sender` are both optional; absent / `undefined` / `null` map to
-/// `None`. Anything other than a string for either field throws.
+/// Parse `new MarkdownFrame({ content?, sender?, closed? })`. `content`
+/// and `sender` are both optional; absent / `undefined` / `null` map to
+/// `None`. `closed` is an optional bool defaulting to `false`; when
+/// `true` the frame's `closed` flag is pre-set so `transcript.push`
+/// emits a `Close` immediately after the `Push` — useful for one-shot
+/// frames like a greeting or echoed user message. Anything other than
+/// a string for the text fields or a bool for `closed` throws.
 fn parse_markdown_arg<'js>(
     ctx: &Ctx<'js>,
     arg: &Value<'js>,
-) -> JsResult<(Option<String>, Option<String>)> {
+) -> JsResult<(Option<String>, Option<String>, bool)> {
     if arg.is_undefined() || arg.is_null() {
-        return Ok((None, None));
+        return Ok((None, None, false));
     }
     let Some(obj) = arg.as_object() else {
         return Err(throw_err(
@@ -728,7 +769,30 @@ fn parse_markdown_arg<'js>(
                 "new MarkdownFrame: `sender` must be a string when present",
             ));
         };
-    Ok((content, sender))
+    let closed = parse_optional_bool(ctx, obj, "closed", "new MarkdownFrame: `closed`")?;
+    Ok((content, sender, closed))
+}
+
+/// Parse an optional bool field. Absent / `undefined` / `null` →
+/// `false`; anything that isn't a bool throws with `field_label`.
+fn parse_optional_bool<'js>(
+    ctx: &Ctx<'js>,
+    obj: &rquickjs::Object<'js>,
+    key: &str,
+    field_label: &str,
+) -> JsResult<bool> {
+    let val: Value<'js> = obj
+        .get(key)
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if val.is_undefined() || val.is_null() {
+        return Ok(false);
+    }
+    val.as_bool().ok_or_else(|| {
+        throw_err(
+            ctx,
+            &format!("{field_label} must be a boolean when present"),
+        )
+    })
 }
 
 fn throw_type<'js, T>(ctx: &Ctx<'js>, message: &str) -> JsResult<T> {

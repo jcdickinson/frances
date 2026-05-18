@@ -78,15 +78,20 @@ chat.tools.push(
 transcript.push(
   new MarkdownFrame({
     content: "frances ready. Type `quit` to exit.",
+    closed: true,
   }),
 );
 
 try {
   for await (const input of inbox) {
     const msg = input.content.trim();
-    transcript.push(new MarkdownFrame({ content: msg, sender: "you" }));
+    transcript.push(
+      new MarkdownFrame({ content: msg, sender: "you", closed: true }),
+    );
     if (msg === "quit") {
-      transcript.push(new MarkdownFrame({ content: "bye", sender: "frances" }));
+      transcript.push(
+        new MarkdownFrame({ content: "bye", sender: "frances", closed: true }),
+      );
       exit();
       break;
     }

@@ -2003,6 +2003,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_session_text_pipe_closes_markdown_frame_on_completion() {
+        use frances_models_llm::wire::{CompletionOutcome, StreamEvent};
+
+        let deps = StubDeps::default();
+        deps.script_next_run(
+            vec![StreamEvent::TextDelta("hello".to_owned())],
+            CompletionOutcome {
+                text: "hello".to_owned(),
+                tool_calls: vec![],
+            },
+        );
+        let rt = Runtime::new(deps).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const r = await s.stream();
+            const out = new MarkdownFrame({ sender: "frances" });
+            transcript.push(out);
+            await r.text.pipeTo(out.writable);
+            await r.completed;
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let push_id = match frames.first() {
+            Some(HostFrame::Push(p)) => p.id,
+            other => panic!("expected first frame push, got {other:?}"),
+        };
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, HostFrame::Append { id, delta } if *id == push_id && delta == "hello")),
+            "expected text append for markdown frame: {frames:?}"
+        );
+        assert!(
+            frames
+                .iter()
+                .any(|f| matches!(f, HostFrame::Close { id } if *id == push_id)),
+            "expected markdown frame to close after text pipe: {frames:?}"
+        );
+    }
+
+    /// `new MarkdownFrame({ ..., closed: true })` pre-seals the frame:
+    /// `transcript.push` emits the `Close` immediately after the `Push`
+    /// so the TUI never paints the active-block spinner over the
+    /// frame. Mirrors the workflow's one-shot patterns (greeting,
+    /// echoed user message, scold messages from `shell.js`).
+    #[tokio::test]
+    async fn markdown_frame_closed_ctor_option_pushes_and_closes_in_one_shot() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: "hi", closed: true }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let push_id = match frames.first() {
+            Some(HostFrame::Push(p)) => p.id,
+            other => panic!("expected push first, got {other:?}"),
+        };
+        assert!(
+            matches!(frames.get(1), Some(HostFrame::Close { id }) if *id == push_id),
+            "second frame must be the matching Close: {frames:?}"
+        );
+    }
+
+    /// `new MarkdownFrame(...).close()` returns `this`, so the
+    /// construct-and-seal idiom can be a one-liner. Same wire effect
+    /// as the `{ closed: true }` ctor option: pre-push close just
+    /// records the intent; `transcript.push` emits Push then Close.
+    #[tokio::test]
+    async fn markdown_frame_close_returns_this_for_chaining() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: "hi" }).close());
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        let push_id = match frames.first() {
+            Some(HostFrame::Push(p)) => p.id,
+            other => panic!("expected push first, got {other:?}"),
+        };
+        assert!(
+            matches!(frames.get(1), Some(HostFrame::Close { id }) if *id == push_id),
+            "expected Push then Close: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn chat_session_stream_aborts_with_signal() {
         // Pre-aborted AbortSignal errors the events stream synchronously
         // during `stream()`, so the first read sees the reason.
