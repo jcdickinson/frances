@@ -75,8 +75,8 @@ pub struct AuthCommand {
 pub struct ModelConfig {
     pub model_provider: String,
     pub id: String,
-    #[serde(default = "default_model_max_tokens")]
-    pub max_tokens: u32,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
     #[serde(default = "default_model_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
     /// 0..=100 → provider-specific scale not implemented yet.
@@ -116,9 +116,6 @@ fn default_refresh_interval_ms() -> u64 {
 }
 fn default_auth_timeout_ms() -> u64 {
     5_000
-}
-fn default_model_max_tokens() -> u32 {
-    1_000
 }
 fn default_model_stream_idle_timeout_ms() -> u64 {
     120_000

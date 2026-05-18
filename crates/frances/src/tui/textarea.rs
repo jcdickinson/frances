@@ -46,10 +46,12 @@ impl Textarea {
     }
 
     pub fn input(&mut self, key: crossterm::event::KeyEvent) {
-        use ratatui_textarea::Input;
         use crossterm::event::KeyCode;
+        use ratatui_textarea::Input;
 
-        let ctrl = key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL);
+        let ctrl = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(crossterm::event::KeyModifiers::ALT);
 
         let input = match key.code {
@@ -130,4 +132,3 @@ impl Textarea {
         self.textarea.input(input);
     }
 }
-

@@ -149,10 +149,12 @@ impl provider::Provider for Provider {
         let mut body = serde_json::json!({
             "model": plan.model.id,
             "messages": messages,
-            "max_tokens": plan.model.max_tokens,
             "stream": true,
             "stream_options": { "include_usage": true },
         });
+        if let Some(max_tokens) = plan.model.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
         if !req.tools.is_empty() {
             body["tools"] = serde_json::to_value(req.tools).map_err(Error::SerializeTools)?;
         }

@@ -138,6 +138,32 @@ async fn no_args_lists_files_with_gitignore_respected() {
 }
 
 #[tokio::test]
+async fn depth_one_alone_lists_cwd_children_only() {
+    // `{ depth: 1 }` with no `paths` is the documented `ls` replacement.
+    // The "no empty" rule must let this through (paths is omitted, not
+    // `[]`), and the walker must keep results to immediate children.
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("top.txt"), "").unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/nested.txt"), "").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let frames = run_script(deps, &dump_raw_script("{ depth: 1 }")).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        vec!["top.txt"],
+        "depth: 1 should only list cwd children"
+    );
+}
+
+#[tokio::test]
 async fn empty_paths_without_search_rejects() {
     let dir = tempfile::tempdir().unwrap();
     let deps = deps_with_cwd(dir.path().to_path_buf());

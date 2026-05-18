@@ -47,7 +47,8 @@ const SEARCH_SCHEMA = {
     depth: {
       type: "integer",
       minimum: 0,
-      description: "Max walk depth. Omit for unbounded.",
+      description:
+        "Max walk depth. Omit for unbounded. Depth counts from each starting point: 0 includes only the starting path itself, 1 includes immediate children, 2 includes grandchildren, etc. Use 1 to list files directly in cwd.",
     },
     paths_only: {
       type: "boolean",
