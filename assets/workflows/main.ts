@@ -32,7 +32,7 @@ import {
   New,
   Overwrite,
 } from "frances:v1/tools/file";
-import { FileSearch, Search } from "frances:v1/tools/file_search";
+import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
 import {
   Variables,
   Get as VarGet,

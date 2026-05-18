@@ -1,5 +1,5 @@
-//! `frances:v1/tools/file_search` — combined name-pattern lookup, content
-//! search, and directory listing primitive.
+//! `frances:v1/tools/file_find_or_grep` — combined name-pattern lookup,
+//! content search, and directory listing primitive.
 //!
 //! `new FileSearch()` exposes a single async method, `search(args)`, that
 //! drives `ignore::WalkParallel` (the same multi-threaded walker ripgrep

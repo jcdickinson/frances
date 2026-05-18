@@ -1,5 +1,5 @@
-// `frances:v1/tools/file_search` — combined name-pattern lookup, content
-// search, and directory listing tool.
+// `frances:v1/tools/file_find_or_grep` — combined name-pattern lookup,
+// content search, and directory listing tool.
 //
 // `FileSearch` is the Rust-backed primitive: one async `search(args)`
 // method that returns a JSON-string payload. `Search` is the LLM-facing
@@ -121,8 +121,8 @@ class Search {
   constructor(fileSearch, vars) {
     this.fileSearch = fileSearch;
     this.vars = vars;
-    this.name = "file_search";
-    this.description = desc.file_search;
+    this.name = "file_find_or_grep";
+    this.description = desc.file_find_or_grep;
     this.parameters = SEARCH_SCHEMA;
   }
 

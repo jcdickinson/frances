@@ -1,4 +1,4 @@
-Search the filesystem by name pattern, by content, or both. The one tool for "questions about files" — pick it over Bash any time you'd otherwise reach for `ls`, `find`, `tree`, `rg`, or `grep -r`. Bash is for "run a thing," not "look at files."
+Find files by name pattern and/or grep their contents. The one tool for any "where are the files," "what files match this glob," or "which files mention X" question — pick it instead of running `ls`, `find`, `tree`, `rg`, or `grep -r` in the shell.
 
 Backed by the ripgrep crates (`ignore::WalkParallel` + `grep-searcher`). Respects `.gitignore`, `.ignore`, and `.rgignore` by default; toggle with `ignore: false`. Hidden files (dotfiles, dot-dirs) are excluded by default; set `hidden: true` to include them. Paths are resolved against the client's working directory unless absolute.
 

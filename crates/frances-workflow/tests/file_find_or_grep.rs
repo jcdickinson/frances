@@ -1,4 +1,4 @@
-//! Integration tests for the `frances:v1/tools/file_search`
+//! Integration tests for the `frances:v1/tools/file_find_or_grep`
 //! `FileSearch` primitive and the LLM-facing `Search` tool class. Each
 //! test drives a JS script through the workflow runtime against a
 //! `StubDeps` with a tempdir cwd, then asserts on what the script
@@ -102,7 +102,7 @@ async fn run_script(deps: StubDeps, script: &str) -> Vec<HostFrame> {
 /// Runs the FileSearch primitive directly and emits the raw JSON
 /// payload via a MarkdownFrame so tests can parse it.
 const DUMP_RAW: &str = r#"
-import { FileSearch } from "frances:v1/tools/file_search";
+import { FileSearch } from "frances:v1/tools/file_find_or_grep";
 import { transcript, MarkdownFrame } from "frances:v1/frames";
 const fs = new FileSearch();
 const json = await fs.search(ARGS);
@@ -169,7 +169,7 @@ async fn empty_paths_without_search_rejects() {
     let deps = deps_with_cwd(dir.path().to_path_buf());
     // Catch the thrown rejection and surface its message via transcript.
     let script = r#"
-        import { FileSearch } from "frances:v1/tools/file_search";
+        import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { transcript, MarkdownFrame } from "frances:v1/frames";
         const fs = new FileSearch();
         let msg;
@@ -335,14 +335,14 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
 
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let script = r#"
-        import { FileSearch, Search } from "frances:v1/tools/file_search";
+        import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, MarkdownFrame } from "frances:v1/frames";
         const fs = new FileSearch();
         const vars = new Variables();
         const tool = new Search(fs, vars);
         const r = await tool.handler({
-            call: { id: "c1", name: "file_search",
+            call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "hello", into: "hits" } },
             scope: null,
         });
@@ -377,12 +377,12 @@ async fn search_tool_without_into_returns_compact_text() {
 
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let script = r#"
-        import { FileSearch, Search } from "frances:v1/tools/file_search";
+        import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, MarkdownFrame } from "frances:v1/frames";
         const tool = new Search(new FileSearch(), new Variables());
         const r = await tool.handler({
-            call: { id: "c1", name: "file_search",
+            call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "hello" } },
             scope: null,
         });

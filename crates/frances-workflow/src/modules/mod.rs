@@ -50,7 +50,7 @@
 //!   tool classes.
 //! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
 //!   `InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
-//! - `frances:v1/tools/file_search` — `FileSearch` primitive + `Search`
+//! - `frances:v1/tools/file_find_or_grep` — `FileSearch` primitive + `Search`
 //!   tool class. Combined name-pattern lookup, content search, and
 //!   directory listing via the ripgrep crates (`ignore::WalkParallel`
 //!   plus `grep-searcher`).
@@ -78,7 +78,7 @@ use crate::runtime::{HostFrame, UserInput, caught};
 
 pub mod chat;
 pub mod file;
-pub mod file_search;
+pub mod file_find_or_grep;
 pub mod frames;
 pub mod inbox;
 pub mod io;
@@ -180,10 +180,13 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("Editor", editor_ctor)?;
     stash.set("EditorDescriptions", file::build_descriptions(ctx)?)?;
 
-    let file_search_ctor = file_search::build_file_search_ctor(ctx, deps)?;
+    let file_search_ctor = file_find_or_grep::build_file_search_ctor(ctx, deps)?;
     stash.set("FileSearch", file_search_ctor)?;
     let file_search_desc = Object::new(ctx.clone())?;
-    file_search_desc.set("file_search", include_str!("desc/file_search.md"))?;
+    file_search_desc.set(
+        "file_find_or_grep",
+        include_str!("desc/file_find_or_grep.md"),
+    )?;
     stash.set("FileSearchDescriptions", file_search_desc)?;
 
     let variable_desc = Object::new(ctx.clone())?;
@@ -241,7 +244,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tools/file_search", FILE_SEARCH_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tools/file_find_or_grep", FILE_SEARCH_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
     Ok(())
 }
@@ -258,7 +261,7 @@ pub(crate) fn remove_stash<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
 /// Cheaper than going through the `Value -> String -> Value` round-trip,
 /// and means JS-side arg shapes map 1:1 to whatever struct the caller
 /// is deserialising into. Shared by `file::edit_inner` (LlmEdit args)
-/// and `file_search::do_search` (FileSearchArgs).
+/// and `file_find_or_grep::do_search` (FileSearchArgs).
 pub(super) fn rquickjs_to_json(value: &Value<'_>) -> Result<serde_json::Value, String> {
     if value.is_undefined() || value.is_null() {
         return Ok(serde_json::Value::Null);
@@ -335,7 +338,7 @@ const APPROVAL_SRC: &str = include_str!("js/approval.js");
 const STORAGE_SRC: &str = include_str!("js/storage.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
-const FILE_SEARCH_SRC: &str = include_str!("js/file_search.js");
+const FILE_SEARCH_SRC: &str = include_str!("js/file_find_or_grep.js");
 const VARIABLE_SRC: &str = include_str!("js/variable.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be
