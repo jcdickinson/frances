@@ -78,6 +78,7 @@ impl Database {
                 &crate::anchor_store::SCHEMA,
                 &crate::history::SCHEMA,
                 &crate::llm::session_provider::SCHEMA,
+                &crate::workflows::SCHEMA,
             ],
         )
         .await?;

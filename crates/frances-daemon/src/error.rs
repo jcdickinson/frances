@@ -4,7 +4,7 @@ use crate::llm::session_provider::SessionConfigWriteError;
 use crate::server::ServerError;
 use crate::session::SessionError;
 use crate::store::DatabaseError;
-use crate::workflows::WorkflowError;
+use crate::workflows::{WorkflowError, WorkflowStackError};
 use frances_edit::EditError;
 use frances_llm::ProviderCacheError;
 use frances_models_llm::chat::{ChatError, HistoryError};
@@ -45,6 +45,9 @@ pub enum Error {
 
     #[error(transparent)]
     Workflow(#[from] WorkflowError),
+
+    #[error(transparent)]
+    WorkflowStack(#[from] WorkflowStackError),
 
     #[error(transparent)]
     ProviderCache(#[from] ProviderCacheError),

@@ -253,6 +253,9 @@ pub(crate) struct ServerState {
     )]
     pub cache: ProviderCache,
     pub workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
+    /// `default_workflow` config binding. `restore_or_seed` reads this
+    /// to choose what to push when the `workflow_stack` table is empty.
+    pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<ServerWorkflowDeps>>,
     pub workflow_stack: WorkflowStack,
     /// Registry of pending user-approval round-trips. Cloned into

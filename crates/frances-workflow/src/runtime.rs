@@ -110,6 +110,12 @@ pub struct Invocation {
     /// the per-runtime `WorkflowDb` cache. [`uuid::Uuid::nil`] when
     /// tests don't care about storage.
     pub entity: uuid::Uuid,
+    /// Per-invocation instance uuid exposed to JS as
+    /// `import.meta.instance`. The daemon allocates one fresh on a new
+    /// push and round-trips it through `workflow_stack` so a restored
+    /// instance reads the same value out of `import.meta.instance`.
+    /// [`uuid::Uuid::nil`] when tests don't care.
+    pub instance_id: uuid::Uuid,
     /// Ready-to-apply migrations, read from disk by the caller. Empty
     /// is fine — workflows without any tables just get an empty handle.
     pub migrations: Vec<frances_storage::Migration>,
@@ -131,8 +137,28 @@ pub struct WorkflowHandle {
     /// Resolves when the workflow terminates (body settled or `exit()`
     /// called). The inner result mirrors the body's outcome.
     pub done: oneshot::Receiver<Result<(), WorkflowError>>,
+    /// Per-invocation instance uuid — same value the JS body sees as
+    /// `import.meta.instance`. Set by [`Runtime::start`] from
+    /// [`Invocation::instance_id`].
+    pub instance: uuid::Uuid,
+    /// Pulsed by [`Self::request_shutdown`] (and by JS `exit()`). The
+    /// `frances:v1/lifecycle` module's IIFE awaits this to run the
+    /// workflow's registered shutdown hook before closing the inbox.
+    shutdown_notify: Arc<Notify>,
     /// Owns the spawned task; dropping the handle aborts the workflow.
     _join: JoinHandle<()>,
+}
+
+impl WorkflowHandle {
+    /// Pulse the shutdown signal. The body's
+    /// `lifecycle.shutdown` hook fires (if registered), then the inbox
+    /// closes; the daemon drains remaining frames and awaits
+    /// [`Self::done`] to complete the wind-down. Idempotent — repeated
+    /// calls are no-ops because `Notify` only delivers to currently-
+    /// registered waiters and the lifecycle IIFE waits exactly once.
+    pub fn request_shutdown(&self) {
+        self.shutdown_notify.notify_waiters();
+    }
 }
 
 /// Workflow script runtime. One per daemon; cheap to share via `Arc`.
@@ -182,13 +208,16 @@ impl<D: WorkflowDeps> Runtime<D> {
         let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
         let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
         let parked = Arc::new(Notify::new());
+        let shutdown_notify = Arc::new(Notify::new());
 
         let task_input_rx = Arc::new(AsyncMutex::new(input_rx));
         let task_closed = Arc::new(AtomicBool::new(false));
         let task_closed_notify = Arc::new(Notify::new());
         let task_parked = parked.clone();
+        let task_shutdown = shutdown_notify.clone();
         let task_frames = frames_tx;
         let task_args = inv.args;
+        let task_instance = inv.instance_id;
         let task_js = self.js.clone();
         let task_deps = self.deps.clone();
 
@@ -197,11 +226,13 @@ impl<D: WorkflowDeps> Runtime<D> {
                 task_js,
                 js_source,
                 task_args,
+                task_instance,
                 task_frames,
                 task_input_rx,
                 task_closed,
                 task_closed_notify,
                 task_parked,
+                task_shutdown,
                 task_deps,
                 workflow_db,
             )
@@ -214,6 +245,8 @@ impl<D: WorkflowDeps> Runtime<D> {
             frames: frames_rx,
             parked,
             done: done_rx,
+            instance: inv.instance_id,
+            shutdown_notify,
             _join: join,
         })
     }
@@ -240,11 +273,13 @@ async fn run_workflow<D: WorkflowDeps>(
     js: AsyncRuntime,
     js_source: String,
     args: Vec<String>,
+    instance_id: uuid::Uuid,
     frames: UnboundedSender<HostFrame>,
     input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
     deps: D,
     workflow_db: Arc<crate::storage::WorkflowDb>,
 ) -> Result<(), WorkflowError> {
@@ -267,6 +302,7 @@ async fn run_workflow<D: WorkflowDeps>(
                     closed: closed.clone(),
                     closed_notify: closed_notify.clone(),
                     parked,
+                    shutdown_notify,
                     deps,
                     workflow_db,
                 },
@@ -285,6 +321,9 @@ async fn run_workflow<D: WorkflowDeps>(
             meta.set("args", args)
                 .catch(&ctx)
                 .map_err(caught("set import.meta.args"))?;
+            meta.set("instance", instance_id.to_string())
+                .catch(&ctx)
+                .map_err(caught("set import.meta.instance"))?;
 
             let (_module, promise) = user_module
                 .eval()
@@ -927,6 +966,133 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert_eq!(text_of(&frames[0]), "a|b|c");
+    }
+
+    #[tokio::test]
+    async fn import_meta_instance_populated() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: import.meta.instance }));
+            "#,
+        );
+        let instance = uuid::Uuid::from_u128(0xfeed_face_0000_0000_0000_0000_0000_0001);
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                instance_id: instance,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(handle.instance, instance);
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        assert_eq!(text_of(&frames[0]), instance.to_string());
+    }
+
+    /// The workflow's `lifecycle.shutdown` handler fires when the host
+    /// calls `request_shutdown`. The handler emits a final frame, then
+    /// the inbox closes and the for-await loop unwinds.
+    #[tokio::test]
+    async fn lifecycle_shutdown_runs_on_request() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { lifecycle } from "frances:v1/lifecycle";
+
+            lifecycle.shutdown = async () => {
+                transcript.push(new MarkdownFrame({ content: "bye" }));
+            };
+            for await (const _ of inbox) {
+                transcript.push(new MarkdownFrame({ content: "got input" }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        // Workflow parks on inbox.next() first.
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(frames.is_empty(), "got {frames:?}");
+        assert!(done.is_none());
+
+        handle.request_shutdown();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "bye");
+    }
+
+    /// `workflow.exit()` now also routes through the lifecycle IIFE, so
+    /// a registered shutdown handler fires before the body terminates.
+    #[tokio::test]
+    async fn lifecycle_shutdown_runs_on_exit() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { inbox } from "frances:v1/inbox";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { lifecycle } from "frances:v1/lifecycle";
+            import { exit } from "frances:v1/workflow";
+
+            lifecycle.shutdown = async () => {
+                transcript.push(new MarkdownFrame({ content: "bye" }));
+            };
+            queueMicrotask(() => exit());
+            for await (const _ of inbox) {
+                transcript.push(new MarkdownFrame({ content: "got input" }));
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "bye");
+    }
+
+    /// A workflow that never registers `lifecycle.shutdown` still
+    /// terminates promptly on `request_shutdown` — the IIFE closes the
+    /// inbox unconditionally after the (absent) handler returns.
+    #[tokio::test]
+    async fn request_shutdown_without_handler_terminates_promptly() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { inbox } from "frances:v1/inbox";
+            for await (const _ of inbox) {}
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(done.is_none());
+
+        handle.request_shutdown();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
     }
 
     #[tokio::test]

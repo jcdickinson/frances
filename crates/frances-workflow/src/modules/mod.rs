@@ -78,6 +78,7 @@ pub mod frames;
 pub mod inbox;
 pub mod io;
 pub mod jaq;
+pub mod lifecycle;
 pub mod shell;
 pub mod storage;
 pub mod workflow;
@@ -96,6 +97,11 @@ pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub closed: Arc<AtomicBool>,
     pub closed_notify: Arc<Notify>,
     pub parked: Arc<Notify>,
+    /// Pulsed when the host (or `exit()`) requests graceful shutdown.
+    /// The `frances:v1/lifecycle` module's IIFE awaits this; on fire
+    /// it runs the workflow's registered handler (if any) then closes
+    /// the inbox.
+    pub shutdown_notify: Arc<Notify>,
     pub deps: D,
     pub workflow_db: Arc<crate::storage::WorkflowDb>,
 }
@@ -114,6 +120,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         closed,
         closed_notify,
         parked,
+        shutdown_notify,
         deps,
         workflow_db,
     } = host;
@@ -126,8 +133,18 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 
     let stash = Object::new(ctx.clone())?;
 
-    let exit_fn = workflow::build_exit(ctx, closed.clone(), closed_notify.clone())?;
+    let exit_fn = workflow::build_exit(ctx, shutdown_notify.clone())?;
     stash.set("exit", exit_fn)?;
+
+    let (lifecycle_obj, wait_for_shutdown, close_inbox) = lifecycle::build_lifecycle_primitives(
+        ctx,
+        shutdown_notify,
+        closed.clone(),
+        closed_notify.clone(),
+    )?;
+    stash.set("lifecycle", lifecycle_obj)?;
+    stash.set("_waitForShutdown", wait_for_shutdown)?;
+    stash.set("_closeInbox", close_inbox)?;
 
     let inbox_instance =
         inbox::build_inbox(ctx, input_rx, closed.clone(), closed_notify.clone(), parked)?;
@@ -201,6 +218,7 @@ pub(crate) fn install_whatwg<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
 /// globalThis.__frances_v1_stash__` and capture its slots.
 pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
     declare_and_eval(ctx, "frances:v1/workflow", WORKFLOW_SRC)?;
+    declare_and_eval(ctx, "frances:v1/lifecycle", LIFECYCLE_SRC)?;
     declare_and_eval(ctx, "frances:v1/inbox", INBOX_SRC)?;
     declare_and_eval(ctx, "frances:v1/frames", FRAMES_SRC)?;
     declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
@@ -248,6 +266,7 @@ fn declare_and_eval<'js>(
 // binding.
 
 const WORKFLOW_SRC: &str = include_str!("js/workflow.js");
+const LIFECYCLE_SRC: &str = include_str!("js/lifecycle.js");
 const INBOX_SRC: &str = include_str!("js/inbox.js");
 const FRAMES_SRC: &str = include_str!("js/frames.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");

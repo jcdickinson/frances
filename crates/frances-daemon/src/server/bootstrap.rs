@@ -82,6 +82,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
     let default_workflow = config.bind::<Option<String>>("default_workflow")?;
 
     let conn = db.connection();
+    let workflow_stack_conn = conn.clone();
     let history = TursoHistoryStore::new(db);
     let chat_deps = ServerChatDeps {
         history: history.clone(),
@@ -114,8 +115,9 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         history,
         cache,
         workflows,
+        default_workflow,
         workflow_runtime,
-        workflow_stack: WorkflowStack::new(),
+        workflow_stack: WorkflowStack::new(workflow_stack_conn),
         approvals,
         session_config_writer,
     });
@@ -148,20 +150,13 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         }
     });
 
-    // Seat the configured default workflow at the bottom of the stack.
-    // Anything the workflow emits during its top-level body buffers in
-    // the handle's frame channel and is flushed on the first prompt
-    // cycle (see `workflows::push_default_workflow`).
-    if let Some(name) = default_workflow
-        .get()
-        .as_deref()
-        .and_then(|opt| opt.as_deref())
-    {
-        match crate::workflows::push_default_workflow(&state, name).await {
-            Ok(true) => debug!(workflow = %name, "pushed default_workflow"),
-            Ok(false) => {}
-            Err(error) => warn!(%error, workflow = %name, "default_workflow start failed"),
-        }
+    // Restore the persisted workflow stack — or, if the table is
+    // literally empty, seat the configured `default_workflow`.
+    // Anything either path emits during top-level evaluation buffers
+    // in the handle's frame channel and is flushed on the first
+    // prompt cycle.
+    if let Err(error) = crate::workflows::restore_or_seed(&state).await {
+        warn!(%error, "workflow stack restore failed");
     }
 
     info!(

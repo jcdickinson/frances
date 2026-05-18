@@ -24,8 +24,6 @@ The prelude carries the load-bearing context that doesn't decay. It is read at e
 ```
 Prelude {
   goal,                          // what we're trying to achieve, prose
-  constraints: [Constraint],     // hard rules ("don't touch X", "must support Y")
-  acceptance_criteria: [str],    // what counts as "the plan succeeded"
   references: [Reference],       // file paths to read, links, prior plan IDs
   glossary: [{term, defn}],      // domain-specific terms, optional
   notes: prose,                  // background context discovered during planning
@@ -43,19 +41,36 @@ Step {
   seq,                           // ordering within the plan; separate from id
   title,                         // short, human-readable
   body,                          // what to do, context, instructions
-  status: pending | in_progress | done | blocked | abandoned,
-  outcome: succeeded | partial | failed | none,
-  summary,                       // prose, written by agent at completion
-  proof: Proof | null,
+  outcome: succeeded | partial | failed | abandoned | none,
+  demands: [Demand],
   findings: [Finding],
   decisions: [Decision],
   open_questions: [Finding],     // same shape as findings; questions vs answers
-  artifacts: Artifacts,
   created_at, started_at, completed_at,
 }
 ```
 
-`status` and `outcome` are deliberately separate: a step can be `done` with `partial` outcome (e.g. "we did what we could; this part remains unsolved"). `abandoned` means "we decided not to do this" — recorded explicitly so replanning leaves an audit trail rather than silent deletion.
+## Attempt
+
+```
+Attempt {
+  id,
+  step_id,
+  proof: [Proof],
+  judgement: Approve | Continue { body } | Clear { body } | Gate { body }
+  started_at, completed_at,
+}
+```
+
+Complete means that the referee considered the task done. Continue means the referee suggests
+continuing in the current context. Clear is Ralph Wiggum. Gate is human attention required. In
+all cases body is for passing information forwards.
+
+We can also have a configurable limit on tokens, beyond which a Continue becomes a Clear.
+
+Configurable limit on attempts in total, force to Gate if it is reached.
+
+If proof does not correlate with demand then the referee is not allowed to approve.
 
 ## Proof
 
@@ -65,12 +80,12 @@ Proof is the killer field. Without proof, "done" is hand-wave; with proof, the g
 Proof = TestRun { command, exit_code, stdout, stderr }
       | BuildOutput { command, exit_code, output }
       | Diff { paths, summary }
-      | UserConfirmation { message, turn_id }   // "user said: yes, that's what I meant"
-      | SelfCheck { description, turn_ids }     // model re-read X and confirmed Y
-      | None                                     // explicitly: no proof attempted
-```
+      | Prose { body }
 
-A step with `outcome: succeeded` and `proof: None` should be visually flagged at the gate — it means the agent claims success without evidence, which the user should examine.
+Demand = TestRun { body }
+      | BuildOutput { body }
+      | ... // Just the names of proof with a body describing what's needed.
+```
 
 ## Finding and Decision
 
@@ -99,18 +114,6 @@ Decision {
 - **Open question** = same shape as finding, but the prose is "we don't know X yet"
 
 Findings, decisions, and open questions are addressable: future steps can reference them by title (semantic) or by id (precise). They survive compaction — the skeleton inlined into the next step's prompt includes finding/decision titles.
-
-## Artifacts
-
-```
-Artifacts {
-  files_touched: [{path, ops: [read | write | delete]}],
-  commands_run: [{command, exit_code}],   // optional, for audit
-  turn_ids: [TurnId],                     // every turn in this step
-}
-```
-
-`files_touched` is the input to per-file summary generation (see [file-summaries.md](file-summaries.md)). `turn_ids` is the back-link from step → cold transcript storage.
 
 ## What's inlined vs cold
 

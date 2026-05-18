@@ -1,20 +1,23 @@
 //! `frances:v1/workflow` — lifecycle (just `exit` in v1).
+//!
+//! `exit()` requests graceful shutdown rather than killing the inbox
+//! directly: it pulses `shutdown_notify`, and the `frances:v1/lifecycle`
+//! module's background IIFE turns that into "run the user's shutdown
+//! hook, then close the inbox." Workflows without a registered
+//! `lifecycle.shutdown` handler still terminate promptly — the IIFE
+//! closes the inbox unconditionally after the (absent) hook returns.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rquickjs::{Ctx, Function, Result as JsResult};
 use tokio::sync::Notify;
 
 pub(crate) fn build_exit<'js>(
     ctx: &Ctx<'js>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
+    shutdown_notify: Arc<Notify>,
 ) -> JsResult<Function<'js>> {
     Function::new(ctx.clone(), move || {
-        if !closed.swap(true, Ordering::AcqRel) {
-            closed_notify.notify_waiters();
-        }
+        shutdown_notify.notify_waiters();
         Ok::<_, rquickjs::Error>(())
     })
 }

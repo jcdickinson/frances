@@ -122,6 +122,7 @@ async fn exec_query_and_query_stream_round_trip() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: ENTITY,
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -158,6 +159,7 @@ async fn transaction_commits_on_success() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: Uuid::from_u128(0xa1),
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -195,6 +197,7 @@ async fn transaction_rolls_back_on_throw() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: Uuid::from_u128(0xa2),
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -230,6 +233,7 @@ async fn explicit_commit_then_throw_keeps_committed_rows() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: Uuid::from_u128(0xa3),
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -261,6 +265,7 @@ async fn unsupported_param_type_throws_typeerror() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: Uuid::from_u128(0xa4),
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -283,6 +288,7 @@ async fn drift_in_migration_sql_fails_start() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: ENTITY,
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1)],
         })
         .await
@@ -298,6 +304,7 @@ async fn drift_in_migration_sql_fails_start() {
             source_path: file.path().to_path_buf(),
             args: Vec::new(),
             entity: ENTITY,
+            instance_id: Uuid::nil(),
             migrations: vec![migration("0001_init.sql", SCHEMA_V1_EDITED)],
         })
         .await;
