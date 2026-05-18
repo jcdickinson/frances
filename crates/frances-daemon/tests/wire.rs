@@ -6,8 +6,9 @@
 //! miss without an explicit round-trip.
 
 use frances_daemon::protocol::{
-    ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest, BlockId, BlockKind, StreamFrame,
+    BlockId, BlockKind, PermissionId, PermissionRequest, PermissionResponseWire, StreamFrame,
 };
+use frances_models_llm::wire::ToolCall;
 
 fn round_trip<T>(value: &T) -> T
 where
@@ -20,37 +21,55 @@ where
     decoded
 }
 
-#[test]
-fn approval_kind_yes_no_round_trips() {
-    let decoded: ApprovalKind = round_trip(&ApprovalKind::YesNo);
-    assert_eq!(decoded, ApprovalKind::YesNo);
+fn sample_tool_call() -> ToolCall {
+    ToolCall {
+        id: "call_1".to_owned(),
+        name: "shell_run".to_owned(),
+        arguments: serde_json::json!({ "cmd": "echo hi" }),
+    }
 }
 
 #[test]
-fn approval_request_round_trips() {
-    let req = ApprovalRequest {
-        id: ApprovalId(42),
+fn permission_request_round_trips_with_tool_call() {
+    let req = PermissionRequest {
+        id: PermissionId(42),
         prompt: "run echo?".to_owned(),
-        kind: ApprovalKind::YesNo,
+        tool_call: Some(sample_tool_call()),
     };
-    let decoded: ApprovalRequest = round_trip(&req);
+    let decoded: PermissionRequest = round_trip(&req);
     assert_eq!(decoded.id, req.id);
     assert_eq!(decoded.prompt, req.prompt);
-    assert_eq!(decoded.kind, req.kind);
+    let call = decoded.tool_call.expect("tool_call survives wire");
+    assert_eq!(call.id, "call_1");
+    assert_eq!(call.name, "shell_run");
+    assert_eq!(call.arguments, serde_json::json!({ "cmd": "echo hi" }));
 }
 
 #[test]
-fn approval_choice_round_trips_all_variants() {
-    let yes = ApprovalChoice::Yes {
+fn permission_request_round_trips_without_tool_call() {
+    let req = PermissionRequest {
+        id: PermissionId(7),
+        prompt: "are you sure?".to_owned(),
+        tool_call: None,
+    };
+    let decoded: PermissionRequest = round_trip(&req);
+    assert_eq!(decoded.id, req.id);
+    assert_eq!(decoded.prompt, req.prompt);
+    assert!(decoded.tool_call.is_none());
+}
+
+#[test]
+fn permission_response_wire_round_trips_all_variants() {
+    let yes = PermissionResponseWire::Yes {
         details: Some("only this once".to_owned()),
     };
-    let no = ApprovalChoice::No { details: None };
-    let chat = ApprovalChoice::Chat {
-        content: "do this differently".to_owned(),
+    let no = PermissionResponseWire::No { details: None };
+    let redirect = PermissionResponseWire::RedirectToChat {
+        content: "use a different directory please".to_owned(),
     };
     assert_eq!(round_trip(&yes), yes);
     assert_eq!(round_trip(&no), no);
-    assert_eq!(round_trip(&chat), chat);
+    assert_eq!(round_trip(&redirect), redirect);
 }
 
 #[test]
@@ -96,23 +115,23 @@ fn block_kind_text_round_trips_with_sender() {
 }
 
 #[test]
-fn stream_frame_approval_round_trips() {
-    let frame = StreamFrame::Approval(ApprovalRequest {
-        id: ApprovalId(7),
+fn stream_frame_permission_round_trips() {
+    let frame = StreamFrame::Permission(PermissionRequest {
+        id: PermissionId(7),
         prompt: "wire test".to_owned(),
-        kind: ApprovalKind::YesNo,
+        tool_call: Some(sample_tool_call()),
     });
     let bytes = bincode::serde::encode_to_vec(&frame, bincode::config::standard())
-        .expect("encode StreamFrame::Approval");
+        .expect("encode StreamFrame::Permission");
     let (decoded, _): (StreamFrame, _) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard())
-            .expect("decode StreamFrame::Approval");
+            .expect("decode StreamFrame::Permission");
     match decoded {
-        StreamFrame::Approval(req) => {
-            assert_eq!(req.id, ApprovalId(7));
+        StreamFrame::Permission(req) => {
+            assert_eq!(req.id, PermissionId(7));
             assert_eq!(req.prompt, "wire test");
-            assert_eq!(req.kind, ApprovalKind::YesNo);
+            assert_eq!(req.tool_call.as_ref().expect("tool_call").name, "shell_run");
         }
-        other => panic!("expected Approval, got {other:?}"),
+        other => panic!("expected Permission, got {other:?}"),
     }
 }

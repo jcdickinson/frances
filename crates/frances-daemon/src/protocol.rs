@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::context::InvocationContext;
 use crate::llm::Usage;
 
-pub use frances_workflow::approval::{ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest};
+pub use frances_workflow::permission::{PermissionId, PermissionRequest, PermissionResponseWire};
 
 /// Identifies a content block (user text, assistant text, etc.) within a
 /// prompt-response cycle.
@@ -72,9 +72,12 @@ pub trait Client {
     async fn attach(context: InvocationContext) -> AttachResponse;
     async fn detach();
     async fn prompt(text: String) -> Result<(), String>;
-    /// Submit a user-chosen response to an outstanding `Approval`
-    /// request previously emitted as a `StreamFrame::Approval`.
-    async fn respond_approval(id: ApprovalId, choice: ApprovalChoice) -> Result<(), String>;
+    /// Submit the user's response to an outstanding `Permission`
+    /// request previously emitted as a `StreamFrame::Permission`.
+    async fn respond_permission(
+        id: PermissionId,
+        response: PermissionResponseWire,
+    ) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,9 +123,9 @@ pub enum StreamFrame {
     Usage(Usage),
     Done,
     Error(String),
-    /// Server is asking the user a question; client responds via the
-    /// `Client::respond_approval` RPC.
-    Approval(ApprovalRequest),
+    /// Server is asking the user for permission; client responds via
+    /// the `Client::respond_permission` RPC.
+    Permission(PermissionRequest),
     /// Replay opener for the currently-active workflow's scrollback.
     /// The TUI clears its in-memory scrollback container, enters replay
     /// mode, and routes the subsequent block / error frames straight

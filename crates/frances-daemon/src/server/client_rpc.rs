@@ -8,11 +8,12 @@ use tarpc::tokio_serde::formats::Bincode;
 use tracing::{trace, warn};
 
 use crate::context::InvocationContext;
-use crate::protocol::{ApprovalChoice, ApprovalId, AttachResponse, Client, SessionId};
+use crate::protocol::{AttachResponse, Client, PermissionId, PermissionResponseWire, SessionId};
 
-use super::ApprovalResponseError;
+use super::PermissionResponseError;
 use super::turn::run_prompt;
 use super::{ServerError, ServerState};
+use frances_workflow::PermissionResponse;
 
 #[derive(Clone)]
 struct ClientServer {
@@ -82,21 +83,53 @@ impl Client for ClientServer {
         Ok(())
     }
 
-    async fn respond_approval(
+    async fn respond_permission(
         self,
         _: context::Context,
-        id: ApprovalId,
-        choice: ApprovalChoice,
+        id: PermissionId,
+        response: PermissionResponseWire,
     ) -> std::result::Result<(), String> {
-        match self.state.approvals.respond(id, choice) {
-            Ok(()) => Ok(()),
-            Err(ApprovalResponseError::UnknownId) => {
-                Err(format!("no pending approval with id {id}"))
+        // RedirectToChat resolves the permission as a denial AND
+        // dispatches the user's text as a fresh prompt. The workflow
+        // never sees the redirect variant; it sees `No`.
+        let (workflow_response, redirect) = match response {
+            PermissionResponseWire::Yes { details } => (PermissionResponse::Yes { details }, None),
+            PermissionResponseWire::No { details } => (PermissionResponse::No { details }, None),
+            PermissionResponseWire::RedirectToChat { content } => {
+                (PermissionResponse::No { details: None }, Some(content))
             }
-            Err(ApprovalResponseError::Dropped) => Err(format!(
-                "approval {id} was dropped before the response landed"
-            )),
+        };
+
+        match self.state.permissions.respond(id, workflow_response) {
+            Ok(()) => {}
+            Err(PermissionResponseError::UnknownId) => {
+                return Err(format!("no pending permission with id {id}"));
+            }
+            Err(PermissionResponseError::Dropped) => {
+                return Err(format!(
+                    "permission {id} was dropped before the response landed"
+                ));
+            }
         }
+
+        if let Some(content) = redirect {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let mut guard = state.events.lock().await;
+                let stream = match guard.stream() {
+                    Some(s) => s,
+                    None => {
+                        warn!(
+                            "permission redirect_to_chat arrived with no events stream; dropping"
+                        );
+                        return;
+                    }
+                };
+                run_prompt(state.clone(), stream, content).await;
+            });
+        }
+
+        Ok(())
     }
 }
 

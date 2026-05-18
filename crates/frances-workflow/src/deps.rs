@@ -18,14 +18,14 @@ use frances_storage::Migration;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
-use crate::approval::ApprovalGateway;
+use crate::permission::Permissions;
 use crate::storage::{WorkflowDb, WorkflowDbError};
 
 pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     type ChatSessionManager: ChatSessionManager;
     type ShellFactory: ShellFactory;
     type EditorFactory: EditorFactory;
-    type ApprovalGateway: ApprovalGateway;
+    type Permissions: Permissions;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
 
@@ -42,7 +42,7 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
 
     /// Gateway for the `frances:v1/approval` `approve()` function. The
     /// daemon impl bridges to the TUI; tests stub it.
-    fn approval_gateway(&self) -> &Self::ApprovalGateway;
+    fn permissions(&self) -> &Self::Permissions;
 
     /// Snapshot of the most recently attached client's environment.
     /// Used by `ChatSession.stream()` so the provider can resolve auth

@@ -8,8 +8,8 @@ use std::io::Write;
 use std::time::Duration;
 
 use frances_workflow::{
-    ApprovalChoice, ApprovalRequest, FrameKind, HostFrame, Invocation, Runtime, WorkflowError,
-    WorkflowHandle, test_deps::StubDepsRealShell,
+    FrameKind, HostFrame, Invocation, PermissionRequest, PermissionResponse, Runtime,
+    WorkflowError, WorkflowHandle, test_deps::StubDepsRealShell,
 };
 
 fn write_source(body: &str) -> tempfile::NamedTempFile {
@@ -71,7 +71,7 @@ fn text_of(frame: &HostFrame) -> String {
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
         HostFrame::Close { id } => format!("[close:{}]", id.0),
-        HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
+        HostFrame::Permission(req) => format!("[permission:{}] {}", req.id, req.prompt),
     }
 }
 
@@ -430,19 +430,19 @@ async fn shell_capture_unset_var_errors() {
 
 /// Drain frames until an approval request lands, return its request and
 /// any frames seen along the way. Panics on timeout.
-async fn await_approval(handle: &mut WorkflowHandle) -> (ApprovalRequest, Vec<HostFrame>) {
+async fn await_approval(handle: &mut WorkflowHandle) -> (PermissionRequest, Vec<HostFrame>) {
     let mut buffered = Vec::new();
     let approval = tokio::time::timeout(CYCLE_TIMEOUT, async {
         loop {
             match handle.frames.recv().await {
-                Some(HostFrame::Approval(req)) => return req,
+                Some(HostFrame::Permission(req)) => return req,
                 Some(other) => buffered.push(other),
-                None => panic!("frames channel closed before approval landed"),
+                None => panic!("frames channel closed before permission request landed"),
             }
         }
     })
     .await
-    .expect("approval did not arrive within timeout");
+    .expect("permission request did not arrive within timeout");
     (approval, buffered)
 }
 
@@ -489,9 +489,15 @@ async fn shell_run_approve_yes_executes_command() {
         "prompt should be rendered as a bash code block: {}",
         req.prompt,
     );
+    let call = req
+        .tool_call
+        .as_ref()
+        .expect("permission request carries the originating tool call");
+    assert_eq!(call.id, "r1");
+    assert_eq!(call.name, "shell_run");
 
     assert!(
-        deps.answer_approval(req.id, ApprovalChoice::Yes { details: None }),
+        deps.answer_approval(req.id, PermissionResponse::Yes { details: None }),
         "answer should land on the pending slot",
     );
 
@@ -543,7 +549,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
 
     assert!(deps.answer_approval(
         req.id,
-        ApprovalChoice::No {
+        PermissionResponse::No {
             details: Some("too scary".into()),
         },
     ));
@@ -561,64 +567,6 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     assert!(out.contains(r#""is_error":true"#), "got `{out}`");
     assert!(out.contains("denied"), "got `{out}`");
     assert!(out.contains("too scary"), "got `{out}`");
-}
-
-#[tokio::test]
-async fn shell_run_approve_chat_skips_command_and_forwards_text() {
-    let deps = StubDepsRealShell::default();
-    let rt = Runtime::new(deps.clone()).unwrap();
-    let file = write_source(
-        r#"
-        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
-
-        const sh = new Shell();
-        const wait = new Wait(sh);
-        const kill = new Kill(sh);
-        const run = new Run(sh, { wait, kill });
-
-        const out = await run.handler({
-            call: { id: "r1", name: "shell_run",
-                    arguments: { cmd: "ls /tmp" } },
-            scope: null,
-        });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(out) }));
-        await sh.close();
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-
-    let (req, _seen) = await_approval(&mut handle).await;
-
-    assert!(deps.answer_approval(
-        req.id,
-        ApprovalChoice::Chat {
-            content: "use a different directory please".into(),
-        },
-    ));
-
-    let (frames, done) = drive_one_cycle(&mut handle).await;
-    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-
-    let out = frames
-        .iter()
-        .find_map(|f| match f {
-            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
-            _ => None,
-        })
-        .expect("expected a tool result transcript push");
-    assert!(out.contains(r#""is_error":true"#), "got `{out}`");
-    assert!(
-        out.contains("use a different directory please"),
-        "got `{out}`",
-    );
 }
 
 #[tokio::test]
@@ -656,7 +604,7 @@ async fn shell_run_approve_false_skips_gate() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     for f in &frames {
         assert!(
-            !matches!(f, HostFrame::Approval(_)),
+            !matches!(f, HostFrame::Permission(_)),
             "approve:false should not emit an approval frame: {f:?}",
         );
     }

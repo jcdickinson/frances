@@ -767,8 +767,8 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
         HostFrame::Close { id: frame_id } => {
             state.close_one(stream, frame_id).await?;
         }
-        HostFrame::Approval(request) => {
-            write_message(stream, &StreamFrame::Approval(request)).await?;
+        HostFrame::Permission(request) => {
+            write_message(stream, &StreamFrame::Permission(request)).await?;
         }
     }
     Ok(())

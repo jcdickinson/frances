@@ -71,7 +71,7 @@ fn text_of(frame: &HostFrame) -> String {
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
         HostFrame::Close { id } => format!("[close:{}]", id.0),
-        HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
+        HostFrame::Permission(req) => format!("[approval:{}] {}", req.id, req.prompt),
     }
 }
 

@@ -21,7 +21,7 @@ use tracing::warn;
 
 use frances_daemon::llm::Usage;
 use frances_daemon::protocol::{
-    self, ApprovalChoice, ApprovalKind, ApprovalRequest, BlockKind, DaemonStatus, StreamFrame,
+    self, BlockKind, DaemonStatus, PermissionRequest, PermissionResponseWire, StreamFrame,
 };
 use frances_daemon::session::Session;
 use frances_tui::{
@@ -213,7 +213,7 @@ impl App<'_> {
 
         let mut textarea = Textarea::new("type a message…");
         let mut state = LiveBlocks::new();
-        let mut pending_approval: Option<ApprovalRequest> = None;
+        let mut pending_approval: Option<PermissionRequest> = None;
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
         let mut events = EventStream::new();
         let mut streaming = false;
@@ -297,10 +297,10 @@ impl App<'_> {
                                     textarea.clear();
                                     if let Some(req) = pending_approval.take() {
                                         textarea.set_placeholder("type a message…");
-                                        spawn_approval(
+                                        spawn_permission(
                                             self.session.clone(),
                                             req.id,
-                                            ApprovalChoice::Chat { content: text },
+                                            PermissionResponseWire::RedirectToChat { content: text },
                                             frame_tx.clone(),
                                         );
                                     } else {
@@ -317,14 +317,16 @@ impl App<'_> {
                                     };
                                     textarea.clear();
                                     textarea.set_placeholder("type a message…");
-                                    let choice = match classify_key(&key, true) {
-                                        KeyAction::Approve => ApprovalChoice::Yes { details },
-                                        _ => ApprovalChoice::No { details },
+                                    let response = match classify_key(&key, true) {
+                                        KeyAction::Approve => {
+                                            PermissionResponseWire::Yes { details }
+                                        }
+                                        _ => PermissionResponseWire::No { details },
                                     };
-                                    spawn_approval(
+                                    spawn_permission(
                                         self.session.clone(),
                                         req.id,
-                                        choice,
+                                        response,
                                         frame_tx.clone(),
                                     );
                                 }
@@ -347,17 +349,17 @@ impl App<'_> {
                 }
                 Some(frame) = frame_rx.recv() => {
                     // The transport-level boundary (`Done`) and any
-                    // terminal frame (`Error`, `Approval`) end the
+                    // terminal frame (`Error`, `Permission`) end the
                     // streaming indicator. A `BlockDelta` re-enters
                     // streaming so a follow-up stream after an Error
-                    // / Approval lights it back up. Replay frames
+                    // / Permission lights it back up. Replay frames
                     // don't change streaming state.
                     if !replay_mode {
                         match &frame {
                             StreamFrame::BlockDelta { .. } => streaming = true,
                             StreamFrame::Done
                             | StreamFrame::Error(_)
-                            | StreamFrame::Approval(_) => streaming = false,
+                            | StreamFrame::Permission(_) => streaming = false,
                             _ => {}
                         }
                     }
@@ -368,7 +370,7 @@ impl App<'_> {
                         &mut replay_mode,
                         frame,
                     )? {
-                        textarea.set_placeholder(approval_placeholder(&req.kind));
+                        textarea.set_placeholder(PERMISSION_PLACEHOLDER);
                         pending_approval = Some(req);
                     }
                 }
@@ -450,7 +452,7 @@ fn handle_frame(
     state: &mut LiveBlocks,
     replay_mode: &mut bool,
     frame: StreamFrame,
-) -> Result<Option<ApprovalRequest>> {
+) -> Result<Option<PermissionRequest>> {
     if *replay_mode {
         return handle_replay_frame(terminal, container, replay_mode, frame);
     }
@@ -505,9 +507,9 @@ fn handle_frame(
                 Style::default().fg(Color::Red),
             )));
         }
-        StreamFrame::Approval(request) => {
+        StreamFrame::Permission(request) => {
             container.push(Box::new(RawBlock::single_styled(
-                format!("approval: {}", request.prompt),
+                format!("permission: {}", request.prompt),
                 Style::default().fg(Color::Yellow),
             )));
             return Ok(Some(request));
@@ -525,7 +527,7 @@ fn handle_replay_frame(
     container: &mut ScrollbackContainer,
     replay_mode: &mut bool,
     frame: StreamFrame,
-) -> Result<Option<ApprovalRequest>> {
+) -> Result<Option<PermissionRequest>> {
     // Thread-local accumulator: the replay burst is single-threaded
     // per frame channel, so a `static mut` would do — but a refcell
     // in the function scope is uglier than tracking the in-flight
@@ -614,18 +616,15 @@ fn handle_replay_frame(
                 Style::default().fg(Color::Red),
             )));
         }
-        // Usage / Done / Approval are not part of the replay burst.
+        // Usage / Done / Permission are not part of the replay burst.
         // Drop them if they sneak in.
-        StreamFrame::Usage(_) | StreamFrame::Done | StreamFrame::Approval(_) => {}
+        StreamFrame::Usage(_) | StreamFrame::Done | StreamFrame::Permission(_) => {}
     }
     Ok(None)
 }
 
-fn approval_placeholder(kind: &ApprovalKind) -> &'static str {
-    match kind {
-        ApprovalKind::YesNo => "Alt+Y yes  Alt+N no  Enter chat (text becomes details for yes/no)",
-    }
-}
+const PERMISSION_PLACEHOLDER: &str =
+    "Alt+Y yes  Alt+N no  Enter chat (text becomes details for yes/no)";
 
 fn spawn_prompt(session: Session, prompt: String, frame_tx: mpsc::UnboundedSender<StreamFrame>) {
     tokio::spawn(async move {
@@ -636,15 +635,15 @@ fn spawn_prompt(session: Session, prompt: String, frame_tx: mpsc::UnboundedSende
     });
 }
 
-fn spawn_approval(
+fn spawn_permission(
     session: Session,
-    id: frances_daemon::protocol::ApprovalId,
-    choice: ApprovalChoice,
+    id: frances_daemon::protocol::PermissionId,
+    response: PermissionResponseWire,
     frame_tx: mpsc::UnboundedSender<StreamFrame>,
 ) {
     tokio::spawn(async move {
-        if let Err(error) = client::respond_approval(&session, id, choice).await {
-            let _ = frame_tx.send(StreamFrame::Error(format!("approval: {error:#}")));
+        if let Err(error) = client::respond_permission(&session, id, response).await {
+            let _ = frame_tx.send(StreamFrame::Error(format!("permission: {error:#}")));
         }
     });
 }

@@ -219,26 +219,23 @@ async function _askApproval(call) {
     "\n```";
   let choice;
   try {
-    choice = await approve(prompt);
+    choice = await approve({
+      prompt,
+      toolCall: { id: call.id, name: call.name, arguments: call.arguments },
+      allowAuto: false,
+    });
   } catch (err) {
     return _errResult(call.id, err);
   }
   if (choice.type === "yes") return null;
-  if (choice.type === "no") {
-    const reason = choice.details ? ` Reason: ${choice.details}` : "";
-    return {
-      role: "tool",
-      call_id: call.id,
-      content: `User denied this shell command.${reason}`,
-      is_error: true,
-    };
-  }
-  // chat — user said something instead of yes/no; surface it back to
-  // the model as a tool_result so it can react in the next round.
+  // `No` — either the user said no, or the daemon translated a
+  // chat-redirect into a `No` (the user's text is dispatched as a
+  // fresh prompt; we just return a denied tool_result here).
+  const reason = choice.details ? ` Reason: ${choice.details}` : "";
   return {
     role: "tool",
     call_id: call.id,
-    content: `User did not approve. They said:\n${choice.content}`,
+    content: `User denied this shell command.${reason}`,
     is_error: true,
   };
 }

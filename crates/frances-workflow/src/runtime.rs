@@ -30,9 +30,9 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::WorkflowError;
-use crate::approval::ApprovalRequest;
 use crate::deps::WorkflowDeps;
 use crate::modules;
+use crate::permission::PermissionRequest;
 use crate::transpile::{SourceKind, ts_to_js};
 
 /// Internal name we declare the user script under. Distinct from the
@@ -62,9 +62,9 @@ pub enum HostFrame {
     /// and persists the row. Idempotent on unknown ids (the JS side
     /// suppresses double-close).
     Close { id: FrameId },
-    /// Ask the user a question. The corresponding answer arrives back
-    /// through the `ApprovalGateway`'s response oneshot.
-    Approval(ApprovalRequest),
+    /// Ask the user for permission. The corresponding answer arrives
+    /// back through the `Permissions` gateway's response oneshot.
+    Permission(PermissionRequest),
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -412,11 +412,10 @@ pub mod test_deps {
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
-    use crate::approval::{
-        ApprovalChoice, ApprovalGateway, ApprovalId, ApprovalKind, ApprovalRequest,
-    };
     use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
+    use crate::permission::{PermissionId, PermissionRequest, PermissionResponse, Permissions};
     use crate::storage::{WorkflowDb, WorkflowDbError};
+    use frances_models_llm::wire::ToolCall;
     use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::OnceCell;
     use tokio::sync::oneshot;
@@ -426,17 +425,17 @@ pub mod test_deps {
         manager: StubManager,
         shell_factory: StubShellFactory,
         editor_factory: StubEditorFactory,
-        approvals: StubApprovalGateway,
+        approvals: StubPermissions,
         cwd: Arc<Mutex<Option<PathBuf>>>,
         storage: StubStorage,
     }
 
     impl StubDeps {
-        /// Resolve the most-recently-allocated approval slot with the
-        /// given choice. Returns `false` if there's no pending slot or
+        /// Resolve the most-recently-allocated permission slot with the
+        /// given response. Returns `false` if there's no pending slot or
         /// it already settled.
-        pub fn answer_approval(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
-            self.approvals.answer(id, choice)
+        pub fn answer_approval(&self, id: PermissionId, response: PermissionResponse) -> bool {
+            self.approvals.answer(id, response)
         }
     }
 
@@ -464,7 +463,7 @@ pub mod test_deps {
         type ChatSessionManager = StubManager;
         type ShellFactory = StubShellFactory;
         type EditorFactory = StubEditorFactory;
-        type ApprovalGateway = StubApprovalGateway;
+        type Permissions = StubPermissions;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -478,7 +477,7 @@ pub mod test_deps {
             &self.editor_factory
         }
 
-        fn approval_gateway(&self) -> &Self::ApprovalGateway {
+        fn permissions(&self) -> &Self::Permissions {
             &self.approvals
         }
 
@@ -555,36 +554,44 @@ pub mod test_deps {
         }
     }
 
-    /// In-memory `ApprovalGateway` for tests. Records each allocation
+    /// In-memory `Permissions` for tests. Records each allocation
     /// and lets the test settle the oneshot via `answer`.
     #[derive(Clone, Default)]
-    pub struct StubApprovalGateway {
-        inner: Arc<StubApprovalInner>,
+    pub struct StubPermissions {
+        inner: Arc<StubPermissionsInner>,
     }
 
     #[derive(Default)]
-    struct StubApprovalInner {
+    struct StubPermissionsInner {
         next_id: AtomicU64,
-        pending: Mutex<HashMap<ApprovalId, oneshot::Sender<ApprovalChoice>>>,
+        pending: Mutex<HashMap<PermissionId, oneshot::Sender<PermissionResponse>>>,
     }
 
-    impl ApprovalGateway for StubApprovalGateway {
+    impl Permissions for StubPermissions {
         fn allocate(
             &self,
             prompt: String,
-            kind: ApprovalKind,
-        ) -> (ApprovalRequest, oneshot::Receiver<ApprovalChoice>) {
-            let id = ApprovalId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+            tool_call: Option<ToolCall>,
+            _allow_auto: bool,
+        ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
+            let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
             let (tx, rx) = oneshot::channel();
             self.inner.pending.lock().insert(id, tx);
-            (ApprovalRequest { id, prompt, kind }, rx)
+            (
+                PermissionRequest {
+                    id,
+                    prompt,
+                    tool_call,
+                },
+                rx,
+            )
         }
     }
 
-    impl StubApprovalGateway {
-        fn answer(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
+    impl StubPermissions {
+        fn answer(&self, id: PermissionId, response: PermissionResponse) -> bool {
             match self.inner.pending.lock().remove(&id) {
-                Some(tx) => tx.send(choice).is_ok(),
+                Some(tx) => tx.send(response).is_ok(),
                 None => false,
             }
         }
@@ -623,7 +630,7 @@ pub mod test_deps {
         manager: StubManager,
         shell_factory: RealShellFactory,
         editor_factory: StubEditorFactory,
-        approvals: StubApprovalGateway,
+        approvals: StubPermissions,
         storage: StubStorage,
     }
 
@@ -631,7 +638,7 @@ pub mod test_deps {
         type ChatSessionManager = StubManager;
         type ShellFactory = RealShellFactory;
         type EditorFactory = StubEditorFactory;
-        type ApprovalGateway = StubApprovalGateway;
+        type Permissions = StubPermissions;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -645,7 +652,7 @@ pub mod test_deps {
             &self.editor_factory
         }
 
-        fn approval_gateway(&self) -> &Self::ApprovalGateway {
+        fn permissions(&self) -> &Self::Permissions {
             &self.approvals
         }
 
@@ -704,11 +711,11 @@ pub mod test_deps {
             self.manager.sessions.lock().clone()
         }
 
-        /// Resolve the pending approval slot `id` with `choice`. Mirrors
+        /// Resolve the pending permission slot `id` with `response`. Mirrors
         /// `StubDeps::answer_approval` for the real-shell deps variant
         /// used by `frances:v1/tools/shell` tests.
-        pub fn answer_approval(&self, id: ApprovalId, choice: ApprovalChoice) -> bool {
-            self.approvals.answer(id, choice)
+        pub fn answer_approval(&self, id: PermissionId, response: PermissionResponse) -> bool {
+            self.approvals.answer(id, response)
         }
     }
 
@@ -822,7 +829,7 @@ pub mod test_deps {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::approval::ApprovalChoice;
+    use crate::permission::PermissionResponse;
     use std::io::Write;
 
     use super::test_deps::StubDeps;
@@ -894,7 +901,7 @@ mod tests {
             HostFrame::Append { delta, .. } => delta.clone(),
             HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
             HostFrame::Close { id } => format!("[close:{}]", id.0),
-            HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
+            HostFrame::Permission(req) => format!("[approval:{}] {}", req.id, req.prompt),
         }
     }
 
@@ -4868,7 +4875,7 @@ mod tests {
         assert_eq!(text_of(&frames[0]), "first=first after=first aborted=true");
     }
 
-    /// `approve()` emits a HostFrame::Approval and awaits the host's
+    /// `approve()` emits a HostFrame::Permission and awaits the host's
     /// response. Unlike `inbox.next()` it does not park, so we drive
     /// the body inline: wait for the first approval frame, answer it,
     /// then drain to `done`.
@@ -4881,7 +4888,7 @@ mod tests {
             r#"
             import { approve } from "frances:v1/approval";
             import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const choice = await approve("delete /tmp/foo?");
+            const choice = await approve({ prompt: "delete /tmp/foo?" });
             transcript.push(new MarkdownFrame({
                 content: `${choice.type}:${choice.details ?? ""}`,
             }));
@@ -4898,7 +4905,7 @@ mod tests {
 
         let req = tokio::time::timeout(CYCLE_TIMEOUT, async {
             loop {
-                if let Some(HostFrame::Approval(req)) = handle.frames.recv().await {
+                if let Some(HostFrame::Permission(req)) = handle.frames.recv().await {
                     return req;
                 }
             }
@@ -4910,7 +4917,7 @@ mod tests {
         assert!(
             deps.answer_approval(
                 req.id,
-                ApprovalChoice::Yes {
+                PermissionResponse::Yes {
                     details: Some("scoped to /tmp".into()),
                 },
             ),

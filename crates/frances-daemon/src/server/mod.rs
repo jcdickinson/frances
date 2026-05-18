@@ -11,16 +11,17 @@ use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
 use crate::history::TursoHistoryStore;
 use crate::llm::SessionConfigWriter;
-use crate::protocol::{ApprovalChoice, ApprovalId, ApprovalKind, ApprovalRequest};
+use crate::protocol::{PermissionId, PermissionRequest};
 use crate::session::Session;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_edit::EditSession;
 use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
+use frances_models_llm::wire::ToolCall;
 use frances_storage::{Database, Migration};
 use frances_workflow::{
-    ApprovalGateway, EditorFactory, Runtime as WorkflowRuntime, WorkflowDb, WorkflowDbError,
-    WorkflowDeps,
+    EditorFactory, PermissionResponse, Permissions, Runtime as WorkflowRuntime, WorkflowDb,
+    WorkflowDbError, WorkflowDeps,
 };
 use std::borrow::Cow;
 use std::path::PathBuf;
@@ -68,10 +69,10 @@ pub struct ServerWorkflowDeps {
     /// env/cwd doesn't carry the user's API keys or project location.
     pub last_context: Arc<StdMutex<Option<InvocationContext>>>,
     pub editor_factory: DaemonEditorFactory,
-    /// Shared with `ServerState::approvals` so the workflow JS surface
-    /// and the `respond_approval` RPC handler talk to the same registry
+    /// Shared with `ServerState::permissions` so the workflow JS surface
+    /// and the `respond_permission` RPC handler talk to the same registry
     /// of pending oneshots.
-    pub approvals: DaemonApprovalGateway,
+    pub permissions: DaemonPermissions,
     /// Per-session [`Database`] — same handle as the daemon's other
     /// consumers (history, anchors, session config). Cloned in for the
     /// workflow storage surface; the connection lock is shared across
@@ -88,7 +89,7 @@ impl WorkflowDeps for ServerWorkflowDeps {
     type ChatSessionManager = ChatSessionManager<ServerChatDeps>;
     type ShellFactory = DaemonShellFactory;
     type EditorFactory = DaemonEditorFactory;
-    type ApprovalGateway = DaemonApprovalGateway;
+    type Permissions = DaemonPermissions;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
@@ -102,8 +103,8 @@ impl WorkflowDeps for ServerWorkflowDeps {
         &self.editor_factory
     }
 
-    fn approval_gateway(&self) -> &Self::ApprovalGateway {
-        &self.approvals
+    fn permissions(&self) -> &Self::Permissions {
+        &self.permissions
     }
 
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
@@ -140,57 +141,94 @@ impl WorkflowDeps for ServerWorkflowDeps {
     }
 }
 
-/// `ApprovalGateway` impl shared between the workflow runtime (which
+/// `Permissions` impl shared between the workflow runtime (which
 /// allocates pending slots) and the client RPC handler (which resolves
 /// them when the TUI sends a response). Cheap to clone — wraps an
 /// `Arc`.
 #[derive(Clone, Default)]
-pub struct DaemonApprovalGateway {
-    inner: Arc<DaemonApprovalInner>,
+pub struct DaemonPermissions {
+    inner: Arc<DaemonPermissionsInner>,
 }
 
 #[derive(Default)]
-struct DaemonApprovalInner {
+struct DaemonPermissionsInner {
     next_id: AtomicU64,
-    pending: DashMap<ApprovalId, oneshot::Sender<ApprovalChoice>>,
+    pending: DashMap<PermissionId, PendingEntry>,
 }
 
-impl ApprovalGateway for DaemonApprovalGateway {
+struct PendingEntry {
+    tx: oneshot::Sender<PermissionResponse>,
+    /// Whether the workflow flagged this gate as eligible for
+    /// auto-approval. No consumer reads it yet — stored for the
+    /// future auto-approver.
+    #[expect(
+        dead_code,
+        reason = "stored for the future auto-approver; nothing reads it yet"
+    )]
+    allow_auto: bool,
+    /// The tool invocation that triggered the request, if any. The
+    /// future auto-approver pattern-matches on this.
+    #[expect(
+        dead_code,
+        reason = "stored for the future auto-approver; nothing reads it yet"
+    )]
+    tool_call: Option<ToolCall>,
+}
+
+impl Permissions for DaemonPermissions {
     fn allocate(
         &self,
         prompt: String,
-        kind: ApprovalKind,
-    ) -> (ApprovalRequest, oneshot::Receiver<ApprovalChoice>) {
-        let id = ApprovalId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
+        tool_call: Option<ToolCall>,
+        allow_auto: bool,
+    ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
+        let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.insert(id, tx);
-        (ApprovalRequest { id, prompt, kind }, rx)
+        self.inner.pending.insert(
+            id,
+            PendingEntry {
+                tx,
+                allow_auto,
+                tool_call: tool_call.clone(),
+            },
+        );
+        (
+            PermissionRequest {
+                id,
+                prompt,
+                tool_call,
+            },
+            rx,
+        )
     }
 }
 
-impl DaemonApprovalGateway {
-    /// Settle a pending approval. Returns `Err` if the id is unknown
+impl DaemonPermissions {
+    /// Settle a pending permission. Returns `Err` if the id is unknown
     /// (already responded or never allocated) or if the awaiter has
     /// gone away.
     pub fn respond(
         &self,
-        id: ApprovalId,
-        choice: ApprovalChoice,
-    ) -> Result<(), ApprovalResponseError> {
-        let (_, tx) = self
+        id: PermissionId,
+        response: PermissionResponse,
+    ) -> Result<(), PermissionResponseError> {
+        let (_, entry) = self
             .inner
             .pending
             .remove(&id)
-            .ok_or(ApprovalResponseError::UnknownId)?;
-        tx.send(choice).map_err(|_| ApprovalResponseError::Dropped)
+            .ok_or(PermissionResponseError::UnknownId)?;
+        entry
+            .tx
+            .send(response)
+            .map_err(|_| PermissionResponseError::Dropped)
     }
 }
 
 #[derive(Debug, thiserror::Error)]
-pub enum ApprovalResponseError {
-    #[error("no pending approval with that id")]
+pub enum PermissionResponseError {
+    #[error("no pending permission with that id")]
     UnknownId,
-    #[error("workflow stopped waiting for this approval")]
+    #[error("workflow stopped waiting for this permission")]
     Dropped,
 }
 
@@ -260,10 +298,10 @@ pub(crate) struct ServerState {
     pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<ServerWorkflowDeps>>,
     pub workflow_stack: WorkflowStack,
-    /// Registry of pending user-approval round-trips. Cloned into
+    /// Registry of pending user-permission round-trips. Cloned into
     /// `ServerWorkflowDeps` so the workflow JS surface and the RPC
     /// handler both see the same pending slots.
-    pub approvals: DaemonApprovalGateway,
+    pub permissions: DaemonPermissions,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
     /// session config.

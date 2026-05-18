@@ -1,7 +1,7 @@
 use frances_daemon::context::InvocationContext;
 use frances_daemon::protocol::{
-    ApprovalChoice, ApprovalId, AttachResponse, ClientClient, DaemonPid, DaemonStatus, SessionId,
-    StreamFrame,
+    AttachResponse, ClientClient, DaemonPid, DaemonStatus, PermissionId, PermissionResponseWire,
+    SessionId, StreamFrame,
 };
 use frances_daemon::session::Session;
 use frances_daemon::transport::{TransportError, read_message};
@@ -184,14 +184,14 @@ pub async fn detach(session: &Session) -> Result<(), ClientError> {
     Ok(())
 }
 
-pub async fn respond_approval(
+pub async fn respond_permission(
     session: &Session,
-    id: ApprovalId,
-    choice: ApprovalChoice,
+    id: PermissionId,
+    response: PermissionResponseWire,
 ) -> Result<(), ClientError> {
     let client = connect_client(session).await?;
     client
-        .respond_approval(context::current(), id, choice)
+        .respond_permission(context::current(), id, response)
         .await?
         .map_err(ClientError::Server)?;
     Ok(())

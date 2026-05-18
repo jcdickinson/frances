@@ -135,11 +135,31 @@ impl Serialize for ToolChoice {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
+    /// JSON-shaped args from the LLM. Serialized through
+    /// [`json_value_as_string`] so non-self-describing formats (bincode)
+    /// can carry it — `serde_json::Value` itself uses
+    /// `deserialize_any`, which bincode rejects.
+    #[serde(with = "json_value_as_string")]
     pub arguments: Value,
+}
+
+mod json_value_as_string {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use serde_json::Value;
+
+    pub fn serialize<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
+        let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
+        serializer.serialize_str(&s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        serde_json::from_str(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 /// Token-usage report. Universal shape; `cached_input_tokens` mirrors

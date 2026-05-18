@@ -38,10 +38,11 @@
 //!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
 //!   primitive (`_setSleep` / `_clearSleep`) on the install-time stash
 //!   that the JS wrapper composes against.
-//! - `frances:v1/approval`       — single async `approve(prompt)` that
-//!   asks the user a yes/no/chat question. Backed by a private
-//!   `_approve` primitive on the install stash; the host bridges via
-//!   `HostFrame::Approval` + the `ApprovalGateway` trait.
+//! - `frances:v1/approval`       — single async
+//!   `approve({ prompt, toolCall?, allowAuto? })` that asks the user
+//!   for permission. Backed by a private `_approve` primitive on the
+//!   install stash; the host bridges via `HostFrame::Permission` +
+//!   the `Permissions` trait.
 //! - `frances:v1/storage`        — `db` singleton with
 //!   `exec`/`query`/`queryStream`/`transaction`. Backed by a workflow's
 //!   per-entity migrations declared in `[workflows.<id>].migrations`.
@@ -75,7 +76,6 @@ use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
 use crate::runtime::{HostFrame, UserInput, caught};
 
-pub mod approval;
 pub mod chat;
 pub mod file;
 pub mod file_search;
@@ -84,6 +84,7 @@ pub mod inbox;
 pub mod io;
 pub mod jaq;
 pub mod lifecycle;
+pub mod permission;
 pub mod shell;
 pub mod storage;
 pub mod workflow;
@@ -199,7 +200,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("_setSleep", set_sleep)?;
     stash.set("_clearSleep", clear_sleep)?;
 
-    let approve_fn = approval::build_approve_primitive(
+    let approve_fn = permission::build_approve_primitive(
         ctx,
         approval_deps,
         approval_frames_tx,
