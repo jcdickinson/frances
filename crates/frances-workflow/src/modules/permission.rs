@@ -57,13 +57,21 @@ pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
             } = parse_options(&ctx, &options)?;
 
             let gateway = deps.permissions().clone();
-            let (request, rx) = gateway.allocate(prompt, tool_call, allow_auto);
+            let (request, rx) = gateway.allocate(prompt, tool_call);
 
             // Best-effort emit; the receiver side is a tokio mpsc that
             // outlives the workflow body (owned by the daemon's drive
             // loop), so a closed channel here means the host is gone
             // and there's nothing to do but resolve the promise.
-            let _ = frames_tx.send(HostFrame::Permission(request));
+            //
+            // `allow_auto` rides on the host frame, not on the wire
+            // `PermissionRequest` — the daemon's emit loop reads it
+            // and either consults the auto-judge or forwards to the
+            // TUI; the TUI never sees the flag.
+            let _ = frames_tx.send(HostFrame::Permission {
+                request,
+                allow_auto,
+            });
 
             let closed = closed.clone();
             let closed_notify = closed_notify.clone();

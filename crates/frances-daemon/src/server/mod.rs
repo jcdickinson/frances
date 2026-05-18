@@ -23,6 +23,8 @@ use frances_workflow::{
     EditorFactory, PermissionResponse, Permissions, Runtime as WorkflowRuntime, WorkflowDb,
     WorkflowDbError, WorkflowDeps,
 };
+
+pub(crate) mod auto_judge;
 use std::borrow::Cow;
 use std::path::PathBuf;
 use tokio::sync::Mutex as AsyncMutex;
@@ -153,26 +155,7 @@ pub struct DaemonPermissions {
 #[derive(Default)]
 struct DaemonPermissionsInner {
     next_id: AtomicU64,
-    pending: DashMap<PermissionId, PendingEntry>,
-}
-
-struct PendingEntry {
-    tx: oneshot::Sender<PermissionResponse>,
-    /// Whether the workflow flagged this gate as eligible for
-    /// auto-approval. No consumer reads it yet — stored for the
-    /// future auto-approver.
-    #[expect(
-        dead_code,
-        reason = "stored for the future auto-approver; nothing reads it yet"
-    )]
-    allow_auto: bool,
-    /// The tool invocation that triggered the request, if any. The
-    /// future auto-approver pattern-matches on this.
-    #[expect(
-        dead_code,
-        reason = "stored for the future auto-approver; nothing reads it yet"
-    )]
-    tool_call: Option<ToolCall>,
+    pending: DashMap<PermissionId, oneshot::Sender<PermissionResponse>>,
 }
 
 impl Permissions for DaemonPermissions {
@@ -180,18 +163,10 @@ impl Permissions for DaemonPermissions {
         &self,
         prompt: String,
         tool_call: Option<ToolCall>,
-        allow_auto: bool,
     ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
         let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel();
-        self.inner.pending.insert(
-            id,
-            PendingEntry {
-                tx,
-                allow_auto,
-                tool_call: tool_call.clone(),
-            },
-        );
+        self.inner.pending.insert(id, tx);
         (
             PermissionRequest {
                 id,
@@ -212,14 +187,12 @@ impl DaemonPermissions {
         id: PermissionId,
         response: PermissionResponse,
     ) -> Result<(), PermissionResponseError> {
-        let (_, entry) = self
+        let (_, tx) = self
             .inner
             .pending
             .remove(&id)
             .ok_or(PermissionResponseError::UnknownId)?;
-        entry
-            .tx
-            .send(response)
+        tx.send(response)
             .map_err(|_| PermissionResponseError::Dropped)
     }
 }
@@ -302,6 +275,11 @@ pub(crate) struct ServerState {
     /// `ServerWorkflowDeps` so the workflow JS surface and the RPC
     /// handler both see the same pending slots.
     pub permissions: DaemonPermissions,
+    /// Same `ChatSessionManager` the workflow runtime uses (it's a
+    /// cheap `Arc`-backed clone). The daemon-level auto-judge calls
+    /// `chat.complete` directly to score permission requests that
+    /// opted into auto.
+    pub chat: ChatSessionManager<ServerChatDeps>,
     /// Writes session-config rows and emits the matching events on the
     /// DB layer in one call. Held for future RPC handlers that mutate
     /// session config.

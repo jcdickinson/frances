@@ -117,6 +117,7 @@ pub async fn run(session: Session, db: Database) -> Result<()> {
         workflow_runtime,
         workflow_stack: WorkflowStack::new(db),
         permissions,
+        chat: chat.clone(),
         session_config_writer,
     });
 

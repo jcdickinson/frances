@@ -434,7 +434,7 @@ async fn push_and_drive(
     // `lifecycle.shutdown` hook (if any) runs first.
     let old = state.workflow_stack.top.lock().await.take();
     if let Some(old) = old {
-        dehydrate(old, stream).await?;
+        dehydrate(state, old, stream).await?;
     }
 
     // Persist the new row. Truncates any non-completed rows above the
@@ -452,7 +452,7 @@ async fn push_and_drive(
         emit: EmitState::new(state.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
     };
-    let exited = drive(&mut new_instance, stream).await?;
+    let exited = drive(state, &mut new_instance, stream).await?;
     if exited {
         // The new workflow ran to completion in its initial cycle.
         // Treat that as an immediate pop: tombstone its row, then
@@ -493,7 +493,7 @@ async fn dispatch_topmost(
     let _ = top.handle.input_tx.send(UserInput {
         content: text.to_owned(),
     });
-    let exited = drive(&mut top, stream).await?;
+    let exited = drive(state, &mut top, stream).await?;
     if exited {
         let instance_id = top.handle.instance;
         // Drop the in-memory state explicitly so its task is gone
@@ -546,25 +546,29 @@ async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, Workflo
 /// Dropping `instance` at the end aborts the spawned task as a final
 /// fallback — but in practice the body has already exited by the time
 /// we get here unless the timeout fired.
-async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> Result<()> {
+async fn dehydrate(
+    state: &Arc<ServerState>,
+    mut instance: WorkflowInstance,
+    stream: &mut UnixStream,
+) -> Result<()> {
     instance.handle.request_shutdown();
     let deadline = tokio::time::sleep(DEHYDRATE_TIMEOUT);
     tokio::pin!(deadline);
     loop {
         // Flush anything sitting in the queue first.
         while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(stream, &mut instance.emit, host_frame).await?;
+            emit(state, stream, &mut instance.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
             Some(host_frame) = instance.handle.frames.recv() => {
-                emit(stream, &mut instance.emit, host_frame).await?;
+                emit(state, stream, &mut instance.emit, host_frame).await?;
             }
             done = &mut instance.handle.done => {
                 // Drain any tail frames the lifecycle hook pushed
                 // immediately before settling.
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(stream, &mut instance.emit, host_frame).await?;
+                    emit(state, stream, &mut instance.emit, host_frame).await?;
                 }
                 // Body exited cleanly: every remaining open block gets
                 // a clean BlockStop on the wire and a non-truncated row.
@@ -594,19 +598,23 @@ async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> R
 /// Drains the instance's host-frame channel until the body either
 /// parks waiting for input or terminates. Returns `true` if the body
 /// exited.
-async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Result<bool> {
+async fn drive(
+    state: &Arc<ServerState>,
+    instance: &mut WorkflowInstance,
+    stream: &mut UnixStream,
+) -> Result<bool> {
     loop {
         while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(stream, &mut instance.emit, host_frame).await?;
+            emit(state, stream, &mut instance.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
             Some(host_frame) = instance.handle.frames.recv() => {
-                emit(stream, &mut instance.emit, host_frame).await?;
+                emit(state, stream, &mut instance.emit, host_frame).await?;
             }
             done = &mut instance.handle.done => {
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(stream, &mut instance.emit, host_frame).await?;
+                    emit(state, stream, &mut instance.emit, host_frame).await?;
                 }
                 instance.emit.close_all_stop(stream).await?;
                 if let Ok(Err(error)) = done {
@@ -620,7 +628,7 @@ async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Resu
             }
             () = instance.handle.parked.notified() => {
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(stream, &mut instance.emit, host_frame).await?;
+                    emit(state, stream, &mut instance.emit, host_frame).await?;
                 }
                 return Ok(false);
             }
@@ -628,7 +636,12 @@ async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Resu
     }
 }
 
-async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) -> Result<()> {
+async fn emit(
+    server: &Arc<ServerState>,
+    stream: &mut UnixStream,
+    state: &mut EmitState,
+    frame: HostFrame,
+) -> Result<()> {
     match frame {
         HostFrame::Push(FramePush { id: frame_id, kind }) => match kind {
             FrameKind::Markdown { content, sender } => {
@@ -767,8 +780,33 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
         HostFrame::Close { id: frame_id } => {
             state.close_one(stream, frame_id).await?;
         }
-        HostFrame::Permission(request) => {
-            write_message(stream, &StreamFrame::Permission(request)).await?;
+        HostFrame::Permission {
+            request,
+            allow_auto,
+        } => {
+            if allow_auto {
+                let id = request.id;
+                let outcome = crate::server::auto_judge::judge(server, &request).await;
+                match outcome {
+                    crate::server::auto_judge::JudgeOutcome::Approve { reason } => {
+                        if let Err(error) = server.permissions.respond(
+                            id,
+                            frances_workflow::PermissionResponse::Yes {
+                                details: Some(reason),
+                            },
+                        ) {
+                            warn!(%error, %id, "auto-judge approve: respond failed");
+                        }
+                    }
+                    crate::server::auto_judge::JudgeOutcome::Reject { reason }
+                    | crate::server::auto_judge::JudgeOutcome::Indeterminate { reason } => {
+                        tracing::debug!(%id, %reason, "auto-judge fell through to user");
+                        write_message(stream, &StreamFrame::Permission(request)).await?;
+                    }
+                }
+            } else {
+                write_message(stream, &StreamFrame::Permission(request)).await?;
+            }
         }
     }
     Ok(())

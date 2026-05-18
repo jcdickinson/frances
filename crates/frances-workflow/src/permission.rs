@@ -71,20 +71,20 @@ pub enum PermissionResponse {
 /// Host-side handle the workflow uses to ask the user a question and
 /// wait for their answer.
 ///
-/// Daemon impl: shared `Arc<DashMap<PermissionId, PendingEntry>>` also
-/// held by the RPC handler that the TUI calls into. Tests can stub it
-/// however they want.
+/// Daemon impl: shared `Arc<DashMap<PermissionId, oneshot::Sender>>`
+/// also held by the RPC handler that the TUI calls into. Tests can
+/// stub it however they want.
 pub trait Permissions: Clone + Send + Sync + 'static {
     /// Reserve a fresh id + register a pending response slot. The
     /// caller emits the returned `PermissionRequest` to the host and
     /// awaits the receiver.
     ///
-    /// `allow_auto` is stored alongside the slot for the daemon's
-    /// auto-approver to inspect later; it never travels over the wire.
+    /// `allow_auto` is not handled here — it rides on the
+    /// `HostFrame::Permission` variant the caller emits, since only
+    /// the host frame's consumer (the daemon's emit loop) reads it.
     fn allocate(
         &self,
         prompt: String,
         tool_call: Option<ToolCall>,
-        allow_auto: bool,
     ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>);
 }

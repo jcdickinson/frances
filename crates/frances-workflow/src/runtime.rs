@@ -64,7 +64,15 @@ pub enum HostFrame {
     Close { id: FrameId },
     /// Ask the user for permission. The corresponding answer arrives
     /// back through the `Permissions` gateway's response oneshot.
-    Permission(PermissionRequest),
+    ///
+    /// `allow_auto` flags the gate as eligible for the host's
+    /// auto-approver. It rides on the host frame (not on the wire
+    /// `PermissionRequest`) so the daemon's emit loop can read it
+    /// without a side lookup, and so it never leaks to the TUI.
+    Permission {
+        request: PermissionRequest,
+        allow_auto: bool,
+    },
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -572,7 +580,6 @@ pub mod test_deps {
             &self,
             prompt: String,
             tool_call: Option<ToolCall>,
-            _allow_auto: bool,
         ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
             let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
             let (tx, rx) = oneshot::channel();
@@ -901,7 +908,9 @@ mod tests {
             HostFrame::Append { delta, .. } => delta.clone(),
             HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
             HostFrame::Close { id } => format!("[close:{}]", id.0),
-            HostFrame::Permission(req) => format!("[approval:{}] {}", req.id, req.prompt),
+            HostFrame::Permission { request, .. } => {
+                format!("[approval:{}] {}", request.id, request.prompt)
+            }
         }
     }
 
@@ -4903,16 +4912,21 @@ mod tests {
             .await
             .unwrap();
 
-        let req = tokio::time::timeout(CYCLE_TIMEOUT, async {
+        let (req, allow_auto) = tokio::time::timeout(CYCLE_TIMEOUT, async {
             loop {
-                if let Some(HostFrame::Permission(req)) = handle.frames.recv().await {
-                    return req;
+                if let Some(HostFrame::Permission {
+                    request,
+                    allow_auto,
+                }) = handle.frames.recv().await
+                {
+                    return (request, allow_auto);
                 }
             }
         })
         .await
         .expect("approval frame did not arrive in time");
         assert_eq!(req.prompt, "delete /tmp/foo?");
+        assert!(!allow_auto, "default allowAuto should be false");
 
         assert!(
             deps.answer_approval(

@@ -222,7 +222,12 @@ async function _askApproval(call) {
     choice = await approve({
       prompt,
       toolCall: { id: call.id, name: call.name, arguments: call.arguments },
-      allowAuto: false,
+      // Opt this gate into the daemon's auto-judge. If `models.auto`
+      // (with fallback `referee`, then `cheap`) is configured, the
+      // daemon may approve without showing the user a prompt. On
+      // judge reject / error the request falls through to the user
+      // exactly as if `allowAuto` were false.
+      allowAuto: true,
     });
   } catch (err) {
     return _errResult(call.id, err);

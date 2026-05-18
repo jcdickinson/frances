@@ -71,7 +71,9 @@ fn text_of(frame: &HostFrame) -> String {
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
         HostFrame::Close { id } => format!("[close:{}]", id.0),
-        HostFrame::Permission(req) => format!("[permission:{}] {}", req.id, req.prompt),
+        HostFrame::Permission { request, .. } => {
+            format!("[permission:{}] {}", request.id, request.prompt)
+        }
     }
 }
 
@@ -435,7 +437,7 @@ async fn await_approval(handle: &mut WorkflowHandle) -> (PermissionRequest, Vec<
     let approval = tokio::time::timeout(CYCLE_TIMEOUT, async {
         loop {
             match handle.frames.recv().await {
-                Some(HostFrame::Permission(req)) => return req,
+                Some(HostFrame::Permission { request, .. }) => return request,
                 Some(other) => buffered.push(other),
                 None => panic!("frames channel closed before permission request landed"),
             }
@@ -604,7 +606,7 @@ async fn shell_run_approve_false_skips_gate() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     for f in &frames {
         assert!(
-            !matches!(f, HostFrame::Permission(_)),
+            !matches!(f, HostFrame::Permission { .. }),
             "approve:false should not emit an approval frame: {f:?}",
         );
     }
