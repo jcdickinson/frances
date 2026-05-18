@@ -125,7 +125,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
             Function::new(
                 ctx.clone(),
                 |this: This<Class<'js, EditorJs<D>>>, value: Value<'js>| {
-                    let raw = rquickjs_to_json(&value);
+                    let raw = super::rquickjs_to_json(&value);
                     let deps = this.0.borrow().deps.clone();
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
@@ -239,50 +239,6 @@ fn mtime_ns_from(meta: &fs::Metadata) -> io::Result<i64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| io::Error::other(format!("mtime before epoch: {e}")))?;
     i64::try_from(dur.as_nanos()).map_err(|e| io::Error::other(format!("mtime overflow: {e}")))
-}
-
-/// Recursively convert an `rquickjs::Value` into a `serde_json::Value`
-/// for `serde_json::from_value::<LlmEdit>`. Cheaper than going through
-/// the `Value -> String -> Value` round-trip, and means the JS-side
-/// edit-arg shape ports 1:1 to the Rust enum.
-fn rquickjs_to_json(value: &Value<'_>) -> Result<serde_json::Value, String> {
-    if value.is_undefined() || value.is_null() {
-        return Ok(serde_json::Value::Null);
-    }
-    if let Some(b) = value.as_bool() {
-        return Ok(serde_json::Value::Bool(b));
-    }
-    if let Some(i) = value.as_int() {
-        return Ok(serde_json::Value::Number(i.into()));
-    }
-    if let Some(f) = value.as_float() {
-        return Ok(serde_json::Number::from_f64(f)
-            .map(serde_json::Value::Number)
-            .unwrap_or(serde_json::Value::Null));
-    }
-    if let Some(s) = value.as_string() {
-        return s
-            .to_string()
-            .map(serde_json::Value::String)
-            .map_err(|e| format!("string conversion: {e}"));
-    }
-    if let Some(arr) = value.as_array() {
-        let mut out = Vec::with_capacity(arr.len());
-        for item in arr.iter::<Value<'_>>() {
-            let item = item.map_err(|e| format!("array iter: {e}"))?;
-            out.push(rquickjs_to_json(&item)?);
-        }
-        return Ok(serde_json::Value::Array(out));
-    }
-    if let Some(obj) = value.as_object() {
-        let mut map = serde_json::Map::new();
-        for entry in obj.props::<String, Value<'_>>() {
-            let (k, v) = entry.map_err(|e| format!("object props: {e}"))?;
-            map.insert(k, rquickjs_to_json(&v)?);
-        }
-        return Ok(serde_json::Value::Object(map));
-    }
-    Err("unsupported JS value type".to_owned())
 }
 
 /// Promise payload that resolves to a string or rejects with an error

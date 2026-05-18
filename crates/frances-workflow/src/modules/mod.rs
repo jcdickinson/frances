@@ -49,6 +49,10 @@
 //!   tool classes.
 //! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
 //!   `InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
+//! - `frances:v1/tools/file_search` — `FileSearch` primitive + `Search`
+//!   tool class. Combined name-pattern lookup, content search, and
+//!   directory listing via the ripgrep crates (`ignore::WalkParallel`
+//!   plus `grep-searcher`).
 //! - `frances:v1/tools/variable` — pure-JS `Variables` JSON store +
 //!   `Get`/`Set` tool classes.
 //! - `whatwg:web-streams`        — `ReadableStream`, `WritableStream`,
@@ -63,7 +67,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use rquickjs::module::Module;
-use rquickjs::{CatchResultExt, Ctx, Object};
+use rquickjs::{CatchResultExt, Ctx, Object, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -74,6 +78,7 @@ use crate::runtime::{HostFrame, UserInput, caught};
 pub mod approval;
 pub mod chat;
 pub mod file;
+pub mod file_search;
 pub mod frames;
 pub mod inbox;
 pub mod io;
@@ -170,9 +175,15 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     shell_desc.set("shell_capture", include_str!("desc/shell_capture.md"))?;
     stash.set("ShellDescriptions", shell_desc)?;
 
-    let editor_ctor = file::build_editor_ctor(ctx, deps)?;
+    let editor_ctor = file::build_editor_ctor(ctx, deps.clone())?;
     stash.set("Editor", editor_ctor)?;
     stash.set("EditorDescriptions", file::build_descriptions(ctx)?)?;
+
+    let file_search_ctor = file_search::build_file_search_ctor(ctx, deps)?;
+    stash.set("FileSearch", file_search_ctor)?;
+    let file_search_desc = Object::new(ctx.clone())?;
+    file_search_desc.set("file_search", include_str!("desc/file_search.md"))?;
+    stash.set("FileSearchDescriptions", file_search_desc)?;
 
     let variable_desc = Object::new(ctx.clone())?;
     variable_desc.set("variable_get", include_str!("desc/variable_get.md"))?;
@@ -229,6 +240,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tools/file_search", FILE_SEARCH_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
     Ok(())
 }
@@ -239,6 +251,51 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
 pub(crate) fn remove_stash<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
     ctx.globals().remove(STASH_KEY)?;
     Ok(())
+}
+
+/// Recursively convert an `rquickjs::Value` into a `serde_json::Value`.
+/// Cheaper than going through the `Value -> String -> Value` round-trip,
+/// and means JS-side arg shapes map 1:1 to whatever struct the caller
+/// is deserialising into. Shared by `file::edit_inner` (LlmEdit args)
+/// and `file_search::do_search` (FileSearchArgs).
+pub(super) fn rquickjs_to_json(value: &Value<'_>) -> Result<serde_json::Value, String> {
+    if value.is_undefined() || value.is_null() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Some(b) = value.as_bool() {
+        return Ok(serde_json::Value::Bool(b));
+    }
+    if let Some(i) = value.as_int() {
+        return Ok(serde_json::Value::Number(i.into()));
+    }
+    if let Some(f) = value.as_float() {
+        return Ok(serde_json::Number::from_f64(f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null));
+    }
+    if let Some(s) = value.as_string() {
+        return s
+            .to_string()
+            .map(serde_json::Value::String)
+            .map_err(|e| format!("string conversion: {e}"));
+    }
+    if let Some(arr) = value.as_array() {
+        let mut out = Vec::with_capacity(arr.len());
+        for item in arr.iter::<Value<'_>>() {
+            let item = item.map_err(|e| format!("array iter: {e}"))?;
+            out.push(rquickjs_to_json(&item)?);
+        }
+        return Ok(serde_json::Value::Array(out));
+    }
+    if let Some(obj) = value.as_object() {
+        let mut map = serde_json::Map::new();
+        for entry in obj.props::<String, Value<'_>>() {
+            let (k, v) = entry.map_err(|e| format!("object props: {e}"))?;
+            map.insert(k, rquickjs_to_json(&v)?);
+        }
+        return Ok(serde_json::Value::Object(map));
+    }
+    Err("unsupported JS value type".to_owned())
 }
 
 /// Declares and evaluates a virtual module. Our modules are
@@ -277,6 +334,7 @@ const APPROVAL_SRC: &str = include_str!("js/approval.js");
 const STORAGE_SRC: &str = include_str!("js/storage.js");
 const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
+const FILE_SEARCH_SRC: &str = include_str!("js/file_search.js");
 const VARIABLE_SRC: &str = include_str!("js/variable.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be

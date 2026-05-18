@@ -32,6 +32,7 @@ import {
   New,
   Overwrite,
 } from "frances:v1/tools/file";
+import { FileSearch, Search } from "frances:v1/tools/file_search";
 import {
   Variables,
   Get as VarGet,
@@ -54,6 +55,7 @@ const sh = new Shell();
 const wait = new Wait(sh);
 const kill = new Kill(sh);
 const editor = new Editor();
+const fileSearch = new FileSearch();
 const vars = new Variables();
 chat.tools.push(
   new Run(sh, { wait, kill }),
@@ -67,6 +69,7 @@ chat.tools.push(
   new InsertBefore(editor, vars),
   new New(editor, vars),
   new Overwrite(editor, vars),
+  new Search(fileSearch, vars),
   new VarGet(vars),
   new VarSet(vars),
   new VarAssign(vars),
