@@ -4,7 +4,9 @@ Args: `{ path, anchor, text }`
 
   path:    the file to edit. Must have been read this turn via `file_read` (or just created with `file_new` / `file_overwrite`, which echo back anchors).
   anchor:  full rendered anchor line that the new content will be inserted AFTER — `Word§content`, exactly as `file_read` produced it.
-  text:    the content to insert. Use `\n` for newlines. Multi-line is fine; do NOT include any anchors in `text`.
+  text:    the raw content of the new line(s) and NOTHING ELSE. Use `\n` for newlines. Multi-line is fine.
+
+CRITICAL: `text` must NEVER contain a `Word§` prefix. Anchors are read-only metadata — they belong in `anchor`, never in `text`. The engine mints fresh anchors for inserted lines. If you write `text: "Until§ratatui-textarea = \"0.9\""`, the literal `Until§` is written into the file and your edit is broken. Pass only the line content: `text: "ratatui-textarea = \"0.9\""`.
 
 Provide exactly one of `text` or `from`:
 

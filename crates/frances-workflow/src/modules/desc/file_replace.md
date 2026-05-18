@@ -5,7 +5,9 @@ Args: `{ path, anchor, end_anchor, text }`
   path:        the file to edit. Must have been read this turn via `file_read` (or just created with `file_new` / `file_overwrite`, which echo back anchors).
   anchor:      full rendered anchor line of the FIRST line in the range — `Word§content`, exactly as `file_read` produced it.
   end_anchor:  full rendered anchor line of the LAST line in the range (inclusive). For a single-line replace, pass the same value as `anchor`.
-  text:        the replacement content. Use `\n` for newlines. Multi-line is fine; do NOT include any anchors in `text`.
+  text:        the raw replacement content and NOTHING ELSE. Use `\n` for newlines. Multi-line is fine.
+
+CRITICAL: `text` must NEVER contain a `Word§` prefix. Anchors are read-only metadata — they belong in `anchor` / `end_anchor`, never in `text`. The engine mints fresh anchors for the replacement lines. If you write `text: "Until§ratatui-textarea = \"0.9\""`, the literal `Until§` is written into the file and your edit is broken. Pass only the line content: `text: "ratatui-textarea = \"0.9\""`.
 
 Provide exactly one of `text` or `from`:
 
