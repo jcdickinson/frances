@@ -12,7 +12,6 @@
 //
 // Type `quit` to exit.
 
-import { WritableStream } from "whatwg:web-streams";
 import { inbox } from "frances:v1/inbox";
 import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
 import { ChatSession } from "frances:v1/chat";
@@ -93,26 +92,14 @@ try {
     try {
       while (true) {
         const r = await chat.stream();
-        // Only push a `frances:` frame once the first text delta arrives.
-        // A turn that returns only tool_calls produces no deltas, so it
-        // leaves no empty `frances:` row in the transcript.
-        let out: any = null;
-        let writer: any = null;
-        await r.text.pipeTo(
-          new WritableStream({
-            async write(chunk) {
-              if (out === null) {
-                out = new MarkdownFrame({ content: "", sender: "frances" });
-                transcript.push(out);
-                writer = out.writable.getWriter();
-              }
-              await writer.write(chunk);
-            },
-            async close() {
-              if (writer) await writer.close();
-            },
-          }),
-        );
+        // Push the `frances:` frame eagerly with no content — the TUI
+        // tracks the id but defers measure / render, and the daemon
+        // skips persistence, until the first text delta materialises
+        // the block. A tool_call-only round therefore leaves no empty
+        // `frances:` row in the transcript.
+        const out = new MarkdownFrame({ sender: "frances" });
+        transcript.push(out);
+        await r.text.pipeTo(out.writable);
         const { tool_calls } = await r.completed;
         if (!tool_calls || tool_calls.length === 0) break;
       }

@@ -32,6 +32,7 @@
 //! workflow is **not** re-seeded.
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -50,7 +51,8 @@ use crate::transport::write_message;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle, parse_slash_command,
+    FrameId, FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle,
+    parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
@@ -143,25 +145,37 @@ struct WorkflowInstance {
 ///
 /// Workflow frames map to wire blocks like this:
 ///
-/// - `MarkdownFrame` push: close previous open block (if any), open a
-///   new `Text { sender }` block, write initial content; the block stays
-///   open so subsequent `append`s stream into it.
-/// - `MarkdownFrame.append`: write a `BlockDelta` on the currently-open
-///   block.
-/// - `ErrorFrame` push: close previous open block, emit a one-shot
-///   `StreamFrame::Error` and persist a scrollback row of kind 'error'.
-/// - `JsonFrame` push: close previous open block, open + immediately
-///   close a one-shot `Text { sender: None }` block rendering
-///   `[tag] body`.
+/// - `MarkdownFrame` push: open a new `Text { sender }` block, write
+///   initial content; the block stays open so subsequent `append`s
+///   stream into it. The JS side sends `Close` for the prior active
+///   markdown before pushing a new one — multiple blocks can be open
+///   concurrently (e.g. a shell-output block running while the LLM
+///   streams text into a markdown block above it).
+/// - `MarkdownFrame.append`: `Append` carries the [`FrameId`]; the
+///   emit state looks up the matching open block and writes a
+///   `BlockDelta` against it.
+/// - `Close { id }`: emit `BlockStop` for the block, persist a clean
+///   scrollback row, remove from `open`.
+/// - `UpdateKind { id, kind }`: emit a no-text `BlockDelta` carrying
+///   the new kind. Used for in-place metadata transitions (ShellOutput
+///   Running → Success/Exit(N)).
+/// - `ErrorFrame` push: emit a one-shot `StreamFrame::Error` and
+///   persist a scrollback row of kind 'error'. Does NOT touch any
+///   open block — error frames are side-channel.
+/// - `JsonFrame` push: open + immediately close a one-shot
+///   `Text { sender: None }` block rendering `[tag] body`.
 ///
-/// On workflow termination the open block is closed before `Done` so
-/// the UI's `BlockState` ends up Idle. `EmitState` also accumulates the
-/// delta text for the open block so we can persist the full body on
-/// close — either clean (a `BlockStop`) or truncated (workflow was
-/// dehydrated while the block was in flight).
+/// On workflow termination every remaining open block is closed so the
+/// UI's `BlockState` ends up Idle. `EmitState` accumulates the delta
+/// text for each open block so we can persist the full body on close
+/// — either clean (a `BlockStop`) or truncated (workflow was dehydrated
+/// while a block was in flight).
 struct EmitState {
     next_block: u64,
-    open: Option<OpenBlock>,
+    /// Open blocks keyed by the workflow-side [`FrameId`]. Emit is
+    /// single-threaded (one task per workflow instance) so a plain
+    /// `HashMap` is enough.
+    open: HashMap<FrameId, OpenBlock>,
     /// Shared per-session [`Database`] used for scrollback writes. Cheap
     /// clone; the underlying connection lock serialises overlapping
     /// writes.
@@ -172,20 +186,26 @@ struct EmitState {
     instance_id: Uuid,
 }
 
-/// The block whose `BlockStart` has been emitted but whose `BlockStop`
-/// has not. We buffer the delta text here so that on close we can write
-/// one scrollback row with the full body.
+/// A block whose first `BlockDelta` has been emitted but whose
+/// `BlockStop` has not. We buffer the delta text here so that on close
+/// we can write one scrollback row with the full body.
+///
+/// `text` is `None` for a block that was pushed without initial content
+/// and has never received an `Append` — the client has only seen the
+/// opener with `text: None` and is still deferring measure / render. On
+/// `Close` we skip persistence for these so the transcript doesn't
+/// gain empty ghost rows for never-written frames.
 struct OpenBlock {
     id: BlockId,
     kind: BlockKind,
-    text: String,
+    text: Option<String>,
 }
 
 impl EmitState {
     fn new(db: Database, instance_id: Uuid) -> Self {
         Self {
             next_block: 1,
-            open: None,
+            open: HashMap::new(),
             db,
             instance_id,
         }
@@ -197,29 +217,64 @@ impl EmitState {
         id
     }
 
-    /// Clean close: emit `BlockStop`, persist a finished row, drop the
-    /// open block.
-    async fn close_open_stop(&mut self, stream: &mut UnixStream) -> Result<()> {
-        let Some(open) = self.open.take() else {
+    /// Clean close for a single block: emit `BlockStop`, persist a
+    /// finished row (if the block ever received body content), drop
+    /// the entry. Idempotent on unknown ids.
+    async fn close_one(&mut self, stream: &mut UnixStream, frame_id: FrameId) -> Result<()> {
+        let Some(open) = self.open.remove(&frame_id) else {
             return Ok(());
         };
         write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
-        crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &open.text, false)
-            .await?;
+        if let Some(text) = open.text {
+            crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &text, false)
+                .await?;
+        }
         Ok(())
     }
 
-    /// Dehydrate close: the workflow is going away while a block is
-    /// in flight. Persist the row marked truncated and drop the open
-    /// block. No wire frame is emitted — the TUI is about to be told
-    /// to clear and replay via `ScrollbackReset`, and the replay will
-    /// surface this row as a `BlockTruncated`.
-    async fn close_open_truncate(&mut self) -> Result<()> {
-        let Some(open) = self.open.take() else {
-            return Ok(());
-        };
-        crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &open.text, true)
-            .await?;
+    /// Clean close for every remaining open block. Called when the
+    /// workflow body exits and we're about to send `Done` — leftover
+    /// opens get a real `BlockStop` so the TUI's per-id active state
+    /// drains. Blocks that never received any text are dropped without
+    /// being persisted (the client never materialised them either).
+    async fn close_all_stop(&mut self, stream: &mut UnixStream) -> Result<()> {
+        let drained: Vec<OpenBlock> = self.open.drain().map(|(_, v)| v).collect();
+        for open in drained {
+            write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
+            if let Some(text) = open.text {
+                crate::scrollback::persist_block(
+                    &self.db,
+                    self.instance_id,
+                    &open.kind,
+                    &text,
+                    false,
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dehydrate close-all: the workflow is going away while blocks are
+    /// in flight. Persist each row marked truncated and drop the
+    /// entries. No wire frames are emitted — the TUI is about to be
+    /// told to clear and replay via `ScrollbackReset`, and the replay
+    /// will surface these rows as `BlockTruncated`. Unmaterialised
+    /// blocks (never wrote anything) are dropped silently.
+    async fn close_all_truncate(&mut self) -> Result<()> {
+        let drained: Vec<OpenBlock> = self.open.drain().map(|(_, v)| v).collect();
+        for open in drained {
+            if let Some(text) = open.text {
+                crate::scrollback::persist_block(
+                    &self.db,
+                    self.instance_id,
+                    &open.kind,
+                    &text,
+                    true,
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -511,9 +566,9 @@ async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> R
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
                     emit(stream, &mut instance.emit, host_frame).await?;
                 }
-                // Body exited cleanly: any open block now gets a clean
-                // BlockStop on the wire and a non-truncated row.
-                instance.emit.close_open_stop(stream).await?;
+                // Body exited cleanly: every remaining open block gets
+                // a clean BlockStop on the wire and a non-truncated row.
+                instance.emit.close_all_stop(stream).await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow shutdown: {error}");
                     instance.emit.persist_error(&msg).await?;
@@ -526,10 +581,10 @@ async fn dehydrate(mut instance: WorkflowInstance, stream: &mut UnixStream) -> R
                     instance = %instance.handle.instance,
                     "workflow shutdown timed out; force-dropping handle"
                 );
-                // Body never settled. Mark the in-flight block (if any)
+                // Body never settled. Mark every in-flight block
                 // truncated. No wire BlockStop — the TUI is about to
                 // be told to ScrollbackReset by the caller's push path.
-                instance.emit.close_open_truncate().await?;
+                instance.emit.close_all_truncate().await?;
                 return Ok(());
             }
         }
@@ -553,7 +608,7 @@ async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Resu
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
                     emit(stream, &mut instance.emit, host_frame).await?;
                 }
-                instance.emit.close_open_stop(stream).await?;
+                instance.emit.close_all_stop(stream).await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow: {error}");
                     instance.emit.persist_error(&msg).await?;
@@ -575,35 +630,61 @@ async fn drive(instance: &mut WorkflowInstance, stream: &mut UnixStream) -> Resu
 
 async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) -> Result<()> {
     match frame {
-        HostFrame::Push(FramePush { id: _, kind }) => match kind {
+        HostFrame::Push(FramePush { id: frame_id, kind }) => match kind {
             FrameKind::Markdown { content, sender } => {
-                state.close_open_stop(stream).await?;
-                let block = state.alloc();
-                let kind = BlockKind::Text {
+                let block_kind = BlockKind::Text {
                     sender: sender.map(Arc::from),
                 };
+                let block = state.alloc();
                 write_message(
                     stream,
                     &StreamFrame::BlockDelta {
                         id: block,
-                        kind: kind.clone(),
+                        kind: block_kind.clone(),
                         text: content.clone(),
                     },
                 )
                 .await?;
-                state.open = Some(OpenBlock {
-                    id: block,
-                    kind,
-                    text: content,
-                });
+                state.open.insert(
+                    frame_id,
+                    OpenBlock {
+                        id: block,
+                        kind: block_kind,
+                        text: content,
+                    },
+                );
+            }
+            FrameKind::ShellOutput {
+                state: shell_state,
+                content,
+            } => {
+                let block_kind = BlockKind::ShellOutput {
+                    state: shell_state_to_protocol(&shell_state),
+                };
+                let block = state.alloc();
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        kind: block_kind.clone(),
+                        text: Some(content.clone()),
+                    },
+                )
+                .await?;
+                state.open.insert(
+                    frame_id,
+                    OpenBlock {
+                        id: block,
+                        kind: block_kind,
+                        text: Some(content),
+                    },
+                );
             }
             FrameKind::Error { content } => {
-                state.close_open_stop(stream).await?;
                 state.persist_error(&content).await?;
                 write_message(stream, &StreamFrame::Error(content)).await?;
             }
             FrameKind::Json { tag, value } => {
-                state.close_open_stop(stream).await?;
                 let body =
                     serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
                 let block = state.alloc();
@@ -614,40 +695,92 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
                     &StreamFrame::BlockDelta {
                         id: block,
                         kind: kind.clone(),
-                        text: text.clone(),
+                        text: Some(text.clone()),
                     },
                 )
                 .await?;
-                state.open = Some(OpenBlock {
-                    id: block,
-                    kind,
-                    text,
-                });
-                state.close_open_stop(stream).await?;
+                // Open + persist + close in one go: a JsonFrame is a
+                // one-shot block. It never enters `state.open`.
+                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, &text, false)
+                    .await?;
             }
         },
-        HostFrame::Append { delta, .. } => {
-            if let Some(open) = state.open.as_mut() {
-                open.text.push_str(&delta);
-                let id = open.id;
+        HostFrame::Append {
+            id: frame_id,
+            delta,
+        } => {
+            if let Some(open) = state.open.get_mut(&frame_id) {
+                match &mut open.text {
+                    Some(buf) => buf.push_str(&delta),
+                    slot @ None => *slot = Some(delta.clone()),
+                }
+                let block = open.id;
                 let kind = open.kind.clone();
                 write_message(
                     stream,
                     &StreamFrame::BlockDelta {
-                        id,
+                        id: block,
                         kind,
-                        text: delta,
+                        text: Some(delta),
                     },
                 )
                 .await?;
             }
         }
+        HostFrame::UpdateKind { id: frame_id, kind } => {
+            // Translate the workflow's FrameKind delta into a wire
+            // BlockKind delta. Frame kinds without a streaming
+            // representation on the wire (Error, Json) are no-ops.
+            let new_block_kind = match kind {
+                FrameKind::Markdown { sender, .. } => Some(BlockKind::Text {
+                    sender: sender.map(Arc::from),
+                }),
+                FrameKind::ShellOutput {
+                    state: shell_state, ..
+                } => Some(BlockKind::ShellOutput {
+                    state: shell_state_to_protocol(&shell_state),
+                }),
+                FrameKind::Error { .. } | FrameKind::Json { .. } => None,
+            };
+            let Some(new_block_kind) = new_block_kind else {
+                return Ok(());
+            };
+            if let Some(open) = state.open.get_mut(&frame_id) {
+                open.kind = new_block_kind.clone();
+                let block = open.id;
+                // No text on a kind-only delta. The client either
+                // updates the kind on a materialised block (re-render)
+                // or, if the block was never materialised, just stores
+                // the new kind for whenever the first body delta lands.
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        kind: new_block_kind,
+                        text: None,
+                    },
+                )
+                .await?;
+            }
+        }
+        HostFrame::Close { id: frame_id } => {
+            state.close_one(stream, frame_id).await?;
+        }
         HostFrame::Approval(request) => {
-            state.close_open_stop(stream).await?;
             write_message(stream, &StreamFrame::Approval(request)).await?;
         }
     }
     Ok(())
+}
+
+fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::protocol::ShellState {
+    use frances_workflow::ShellState as W;
+    match state {
+        W::Running => crate::protocol::ShellState::Running,
+        W::Success => crate::protocol::ShellState::Success,
+        W::Exit(n) => crate::protocol::ShellState::Exit(*n),
+    }
 }
 
 // --- Persistence helpers --------------------------------------------------

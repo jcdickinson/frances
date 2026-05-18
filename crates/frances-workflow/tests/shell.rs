@@ -63,12 +63,38 @@ async fn drive_one_cycle_inner(
 fn text_of(frame: &HostFrame) -> String {
     match frame {
         HostFrame::Push(p) => match &p.kind {
-            FrameKind::Markdown { content, .. } | FrameKind::Error { content } => content.clone(),
+            FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
+            FrameKind::Error { content } => content.clone(),
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
+            FrameKind::ShellOutput { state, content } => format!("[shell:{state:?}] {content}"),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
+        HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
+        HostFrame::Close { id } => format!("[close:{}]", id.0),
         HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
     }
+}
+
+/// Collect content from every `MarkdownFrame` push in order. Most
+/// shell tests use `transcript.push(new MarkdownFrame({ content }))`
+/// to surface tool_result text and then index into the resulting
+/// frames — but `Run.handler` now also pushes a `ShellOutputFrame`
+/// (plus its Append/UpdateKind/Close trail), which would otherwise
+/// shift those indices around. Filtering by kind keeps the tests
+/// focused on the markdown frames they care about. Empty-content
+/// pushes (the `None` case) collapse to "" since the tests work in
+/// terms of body text.
+fn markdown_pushes(frames: &[HostFrame]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            HostFrame::Push(p) => match &p.kind {
+                FrameKind::Markdown { content, .. } => Some(content.clone().unwrap_or_default()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -123,11 +149,17 @@ async fn shell_set_set_form_is_not_exported() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let seen = text_of(&frames[0]);
-    assert!(seen.contains("[abc]"), "expected [abc] in {seen}");
-
-    let sub = text_of(&frames[1]);
-    assert!(sub.contains("[unset]"), "expected [unset] in {sub}");
+    let pushes = markdown_pushes(&frames);
+    assert!(
+        pushes[0].contains("[abc]"),
+        "expected [abc] in {:?}",
+        pushes[0]
+    );
+    assert!(
+        pushes[1].contains("[unset]"),
+        "expected [unset] in {:?}",
+        pushes[1]
+    );
 }
 
 #[tokio::test]
@@ -176,7 +208,8 @@ async fn shell_set_export_form_visible_to_subprocesses() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let out = text_of(&frames[0]);
+    let pushes = markdown_pushes(&frames);
+    let out = &pushes[0];
     assert!(out.contains("alpha\nbeta\ngamma"), "got: {out}");
 }
 
@@ -223,7 +256,8 @@ async fn shell_set_object_value_is_json_encoded() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let out = text_of(&frames[0]);
+    let pushes = markdown_pushes(&frames);
+    let out = &pushes[0];
     assert!(out.contains(r#"{"a":1,"b":[2,3]}"#), "got: {out}");
 }
 
@@ -347,8 +381,9 @@ async fn shell_capture_round_trip_via_variable_assign() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    assert_eq!(text_of(&frames[0]), r#"{"a":1,"b":[2,3]}"#);
-    assert_eq!(text_of(&frames[1]), r#"{"a":1,"b":[2,3]}"#);
+    let pushes = markdown_pushes(&frames);
+    assert_eq!(pushes[0], r#"{"a":1,"b":[2,3]}"#);
+    assert_eq!(pushes[1], r#"{"a":1,"b":[2,3]}"#);
 }
 
 #[tokio::test]
@@ -463,13 +498,10 @@ async fn shell_run_approve_yes_executes_command() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let out = frames
-        .iter()
-        .find_map(|f| match f {
-            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
-            _ => None,
-        })
-        .expect("expected a transcript push after approval");
+    let pushes = markdown_pushes(&frames);
+    let out = pushes
+        .first()
+        .expect("expected a markdown push after approval");
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("approved-and-ran"), "got `{out}`");
 }
@@ -628,7 +660,8 @@ async fn shell_run_approve_false_skips_gate() {
             "approve:false should not emit an approval frame: {f:?}",
         );
     }
-    let out = text_of(&frames[0]);
+    let pushes = markdown_pushes(&frames);
+    let out = &pushes[0];
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("no-gate"), "got `{out}`");
 }

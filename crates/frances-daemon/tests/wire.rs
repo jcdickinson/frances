@@ -60,7 +60,7 @@ fn block_kind_text_round_trips_with_sender() {
         kind: BlockKind::Text {
             sender: Some("you".into()),
         },
-        text: "hello".to_owned(),
+        text: Some("hello".to_owned()),
     };
     let bytes = bincode::serde::encode_to_vec(&with, bincode::config::standard()).unwrap();
     let (decoded, _): (StreamFrame, _) =
@@ -72,7 +72,7 @@ fn block_kind_text_round_trips_with_sender() {
             ..
         } => {
             assert_eq!(&*s, "you");
-            assert_eq!(text, "hello");
+            assert_eq!(text.as_deref(), Some("hello"));
         }
         other => panic!("expected Text {{ sender: Some(\"you\") }}, got {other:?}"),
     }
@@ -80,7 +80,7 @@ fn block_kind_text_round_trips_with_sender() {
     let without = StreamFrame::BlockDelta {
         id: BlockId(2),
         kind: BlockKind::Text { sender: None },
-        text: String::new(),
+        text: None,
     };
     let bytes = bincode::serde::encode_to_vec(&without, bincode::config::standard()).unwrap();
     let (decoded, _): (StreamFrame, _) =
@@ -88,9 +88,10 @@ fn block_kind_text_round_trips_with_sender() {
     match decoded {
         StreamFrame::BlockDelta {
             kind: BlockKind::Text { sender: None },
+            text: None,
             ..
         } => {}
-        other => panic!("expected Text {{ sender: None }}, got {other:?}"),
+        other => panic!("expected Text {{ sender: None }} with text=None, got {other:?}"),
     }
 }
 

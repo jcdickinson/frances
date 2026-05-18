@@ -1,4 +1,4 @@
-use frances_daemon::protocol::BlockKind;
+use frances_daemon::protocol::{BlockKind, ShellState};
 use frances_tui::Block;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -171,13 +171,11 @@ pub fn prefix_for(kind: &BlockKind) -> String {
         BlockKind::Text { sender: Some(s) } => format!("{s}: "),
         BlockKind::Text { sender: None } => String::new(),
         BlockKind::ToolUse { name } => format!("→ {name}("),
-        BlockKind::ToolResult { is_error, .. } => {
-            if *is_error {
-                "[err] ".to_string()
-            } else {
-                "[ok] ".to_string()
-            }
-        }
+        BlockKind::ShellOutput { state } => match state {
+            ShellState::Running => "[…] ".to_string(),
+            ShellState::Success => "[ok] ".to_string(),
+            ShellState::Exit(n) => format!("[exit {n}] "),
+        },
     }
 }
 
@@ -185,10 +183,11 @@ fn prefix_style(kind: &BlockKind) -> Style {
     match kind {
         BlockKind::Text { .. } => Style::default(),
         BlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
-        BlockKind::ToolResult { is_error: true, .. } => Style::default().fg(Color::Red),
-        BlockKind::ToolResult {
-            is_error: false, ..
-        } => Style::default().fg(Color::Green),
+        BlockKind::ShellOutput { state } => match state {
+            ShellState::Running => Style::default().fg(Color::Cyan),
+            ShellState::Success => Style::default().fg(Color::Green),
+            ShellState::Exit(_) => Style::default().fg(Color::Red),
+        },
     }
 }
 
@@ -196,6 +195,13 @@ pub fn wrapped_block_lines(kind: &BlockKind, text: &str, width: u16) -> Vec<Stri
     let prefix = prefix_for(kind);
     let indent = " ".repeat(display_width(&prefix));
     let max = width.max(1) as usize;
+    // LLM completions routinely end with one or more trailing `\n`s.
+    // Without stripping, `split('\n')` yields an empty trailing element
+    // that renders as an indent-only continuation row — visually a
+    // blank line between this block and whatever comes next. Embedded
+    // blank lines (`\n\n` mid-text) are preserved as real paragraph
+    // breaks.
+    let text = text.trim_end_matches('\n');
 
     let mut out = Vec::new();
     for (i, source_line) in text.split('\n').enumerate() {
@@ -263,4 +269,77 @@ fn pad_to_width(s: &str, target_width: usize) -> String {
         out.push_str(&" ".repeat(target_width - used));
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frances() -> BlockKind {
+        BlockKind::Text {
+            sender: Some("frances".into()),
+        }
+    }
+
+    #[test]
+    fn no_trailing_newline_is_unchanged() {
+        let lines = wrapped_block_lines(&frances(), "Hello", 80);
+        assert_eq!(lines, vec!["frances: Hello"]);
+    }
+
+    #[test]
+    fn single_trailing_newline_is_stripped() {
+        let lines = wrapped_block_lines(&frances(), "Hello\n", 80);
+        assert_eq!(
+            lines,
+            vec!["frances: Hello"],
+            "trailing `\\n` should not produce an indent-only continuation row"
+        );
+    }
+
+    #[test]
+    fn multiple_trailing_newlines_are_stripped() {
+        let lines = wrapped_block_lines(&frances(), "Hello\n\n\n", 80);
+        assert_eq!(lines, vec!["frances: Hello"]);
+    }
+
+    #[test]
+    fn mid_text_paragraph_break_is_preserved() {
+        let lines = wrapped_block_lines(&frances(), "One\n\nTwo", 80);
+        assert_eq!(
+            lines,
+            vec![
+                "frances: One".to_string(),
+                "         ".to_string(),
+                "         Two".to_string(),
+            ],
+            "an internal `\\n\\n` is a real paragraph break and stays"
+        );
+    }
+
+    #[test]
+    fn mid_text_paragraph_break_with_trailing_newline_keeps_only_the_break() {
+        let lines = wrapped_block_lines(&frances(), "One\n\nTwo\n", 80);
+        assert_eq!(
+            lines,
+            vec![
+                "frances: One".to_string(),
+                "         ".to_string(),
+                "         Two".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn newline_only_text_collapses_to_just_the_prefix() {
+        let lines = wrapped_block_lines(&frances(), "\n", 80);
+        assert_eq!(lines, vec!["frances: "]);
+    }
+
+    #[test]
+    fn senderless_text_block_with_trailing_newline_does_not_emit_blank_row() {
+        let kind = BlockKind::Text { sender: None };
+        let lines = wrapped_block_lines(&kind, "Hello\n", 80);
+        assert_eq!(lines, vec!["Hello"]);
+    }
 }

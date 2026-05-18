@@ -28,7 +28,8 @@ pub use config::WorkflowConfig;
 pub use deps::{EditorFactory, ShellFactory, WorkflowDeps};
 pub use error::WorkflowError;
 pub use runtime::{
-    FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, UserInput, WorkflowHandle,
+    FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, ShellState, UserInput,
+    WorkflowHandle,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

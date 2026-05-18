@@ -20,20 +20,20 @@ One tool covering name-pattern lookup, content search, and directory listing, wi
 ### Inputs
 
 - `paths`: list of glob patterns to include. Optional.
-- `search_text`: content pattern (regex). Optional.
+- `search`: content pattern (regex). Optional.
 - `exclude`: list of glob patterns to exclude. Optional.
-- `respect_gitignore`: bool, default `true`. Also honors `.ignore` and `.rgignore`.
-- `include_hidden`: bool, default `false`. Separate from gitignore — hidden files like `.env.example` are a different concern from vendored/ignored trees.
-- `max_depth`: int, optional. Unset = unlimited.
-- `files_with_matches_only`: bool, default `false`. When `search_text` is given, returns paths only without per-match detail.
-- `output_var`: string, optional. Variable name to dump the full structured result into.
+- `ignore`: bool, default `true`. Honors `.gitignore`, `.ignore` and `.rgignore`.
+- `hidden`: bool, default `false`. Separate from gitignore — hidden files like `.env.example` are a different concern from vendored/ignored trees.
+- `depth`: int, optional. Unset = unlimited.
+- `paths_only`: bool, default `false`. When `search_text` is given, returns paths only without per-match detail.
+- `into`: string, optional. Variable name to dump the full structured result into.
 
 #### Argument validity
 
-- `paths` and `search_text` are both optional. At least one of: `paths`, `search_text`, or no-args may be supplied.
+- `paths` and `search` are both optional. At least one of: `paths`, `search`, or no-args may be supplied.
 - No-args is **valid** and means "recursive listing of pwd, gitignore on" — equivalent to `paths: ["**/*"]`. This matches the common orientation move when an agent enters an unfamiliar repo.
-- Empty `paths: []` with no `search_text` is an **error**, not "everything." Empty list is different from omitted, and silently treating `[]` as a wildcard is a footgun for agents building args programmatically.
-- Error messages must be blunt: `provide at least one of "paths" or "search_text", or call with no arguments`. Vague "invalid arguments" wastes a turn.
+- Empty `paths: []` with no `search` is an **error**, not "everything." Empty list is different from omitted, and silently treating `[]` as a wildcard is a footgun for agents building args programmatically.
+- Error messages must be blunt: `provide at least one of "paths" or "search", or call with no arguments`. Vague "invalid arguments" wastes a turn.
 
 ### Pattern syntax
 
@@ -47,7 +47,7 @@ Each result entry:
 - `size` (bytes)
 - `mtime` (ISO 8601)
 - `binary: bool` — so the agent knows to skip reading it
-- If `search_text` given and not `files_with_matches_only`:
+- If `search` given and not `paths_only`:
   - `match_count`
   - `first_match`: `{ line: int, text: string }` — the matching line itself, no surrounding context by default
 
@@ -55,12 +55,12 @@ Sort: alphabetical by path. **No relevance ranking.** Ranking is hard, surprisin
 
 ### Inline summary vs. variable dump
 
-When `output_var` is set:
+When `input` is set:
 
 - Write the full structured result to the variable.
 - **Also** return an inline summary alongside the variable write — count plus the first ~5 paths (or first 5 matches). If the only output is "stored as $files," the agent must make a second call to peek, which destroys the ergonomics.
 
-When `output_var` is unset:
+When `input` is unset:
 
 - Return results inline.
 
@@ -80,7 +80,7 @@ Tell the agent in the tool description:
 - The glob dialect being used.
 - Two worked examples covering the common shapes:
   - `paths` only ("what Rust files are here")
-  - `paths` + `search_text` ("which configs mention DATABASE_URL")
+  - `paths` + `search` ("which configs mention DATABASE_URL")
 
 ## Decisions made
 
@@ -91,7 +91,7 @@ Tell the agent in the tool description:
 
 ## Explicitly rejected
 
-- **Relevance ranking on `search_text` results.** Sort alphabetically.
+- **Relevance ranking on `search` results.** Sort alphabetically.
 - **Inventing a glob dialect.** Pick rg's and document.
 - **Single-pattern `paths` / `exclude`.** Must be lists.
 - **Silent `[]` = everything fallback.** Error instead.

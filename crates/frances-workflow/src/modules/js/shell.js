@@ -44,7 +44,11 @@
 //   const vars = new Variables();
 //   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
 
-import { transcript, MarkdownFrame } from "frances:v1/frames";
+import {
+  transcript,
+  MarkdownFrame,
+  ShellOutputFrame,
+} from "frances:v1/frames";
 import { approve } from "frances:v1/approval";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
@@ -106,6 +110,101 @@ function _errResult(call_id, err) {
     content: String((err && err.message) || err),
     is_error: true,
   };
+}
+
+// The visible frame for the currently-running shell command — Run
+// pushes it, Wait/Kill append to it. A Shell instance only runs one
+// command at a time so a single slot is enough.
+//
+// `frame` is a `ShellOutputFrame`; `writer` is its writable's locked
+// writer (acquired once per frame so we don't fight reacquisition).
+function _openShellFrame(shell, cmd) {
+  // Defensive: a previous frame should have been finalized by Done/
+  // Dead/kill. If one's still around, close it before opening a new
+  // one so the scrollback row gets persisted.
+  if (shell._frame) {
+    _closeShellFrame(shell);
+  }
+  const frame = new ShellOutputFrame({ content: `$ ${cmd}\n` });
+  transcript.push(frame);
+  const writer = frame.writable.getWriter();
+  shell._frame = frame;
+  shell._writer = writer;
+  return { frame, writer };
+}
+
+// Append `text` to the open shell frame. No-op if no frame is open
+// (e.g. Wait was called before Run; the caller's tool_result will
+// surface the protocol violation).
+async function _appendShellOutput(shell, text) {
+  if (!shell._writer || !text) return;
+  try {
+    await shell._writer.write(text);
+  } catch (_) {
+    // Writer is closed/errored — drop the chunk silently. The body
+    // already on the frame remains; subsequent calls will discover
+    // shell._writer is gone and skip too.
+  }
+}
+
+// Set the frame's terminal state (`Success`/`Exit(N)`) and close the
+// writable. Autoclose on the writable's sink fires `frame.close()`.
+// No-op if there's no open frame.
+async function _closeShellFrame(shell, terminal) {
+  const frame = shell._frame;
+  const writer = shell._writer;
+  shell._frame = null;
+  shell._writer = null;
+  if (!frame) return;
+  if (terminal === "success") {
+    frame.success();
+  } else if (terminal && typeof terminal.exit === "number") {
+    frame.exit(terminal.exit);
+  }
+  if (writer) {
+    try {
+      await writer.close();
+    } catch (_) {
+      // Already closed/errored — fine.
+    }
+  } else {
+    // No writer? Close the frame directly so the daemon gets a Close.
+    try {
+      frame.close();
+    } catch (_) {
+      // Already closed — fine.
+    }
+  }
+}
+
+// Given a `runOnce`/`keepWaiting` outcome, append its captured output
+// to the frame and, if terminal (Done/Dead), close the frame with the
+// matching state. Returns the same outcome so the caller can chain.
+async function _frameOutcome(shell, outcome, killedSuffix) {
+  if (outcome.kind === "done") {
+    await _appendShellOutput(shell, outcome.output);
+    if (killedSuffix) {
+      await _appendShellOutput(shell, killedSuffix);
+    }
+    await _closeShellFrame(
+      shell,
+      outcome.exit_code === 0 ? "success" : { exit: outcome.exit_code },
+    );
+  } else if (outcome.kind === "dead") {
+    await _appendShellOutput(shell, outcome.output);
+    if (killedSuffix) {
+      await _appendShellOutput(shell, killedSuffix);
+    }
+    // Bash itself exited. We don't know the cause; use -1 as a
+    // sentinel so the TUI renders it red without colliding with a
+    // typical exit code.
+    await _closeShellFrame(shell, { exit: -1 });
+  } else {
+    // Quiet — leave the frame open. The output captured up to this
+    // point still goes into the body so the user sees progress.
+    await _appendShellOutput(shell, outcome.output);
+  }
+  return outcome;
 }
 
 // Ask the user to approve a `shell_run` call. Returns `null` if the
@@ -173,12 +272,17 @@ class Run {
       if (gate !== null) return gate;
     }
 
+    _openShellFrame(this.shell, call.arguments.cmd);
     let outcome;
     try {
       outcome = await this.shell.runOnce(call.arguments.cmd);
     } catch (err) {
+      // The frame is open but the command never produced an outcome;
+      // close it as exit(-1) so the user sees a terminal state.
+      await _closeShellFrame(this.shell, { exit: -1 });
       return _errResult(call.id, err);
     }
+    await _frameOutcome(this.shell, outcome);
     if (outcome.kind !== "quiet") return _format(call.id, outcome);
 
     // Quiet: register a post-batch turn to negotiate wait/kill with the
@@ -224,15 +328,20 @@ class Run {
 
         if (scoldsRemaining <= 0) {
           // Budget exhausted — kill the in-flight command and drain.
+          // Both phases' outputs land in the shell frame so the user
+          // sees the final state.
           try {
             await shell.kill();
           } catch (_) {
             // Already settled — fine.
           }
           try {
-            await shell.keepWaiting();
+            const drained = await shell.keepWaiting();
+            await _frameOutcome(shell, drained, "\n(killed)");
           } catch (_) {
-            // Already idle — fine.
+            // Already idle — close the frame defensively if anyone
+            // left it open.
+            await _closeShellFrame(shell, { exit: -1 });
           }
           const killMsg =
             `Killed the shell command from ${call.id} — model did not call ` +
@@ -268,6 +377,7 @@ class Wait {
   handler = async ({ call }) => {
     try {
       const outcome = await this.shell.keepWaiting();
+      await _frameOutcome(this.shell, outcome);
       return _format(call.id, outcome);
     } catch (err) {
       return _errResult(call.id, err);
@@ -296,7 +406,13 @@ class Kill {
       } catch (_) {
         // Nothing in flight — already idle, no drain needed.
       }
-      if (final) return _format(call.id, final);
+      if (final) {
+        await _frameOutcome(this.shell, final, "\n(killed)");
+        return _format(call.id, final);
+      }
+      // Nothing was in flight. Close any leftover frame so the row
+      // gets persisted; the LLM gets a plain "killed" tool_result.
+      await _closeShellFrame(this.shell, { exit: -1 });
       return {
         role: "tool",
         call_id: call.id,

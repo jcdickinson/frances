@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS scrollback_blocks (
     -- Workflow instance UUID (matches `workflow_stack.instance_id`).
     -- Replay filters on this so each workflow has its own scrollback.
     instance_id  BLOB    NOT NULL,
-    -- 'text' | 'tool_use' | 'tool_result' | 'error'
+    -- 'text' | 'tool_use' | 'shell_output' | 'error'
     kind         TEXT    NOT NULL,
     -- Kind-shaped JSON; serde-on-read decides the shape.
     payload      JSONB   NOT NULL,

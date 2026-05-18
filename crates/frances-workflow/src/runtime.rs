@@ -44,13 +44,24 @@ const USER_MODULE_NAME: &str = "frances:user-script";
 /// host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
 pub enum HostFrame {
-    /// A new frame was pushed onto the transcript. Implicitly seals the
-    /// previously-active frame (the host should close that wire block
-    /// before opening this one).
+    /// A new frame was pushed onto the transcript. Does NOT implicitly
+    /// seal anything — each frame type chooses when it's done (markdown
+    /// emits `Close` for its predecessor before its own `Push`; shell
+    /// output emits `Close` when its state goes terminal).
     Push(FramePush),
-    /// Append text to the frame with the given id. Only valid while
-    /// that frame is still the active one — the JS side enforces this.
+    /// Append text to the frame with the given id. Valid for as long
+    /// as the frame remains open; the JS side enforces per-frame-type
+    /// rules (active-markdown slot, ShellOutput's open flag).
     Append { id: FrameId, delta: String },
+    /// Replace the kind of the frame with the given id. Used for
+    /// in-place metadata transitions (e.g. ShellOutput's state going
+    /// from Running to Success/Exit). The host emits a no-text
+    /// `BlockDelta` carrying the new kind so the TUI re-renders.
+    UpdateKind { id: FrameId, kind: FrameKind },
+    /// Close the frame with the given id. The host emits a `BlockStop`
+    /// and persists the row. Idempotent on unknown ids (the JS side
+    /// suppresses double-close).
+    Close { id: FrameId },
     /// Ask the user a question. The corresponding answer arrives back
     /// through the `ApprovalGateway`'s response oneshot.
     Approval(ApprovalRequest),
@@ -73,8 +84,13 @@ pub enum FrameKind {
     /// `MarkdownFrame` — text content that may be extended with `append`.
     /// `sender` labels the speaker (e.g. `"you"`, `"frances"`); the host
     /// renders it as a block prefix. `None` ⇒ no prefix.
+    ///
+    /// `content` is `None` when the workflow constructed the frame
+    /// without an initial body — the daemon sends a `BlockDelta` with
+    /// `text: None`, the client tracks the id but doesn't measure or
+    /// render it. The first `append` materialises the block.
     Markdown {
-        content: String,
+        content: Option<String>,
         sender: Option<String>,
     },
     /// `ErrorFrame` — text content (typically rendered as an error) that
@@ -85,6 +101,22 @@ pub enum FrameKind {
         tag: String,
         value: serde_json::Value,
     },
+    /// `ShellOutputFrame` — streaming output from one shell command.
+    /// `content` is the initial body (typically the `$ cmd` header
+    /// plus any output captured before the first push). `state`
+    /// transitions from `Running` to `Success`/`Exit(N)` via
+    /// [`HostFrame::UpdateKind`] as the command completes.
+    ShellOutput { state: ShellState, content: String },
+}
+
+/// Terminal status for [`FrameKind::ShellOutput`]. Mirrors
+/// `frances_daemon::protocol::ShellState`; the daemon translates one
+/// to the other when it emits the wire `BlockKind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ShellState {
+    Running,
+    Success,
+    Exit(i32),
 }
 
 /// A single user input event delivered to `inbox`.
@@ -852,12 +884,16 @@ mod tests {
     fn text_of(frame: &HostFrame) -> String {
         match frame {
             HostFrame::Push(p) => match &p.kind {
-                FrameKind::Markdown { content, .. } | FrameKind::Error { content } => {
-                    content.clone()
-                }
+                FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
+                FrameKind::Error { content } => content.clone(),
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
+                FrameKind::ShellOutput { state, content } => {
+                    format!("[shell:{state:?}] {content}")
+                }
             },
             HostFrame::Append { delta, .. } => delta.clone(),
+            HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
+            HostFrame::Close { id } => format!("[close:{}]", id.0),
             HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
         }
     }
@@ -1273,6 +1309,83 @@ mod tests {
         );
     }
 
+    /// `new MarkdownFrame({ sender })` (and `{ content: undefined }`
+    /// and `{ content: null }`) all produce `FrameKind::Markdown` with
+    /// `content: None`. The wire opener carries no body, so the TUI
+    /// defers measure / render until the workflow writes into it.
+    #[tokio::test]
+    async fn markdown_frame_content_can_be_omitted() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ sender: "frances" }));
+            transcript.push(new MarkdownFrame({ content: undefined }));
+            transcript.push(new MarkdownFrame({ content: null }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        for (i, expect_sender) in [Some("frances"), None, None].iter().enumerate() {
+            match &frames[i] {
+                HostFrame::Push(p) => match &p.kind {
+                    FrameKind::Markdown { content, sender } => {
+                        assert!(content.is_none(), "frame {i} should have content=None");
+                        assert_eq!(sender.as_deref(), *expect_sender, "frame {i} sender");
+                    }
+                    other => panic!("frame {i} unexpected kind {other:?}"),
+                },
+                other => panic!("frame {i} unexpected {other:?}"),
+            }
+        }
+    }
+
+    /// Pushing an empty-content frame and never writing to it produces
+    /// `Push` + `Close` only — no `Append` in between. The daemon side
+    /// uses this signal to skip persisting the row and the client uses
+    /// the absent body delta to skip rendering.
+    #[tokio::test]
+    async fn empty_markdown_frame_pushes_and_closes_without_appends() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const f = new MarkdownFrame({ sender: "frances" });
+            transcript.push(f);
+            await f.writable.close();
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        assert!(matches!(
+            &frames[0],
+            HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content: None, .. })
+        ));
+        assert!(matches!(&frames[1], HostFrame::Close { .. }));
+        assert!(
+            !frames.iter().any(|f| matches!(f, HostFrame::Append { .. })),
+            "no Append should be emitted for a never-written frame"
+        );
+    }
+
     #[tokio::test]
     async fn write_on_active_frame_emits_delta() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
@@ -1298,7 +1411,7 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert!(
-            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content, .. } if content == "hello"))
+            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content: Some(content), .. } if content == "hello"))
         );
         assert!(matches!(&frames[1], HostFrame::Append { delta, .. } if delta == " world"));
     }
@@ -1327,13 +1440,13 @@ mod tests {
         assert!(matches!(
             &frames[0],
             HostFrame::Push(p)
-                if matches!(&p.kind, FrameKind::Markdown { content, sender: Some(s) }
+                if matches!(&p.kind, FrameKind::Markdown { content: Some(content), sender: Some(s) }
                     if content == "hi" && s == "you")
         ));
         assert!(matches!(
             &frames[1],
             HostFrame::Push(p)
-                if matches!(&p.kind, FrameKind::Markdown { content, sender: None }
+                if matches!(&p.kind, FrameKind::Markdown { content: Some(content), sender: None }
                     if content == "ok")
         ));
     }
@@ -1365,7 +1478,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_on_superseded_frame_throws() {
+    async fn write_to_earlier_frame_after_newer_push_still_works() {
+        // Pushing a second frame doesn't seal the first — multiple
+        // frames can be writeable at once. Each frame's writes route
+        // by id, so a workflow can stream into a long-running shell
+        // block while also emitting markdown text alongside it.
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
@@ -1375,7 +1492,7 @@ mod tests {
             transcript.push(a);
             transcript.push(new MarkdownFrame({ content: "b" }));
             const w = a.writable.getWriter();
-            await w.write(" extra");  // should reject — a is no longer active
+            await w.write(" extra");
             "#,
         );
         let mut handle = rt
@@ -1386,12 +1503,121 @@ mod tests {
             })
             .await
             .unwrap();
-        let (_frames, result) = drive_one_cycle(&mut handle).await;
+        let (frames, result) = drive_one_cycle(&mut handle).await;
         let result = result.expect("workflow should have terminated");
-        assert!(
-            matches!(result, Err(WorkflowError::ScriptCaught { .. })),
-            "got {result:?}"
+        assert!(matches!(result, Ok(())), "got {result:?}");
+        // Two Push frames (a, b) then one Append carrying " extra"
+        // for `a`'s id.
+        let appends: Vec<_> = frames
+            .iter()
+            .filter_map(|f| match f {
+                HostFrame::Append { id, delta } => Some((*id, delta.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(appends.len(), 1, "expected one append, got {appends:?}");
+        assert_eq!(appends[0].1, " extra");
+    }
+
+    #[tokio::test]
+    async fn shell_output_frame_pushes_streams_transitions_and_closes() {
+        // Exercise the ShellOutputFrame lifecycle: push (Running), pipe
+        // stdout in, transition to exit, autoclose seals the block.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, ShellOutputFrame } from "frances:v1/frames";
+            const f = new ShellOutputFrame({ content: "$ ls\n" });
+            transcript.push(f);
+            const w = f.writable.getWriter();
+            await w.write("a\n");
+            await w.write("b\n");
+            f.exit(0);
+            await w.close();   // autoclose fires frame.close()
+            "#,
         );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, result) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(result, Some(Ok(()))), "got {result:?}");
+
+        // Expect: one Push (Running, "$ ls\n"), two Appends ("a\n",
+        // "b\n"), one UpdateKind (Exit(0)), one Close.
+        let push = match frames.first() {
+            Some(HostFrame::Push(p)) => p,
+            other => panic!("expected first frame to be Push, got {other:?}"),
+        };
+        let frame_id = push.id;
+        match &push.kind {
+            FrameKind::ShellOutput {
+                state: ShellState::Running,
+                content,
+            } => assert_eq!(content, "$ ls\n"),
+            other => panic!("expected ShellOutput Running, got {other:?}"),
+        }
+
+        let appends: Vec<&String> = frames
+            .iter()
+            .filter_map(|f| match f {
+                HostFrame::Append { id, delta } if *id == frame_id => Some(delta),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            appends.iter().map(|s| s.as_str()).collect::<Vec<_>>(),
+            vec!["a\n", "b\n"]
+        );
+
+        let saw_exit = frames.iter().any(|f| {
+            matches!(
+                f,
+                HostFrame::UpdateKind { id, kind: FrameKind::ShellOutput { state: ShellState::Exit(0), .. } } if *id == frame_id,
+            )
+        });
+        assert!(saw_exit, "expected UpdateKind(Exit(0)) for the frame");
+
+        let saw_close = frames
+            .iter()
+            .any(|f| matches!(f, HostFrame::Close { id } if *id == frame_id));
+        assert!(saw_close, "expected Close for the frame");
+    }
+
+    #[tokio::test]
+    async fn frame_autoclose_can_be_disabled() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const f = new MarkdownFrame({ content: "" });
+            f.autoclose = false;
+            transcript.push(f);
+            const w = f.writable.getWriter();
+            await w.write("hi");
+            await w.close();   // autoclose disabled — no Close emitted
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, _result) = drive_one_cycle(&mut handle).await;
+        let close_count = frames
+            .iter()
+            .filter(|f| matches!(f, HostFrame::Close { .. }))
+            .count();
+        assert_eq!(close_count, 0, "autoclose=false should suppress Close");
     }
 
     #[tokio::test]
@@ -4710,7 +4936,7 @@ mod tests {
             })
             .expect("expected a markdown push after approval");
         assert!(
-            matches!(&last.kind, FrameKind::Markdown { content, .. } if content == "yes:scoped to /tmp"),
+            matches!(&last.kind, FrameKind::Markdown { content: Some(content), .. } if content == "yes:scoped to /tmp"),
             "got {:?}",
             last.kind,
         );

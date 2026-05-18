@@ -92,10 +92,17 @@ pub enum StreamFrame {
     /// client that connects mid-block (or reconnects after the events
     /// socket died) can construct the block from the very next delta
     /// without needing to have seen the start.
+    ///
+    /// `text` is `None` when the frame carries no body delta this
+    /// round — either an opener for a block that was pushed without
+    /// initial content (the workflow will write to it later) or an
+    /// in-place metadata transition (kind-only update). The client
+    /// tracks the id but skips measure/render until the first
+    /// `Some(_)` text arrives.
     BlockDelta {
         id: BlockId,
         kind: BlockKind,
-        text: String,
+        text: Option<String>,
     },
     BlockStop {
         id: BlockId,
@@ -149,10 +156,26 @@ pub enum BlockKind {
     ToolUse {
         name: Arc<str>,
     },
-    ToolResult {
-        tool_use_id: Arc<str>,
-        is_error: bool,
+    /// Streaming output from a shell command. The body carries the
+    /// command and its accumulated stdout; `state` advances from
+    /// `Running` to `Success`/`Exit(N)` as the command completes,
+    /// with the TUI re-rendering on each transition.
+    ShellOutput {
+        state: ShellState,
     },
+}
+
+/// Terminal-status enum for [`BlockKind::ShellOutput`]. Carried on
+/// every `BlockDelta` so an in-place transition is just a no-text
+/// delta with the new state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShellState {
+    /// Command is still in flight.
+    Running,
+    /// Command exited 0.
+    Success,
+    /// Command exited with a non-zero code (or was killed before exit).
+    Exit(i32),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

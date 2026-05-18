@@ -63,10 +63,14 @@ async fn drive_one_cycle_inner(
 fn text_of(frame: &HostFrame) -> String {
     match frame {
         HostFrame::Push(p) => match &p.kind {
-            FrameKind::Markdown { content, .. } | FrameKind::Error { content } => content.clone(),
+            FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
+            FrameKind::Error { content } => content.clone(),
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
+            FrameKind::ShellOutput { state, content } => format!("[shell:{state:?}] {content}"),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
+        HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
+        HostFrame::Close { id } => format!("[close:{}]", id.0),
         HostFrame::Approval(req) => format!("[approval:{}] {}", req.id, req.prompt),
     }
 }

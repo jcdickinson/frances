@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{Stdout, Write, stdout};
 
 use anyhow::{Context, Result};
@@ -59,123 +60,106 @@ enum ScrollbackAction {
 }
 
 struct ActiveBlock {
-    protocol_id: protocol::BlockId,
-    container_id: ContainerBlockId,
+    /// `None` until the first `Some(text)` delta materialises the
+    /// block — the wire opener for an empty-content push tracks the
+    /// id and kind here without ever measuring or rendering. As soon
+    /// as any body text arrives we push to the container and remember
+    /// its slot.
+    container_id: Option<ContainerBlockId>,
     kind: BlockKind,
     text: String,
 }
 
-/// Local state machine for the in-progress streamed block. Out-of-order
-/// frames (delta with no active block, stop for a mismatched id) become
-/// explicit errors instead of silent drops.
-enum BlockState {
-    Idle,
-    Active(ActiveBlock),
+/// Per-protocol-id tracker for the live blocks currently in flight.
+/// The container itself supports arbitrarily many simultaneously-active
+/// blocks; this map is just the bridge from wire `BlockId`s to the
+/// container's local ids plus the accumulated text needed to re-render
+/// on each delta.
+struct LiveBlocks {
+    by_id: HashMap<protocol::BlockId, ActiveBlock>,
 }
 
-impl BlockState {
+impl LiveBlocks {
     fn new() -> Self {
-        Self::Idle
+        Self {
+            by_id: HashMap::new(),
+        }
     }
 
-    /// Process one self-describing delta. If `self` is `Idle`, opens a
-    /// new active block of `kind` with `text` as its initial content.
-    /// If `self` is `Active` with a matching id, appends. If the id
-    /// doesn't match, closes the previous block (returning its
-    /// container id so the caller can `mark_safe` it) and opens a
-    /// fresh one. Always leaves `self` in `Active` state.
+    /// Process one self-describing delta. The first time we see `id`
+    /// we record `kind` (and any body text) but only push to the
+    /// container once `text` is `Some(_)` — an opener with `text: None`
+    /// is a "tracked but not yet rendered" block. Subsequent deltas
+    /// update the kind on every call (so ShellOutput state transitions
+    /// land in-place); body text accumulates, materialising the block
+    /// the first time `text` is `Some(_)`.
     fn delta(
         &mut self,
         container: &mut ScrollbackContainer,
         id: protocol::BlockId,
         kind: BlockKind,
-        text: &str,
-    ) -> Option<ContainerBlockId> {
-        if let Self::Active(active) = self
-            && active.protocol_id == id
-        {
-            active.text.push_str(text);
-            container.update_active(
-                active.container_id,
-                Box::new(LabelledBlock::new(active.kind.clone(), active.text.clone())),
-            );
-            return None;
-        }
-        // Either Idle, or Active with a different id. Take the previous
-        // (if any) so the caller can mark_safe it, then open fresh.
-        let previous = match std::mem::replace(self, Self::Idle) {
-            Self::Active(prev) => Some(prev.container_id),
-            Self::Idle => None,
-        };
-        let container_id =
-            container.push_active(Box::new(LabelledBlock::new(kind.clone(), text.to_owned())));
-        *self = Self::Active(ActiveBlock {
-            protocol_id: id,
-            container_id,
-            kind,
-            text: text.to_owned(),
+        text: Option<String>,
+    ) {
+        let entry = self.by_id.entry(id).or_insert_with(|| ActiveBlock {
+            container_id: None,
+            kind: kind.clone(),
+            text: String::new(),
         });
-        previous
-    }
-
-    fn stop(&mut self, id: protocol::BlockId) -> Result<ContainerBlockId> {
-        let container_id = match self {
-            Self::Idle => {
-                return Err(anyhow::anyhow!(
-                    "BlockStop {id} arrived with no active block"
-                ));
-            }
-            Self::Active(active) => {
-                if active.protocol_id != id {
-                    return Err(anyhow::anyhow!(
-                        "BlockStop {id} does not match active block {}",
-                        active.protocol_id
-                    ));
+        entry.kind = kind;
+        if let Some(t) = text {
+            entry.text.push_str(&t);
+            match entry.container_id {
+                Some(cid) => container.update_active(
+                    cid,
+                    Box::new(LabelledBlock::new(entry.kind.clone(), entry.text.clone())),
+                ),
+                None => {
+                    let cid = container.push_active(Box::new(LabelledBlock::new(
+                        entry.kind.clone(),
+                        entry.text.clone(),
+                    )));
+                    entry.container_id = Some(cid);
                 }
-                active.container_id
             }
-        };
-        *self = Self::Idle;
-        Ok(container_id)
+        } else if let Some(cid) = entry.container_id {
+            // Kind-only delta on an already-materialised block — re-render
+            // so the new kind's prefix / style takes effect.
+            container.update_active(
+                cid,
+                Box::new(LabelledBlock::new(entry.kind.clone(), entry.text.clone())),
+            );
+        }
     }
 
-    /// Like [`stop`] but never returns an error: on an id mismatch
-    /// or no-active condition (protocol bug on the daemon side), it
-    /// logs via `tracing::warn!` and returns the orphan's container
-    /// id (if any) so the caller can still `mark_safe` it. The
-    /// dispatch loop uses this so a misbehaving daemon doesn't kill
-    /// the TUI.
-    ///
-    /// `frame_label` is the wire frame's variant name, included in
-    /// the log for triage.
+    /// Mark the block at `id` ready to commit. Returns the container
+    /// slot if the block was ever materialised; an unmaterialised
+    /// block (only ever saw `text: None`) returns `None` silently.
+    /// A `BlockStop` for a completely-unknown id is a daemon-side
+    /// protocol bug — we warn and return `None`.
     fn stop_or_recover(
         &mut self,
         id: protocol::BlockId,
         frame_label: &'static str,
     ) -> Option<ContainerBlockId> {
-        match self.stop(id) {
-            Ok(container_id) => Some(container_id),
-            Err(err) => {
-                warn!(%err, frame = frame_label, "protocol violation; recovering");
-                self.take_container_id()
+        match self.by_id.remove(&id) {
+            Some(active) => active.container_id,
+            None => {
+                warn!(
+                    %id,
+                    frame = frame_label,
+                    "BlockStop for unknown id; recovering",
+                );
+                None
             }
         }
     }
 
-    fn take_container_id(&mut self) -> Option<ContainerBlockId> {
-        match std::mem::replace(self, Self::Idle) {
-            Self::Active(active) => Some(active.container_id),
-            Self::Idle => None,
-        }
-    }
-
-    /// Drop any in-flight active tracking without writing back to the
-    /// container. Used on `ScrollbackReset`: the container is about
-    /// to be cleared, so the in-memory active entry will go away with
-    /// it; the protocol tracking state on this side just needs to
-    /// reset.
+    /// Drop all live tracking without touching the container. Used on
+    /// `ScrollbackReset`: the container is about to be cleared, so
+    /// every in-memory active entry will go away with it; we just
+    /// need to reset the protocol-id → container-id map.
     fn discard(&mut self) {
-        *self = Self::Idle;
+        self.by_id.clear();
     }
 }
 
@@ -228,7 +212,7 @@ impl App<'_> {
         }
 
         let mut textarea = Textarea::new("type a message…");
-        let mut state = BlockState::new();
+        let mut state = LiveBlocks::new();
         let mut pending_approval: Option<ApprovalRequest> = None;
         let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
         let mut events = EventStream::new();
@@ -463,7 +447,7 @@ struct ReplayBlock {
 fn handle_frame(
     terminal: &mut AppTerminal,
     container: &mut ScrollbackContainer,
-    state: &mut BlockState,
+    state: &mut LiveBlocks,
     replay_mode: &mut bool,
     frame: StreamFrame,
 ) -> Result<Option<ApprovalRequest>> {
@@ -487,9 +471,7 @@ fn handle_frame(
             // malformed bracket. Ignore.
         }
         StreamFrame::BlockDelta { id, kind, text } => {
-            if let Some(prev_id) = state.delta(container, id, kind, &text) {
-                container.mark_safe(prev_id);
-            }
+            state.delta(container, id, kind, text);
         }
         StreamFrame::BlockStop { id } => {
             if let Some(container_id) = state.stop_or_recover(id, "BlockStop") {
@@ -513,22 +495,17 @@ fn handle_frame(
         StreamFrame::Done => {
             // Done is a transport boundary ("this prompt's stream
             // ended"), not a semantic "close everything". Blocks live
-            // until an explicit BlockStop or until a newer BlockStart
-            // supersedes them.
+            // until an explicit BlockStop.
         }
         StreamFrame::Error(message) => {
-            if let Some(id) = state.take_container_id() {
-                container.mark_safe(id);
-            }
+            // Error frames are a side-channel — they don't seal any
+            // open block. They render below whatever's in flight.
             container.push(Box::new(RawBlock::single_styled(
                 format!("frances: error: {message}"),
                 Style::default().fg(Color::Red),
             )));
         }
         StreamFrame::Approval(request) => {
-            if let Some(id) = state.take_container_id() {
-                container.mark_safe(id);
-            }
             container.push(Box::new(RawBlock::single_styled(
                 format!("approval: {}", request.prompt),
                 Style::default().fg(Color::Yellow),
@@ -576,13 +553,25 @@ fn handle_replay_frame(
                 let mut guard = cell.borrow_mut();
                 match guard.as_mut() {
                     Some(open) if open.id == id => {
-                        open.text.push_str(&text);
+                        // Replay sends `text: Some(_)` for every stored
+                        // row; `None` here would mean an in-place
+                        // metadata transition replayed against an
+                        // existing open block (unused today, but cheap
+                        // to handle and keeps the kind in sync).
+                        open.kind = kind;
+                        if let Some(t) = text {
+                            open.text.push_str(&t);
+                        }
                     }
                     _ => {
                         // Either nothing open, or a new id: drop any
                         // orphan (the daemon is expected to close
                         // every block it opens) and start fresh.
-                        *guard = Some(ReplayBlock { id, kind, text });
+                        *guard = Some(ReplayBlock {
+                            id,
+                            kind,
+                            text: text.unwrap_or_default(),
+                        });
                     }
                 }
             });
@@ -739,16 +728,14 @@ mod tests {
         Box::new(Paragraph::new(Line::raw("footer")))
     }
 
-    /// Drives `BlockState::delta` against a real `ScrollbackContainer`
-    /// (paragraph footer; no terminal needed). Verifies the
-    /// delta-driven state machine: a first delta on `Idle` opens the
-    /// block; same-id subsequent delta appends; different-id delta
-    /// closes the previous one (returning its container id so the
-    /// caller can `mark_safe`) and opens a fresh block.
+    /// Drives `LiveBlocks::delta` against a real `ScrollbackContainer`.
+    /// Verifies that two distinct ids coexist as concurrently-open
+    /// active blocks (no implicit close), same-id deltas append, and
+    /// each block closes independently via `stop_or_recover`.
     #[test]
-    fn block_state_delta_opens_appends_and_supersedes() {
+    fn live_blocks_two_ids_coexist_and_close_independently() {
         let mut container = ScrollbackContainer::new(footer(), 0);
-        let mut state = BlockState::new();
+        let mut state = LiveBlocks::new();
         let kind_a = BlockKind::Text {
             sender: Some("user".into()),
         };
@@ -756,85 +743,177 @@ mod tests {
             name: "shell".into(),
         };
 
-        // First delta on Idle: opens A. No previous container id to
-        // mark safe.
-        assert!(
-            state
-                .delta(&mut container, protocol::BlockId(1), kind_a.clone(), "hel")
-                .is_none()
+        // Open id 1.
+        state.delta(
+            &mut container,
+            protocol::BlockId(1),
+            kind_a.clone(),
+            Some("hel".to_owned()),
         );
         assert_eq!(container.active_count(), 1);
+
+        // Same-id append.
+        state.delta(
+            &mut container,
+            protocol::BlockId(1),
+            kind_a,
+            Some("lo".to_owned()),
+        );
+        assert_eq!(container.active_count(), 1);
+
+        // Different-id delta: opens a second active alongside the
+        // first. Neither closes.
+        state.delta(
+            &mut container,
+            protocol::BlockId(2),
+            kind_b,
+            Some("ls".to_owned()),
+        );
+        assert_eq!(container.active_count(), 2);
         assert_eq!(container.safe_count(), 0);
 
-        // Same-id delta: appends. Still no previous id returned.
-        assert!(
-            state
-                .delta(&mut container, protocol::BlockId(1), kind_a.clone(), "lo")
-                .is_none()
-        );
-        assert_eq!(container.active_count(), 1);
-
-        // Different-id delta: closes A (returns its container id so
-        // caller can mark_safe) and opens B.
-        let prev = state.delta(&mut container, protocol::BlockId(2), kind_b.clone(), "ls");
-        let prev_id = prev.expect("supersession returns prior container id");
-        container.mark_safe(prev_id);
-        // A drained to safe, B is the new active.
-        assert_eq!(container.active_count(), 1);
-        assert_eq!(container.safe_count(), 1);
-
-        // Closing B leaves both in safe / nothing active.
-        let b_id = state.stop(protocol::BlockId(2)).expect("stop B");
+        // Close id 2 first — its slot drains; id 1 is still active
+        // but stuck behind id 2 in container order, so it's now also
+        // ready to commit (mark_safe drains the contiguous prefix).
+        let b_id = state
+            .stop_or_recover(protocol::BlockId(2), "BlockStop")
+            .expect("stop id 2");
         container.mark_safe(b_id);
+
+        // Close id 1.
+        let a_id = state
+            .stop_or_recover(protocol::BlockId(1), "BlockStop")
+            .expect("stop id 1");
+        container.mark_safe(a_id);
+
         assert_eq!(container.active_count(), 0);
         assert_eq!(container.safe_count(), 2);
     }
 
-    /// `BlockStop` for an id we don't have open is a protocol bug
-    /// on the daemon side. The TUI should not bail back to the CLI
-    /// — it should log and continue. With no active block at all,
-    /// `stop_or_recover` returns `None` so the caller does nothing.
+    /// `BlockStop` for an id we don't have open is a protocol bug on
+    /// the daemon side. The TUI should not bail back to the CLI — it
+    /// should log and continue. `stop_or_recover` returns `None`.
     #[test]
     fn block_stop_for_unknown_id_does_not_bail() {
         let container = ScrollbackContainer::new(footer(), 0);
-        let mut state = BlockState::new();
+        let mut state = LiveBlocks::new();
 
         let result = state.stop_or_recover(protocol::BlockId(99), "BlockStop");
 
-        assert!(
-            result.is_none(),
-            "with no active block there's nothing to mark safe"
-        );
+        assert!(result.is_none(), "unknown id stop returns None");
         assert_eq!(container.active_count(), 0);
         assert_eq!(container.safe_count(), 0);
         assert_eq!(container.committed_count(), 0);
     }
 
-    /// `BlockStop` whose id doesn't match the active block. The
-    /// orphan active block must still be reclaimed (via the
-    /// returned container id, which the caller marks safe), so the
-    /// container doesn't drift into a half-open state.
+    /// A run of `text: None` deltas between two completed blocks —
+    /// covering both `sender: Some(_)` and `sender: None` shapes, plus
+    /// closing some of them while leaving others tracked — must not
+    /// insert anything into the container. Guards against the case
+    /// where a `transcript.push(new MarkdownFrame({ sender }))` /
+    /// `transcript.push(new MarkdownFrame({ content: null }))` pair
+    /// would somehow surface as a blank row between the real frames
+    /// either side of it.
     #[test]
-    fn block_stop_with_mismatched_id_marks_orphan_safe_and_recovers() {
+    fn none_text_frames_between_completed_blocks_add_no_rows() {
         let mut container = ScrollbackContainer::new(footer(), 0);
-        let mut state = BlockState::new();
+        let mut state = LiveBlocks::new();
+        let frances = || BlockKind::Text {
+            sender: Some("frances".into()),
+        };
+        let bare = || BlockKind::Text { sender: None };
+        let you = || BlockKind::Text {
+            sender: Some("you".into()),
+        };
+
+        // Completed block A.
+        state.delta(
+            &mut container,
+            protocol::BlockId(1),
+            frances(),
+            Some("first".to_owned()),
+        );
+        let a_id = state
+            .stop_or_recover(protocol::BlockId(1), "BlockStop")
+            .expect("close A");
+        container.mark_safe(a_id);
+        assert_eq!(container.safe_count(), 1);
+        assert_eq!(container.active_count(), 0);
+
+        // None-content frames in between: mixed senders, some closed,
+        // some still tracked when block B opens.
+        state.delta(&mut container, protocol::BlockId(2), frances(), None);
+        state.delta(&mut container, protocol::BlockId(3), bare(), None);
+        state.delta(&mut container, protocol::BlockId(4), you(), None);
+        state.delta(&mut container, protocol::BlockId(5), bare(), None);
+        assert_eq!(
+            container.active_count(),
+            0,
+            "no None-text frame may materialise"
+        );
+
+        // Closing a tracked-but-unmaterialised frame must return None
+        // (no container id to mark safe) and not touch the container.
+        assert!(
+            state
+                .stop_or_recover(protocol::BlockId(2), "BlockStop")
+                .is_none()
+        );
+        assert!(
+            state
+                .stop_or_recover(protocol::BlockId(4), "BlockStop")
+                .is_none()
+        );
+        assert_eq!(container.active_count(), 0);
+        assert_eq!(container.safe_count(), 1);
+
+        // Completed block B opens with ids 3 and 5 still tracked but
+        // unrendered — they must not affect ordering or counts.
+        state.delta(
+            &mut container,
+            protocol::BlockId(6),
+            frances(),
+            Some("second".to_owned()),
+        );
+        let b_id = state
+            .stop_or_recover(protocol::BlockId(6), "BlockStop")
+            .expect("close B");
+        container.mark_safe(b_id);
+
+        assert_eq!(container.active_count(), 0);
+        assert_eq!(
+            container.safe_count(),
+            2,
+            "exactly two materialised blocks; None-content frames contributed nothing"
+        );
+        assert_eq!(container.committed_count(), 0);
+    }
+
+    /// `BlockStop` with an id that doesn't match any open block must
+    /// leave the existing opens alone — multi-open means an unknown
+    /// stop is a side event, not a "close the current block" signal.
+    #[test]
+    fn block_stop_with_unknown_id_leaves_others_open() {
+        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut state = LiveBlocks::new();
         let kind = BlockKind::Text {
             sender: Some("user".into()),
         };
 
         // Open id 1.
-        let _ = state.delta(&mut container, protocol::BlockId(1), kind, "hi");
+        state.delta(
+            &mut container,
+            protocol::BlockId(1),
+            kind,
+            Some("hi".to_owned()),
+        );
         assert_eq!(container.active_count(), 1);
 
-        // Stop with id 2 — mismatched.
+        // Stop with id 2 — unknown. Returns None; id 1 stays open.
         let recovered = state.stop_or_recover(protocol::BlockId(2), "BlockStop");
-        let orphan = recovered.expect("mismatch path returns orphan's container id");
-        container.mark_safe(orphan);
-
-        // Orphan drained to safe; nothing left active; the state
-        // machine is back to Idle.
-        assert_eq!(container.active_count(), 0);
-        assert_eq!(container.safe_count(), 1);
-        assert!(matches!(state, BlockState::Idle));
+        assert!(recovered.is_none());
+        assert_eq!(container.active_count(), 1);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(state.by_id.len(), 1);
     }
 }

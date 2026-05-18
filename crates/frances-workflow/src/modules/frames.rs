@@ -1,22 +1,31 @@
 //! `frances:v1/frames` — transcript + frame classes.
 //!
-//! The transcript is an append-only sequence of frames. The user holds a
-//! frame object after `transcript.push(frame)` and may call
-//! `frame.write(text)` to extend its content — **but only while the
-//! frame is the most recently pushed one**. Pushing a new frame seals
-//! the previous frame; writing to a sealed frame throws.
+//! The transcript is an append-only sequence of frames. The user holds
+//! a frame object after `transcript.push(frame)` and may call
+//! `frame.write(text)` to extend its content. Frames stay writeable
+//! until they're explicitly closed; the host supports many open blocks
+//! at once, so a long-running [`ShellOutputFrame`] can keep streaming
+//! while later [`MarkdownFrame`]s are pushed alongside it.
+//!
+//! Each writeable frame exposes:
+//!   - `frame.write(text)` — append, throws if `closed`.
+//!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
+//!   - `frame.close()` — emit [`HostFrame::Close`], flip `closed`.
+//!   - `frame.autoclose` (default `true`) — when truthy, the writable's
+//!     `close`/`abort` hook calls `frame.close()` so a finished pipe
+//!     seals the frame automatically.
 //!
 //! For v1 there is exactly one transcript (the live binding behind the
 //! `transcript` import). The `Transcript` class is exported as a type
 //! for future rotation work; users can't construct one in v1.
 //!
 //! Wire contract: the host receives a [`HostFrame::Push`] for each new
-//! frame and a [`HostFrame::Append`] for every text append. The host is
-//! responsible for opening/closing wire blocks; this module only emits
-//! semantic events.
+//! frame, [`HostFrame::Append`] for each text delta, [`HostFrame::UpdateKind`]
+//! for in-place metadata transitions (e.g. shell state going terminal),
+//! and [`HostFrame::Close`] when a frame is sealed.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
@@ -31,9 +40,6 @@ use crate::runtime::{FrameId, FrameKind, FramePush, HostFrame};
 pub(crate) struct FramesState {
     /// Monotonically-increasing frame id. Bumped by `transcript.push`.
     next_id: AtomicU64,
-    /// Id of the currently-mutable frame. Equal to whatever was assigned
-    /// most recently; older frames compare unequal and reject `write`.
-    active_id: AtomicU64,
     /// Where push/append events go.
     tx: UnboundedSender<HostFrame>,
 }
@@ -42,7 +48,6 @@ impl FramesState {
     fn new(tx: UnboundedSender<HostFrame>) -> Arc<Self> {
         Arc::new(Self {
             next_id: AtomicU64::new(0),
-            active_id: AtomicU64::new(0),
             tx,
         })
     }
@@ -61,6 +66,7 @@ pub(crate) fn build_frames<'js>(
     Ctor<'js>,
     Ctor<'js>,
     Ctor<'js>,
+    Ctor<'js>,
 )> {
     let state = FramesState::new(tx);
 
@@ -73,9 +79,10 @@ pub(crate) fn build_frames<'js>(
 
     let md_ctor = build_markdown_ctor(ctx, state.clone())?;
     let err_ctor = build_error_ctor(ctx, state.clone())?;
-    let json_ctor = build_json_ctor(ctx, state)?;
+    let json_ctor = build_json_ctor(ctx, state.clone())?;
+    let shell_output_ctor = build_shell_output_ctor(ctx, state)?;
 
-    Ok((transcript, md_ctor, err_ctor, json_ctor))
+    Ok((transcript, md_ctor, err_ctor, json_ctor, shell_output_ctor))
 }
 
 // ---------------------------------------------------------------------
@@ -130,7 +137,6 @@ fn push_frame<'js>(
         let new_id = state.assign_id();
         let borrow = md.borrow();
         borrow.id.store(new_id, Ordering::Release);
-        state.active_id.store(new_id, Ordering::Release);
         let kind = FrameKind::Markdown {
             content: borrow.content.clone(),
             sender: borrow.sender.clone(),
@@ -144,7 +150,6 @@ fn push_frame<'js>(
     if let Some(err) = as_frame::<ErrorFrame>(&frame) {
         let new_id = state.assign_id();
         err.borrow().id.store(new_id, Ordering::Release);
-        state.active_id.store(new_id, Ordering::Release);
         let kind = FrameKind::Error {
             content: err.borrow().content.clone(),
         };
@@ -157,7 +162,6 @@ fn push_frame<'js>(
     if let Some(json) = as_frame::<JsonFrame>(&frame) {
         let new_id = state.assign_id();
         json.borrow().id.store(new_id, Ordering::Release);
-        state.active_id.store(new_id, Ordering::Release);
         let borrow = json.borrow();
         let kind = FrameKind::Json {
             tag: borrow.tag.clone(),
@@ -169,9 +173,23 @@ fn push_frame<'js>(
         }));
         return Ok(());
     }
+    if let Some(sh) = as_frame::<ShellOutputFrame>(&frame) {
+        let new_id = state.assign_id();
+        let borrow = sh.borrow();
+        borrow.id.store(new_id, Ordering::Release);
+        let kind = FrameKind::ShellOutput {
+            state: load_shell_state(&borrow.state_atom),
+            content: borrow.content.clone(),
+        };
+        let _ = state.tx.send(HostFrame::Push(FramePush {
+            id: FrameId(new_id),
+            kind,
+        }));
+        return Ok(());
+    }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownFrame, ErrorFrame, or JsonFrame",
+        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, or ShellOutputFrame",
     )
 }
 
@@ -187,11 +205,19 @@ pub struct MarkdownFrame {
     state: Arc<FramesState>,
     /// Set by `transcript.push`; 0 means "not yet pushed".
     id: AtomicU64,
-    /// Initial content captured at construction. Appends go straight to
-    /// the host channel; we don't reconstruct the full text here.
-    content: String,
+    /// Initial content captured at construction. `None` when the
+    /// workflow omitted `content` (or passed `undefined` / `null`) —
+    /// the frame is pushed with no body, and the client defers measure
+    /// and render until the first `write` materialises it. Appends go
+    /// straight to the host channel; we don't reconstruct the full text
+    /// here.
+    content: Option<String>,
     /// Optional speaker label. `None` ⇒ the host renders no prefix.
     sender: Option<String>,
+    /// Flipped by [`close_frame`] (either explicit `.close()` or the
+    /// writable's auto-close hook on the JS side). Subsequent writes
+    /// throw; subsequent closes are no-ops.
+    closed: AtomicBool,
 }
 
 impl<'js> Trace<'js> for MarkdownFrame {
@@ -214,7 +240,17 @@ impl<'js> JsClass<'js> for MarkdownFrame {
                 ctx.clone(),
                 |ctx: Ctx<'js>, this: This<Class<'js, MarkdownFrame>>, delta: String| {
                     let b = this.0.borrow();
-                    append_text(&ctx, &b.state, &b.id, delta)
+                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
+                },
+            )?,
+        )?;
+        proto.set(
+            "close",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, MarkdownFrame>>| {
+                    let b = this.0.borrow();
+                    close_frame(&ctx, &b.state, &b.id, &b.closed)
                 },
             )?,
         )?;
@@ -266,26 +302,47 @@ fn append_text<'js>(
     ctx: &Ctx<'js>,
     state: &Arc<FramesState>,
     id: &AtomicU64,
+    closed: &AtomicBool,
     delta: String,
 ) -> JsResult<()> {
     let frame_id = id.load(Ordering::Acquire);
-    let active = state.active_id.load(Ordering::Acquire);
     if frame_id == 0 {
         return throw_type(
             ctx,
             "frame.write: frame has not been pushed onto the transcript yet",
         );
     }
-    if frame_id != active {
-        return throw_type(
-            ctx,
-            "frame.write: this frame is no longer the active frame (a newer frame was pushed)",
-        );
+    if closed.load(Ordering::Acquire) {
+        return throw_type(ctx, "frame.write: frame is closed");
     }
     let _ = state.tx.send(HostFrame::Append {
         id: FrameId(frame_id),
         delta,
     });
+    Ok(())
+}
+
+/// Mark the frame closed and emit [`HostFrame::Close`] exactly once.
+/// Idempotent: a second call is a silent no-op. Throws if called
+/// before the frame has been pushed.
+fn close_frame<'js>(
+    ctx: &Ctx<'js>,
+    state: &Arc<FramesState>,
+    id: &AtomicU64,
+    closed: &AtomicBool,
+) -> JsResult<()> {
+    let frame_id = id.load(Ordering::Acquire);
+    if frame_id == 0 {
+        return throw_type(
+            ctx,
+            "frame.close: frame has not been pushed onto the transcript yet",
+        );
+    }
+    if !closed.swap(true, Ordering::AcqRel) {
+        let _ = state.tx.send(HostFrame::Close {
+            id: FrameId(frame_id),
+        });
+    }
     Ok(())
 }
 
@@ -329,6 +386,162 @@ impl<'js> JsClass<'js> for JsonFrame {
 }
 
 // ---------------------------------------------------------------------
+// ShellOutputFrame — streaming shell-command output with mutable state
+// ---------------------------------------------------------------------
+
+/// Compact wire encoding for [`crate::runtime::ShellState`] so we can
+/// store it in an `AtomicU64`. `set_shell_state` / `load_shell_state`
+/// translate to and from this format; nothing outside this module
+/// should care about the layout.
+const SHELL_STATE_RUNNING: u64 = 0;
+const SHELL_STATE_SUCCESS: u64 = 1;
+/// Exit codes pack the i32 into the low 32 bits with a discriminator
+/// in the high half (`2 << 32 | code as u32`).
+const SHELL_STATE_EXIT_TAG: u64 = 2;
+
+fn encode_shell_state(state: &crate::runtime::ShellState) -> u64 {
+    match state {
+        crate::runtime::ShellState::Running => SHELL_STATE_RUNNING,
+        crate::runtime::ShellState::Success => SHELL_STATE_SUCCESS,
+        crate::runtime::ShellState::Exit(n) => (SHELL_STATE_EXIT_TAG << 32) | (*n as u32 as u64),
+    }
+}
+
+fn load_shell_state(atom: &AtomicU64) -> crate::runtime::ShellState {
+    let raw = atom.load(Ordering::Acquire);
+    let tag = raw >> 32;
+    if tag == SHELL_STATE_EXIT_TAG {
+        crate::runtime::ShellState::Exit(raw as u32 as i32)
+    } else if raw == SHELL_STATE_SUCCESS {
+        crate::runtime::ShellState::Success
+    } else {
+        crate::runtime::ShellState::Running
+    }
+}
+
+pub struct ShellOutputFrame {
+    state: Arc<FramesState>,
+    id: AtomicU64,
+    /// Initial body captured at construction. Mirrors `MarkdownFrame.content`.
+    content: String,
+    /// Encoded [`crate::runtime::ShellState`]. Mutated by
+    /// `.setState()` / `.success()` / `.exit()`.
+    state_atom: AtomicU64,
+    /// Same close lifecycle as `MarkdownFrame`.
+    closed: AtomicBool,
+}
+
+impl<'js> Trace<'js> for ShellOutputFrame {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for ShellOutputFrame {
+    type Changed<'to> = ShellOutputFrame;
+}
+
+impl<'js> JsClass<'js> for ShellOutputFrame {
+    const NAME: &'static str = "ShellOutputFrame";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        let proto = Object::new(ctx.clone())?;
+        proto.set(
+            "write",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>, delta: String| {
+                    let b = this.0.borrow();
+                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
+                },
+            )?,
+        )?;
+        proto.set(
+            "close",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>| {
+                    let b = this.0.borrow();
+                    close_frame(&ctx, &b.state, &b.id, &b.closed)
+                },
+            )?,
+        )?;
+        // `frame.success()` and `frame.exit(code)` set the new state
+        // on the wire via `HostFrame::UpdateKind`. They do NOT close
+        // the frame — JS-side auto-close (writable's close hook) or
+        // an explicit `frame.close()` is still required to seal the
+        // block. Keeping these orthogonal lets the workflow stream a
+        // tail of output between "got exit code" and "EOF on stdout".
+        proto.set(
+            "success",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>| {
+                    let b = this.0.borrow();
+                    set_shell_state(
+                        &ctx,
+                        &b.state,
+                        &b.id,
+                        &b.state_atom,
+                        crate::runtime::ShellState::Success,
+                    )
+                },
+            )?,
+        )?;
+        proto.set(
+            "exit",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>, code: i32| {
+                    let b = this.0.borrow();
+                    set_shell_state(
+                        &ctx,
+                        &b.state,
+                        &b.id,
+                        &b.state_atom,
+                        crate::runtime::ShellState::Exit(code),
+                    )
+                },
+            )?,
+        )?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+/// Update the frame's state and emit [`HostFrame::UpdateKind`].
+/// Throws if the frame hasn't been pushed yet.
+fn set_shell_state<'js>(
+    ctx: &Ctx<'js>,
+    state: &Arc<FramesState>,
+    id: &AtomicU64,
+    state_atom: &AtomicU64,
+    new_state: crate::runtime::ShellState,
+) -> JsResult<()> {
+    let frame_id = id.load(Ordering::Acquire);
+    if frame_id == 0 {
+        return throw_type(
+            ctx,
+            "shellOutput.setState: frame has not been pushed onto the transcript yet",
+        );
+    }
+    state_atom.store(encode_shell_state(&new_state), Ordering::Release);
+    // Content is empty here — the daemon's UpdateKind handler emits a
+    // no-text BlockDelta carrying just the new kind.
+    let kind = FrameKind::ShellOutput {
+        state: new_state,
+        content: String::new(),
+    };
+    let _ = state.tx.send(HostFrame::UpdateKind {
+        id: FrameId(frame_id),
+        kind,
+    });
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // Constructors
 // ---------------------------------------------------------------------
 //
@@ -349,6 +562,7 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
                     id: AtomicU64::new(0),
                     content,
                     sender,
+                    closed: AtomicBool::new(false),
                 },
             )
         },
@@ -406,6 +620,55 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Cto
     })
 }
 
+fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ShellOutputFrame, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Value<'js>| {
+            let content = parse_shell_output_arg(&ctx, &arg)?;
+            Class::instance(
+                ctx.clone(),
+                ShellOutputFrame {
+                    state: state.clone(),
+                    id: AtomicU64::new(0),
+                    content,
+                    state_atom: AtomicU64::new(SHELL_STATE_RUNNING),
+                    closed: AtomicBool::new(false),
+                },
+            )
+        },
+    )
+}
+
+/// Parse `new ShellOutputFrame({ content? })`. `content` is optional;
+/// if absent it defaults to an empty string (workflows usually push
+/// the frame first, then stream output via `.writable`).
+fn parse_shell_output_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<String> {
+    if arg.is_undefined() || arg.is_null() {
+        return Ok(String::new());
+    }
+    let Some(obj) = arg.as_object() else {
+        return throw_type(
+            ctx,
+            "new ShellOutputFrame: expected { content?: string } or no argument",
+        );
+    };
+    let content_val: Value<'js> = obj
+        .get("content")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if content_val.is_undefined() || content_val.is_null() {
+        return Ok(String::new());
+    }
+    if let Some(s) = content_val.as_string() {
+        s.to_string()
+            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `content` must be UTF-8"))
+    } else {
+        Err(throw_err(
+            ctx,
+            "new ShellOutputFrame: `content` must be a string when present",
+        ))
+    }
+}
+
 fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsResult<String> {
     let Some(obj) = arg.as_object() else {
         return Err(throw_err(
@@ -417,18 +680,38 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
 }
 
-/// Parse `new MarkdownFrame({ content, sender? })`. `sender` is
-/// optional; if present it must be a string. Anything else throws.
-fn parse_markdown_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<(String, Option<String>)> {
+/// Parse `new MarkdownFrame({ content?, sender? })`. `content` and
+/// `sender` are both optional; absent / `undefined` / `null` map to
+/// `None`. Anything other than a string for either field throws.
+fn parse_markdown_arg<'js>(
+    ctx: &Ctx<'js>,
+    arg: &Value<'js>,
+) -> JsResult<(Option<String>, Option<String>)> {
+    if arg.is_undefined() || arg.is_null() {
+        return Ok((None, None));
+    }
     let Some(obj) = arg.as_object() else {
         return Err(throw_err(
             ctx,
-            "new MarkdownFrame: expected { content: string, sender?: string }",
+            "new MarkdownFrame: expected { content?: string, sender?: string } or no argument",
         ));
     };
-    let content: String = obj
+    let content_val: Value<'js> = obj
         .get("content")
-        .map_err(|_| throw_err(ctx, "new MarkdownFrame: `content` must be a string"))?;
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let content = if content_val.is_undefined() || content_val.is_null() {
+        None
+    } else if let Some(s) = content_val.as_string() {
+        Some(
+            s.to_string()
+                .map_err(|_| throw_err(ctx, "new MarkdownFrame: `content` must be UTF-8"))?,
+        )
+    } else {
+        return Err(throw_err(
+            ctx,
+            "new MarkdownFrame: `content` must be a string when present",
+        ));
+    };
     let sender_val: Value<'js> = obj
         .get("sender")
         .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));

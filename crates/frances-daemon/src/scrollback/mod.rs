@@ -118,11 +118,10 @@ struct ToolUsePayload {
     text: String,
 }
 
-/// On-disk JSON shape for `kind` = 'tool_result' rows.
+/// On-disk JSON shape for `kind` = 'shell_output' rows.
 #[derive(Serialize, Deserialize)]
-struct ToolResultPayload {
-    tool_use_id: Arc<str>,
-    is_error: bool,
+struct ShellOutputPayload {
+    state: crate::protocol::ShellState,
     text: String,
 }
 
@@ -263,9 +262,19 @@ pub async fn replay_to_stream(
                 next_id += 1;
                 // The first (and only) delta carries the kind — the
                 // TUI opens the block on the first delta for an unseen
-                // id. We always emit one delta even when `text` is
-                // empty so the TUI sees the implicit "open".
-                write_message(stream, &StreamFrame::BlockDelta { id, kind, text }).await?;
+                // id. Stored rows always have a body (unmaterialised
+                // blocks are never persisted), so we always send
+                // `text: Some(_)` and the block materialises on the
+                // client.
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id,
+                        kind,
+                        text: Some(text),
+                    },
+                )
+                .await?;
                 if truncated {
                     write_message(stream, &StreamFrame::BlockTruncated { id }).await?;
                 } else {
@@ -304,7 +313,11 @@ pub async fn replay_frames(
             } => {
                 let id = BlockId(next_id);
                 next_id += 1;
-                out.push(StreamFrame::BlockDelta { id, kind, text });
+                out.push(StreamFrame::BlockDelta {
+                    id,
+                    kind,
+                    text: Some(text),
+                });
                 if truncated {
                     out.push(StreamFrame::BlockTruncated { id });
                 } else {
@@ -341,14 +354,10 @@ fn encode_block(
             })
             .map_err(ScrollbackError::Encode)?,
         ),
-        BlockKind::ToolResult {
-            tool_use_id,
-            is_error,
-        } => (
-            "tool_result",
-            serde_json::to_value(ToolResultPayload {
-                tool_use_id: tool_use_id.clone(),
-                is_error: *is_error,
+        BlockKind::ShellOutput { state } => (
+            "shell_output",
+            serde_json::to_value(ShellOutputPayload {
+                state: state.clone(),
                 text: text.to_owned(),
             })
             .map_err(ScrollbackError::Encode)?,
@@ -388,17 +397,14 @@ fn decode_row(
                 truncated,
             })
         }
-        "tool_result" => {
-            let p: ToolResultPayload =
+        "shell_output" => {
+            let p: ShellOutputPayload =
                 serde_json::from_str(payload_text).map_err(|source| ScrollbackError::Decode {
                     kind: kind.to_owned(),
                     source,
                 })?;
             Ok(StoredRow::Block {
-                kind: BlockKind::ToolResult {
-                    tool_use_id: p.tool_use_id,
-                    is_error: p.is_error,
-                },
+                kind: BlockKind::ShellOutput { state: p.state },
                 text: p.text,
                 truncated,
             })
@@ -489,6 +495,52 @@ mod tests {
                 text: "ls /".into(),
                 truncated: true,
             }]
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_output_round_trips_each_state() {
+        use crate::protocol::ShellState;
+        let db = fresh_db().await;
+        let instance = Uuid::new_v4();
+        for (state, body) in [
+            (ShellState::Running, "$ sleep 1\n"),
+            (ShellState::Success, "$ true\n"),
+            (ShellState::Exit(137), "$ sleep 9\n(killed)"),
+        ] {
+            persist_block(
+                &db,
+                instance,
+                &BlockKind::ShellOutput {
+                    state: state.clone(),
+                },
+                body,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let rows = load_for_instance(&db, instance).await.unwrap();
+        let kinds: Vec<_> = rows
+            .iter()
+            .map(|r| match r {
+                StoredRow::Block { kind, .. } => kind.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::ShellOutput {
+                    state: ShellState::Running
+                },
+                BlockKind::ShellOutput {
+                    state: ShellState::Success
+                },
+                BlockKind::ShellOutput {
+                    state: ShellState::Exit(137)
+                },
+            ]
         );
     }
 
@@ -626,7 +678,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(&**name, "shell");
-                assert_eq!(text, "ls /");
+                assert_eq!(text.as_deref(), Some("ls /"));
             }
             other => panic!("expected BlockDelta with ToolUse kind at [1], got {other:?}"),
         }
