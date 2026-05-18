@@ -589,19 +589,14 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
             FrameKind::Markdown { content, sender } => {
                 state.close_open_stop(stream).await?;
                 let block = state.alloc();
-                let kind = BlockKind::Text { sender };
-                write_message(
-                    stream,
-                    &StreamFrame::BlockStart {
-                        id: block,
-                        kind: kind.clone(),
-                    },
-                )
-                .await?;
+                let kind = BlockKind::Text {
+                    sender: sender.map(Arc::from),
+                };
                 write_message(
                     stream,
                     &StreamFrame::BlockDelta {
                         id: block,
+                        kind: kind.clone(),
                         text: content.clone(),
                     },
                 )
@@ -626,16 +621,9 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
                 let text = format!("[{tag}] {body}");
                 write_message(
                     stream,
-                    &StreamFrame::BlockStart {
-                        id: block,
-                        kind: kind.clone(),
-                    },
-                )
-                .await?;
-                write_message(
-                    stream,
                     &StreamFrame::BlockDelta {
                         id: block,
+                        kind: kind.clone(),
                         text: text.clone(),
                     },
                 )
@@ -652,7 +640,16 @@ async fn emit(stream: &mut UnixStream, state: &mut EmitState, frame: HostFrame) 
             if let Some(open) = state.open.as_mut() {
                 open.text.push_str(&delta);
                 let id = open.id;
-                write_message(stream, &StreamFrame::BlockDelta { id, text: delta }).await?;
+                let kind = open.kind.clone();
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id,
+                        kind,
+                        text: delta,
+                    },
+                )
+                .await?;
             }
         }
         HostFrame::Approval(request) => {

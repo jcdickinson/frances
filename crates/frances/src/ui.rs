@@ -16,6 +16,7 @@ use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Style};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
+use tracing::warn;
 
 use frances_daemon::llm::Usage;
 use frances_daemon::protocol::{
@@ -77,56 +78,44 @@ impl BlockState {
         Self::Idle
     }
 
-    /// Start a new active block in the container and remember the
-    /// returned id. If a block was already active, returns its
-    /// container id so the caller can `mark_safe` it.
-    fn start(
+    /// Process one self-describing delta. If `self` is `Idle`, opens a
+    /// new active block of `kind` with `text` as its initial content.
+    /// If `self` is `Active` with a matching id, appends. If the id
+    /// doesn't match, closes the previous block (returning its
+    /// container id so the caller can `mark_safe` it) and opens a
+    /// fresh one. Always leaves `self` in `Active` state.
+    fn delta(
         &mut self,
         container: &mut ScrollbackContainer,
         id: protocol::BlockId,
         kind: BlockKind,
+        text: &str,
     ) -> Option<ContainerBlockId> {
+        if let Self::Active(active) = self
+            && active.protocol_id == id
+        {
+            active.text.push_str(text);
+            container.update_active(
+                active.container_id,
+                Box::new(LabelledBlock::new(active.kind.clone(), active.text.clone())),
+            );
+            return None;
+        }
+        // Either Idle, or Active with a different id. Take the previous
+        // (if any) so the caller can mark_safe it, then open fresh.
         let previous = match std::mem::replace(self, Self::Idle) {
             Self::Active(prev) => Some(prev.container_id),
             Self::Idle => None,
         };
         let container_id =
-            container.push_active(Box::new(LabelledBlock::new(kind.clone(), String::new())));
+            container.push_active(Box::new(LabelledBlock::new(kind.clone(), text.to_owned())));
         *self = Self::Active(ActiveBlock {
             protocol_id: id,
             container_id,
             kind,
-            text: String::new(),
+            text: text.to_owned(),
         });
         previous
-    }
-
-    fn delta(
-        &mut self,
-        container: &mut ScrollbackContainer,
-        id: protocol::BlockId,
-        text: &str,
-    ) -> Result<()> {
-        let active = match self {
-            Self::Idle => {
-                return Err(anyhow::anyhow!(
-                    "BlockDelta {id} arrived with no active block"
-                ));
-            }
-            Self::Active(active) => active,
-        };
-        if active.protocol_id != id {
-            return Err(anyhow::anyhow!(
-                "BlockDelta {id} does not match active block {}",
-                active.protocol_id
-            ));
-        }
-        active.text.push_str(text);
-        container.update_active(
-            active.container_id,
-            Box::new(LabelledBlock::new(active.kind.clone(), active.text.clone())),
-        );
-        Ok(())
     }
 
     fn stop(&mut self, id: protocol::BlockId) -> Result<ContainerBlockId> {
@@ -148,6 +137,29 @@ impl BlockState {
         };
         *self = Self::Idle;
         Ok(container_id)
+    }
+
+    /// Like [`stop`] but never returns an error: on an id mismatch
+    /// or no-active condition (protocol bug on the daemon side), it
+    /// logs via `tracing::warn!` and returns the orphan's container
+    /// id (if any) so the caller can still `mark_safe` it. The
+    /// dispatch loop uses this so a misbehaving daemon doesn't kill
+    /// the TUI.
+    ///
+    /// `frame_label` is the wire frame's variant name, included in
+    /// the log for triage.
+    fn stop_or_recover(
+        &mut self,
+        id: protocol::BlockId,
+        frame_label: &'static str,
+    ) -> Option<ContainerBlockId> {
+        match self.stop(id) {
+            Ok(container_id) => Some(container_id),
+            Err(err) => {
+                warn!(%err, frame = frame_label, "protocol violation; recovering");
+                self.take_container_id()
+            }
+        }
     }
 
     fn take_container_id(&mut self) -> Option<ContainerBlockId> {
@@ -226,9 +238,11 @@ impl App<'_> {
         // Single reader task: pumps frames off the per-attach events
         // socket into `frame_rx`. The socket carries initial replay,
         // every prompt's frames, and any mid-cycle workflow-switch
-        // replay. The task ends only when the stream closes (daemon
-        // gone) or errors — at which point the dispatch loop exits
-        // because `frame_rx.recv()` returns `None`.
+        // replay. On EOF / read error (daemon gone, socket closed)
+        // the task sends one final synthetic `Error` frame so the
+        // user gets a visible "connection to daemon lost" row, then
+        // exits. The dispatch loop keeps running — the user can
+        // still close the TUI on their own time.
         let events_socket = self.events;
         let reader_tx = frame_tx.clone();
         tokio::spawn(async move {
@@ -240,7 +254,12 @@ impl App<'_> {
                             return;
                         }
                     }
-                    Err(_) => return,
+                    Err(err) => {
+                        let _ = reader_tx.send(StreamFrame::Error(format!(
+                            "connection to daemon lost: {err}"
+                        )));
+                        return;
+                    }
                 }
             }
         });
@@ -258,8 +277,14 @@ impl App<'_> {
                             match classify_scrollback_key(&key, page) {
                                 ScrollbackAction::Quit => return Ok(()),
                                 ScrollbackAction::Exit => {
+                                    // Flip the scrollback flag first so a
+                                    // failed alt-screen leave doesn't pin
+                                    // us in inspector mode forever; the
+                                    // next redraw will reconcile.
                                     container.set_scrollback(false);
-                                    leave_scrollback(&mut terminal)?;
+                                    if let Err(err) = leave_scrollback(&mut terminal) {
+                                        warn!(%err, "leave_scrollback failed; continuing");
+                                    }
                                 }
                                 ScrollbackAction::ScrollUp(n) => container.scroll_up(n),
                                 ScrollbackAction::ScrollDown(n) => container.scroll_down(n),
@@ -271,8 +296,16 @@ impl App<'_> {
                             match classify_key(&key, pending_approval.is_some()) {
                                 KeyAction::Quit => return Ok(()),
                                 KeyAction::EnterScrollback => {
-                                    container.set_scrollback(true);
-                                    enter_scrollback(&mut terminal)?;
+                                    // If the alt-screen escape sequence
+                                    // fails, leave the flag clear so we
+                                    // stay in live mode rather than
+                                    // entering a half-applied inspector.
+                                    match enter_scrollback(&mut terminal) {
+                                        Ok(()) => container.set_scrollback(true),
+                                        Err(err) => {
+                                            warn!(%err, "enter_scrollback failed; staying in live mode");
+                                        }
+                                    }
                                 }
                                 KeyAction::Submit => {
                                     if textarea.is_empty() { continue; }
@@ -316,10 +349,14 @@ impl App<'_> {
                         }
                         Event::Resize(width, height) => {
                             term_size = Size { width, height };
-                            terminal
-                                .backend_mut()
-                                .handle_terminal_resize(term_size)?;
-                            terminal.clear()?;
+                            if let Err(err) =
+                                terminal.backend_mut().handle_terminal_resize(term_size)
+                            {
+                                warn!(%err, "handle_terminal_resize failed; redraw will reconcile");
+                            }
+                            if let Err(err) = terminal.clear() {
+                                warn!(%err, "terminal clear after resize failed; continuing");
+                            }
                         }
                         _ => {}
                     }
@@ -327,13 +364,13 @@ impl App<'_> {
                 Some(frame) = frame_rx.recv() => {
                     // The transport-level boundary (`Done`) and any
                     // terminal frame (`Error`, `Approval`) end the
-                    // streaming indicator. `BlockStart` re-enters
+                    // streaming indicator. A `BlockDelta` re-enters
                     // streaming so a follow-up stream after an Error
                     // / Approval lights it back up. Replay frames
                     // don't change streaming state.
                     if !replay_mode {
                         match &frame {
-                            StreamFrame::BlockStart { .. } => streaming = true,
+                            StreamFrame::BlockDelta { .. } => streaming = true,
                             StreamFrame::Done
                             | StreamFrame::Error(_)
                             | StreamFrame::Approval(_) => streaming = false,
@@ -449,24 +486,23 @@ fn handle_frame(
             // Defensive: replay end outside replay mode means a
             // malformed bracket. Ignore.
         }
-        StreamFrame::BlockStart { id, kind } => {
-            if let Some(prev_id) = state.start(container, id, kind) {
+        StreamFrame::BlockDelta { id, kind, text } => {
+            if let Some(prev_id) = state.delta(container, id, kind, &text) {
                 container.mark_safe(prev_id);
             }
         }
-        StreamFrame::BlockDelta { id, text } => {
-            state.delta(container, id, &text)?;
-        }
         StreamFrame::BlockStop { id } => {
-            let container_id = state.stop(id)?;
-            container.mark_safe(container_id);
+            if let Some(container_id) = state.stop_or_recover(id, "BlockStop") {
+                container.mark_safe(container_id);
+            }
         }
         StreamFrame::BlockTruncated { id } => {
             // Live wire shouldn't emit truncated stops — they only
-            // appear during replay. Treat as a clean stop so we don't
-            // get stuck with an open block.
-            let container_id = state.stop(id)?;
-            container.mark_safe(container_id);
+            // appear during replay. Recover the same way as a stop
+            // for an unknown id (warn + mark orphan safe).
+            if let Some(container_id) = state.stop_or_recover(id, "BlockTruncated") {
+                container.mark_safe(container_id);
+            }
         }
         StreamFrame::Usage(usage) => {
             container.push(Box::new(RawBlock::single_styled(
@@ -535,21 +571,19 @@ fn handle_replay_frame(
             REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
             *replay_mode = false;
         }
-        StreamFrame::BlockStart { id, kind } => {
+        StreamFrame::BlockDelta { id, kind, text } => {
             REPLAY_OPEN.with(|cell| {
-                *cell.borrow_mut() = Some(ReplayBlock {
-                    id,
-                    kind,
-                    text: String::new(),
-                });
-            });
-        }
-        StreamFrame::BlockDelta { id, text } => {
-            REPLAY_OPEN.with(|cell| {
-                if let Some(open) = cell.borrow_mut().as_mut()
-                    && open.id == id
-                {
-                    open.text.push_str(&text);
+                let mut guard = cell.borrow_mut();
+                match guard.as_mut() {
+                    Some(open) if open.id == id => {
+                        open.text.push_str(&text);
+                    }
+                    _ => {
+                        // Either nothing open, or a new id: drop any
+                        // orphan (the daemon is expected to close
+                        // every block it opens) and start fresh.
+                        *guard = Some(ReplayBlock { id, kind, text });
+                    }
                 }
             });
         }
@@ -692,4 +726,115 @@ fn leave_scrollback(terminal: &mut AppTerminal) -> Result<()> {
         .context("leave alt screen")?;
     Backend::flush(backend)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frances_tui::Block;
+    use ratatui::text::Line;
+    use ratatui::widgets::Paragraph;
+
+    fn footer() -> Box<dyn Block> {
+        Box::new(Paragraph::new(Line::raw("footer")))
+    }
+
+    /// Drives `BlockState::delta` against a real `ScrollbackContainer`
+    /// (paragraph footer; no terminal needed). Verifies the
+    /// delta-driven state machine: a first delta on `Idle` opens the
+    /// block; same-id subsequent delta appends; different-id delta
+    /// closes the previous one (returning its container id so the
+    /// caller can `mark_safe`) and opens a fresh block.
+    #[test]
+    fn block_state_delta_opens_appends_and_supersedes() {
+        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut state = BlockState::new();
+        let kind_a = BlockKind::Text {
+            sender: Some("user".into()),
+        };
+        let kind_b = BlockKind::ToolUse {
+            name: "shell".into(),
+        };
+
+        // First delta on Idle: opens A. No previous container id to
+        // mark safe.
+        assert!(
+            state
+                .delta(&mut container, protocol::BlockId(1), kind_a.clone(), "hel")
+                .is_none()
+        );
+        assert_eq!(container.active_count(), 1);
+        assert_eq!(container.safe_count(), 0);
+
+        // Same-id delta: appends. Still no previous id returned.
+        assert!(
+            state
+                .delta(&mut container, protocol::BlockId(1), kind_a.clone(), "lo")
+                .is_none()
+        );
+        assert_eq!(container.active_count(), 1);
+
+        // Different-id delta: closes A (returns its container id so
+        // caller can mark_safe) and opens B.
+        let prev = state.delta(&mut container, protocol::BlockId(2), kind_b.clone(), "ls");
+        let prev_id = prev.expect("supersession returns prior container id");
+        container.mark_safe(prev_id);
+        // A drained to safe, B is the new active.
+        assert_eq!(container.active_count(), 1);
+        assert_eq!(container.safe_count(), 1);
+
+        // Closing B leaves both in safe / nothing active.
+        let b_id = state.stop(protocol::BlockId(2)).expect("stop B");
+        container.mark_safe(b_id);
+        assert_eq!(container.active_count(), 0);
+        assert_eq!(container.safe_count(), 2);
+    }
+
+    /// `BlockStop` for an id we don't have open is a protocol bug
+    /// on the daemon side. The TUI should not bail back to the CLI
+    /// — it should log and continue. With no active block at all,
+    /// `stop_or_recover` returns `None` so the caller does nothing.
+    #[test]
+    fn block_stop_for_unknown_id_does_not_bail() {
+        let container = ScrollbackContainer::new(footer(), 0);
+        let mut state = BlockState::new();
+
+        let result = state.stop_or_recover(protocol::BlockId(99), "BlockStop");
+
+        assert!(
+            result.is_none(),
+            "with no active block there's nothing to mark safe"
+        );
+        assert_eq!(container.active_count(), 0);
+        assert_eq!(container.safe_count(), 0);
+        assert_eq!(container.committed_count(), 0);
+    }
+
+    /// `BlockStop` whose id doesn't match the active block. The
+    /// orphan active block must still be reclaimed (via the
+    /// returned container id, which the caller marks safe), so the
+    /// container doesn't drift into a half-open state.
+    #[test]
+    fn block_stop_with_mismatched_id_marks_orphan_safe_and_recovers() {
+        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut state = BlockState::new();
+        let kind = BlockKind::Text {
+            sender: Some("user".into()),
+        };
+
+        // Open id 1.
+        let _ = state.delta(&mut container, protocol::BlockId(1), kind, "hi");
+        assert_eq!(container.active_count(), 1);
+
+        // Stop with id 2 — mismatched.
+        let recovered = state.stop_or_recover(protocol::BlockId(2), "BlockStop");
+        let orphan = recovered.expect("mismatch path returns orphan's container id");
+        container.mark_safe(orphan);
+
+        // Orphan drained to safe; nothing left active; the state
+        // machine is back to Idle.
+        assert_eq!(container.active_count(), 0);
+        assert_eq!(container.safe_count(), 1);
+        assert!(matches!(state, BlockState::Idle));
+    }
 }

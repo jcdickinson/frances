@@ -55,32 +55,38 @@ fn approval_choice_round_trips_all_variants() {
 
 #[test]
 fn block_kind_text_round_trips_with_sender() {
-    let with = StreamFrame::BlockStart {
+    let with = StreamFrame::BlockDelta {
         id: BlockId(1),
         kind: BlockKind::Text {
-            sender: Some("you".to_owned()),
+            sender: Some("you".into()),
         },
+        text: "hello".to_owned(),
     };
     let bytes = bincode::serde::encode_to_vec(&with, bincode::config::standard()).unwrap();
     let (decoded, _): (StreamFrame, _) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
     match decoded {
-        StreamFrame::BlockStart {
+        StreamFrame::BlockDelta {
             kind: BlockKind::Text { sender: Some(s) },
+            text,
             ..
-        } => assert_eq!(s, "you"),
+        } => {
+            assert_eq!(&*s, "you");
+            assert_eq!(text, "hello");
+        }
         other => panic!("expected Text {{ sender: Some(\"you\") }}, got {other:?}"),
     }
 
-    let without = StreamFrame::BlockStart {
+    let without = StreamFrame::BlockDelta {
         id: BlockId(2),
         kind: BlockKind::Text { sender: None },
+        text: String::new(),
     };
     let bytes = bincode::serde::encode_to_vec(&without, bincode::config::standard()).unwrap();
     let (decoded, _): (StreamFrame, _) =
         bincode::serde::decode_from_slice(&bytes, bincode::config::standard()).unwrap();
     match decoded {
-        StreamFrame::BlockStart {
+        StreamFrame::BlockDelta {
             kind: BlockKind::Text { sender: None },
             ..
         } => {}

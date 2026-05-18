@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -84,12 +85,16 @@ pub enum AttachResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum StreamFrame {
-    BlockStart {
-        id: BlockId,
-        kind: BlockKind,
-    },
+    /// Self-describing block content. The first delta with a
+    /// previously-unseen `id` implicitly opens a new block of `kind`;
+    /// subsequent deltas with the same id append to that block's
+    /// text. There is no separate "block start" frame — that way a
+    /// client that connects mid-block (or reconnects after the events
+    /// socket died) can construct the block from the very next delta
+    /// without needing to have seen the start.
     BlockDelta {
         id: BlockId,
+        kind: BlockKind,
         text: String,
     },
     BlockStop {
@@ -124,6 +129,13 @@ pub enum StreamFrame {
     ScrollbackReplayEnd,
 }
 
+/// Distinguishing tag for a block. Fields are [`Arc<str>`] so that
+/// the enum is cheap to clone — every [`StreamFrame::BlockDelta`] now
+/// carries a `BlockKind`, so cloning is on the hot path. `Arc<str>`
+/// serializes the same way `String` does on the wire (writes the
+/// string body, allocates a fresh `Arc` on deserialize) and compares
+/// via the underlying `str`, so callers see no behavioural change
+/// beyond the cheap clone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
     /// A free-form text block. `sender` labels the speaker; the TUI
@@ -132,13 +144,13 @@ pub enum BlockKind {
     /// `new MarkdownFrame({ content, sender })` — there is no
     /// host-side meaning beyond the label.
     Text {
-        sender: Option<String>,
+        sender: Option<Arc<str>>,
     },
     ToolUse {
-        name: String,
+        name: Arc<str>,
     },
     ToolResult {
-        tool_use_id: String,
+        tool_use_id: Arc<str>,
         is_error: bool,
     },
 }

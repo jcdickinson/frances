@@ -25,17 +25,23 @@
 //!
 //! 1. [`StreamFrame::ScrollbackReset`] — TUI clears its in-memory
 //!    scrollback and enters replay mode.
-//! 2. For each row: synthesised `BlockStart` + `BlockDelta` +
-//!    (`BlockStop` | `BlockTruncated`), or a single `Error` frame.
+//! 2. For each row: a single self-describing `BlockDelta { id, kind,
+//!    text }` (the first delta with an unseen id implicitly opens the
+//!    block) followed by `BlockStop` or `BlockTruncated`. Error rows
+//!    emit a single `Error` frame.
 //! 3. [`StreamFrame::ScrollbackReplayEnd`] — TUI returns to live mode.
 //!
 //! The replay uses its own block-id allocator (independent of
 //! `EmitState`'s) — collisions across the boundary are harmless because
 //! each replayed block opens and closes within the replay before the
 //! next one starts, so the TUI's `BlockState` is `Idle` at
-//! `ScrollbackReplayEnd`.
+//! `ScrollbackReplayEnd`. And committed blocks have no ids at all
+//! (`crates/frances-tui/src/scrollback_container.rs`'s `committed`
+//! field stores bare trait objects), so live frames after the replay
+//! collide with nothing in scrollback either.
 
 use std::borrow::Cow;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -96,24 +102,27 @@ pub enum StoredRow {
     },
 }
 
-/// On-disk JSON shape for `kind` = 'text' rows.
+/// On-disk JSON shape for `kind` = 'text' rows. `sender` mirrors the
+/// wire-level `BlockKind::Text { sender: Option<Arc<str>> }`; `Arc<str>`
+/// serializes through serde the same way `String` does, so the on-disk
+/// JSON shape is identical to a `Option<String>` / `String` schema.
 #[derive(Serialize, Deserialize)]
 struct TextPayload {
-    sender: Option<String>,
+    sender: Option<Arc<str>>,
     text: String,
 }
 
 /// On-disk JSON shape for `kind` = 'tool_use' rows.
 #[derive(Serialize, Deserialize)]
 struct ToolUsePayload {
-    name: String,
+    name: Arc<str>,
     text: String,
 }
 
 /// On-disk JSON shape for `kind` = 'tool_result' rows.
 #[derive(Serialize, Deserialize)]
 struct ToolResultPayload {
-    tool_use_id: String,
+    tool_use_id: Arc<str>,
     is_error: bool,
     text: String,
 }
@@ -250,10 +259,11 @@ pub async fn replay_to_stream(
             } => {
                 let id = BlockId(next_id);
                 next_id += 1;
-                write_message(stream, &StreamFrame::BlockStart { id, kind }).await?;
-                if !text.is_empty() {
-                    write_message(stream, &StreamFrame::BlockDelta { id, text }).await?;
-                }
+                // The first (and only) delta carries the kind — the
+                // TUI opens the block on the first delta for an unseen
+                // id. We always emit one delta even when `text` is
+                // empty so the TUI sees the implicit "open".
+                write_message(stream, &StreamFrame::BlockDelta { id, kind, text }).await?;
                 if truncated {
                     write_message(stream, &StreamFrame::BlockTruncated { id }).await?;
                 } else {
@@ -278,7 +288,7 @@ pub async fn replay_frames(
     instance: Uuid,
 ) -> std::result::Result<Vec<StreamFrame>, ScrollbackError> {
     let rows = load_for_instance(conn, instance).await?;
-    let mut out = Vec::with_capacity(rows.len() * 3 + 2);
+    let mut out = Vec::with_capacity(rows.len() * 2 + 2);
     out.push(StreamFrame::ScrollbackReset {
         instance_id: instance,
     });
@@ -292,10 +302,7 @@ pub async fn replay_frames(
             } => {
                 let id = BlockId(next_id);
                 next_id += 1;
-                out.push(StreamFrame::BlockStart { id, kind });
-                if !text.is_empty() {
-                    out.push(StreamFrame::BlockDelta { id, text });
-                }
+                out.push(StreamFrame::BlockDelta { id, kind, text });
                 if truncated {
                     out.push(StreamFrame::BlockTruncated { id });
                 } else {
@@ -554,8 +561,8 @@ mod tests {
         .unwrap();
 
         let frames = replay_frames(&conn, instance).await.unwrap();
-        // Reset + (Start+Delta+Stop) + Error + (Start+Delta+Truncated) + End
-        assert_eq!(frames.len(), 1 + 3 + 1 + 3 + 1);
+        // Reset + (Delta+Stop) + Error + (Delta+Truncated) + End
+        assert_eq!(frames.len(), 1 + 2 + 1 + 2 + 1);
         assert!(matches!(
             frames.first(),
             Some(StreamFrame::ScrollbackReset { .. })
@@ -564,5 +571,73 @@ mod tests {
             frames.last(),
             Some(StreamFrame::ScrollbackReplayEnd)
         ));
+        // Each block row produces exactly one self-describing delta
+        // (kind + full text in one frame) followed by stop / truncated.
+        assert!(matches!(
+            frames.get(1),
+            Some(StreamFrame::BlockDelta {
+                kind: BlockKind::Text { sender: Some(_) },
+                ..
+            }),
+        ));
+        assert!(matches!(frames.get(2), Some(StreamFrame::BlockStop { .. })));
+        assert!(matches!(frames.get(3), Some(StreamFrame::Error(_))));
+        assert!(matches!(
+            frames.get(4),
+            Some(StreamFrame::BlockDelta {
+                kind: BlockKind::ToolUse { .. },
+                ..
+            }),
+        ));
+        assert!(matches!(
+            frames.get(5),
+            Some(StreamFrame::BlockTruncated { .. }),
+        ));
+    }
+
+    /// A single stored block produces exactly:
+    /// `[ScrollbackReset, BlockDelta { kind, text }, BlockStop, ScrollbackReplayEnd]`.
+    /// No extra frames slip in (no `BlockStart`).
+    #[tokio::test]
+    async fn replay_frames_for_single_block_is_minimal() {
+        let conn = fresh_conn().await;
+        let instance = Uuid::new_v4();
+        persist_block(
+            &conn,
+            instance,
+            &BlockKind::ToolUse {
+                name: "shell".into(),
+            },
+            "ls /",
+            false,
+        )
+        .await
+        .unwrap();
+
+        let frames = replay_frames(&conn, instance).await.unwrap();
+        assert_eq!(frames.len(), 4);
+        match &frames[0] {
+            StreamFrame::ScrollbackReset { .. } => {}
+            other => panic!("expected ScrollbackReset at [0], got {other:?}"),
+        }
+        match &frames[1] {
+            StreamFrame::BlockDelta {
+                kind: BlockKind::ToolUse { name },
+                text,
+                ..
+            } => {
+                assert_eq!(&**name, "shell");
+                assert_eq!(text, "ls /");
+            }
+            other => panic!("expected BlockDelta with ToolUse kind at [1], got {other:?}"),
+        }
+        match &frames[2] {
+            StreamFrame::BlockStop { .. } => {}
+            other => panic!("expected BlockStop at [2], got {other:?}"),
+        }
+        match &frames[3] {
+            StreamFrame::ScrollbackReplayEnd => {}
+            other => panic!("expected ScrollbackReplayEnd at [3], got {other:?}"),
+        }
     }
 }
