@@ -23,6 +23,7 @@ const SHELL_TAIL_LINES: usize = 10;
 pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
     match kind {
         BlockKind::ShellOutput { state, cmd } => Box::new(ShellOutputBlock::new(state, cmd, text)),
+        BlockKind::Diff { lines } => Box::new(DiffBlock::new(lines)),
         BlockKind::ToolUse {
             name,
             detail: Some(detail),
@@ -47,12 +48,14 @@ impl Block for DiffBlock {
         let mut count = 0;
         for line in &self.lines {
             let content = match line {
-                frances_daemon::protocol::DiffLine::Context(c) => c.as_ref(),
-                frances_daemon::protocol::DiffLine::Added(a) => a.as_ref(),
-                frances_daemon::protocol::DiffLine::Removed(r) => r.as_ref(),
+                frances_daemon::protocol::DiffLine::Context { text: c, line: l } => {
+                    format!("{:4} {}", l, c)
+                }
+                frances_daemon::protocol::DiffLine::Added(a) => a.to_string(),
+                frances_daemon::protocol::DiffLine::Removed(r) => r.to_string(),
             };
             let mut out = Vec::new();
-            wrap_into("", content, max, &mut out);
+            wrap_into("", &content, max, &mut out);
             count += out.len().max(1) as u16;
         }
         count
@@ -63,18 +66,21 @@ impl Block for DiffBlock {
         let max = area.width.max(1) as usize;
         for line in &self.lines {
             let (content, style) = match line {
-                frances_daemon::protocol::DiffLine::Context(c) => (c.as_ref(), Style::default()),
+                frances_daemon::protocol::DiffLine::Context { text: c, line: l } => {
+                    let formatted = format!("{:4} {}", l, c);
+                    (formatted, Style::default())
+                }
                 frances_daemon::protocol::DiffLine::Added(a) => (
-                    a.as_ref(),
+                    a.to_string(),
                     Style::default().bg(Color::Green).fg(Color::Black),
                 ),
                 frances_daemon::protocol::DiffLine::Removed(r) => {
-                    (r.as_ref(), Style::default().bg(Color::Red).fg(Color::Black))
+                    (r.to_string(), Style::default().bg(Color::Red).fg(Color::Black))
                 }
             };
 
             let mut out = Vec::new();
-            wrap_into("", content, max, &mut out);
+            wrap_into("", &content, max, &mut out);
 
             for wrapped_line in out {
                 if row >= area.height {
@@ -480,6 +486,7 @@ pub fn prefix_for(kind: &BlockKind) -> String {
             // its own prefix; LabelledBlock should never see this kind.
             String::new()
         }
+        BlockKind::Diff { .. } => String::new(),
     }
 }
 
@@ -488,6 +495,7 @@ fn prefix_style(kind: &BlockKind) -> Style {
         BlockKind::Text { .. } => Style::default(),
         BlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
         BlockKind::ShellOutput { .. } => Style::default(),
+        BlockKind::Diff { .. } => Style::default(),
     }
 }
 

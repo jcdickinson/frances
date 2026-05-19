@@ -376,6 +376,14 @@ fn encode_block(
             })
             .map_err(ScrollbackError::Encode)?,
         ),
+        BlockKind::Diff { lines } => (
+            "diff",
+            serde_json::to_value(DiffPayload {
+                lines: lines.clone(),
+                text: text.to_owned(),
+            })
+            .map_err(ScrollbackError::Encode)?,
+        ),
     };
     let payload_json = serde_json::to_string(&payload).map_err(ScrollbackError::Encode)?;
     Ok((kind_text, payload_json))
@@ -408,6 +416,7 @@ fn decode_row(
             Ok(StoredRow::Block {
                 kind: BlockKind::ToolUse {
                     name: p.name,
+
                     detail: p.detail,
                 },
                 text: p.text,

@@ -168,6 +168,15 @@ pub enum BlockKind {
     /// `Success`/`Exit(N)` as the command completes, with the TUI
     /// re-rendering on each transition.
     ShellOutput { state: ShellState, cmd: Arc<str> },
+    /// A unified diff block.
+    Diff { lines: Vec<DiffLine> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiffLine {
+    Context { text: Arc<str>, line: u32 },
+    Added(Arc<str>),
+    Removed(Arc<str>),
 }
 
 /// Terminal-status enum for [`BlockKind::ShellOutput`]. Carried on

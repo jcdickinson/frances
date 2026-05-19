@@ -58,38 +58,38 @@ pub fn render_diff_block(
 
                 if take_start + take_end >= len {
                     for i in new_range.clone() {
-                        emit_line(&mut out, ' ', post_anchors[i], &post_lines[i]);
+                        emit_line(&mut out, ' ', post_anchors[i], &post_lines[i], i + 1);
                     }
                 } else {
                     for i in 0..take_start {
                         let idx = new_range.start + i;
-                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx]);
+                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx], idx + 1);
                     }
                     if take_start > 0 {
                         out.push('\n');
                     }
                     for i in 0..take_end {
                         let idx = new_range.end - take_end + i;
-                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx]);
+                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx], idx + 1);
                     }
                 }
             }
             DiffTag::Delete => {
                 for i in op.old_range() {
-                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i]);
+                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i], i + 1);
                 }
             }
             DiffTag::Insert => {
                 for i in op.new_range() {
-                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i]);
+                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i], i + 1);
                 }
             }
             DiffTag::Replace => {
                 for i in op.old_range() {
-                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i]);
+                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i], i + 1);
                 }
                 for i in op.new_range() {
-                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i]);
+                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i], i + 1);
                 }
             }
         }
@@ -98,8 +98,15 @@ pub fn render_diff_block(
     out
 }
 
-fn emit_line(out: &mut String, prefix: char, anchor: &Anchor, content: &str) {
-    write!(out, "{prefix}{anchor}{ANCHOR_SEP}{content}").expect("write to String");
+
+fn emit_line(
+    out: &mut String,
+    prefix: char,
+    anchor: &Anchor,
+    content: &str,
+    line: usize,
+) {
+    write!(out, "{prefix} {line:4} {anchor}{ANCHOR_SEP}{content}").expect("write to String");
     out.push('\n');
 }
 
