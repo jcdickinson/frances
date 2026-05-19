@@ -122,6 +122,7 @@ struct ToolUsePayload {
 #[derive(Serialize, Deserialize)]
 struct ShellOutputPayload {
     state: crate::protocol::ShellState,
+    cmd: Arc<str>,
     text: String,
 }
 
@@ -354,10 +355,11 @@ fn encode_block(
             })
             .map_err(ScrollbackError::Encode)?,
         ),
-        BlockKind::ShellOutput { state } => (
+        BlockKind::ShellOutput { state, cmd } => (
             "shell_output",
             serde_json::to_value(ShellOutputPayload {
                 state: state.clone(),
+                cmd: cmd.clone(),
                 text: text.to_owned(),
             })
             .map_err(ScrollbackError::Encode)?,
@@ -404,7 +406,10 @@ fn decode_row(
                     source,
                 })?;
             Ok(StoredRow::Block {
-                kind: BlockKind::ShellOutput { state: p.state },
+                kind: BlockKind::ShellOutput {
+                    state: p.state,
+                    cmd: p.cmd,
+                },
                 text: p.text,
                 truncated,
             })
@@ -503,16 +508,17 @@ mod tests {
         use crate::protocol::ShellState;
         let db = fresh_db().await;
         let instance = Uuid::new_v4();
-        for (state, body) in [
-            (ShellState::Running, "$ sleep 1\n"),
-            (ShellState::Success, "$ true\n"),
-            (ShellState::Exit(137), "$ sleep 9\n(killed)"),
+        for (state, cmd, body) in [
+            (ShellState::Running, "sleep 1", ""),
+            (ShellState::Success, "true", ""),
+            (ShellState::Exit(137), "sleep 9", "(killed)"),
         ] {
             persist_block(
                 &db,
                 instance,
                 &BlockKind::ShellOutput {
                     state: state.clone(),
+                    cmd: Arc::from(cmd),
                 },
                 body,
                 false,
@@ -532,13 +538,16 @@ mod tests {
             kinds,
             vec![
                 BlockKind::ShellOutput {
-                    state: ShellState::Running
+                    state: ShellState::Running,
+                    cmd: Arc::from("sleep 1"),
                 },
                 BlockKind::ShellOutput {
-                    state: ShellState::Success
+                    state: ShellState::Success,
+                    cmd: Arc::from("true"),
                 },
                 BlockKind::ShellOutput {
-                    state: ShellState::Exit(137)
+                    state: ShellState::Exit(137),
+                    cmd: Arc::from("sleep 9"),
                 },
             ]
         );

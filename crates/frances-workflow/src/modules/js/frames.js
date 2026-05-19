@@ -8,6 +8,7 @@ export const {
   ErrorFrame,
   JsonFrame,
   ShellOutputFrame,
+  ToolUseFrame,
 } = globalThis.__frances_v1_stash__;
 
 // Each writable-capable frame class composes a WHATWG WritableStream

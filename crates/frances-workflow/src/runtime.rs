@@ -104,17 +104,28 @@ pub enum FrameKind {
     /// `ErrorFrame` — text content (typically rendered as an error) that
     /// may be extended with `append`.
     Error { content: String },
+    /// `ToolUseFrame` — one-shot marker that names a tool the workflow
+    /// is about to invoke. The host renders this as a small "→ name"
+    /// row so the user can see the tool being called even when the
+    /// tool itself emits no other frames.
+    ToolUse { name: String },
     /// `JsonFrame` — single tagged JSON value. Immutable after push.
     Json {
         tag: String,
         value: serde_json::Value,
     },
     /// `ShellOutputFrame` — streaming output from one shell command.
-    /// `content` is the initial body (typically the `$ cmd` header
-    /// plus any output captured before the first push). `state`
+    /// `cmd` is the bash source that produced the output; it rides on
+    /// every frame so the host can keep it pinned even after the body
+    /// has been truncated for display. `content` is the initial body
+    /// (any output captured before the first push, or empty). `state`
     /// transitions from `Running` to `Success`/`Exit(N)` via
     /// [`HostFrame::UpdateKind`] as the command completes.
-    ShellOutput { state: ShellState, content: String },
+    ShellOutput {
+        state: ShellState,
+        cmd: String,
+        content: String,
+    },
 }
 
 /// Terminal status for [`FrameKind::ShellOutput`]. Mirrors
@@ -900,9 +911,14 @@ mod tests {
             HostFrame::Push(p) => match &p.kind {
                 FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
                 FrameKind::Error { content } => content.clone(),
+                FrameKind::ToolUse { name } => format!("→ {name}"),
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-                FrameKind::ShellOutput { state, content } => {
-                    format!("[shell:{state:?}] {content}")
+                FrameKind::ShellOutput {
+                    state,
+                    cmd,
+                    content,
+                } => {
+                    format!("[shell:{state:?}] $ {cmd}\n{content}")
                 }
             },
             HostFrame::Append { delta, .. } => delta.clone(),
@@ -1544,7 +1560,7 @@ mod tests {
             "js",
             r#"
             import { transcript, ShellOutputFrame } from "frances:v1/frames";
-            const f = new ShellOutputFrame({ content: "$ ls\n" });
+            const f = new ShellOutputFrame({ cmd: "ls" });
             transcript.push(f);
             const w = f.writable.getWriter();
             await w.write("a\n");
@@ -1574,8 +1590,12 @@ mod tests {
         match &push.kind {
             FrameKind::ShellOutput {
                 state: ShellState::Running,
+                cmd,
                 content,
-            } => assert_eq!(content, "$ ls\n"),
+            } => {
+                assert_eq!(cmd, "ls");
+                assert_eq!(content, "");
+            }
             other => panic!("expected ShellOutput Running, got {other:?}"),
         }
 

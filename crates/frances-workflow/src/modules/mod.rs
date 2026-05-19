@@ -156,13 +156,14 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         inbox::build_inbox(ctx, input_rx, closed.clone(), closed_notify.clone(), parked)?;
     stash.set("inbox", inbox_instance)?;
 
-    let (transcript_proxy, md_ctor, err_ctor, json_ctor, shell_output_ctor) =
+    let (transcript_proxy, md_ctor, err_ctor, json_ctor, shell_output_ctor, tool_use_ctor) =
         frames::build_frames(ctx, frames_tx)?;
     stash.set("transcript", transcript_proxy)?;
     stash.set("MarkdownFrame", md_ctor)?;
     stash.set("ErrorFrame", err_ctor)?;
     stash.set("JsonFrame", json_ctor)?;
     stash.set("ShellOutputFrame", shell_output_ctor)?;
+    stash.set("ToolUseFrame", tool_use_ctor)?;
 
     let (chat_ctor, chat_inner_stream) = chat::build_chat_session_ctor(ctx, deps.clone())?;
     stash.set("ChatSession", chat_ctor)?;

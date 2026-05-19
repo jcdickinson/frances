@@ -31,7 +31,7 @@ use frances_tui::{
 };
 
 use crate::client;
-use crate::tui::{FooterBlock, INPUT_HEIGHT, LabelledBlock, RawBlock, Textarea};
+use crate::tui::{FooterBlock, INPUT_HEIGHT, RawBlock, Textarea, block_for_kind};
 
 pub struct App<'a> {
     pub session: &'a Session,
@@ -111,25 +111,18 @@ impl LiveBlocks {
         if let Some(t) = text {
             entry.text.push_str(&t);
             match entry.container_id {
-                Some(cid) => container.update_active(
-                    cid,
-                    Box::new(LabelledBlock::new(entry.kind.clone(), entry.text.clone())),
-                ),
+                Some(cid) => container
+                    .update_active(cid, block_for_kind(entry.kind.clone(), entry.text.clone())),
                 None => {
-                    let cid = container.push_active(Box::new(LabelledBlock::new(
-                        entry.kind.clone(),
-                        entry.text.clone(),
-                    )));
+                    let cid = container
+                        .push_active(block_for_kind(entry.kind.clone(), entry.text.clone()));
                     entry.container_id = Some(cid);
                 }
             }
         } else if let Some(cid) = entry.container_id {
             // Kind-only delta on an already-materialised block — re-render
             // so the new kind's prefix / style takes effect.
-            container.update_active(
-                cid,
-                Box::new(LabelledBlock::new(entry.kind.clone(), entry.text.clone())),
-            );
+            container.update_active(cid, block_for_kind(entry.kind.clone(), entry.text.clone()));
         }
     }
 
@@ -600,7 +593,7 @@ fn handle_replay_frame(
                 }
             });
             if let Some(open) = finished {
-                container.push_committed(Box::new(LabelledBlock::new(open.kind, open.text)));
+                container.push_committed(block_for_kind(open.kind, open.text));
             }
         }
         StreamFrame::BlockTruncated { id } => {
@@ -615,8 +608,7 @@ fn handle_replay_frame(
                 }
             });
             if let Some(open) = finished {
-                let inner: Box<dyn frances_tui::Block> =
-                    Box::new(LabelledBlock::new(open.kind, open.text));
+                let inner = block_for_kind(open.kind, open.text);
                 container.push_committed(Box::new(TruncatedBlock::new(inner)));
             }
         }

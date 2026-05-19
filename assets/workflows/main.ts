@@ -19,7 +19,12 @@
 // Type `quit` to exit.
 
 import { inbox } from "frances:v1/inbox";
-import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+import {
+  transcript,
+  MarkdownFrame,
+  ErrorFrame,
+  ToolUseFrame,
+} from "frances:v1/frames";
 import { ChatSession } from "frances:v1/chat";
 import {
   Shell,
@@ -617,6 +622,7 @@ const tools = [
 for (const tool of tools) {
   const original = tool.handler.bind(tool);
   tool.handler = async ({ call, scope }: any) => {
+    transcript.push(new ToolUseFrame({ name: call.name }));
     recordStepTranscript(
       `Tool call: ${call.name}`,
       `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,

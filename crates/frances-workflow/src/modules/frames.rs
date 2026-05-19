@@ -73,6 +73,7 @@ pub(crate) fn build_frames<'js>(
     Ctor<'js>,
     Ctor<'js>,
     Ctor<'js>,
+    Ctor<'js>,
 )> {
     let state = FramesState::new(tx);
 
@@ -86,9 +87,17 @@ pub(crate) fn build_frames<'js>(
     let md_ctor = build_markdown_ctor(ctx, state.clone())?;
     let err_ctor = build_error_ctor(ctx, state.clone())?;
     let json_ctor = build_json_ctor(ctx, state.clone())?;
-    let shell_output_ctor = build_shell_output_ctor(ctx, state)?;
+    let shell_output_ctor = build_shell_output_ctor(ctx, state.clone())?;
+    let tool_use_ctor = build_tool_use_ctor(ctx, state)?;
 
-    Ok((transcript, md_ctor, err_ctor, json_ctor, shell_output_ctor))
+    Ok((
+        transcript,
+        md_ctor,
+        err_ctor,
+        json_ctor,
+        shell_output_ctor,
+        tool_use_ctor,
+    ))
 }
 
 // ---------------------------------------------------------------------
@@ -175,6 +184,21 @@ fn push_frame<'js>(
         }));
         return Ok(());
     }
+    if let Some(tu) = as_frame::<ToolUseFrame>(&frame) {
+        let new_id = state.assign_id();
+        tu.borrow().id.store(new_id, Ordering::Release);
+        let kind = FrameKind::ToolUse {
+            name: tu.borrow().name.clone(),
+        };
+        let _ = state.tx.send(HostFrame::Push(FramePush {
+            id: FrameId(new_id),
+            kind,
+        }));
+        // One-shot: the daemon closes + persists this frame on its end
+        // (see emit() for FrameKind::ToolUse). No HostFrame::Close from
+        // the workflow side — keeps the JS API simple.
+        return Ok(());
+    }
     if let Some(json) = as_frame::<JsonFrame>(&frame) {
         let new_id = state.assign_id();
         json.borrow().id.store(new_id, Ordering::Release);
@@ -195,6 +219,7 @@ fn push_frame<'js>(
         borrow.id.store(new_id, Ordering::Release);
         let kind = FrameKind::ShellOutput {
             state: load_shell_state(&borrow.state_atom),
+            cmd: borrow.cmd.clone(),
             content: borrow.content.clone(),
         };
         let _ = state.tx.send(HostFrame::Push(FramePush {
@@ -210,7 +235,7 @@ fn push_frame<'js>(
     }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, or ShellOutputFrame",
+        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, ShellOutputFrame, or ToolUseFrame",
     )
 }
 
@@ -414,6 +439,65 @@ impl<'js> JsClass<'js> for JsonFrame {
 }
 
 // ---------------------------------------------------------------------
+// ToolUseFrame — one-shot "→ tool_name" marker
+// ---------------------------------------------------------------------
+
+pub struct ToolUseFrame {
+    #[expect(
+        dead_code,
+        reason = "kept for symmetry with the other frame types; never read after construction since ToolUseFrame is one-shot"
+    )]
+    state: Arc<FramesState>,
+    id: AtomicU64,
+    name: String,
+}
+
+impl<'js> Trace<'js> for ToolUseFrame {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for ToolUseFrame {
+    type Changed<'to> = ToolUseFrame;
+}
+
+impl<'js> JsClass<'js> for ToolUseFrame {
+    const NAME: &'static str = "ToolUseFrame";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        // No `write` / `close` — one-shot, sealed on the daemon side.
+        let proto = Object::new(ctx.clone())?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ToolUseFrame, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Value<'js>| {
+            let Some(obj) = arg.as_object() else {
+                return throw_type(&ctx, "new ToolUseFrame: expected { name: string }");
+            };
+            let name: String = obj
+                .get("name")
+                .map_err(|_| throw_err(&ctx, "new ToolUseFrame: missing or non-string `name`"))?;
+            Class::instance(
+                ctx.clone(),
+                ToolUseFrame {
+                    state: state.clone(),
+                    id: AtomicU64::new(0),
+                    name,
+                },
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------
 // ShellOutputFrame — streaming shell-command output with mutable state
 // ---------------------------------------------------------------------
 
@@ -450,6 +534,10 @@ fn load_shell_state(atom: &AtomicU64) -> crate::runtime::ShellState {
 pub struct ShellOutputFrame {
     state: Arc<FramesState>,
     id: AtomicU64,
+    /// Bash source that produced this output. Pinned on every wire
+    /// frame so the TUI can render it as a header even when the body
+    /// has been truncated.
+    cmd: String,
     /// Initial body captured at construction. Mirrors `MarkdownFrame.content`.
     content: String,
     /// Encoded [`crate::runtime::ShellState`]. Mutated by
@@ -515,6 +603,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
                         &b.state,
                         &b.id,
                         &b.state_atom,
+                        &b.cmd,
                         crate::runtime::ShellState::Success,
                     )
                 },
@@ -531,6 +620,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
                         &b.state,
                         &b.id,
                         &b.state_atom,
+                        &b.cmd,
                         crate::runtime::ShellState::Exit(code),
                     )
                 },
@@ -551,6 +641,7 @@ fn set_shell_state<'js>(
     state: &Arc<FramesState>,
     id: &AtomicU64,
     state_atom: &AtomicU64,
+    cmd: &str,
     new_state: crate::runtime::ShellState,
 ) -> JsResult<()> {
     let frame_id = id.load(Ordering::Acquire);
@@ -562,9 +653,12 @@ fn set_shell_state<'js>(
     }
     state_atom.store(encode_shell_state(&new_state), Ordering::Release);
     // Content is empty here — the daemon's UpdateKind handler emits a
-    // no-text BlockDelta carrying just the new kind.
+    // no-text BlockDelta carrying just the new kind. `cmd` rides along
+    // because the wire `BlockKind::ShellOutput` carries it on every
+    // delta.
     let kind = FrameKind::ShellOutput {
         state: new_state,
+        cmd: cmd.to_owned(),
         content: String::new(),
     };
     let _ = state.tx.send(HostFrame::UpdateKind {
@@ -657,12 +751,13 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
     Constructor::new_class::<ShellOutputFrame, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| {
-            let (content, closed) = parse_shell_output_arg(&ctx, &arg)?;
+            let (cmd, content, closed) = parse_shell_output_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
                 ShellOutputFrame {
                     state: state.clone(),
                     id: AtomicU64::new(0),
+                    cmd,
                     content,
                     state_atom: AtomicU64::new(SHELL_STATE_RUNNING),
                     closed: AtomicBool::new(closed),
@@ -672,21 +767,34 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
     )
 }
 
-/// Parse `new ShellOutputFrame({ content?, closed? })`. `content` is
-/// optional; if absent it defaults to an empty string (workflows
-/// usually push the frame first, then stream output via `.writable`).
-/// `closed` mirrors the MarkdownFrame option: setting it to `true`
-/// pre-seals the frame so `transcript.push` emits a `Close` right
-/// after the `Push`.
-fn parse_shell_output_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<(String, bool)> {
-    if arg.is_undefined() || arg.is_null() {
-        return Ok((String::new(), false));
-    }
+/// Parse `new ShellOutputFrame({ cmd, content?, closed? })`. `cmd` is
+/// required — it's the bash source that produced this output and the
+/// TUI renders it as a header. `content` is optional; if absent it
+/// defaults to an empty string (workflows usually push the frame first,
+/// then stream output via `.writable`). `closed` mirrors the
+/// MarkdownFrame option: setting it to `true` pre-seals the frame so
+/// `transcript.push` emits a `Close` right after the `Push`.
+fn parse_shell_output_arg<'js>(
+    ctx: &Ctx<'js>,
+    arg: &Value<'js>,
+) -> JsResult<(String, String, bool)> {
     let Some(obj) = arg.as_object() else {
         return throw_type(
             ctx,
-            "new ShellOutputFrame: expected { content?: string, closed?: bool } or no argument",
+            "new ShellOutputFrame: expected { cmd: string, content?: string, closed?: bool }",
         );
+    };
+    let cmd_val: Value<'js> = obj
+        .get("cmd")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let cmd = if let Some(s) = cmd_val.as_string() {
+        s.to_string()
+            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `cmd` must be UTF-8"))?
+    } else {
+        return Err(throw_err(
+            ctx,
+            "new ShellOutputFrame: `cmd` is required and must be a string",
+        ));
     };
     let content_val: Value<'js> = obj
         .get("content")
@@ -703,7 +811,7 @@ fn parse_shell_output_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<(St
         ));
     };
     let closed = parse_optional_bool(ctx, obj, "closed", "new ShellOutputFrame: `closed`")?;
-    Ok((content, closed))
+    Ok((cmd, content, closed))
 }
 
 fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsResult<String> {

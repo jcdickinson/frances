@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use frances_daemon::protocol::{BlockKind, ShellState};
 use frances_tui::Block;
 use ratatui::buffer::Buffer;
@@ -6,6 +8,22 @@ use ratatui::style::{Color, Style};
 use unicode_width::UnicodeWidthChar;
 
 use super::textarea::INPUT_HEIGHT;
+
+/// Maximum body lines (post trailing-newline strip) shown for a shell
+/// output block. Earlier lines are collapsed into a single `… [N earlier
+/// lines]` marker so the visible tail tracks the action.
+const SHELL_TAIL_LINES: usize = 10;
+
+/// Build the right [`Block`] impl for a wire `BlockKind` + accumulated
+/// text. Most kinds map onto a generic [`LabelledBlock`]; `ShellOutput`
+/// has its own structural shape (header + body tail) and gets a
+/// dedicated [`ShellOutputBlock`].
+pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
+    match kind {
+        BlockKind::ShellOutput { state, cmd } => Box::new(ShellOutputBlock::new(state, cmd, text)),
+        other => Box::new(LabelledBlock::new(other, text)),
+    }
+}
 
 /// History row for a labelled (kind + text) block. Wraps to the
 /// available width with the kind prefix on the first row and a
@@ -51,6 +69,131 @@ impl Block for LabelledBlock {
                 buf.set_string(area.x, y, line, Style::default());
             }
         }
+    }
+}
+
+/// History row for a shell command's output. Renders as:
+///   `[state] cmd` (the cmd may wrap; continuation rows are unindented)
+///   `… [N earlier lines]` (only when the body is longer than the tail)
+///   last-`SHELL_TAIL_LINES` body lines (wrapped, unindented)
+///
+/// `state` drives the prefix label and its colour; `cmd` rides on every
+/// `BlockDelta` so the header stays pinned even while the body keeps
+/// streaming.
+pub struct ShellOutputBlock {
+    pub state: ShellState,
+    pub cmd: Arc<str>,
+    pub text: String,
+}
+
+impl ShellOutputBlock {
+    pub fn new(state: ShellState, cmd: Arc<str>, text: String) -> Self {
+        Self { state, cmd, text }
+    }
+
+    fn header_prefix(&self) -> String {
+        shell_state_prefix(&self.state)
+    }
+
+    fn header_lines(&self, width: u16) -> Vec<String> {
+        let prefix = self.header_prefix();
+        let mut out = Vec::new();
+        wrap_into(&prefix, &self.cmd, width.max(1) as usize, &mut out);
+        out
+    }
+
+    /// Body rows: ellipsis marker (if any) plus the last
+    /// `SHELL_TAIL_LINES` source lines, each wrapped to width. Returns
+    /// an empty Vec when there is no body content beyond the cmd.
+    fn body_lines(&self, width: u16) -> Vec<String> {
+        let mut source: Vec<&str> = self.text.split('\n').collect();
+        // Drop trailing empty entries from a trailing `\n` so we don't
+        // burn budget rendering a blank tail row.
+        while matches!(source.last(), Some(&"")) {
+            source.pop();
+        }
+        if source.is_empty() {
+            return Vec::new();
+        }
+
+        let max = width.max(1) as usize;
+        let mut out = Vec::new();
+        if source.len() > SHELL_TAIL_LINES {
+            let omitted = source.len() - SHELL_TAIL_LINES;
+            let marker = format!(
+                "… [{omitted} earlier line{}]",
+                if omitted == 1 { "" } else { "s" }
+            );
+            wrap_into("", &marker, max, &mut out);
+            for line in &source[source.len() - SHELL_TAIL_LINES..] {
+                wrap_into("", line, max, &mut out);
+            }
+        } else {
+            for line in &source {
+                wrap_into("", line, max, &mut out);
+            }
+        }
+        out
+    }
+}
+
+impl Block for ShellOutputBlock {
+    fn measure(&self, width: u16) -> u16 {
+        (self.header_lines(width).len() + self.body_lines(width).len()) as u16
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let header = self.header_lines(area.width);
+        let body = self.body_lines(area.width);
+        let prefix = self.header_prefix();
+        let prefix_bytes = prefix.len();
+        let prefix_cols = display_width(&prefix) as u16;
+        let prefix_style = shell_state_prefix_style(&self.state);
+
+        let mut row = 0u16;
+        for (i, line) in header.iter().enumerate() {
+            if row >= area.height {
+                return;
+            }
+            let y = area.y + row;
+            if i == 0 && line.starts_with(&prefix) {
+                buf.set_string(area.x, y, &line[..prefix_bytes], prefix_style);
+                if line.len() > prefix_bytes {
+                    buf.set_string(
+                        area.x + prefix_cols,
+                        y,
+                        &line[prefix_bytes..],
+                        Style::default(),
+                    );
+                }
+            } else {
+                buf.set_string(area.x, y, line, Style::default());
+            }
+            row += 1;
+        }
+        for line in body.iter() {
+            if row >= area.height {
+                return;
+            }
+            buf.set_string(area.x, area.y + row, line, Style::default());
+            row += 1;
+        }
+    }
+}
+
+fn shell_state_prefix(state: &ShellState) -> String {
+    match state {
+        ShellState::Running => "[…] ".to_string(),
+        ShellState::Success => "[ok] ".to_string(),
+        ShellState::Exit(n) => format!("[exit {n}] "),
+    }
+}
+
+fn shell_state_prefix_style(state: &ShellState) -> Style {
+    match state {
+        ShellState::Running => Style::default().fg(Color::Cyan),
+        ShellState::Success => Style::default().fg(Color::Green),
+        ShellState::Exit(_) => Style::default().fg(Color::Red),
     }
 }
 
@@ -170,12 +313,12 @@ pub fn prefix_for(kind: &BlockKind) -> String {
     match kind {
         BlockKind::Text { sender: Some(s) } => format!("{s}: "),
         BlockKind::Text { sender: None } => String::new(),
-        BlockKind::ToolUse { name } => format!("→ {name}("),
-        BlockKind::ShellOutput { state } => match state {
-            ShellState::Running => "[…] ".to_string(),
-            ShellState::Success => "[ok] ".to_string(),
-            ShellState::Exit(n) => format!("[exit {n}] "),
-        },
+        BlockKind::ToolUse { name } => format!("→ {name}"),
+        BlockKind::ShellOutput { .. } => {
+            // ShellOutput renders through ShellOutputBlock, which owns
+            // its own prefix; LabelledBlock should never see this kind.
+            String::new()
+        }
     }
 }
 
@@ -183,11 +326,7 @@ fn prefix_style(kind: &BlockKind) -> Style {
     match kind {
         BlockKind::Text { .. } => Style::default(),
         BlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
-        BlockKind::ShellOutput { state } => match state {
-            ShellState::Running => Style::default().fg(Color::Cyan),
-            ShellState::Success => Style::default().fg(Color::Green),
-            ShellState::Exit(_) => Style::default().fg(Color::Red),
-        },
+        BlockKind::ShellOutput { .. } => Style::default(),
     }
 }
 

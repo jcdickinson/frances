@@ -160,11 +160,14 @@ pub enum BlockKind {
         name: Arc<str>,
     },
     /// Streaming output from a shell command. The body carries the
-    /// command and its accumulated stdout; `state` advances from
-    /// `Running` to `Success`/`Exit(N)` as the command completes,
-    /// with the TUI re-rendering on each transition.
+    /// accumulated stdout; `cmd` is the bash source that produced it,
+    /// pinned separately so the TUI can render it as a header even when
+    /// the body is truncated. `state` advances from `Running` to
+    /// `Success`/`Exit(N)` as the command completes, with the TUI
+    /// re-rendering on each transition.
     ShellOutput {
         state: ShellState,
+        cmd: Arc<str>,
     },
 }
 

@@ -62,8 +62,13 @@ fn text_of(frame: &HostFrame) -> String {
         HostFrame::Push(p) => match &p.kind {
             FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
             FrameKind::Error { content } => content.clone(),
+            FrameKind::ToolUse { name } => format!("→ {name}"),
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput { state, content } => format!("[shell:{state:?}] {content}"),
+            FrameKind::ShellOutput {
+                state,
+                cmd,
+                content,
+            } => format!("[shell:{state:?}] $ {cmd}\n{content}"),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),

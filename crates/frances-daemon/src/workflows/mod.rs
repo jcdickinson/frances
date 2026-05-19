@@ -669,10 +669,12 @@ async fn emit(
             }
             FrameKind::ShellOutput {
                 state: shell_state,
+                cmd,
                 content,
             } => {
                 let block_kind = BlockKind::ShellOutput {
                     state: shell_state_to_protocol(&shell_state),
+                    cmd: Arc::from(cmd),
                 };
                 let block = state.alloc();
                 write_message(
@@ -696,6 +698,28 @@ async fn emit(
             FrameKind::Error { content } => {
                 state.persist_error(&content).await?;
                 write_message(stream, &StreamFrame::Error(content)).await?;
+            }
+            FrameKind::ToolUse { name } => {
+                let block = state.alloc();
+                let name_arc: Arc<str> = Arc::from(name);
+                let kind = BlockKind::ToolUse {
+                    name: name_arc.clone(),
+                };
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        kind: kind.clone(),
+                        text: Some(String::new()),
+                    },
+                )
+                .await?;
+                // One-shot: stop + persist immediately, no entry in
+                // `state.open`. Text is empty — the name lives in the
+                // prefix on the TUI side.
+                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
+                    .await?;
             }
             FrameKind::Json { tag, value } => {
                 let body =
@@ -750,11 +774,16 @@ async fn emit(
                     sender: sender.map(Arc::from),
                 }),
                 FrameKind::ShellOutput {
-                    state: shell_state, ..
+                    state: shell_state,
+                    cmd,
+                    ..
                 } => Some(BlockKind::ShellOutput {
                     state: shell_state_to_protocol(&shell_state),
+                    cmd: Arc::from(cmd),
                 }),
-                FrameKind::Error { .. } | FrameKind::Json { .. } => None,
+                FrameKind::Error { .. } | FrameKind::Json { .. } | FrameKind::ToolUse { .. } => {
+                    None
+                }
             };
             let Some(new_block_kind) = new_block_kind else {
                 return Ok(());

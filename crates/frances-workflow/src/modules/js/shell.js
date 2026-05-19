@@ -125,7 +125,7 @@ function _openShellFrame(shell, cmd) {
   if (shell._frame) {
     _closeShellFrame(shell);
   }
-  const frame = new ShellOutputFrame({ content: `$ ${cmd}\n` });
+  const frame = new ShellOutputFrame({ cmd });
   transcript.push(frame);
   const writer = frame.writable.getWriter();
   shell._frame = frame;
