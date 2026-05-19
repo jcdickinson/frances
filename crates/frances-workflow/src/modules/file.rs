@@ -12,7 +12,7 @@
 //!   cached anchor state, return the anchored render. Throws on disk
 //!   error or unknown anchor.
 //! - `edit(value)` — apply one structured edit. `value` is a tagged
-//!   object: `{ kind: "ReplaceLines"|"InsertAfter"|"InsertBefore"|"New"|
+//!   object: `{ kind: "ReplaceLines"|"ReplaceAll"|"InsertAfter"|"InsertBefore"|"New"|
 //!   "Overwrite", path, ... }`. Returns the diff block (or full
 //!   anchored file for `New`).
 //!
@@ -65,6 +65,7 @@ pub(crate) fn build_descriptions<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
         "file_replace_lines",
         include_str!("desc/file_replace_lines.md"),
     )?;
+    obj.set("file_replace_all", include_str!("desc/file_replace_all.md"))?;
     obj.set(
         "file_insert_after",
         include_str!("desc/file_insert_after.md"),
@@ -183,6 +184,7 @@ async fn edit_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Result
 fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
     let path = match edit {
         LlmEdit::ReplaceLines { path, .. }
+        | LlmEdit::ReplaceAll { path, .. }
         | LlmEdit::InsertAfter { path, .. }
         | LlmEdit::InsertBefore { path, .. }
         | LlmEdit::New { path, .. }

@@ -1388,6 +1388,7 @@ dependencies = [
  "bincode 2.0.1",
  "frances-anchors",
  "parking_lot",
+ "regex",
  "serde",
  "serde_json",
  "similar",

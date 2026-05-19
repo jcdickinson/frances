@@ -14,6 +14,7 @@ thiserror.workspace = true
 twox-hash.workspace = true
 smallvec.workspace = true
 serde.workspace = true
+regex.workspace = true
 
 [features]
 # Exposes `FakeStore` for downstream crates to use in their own tests.

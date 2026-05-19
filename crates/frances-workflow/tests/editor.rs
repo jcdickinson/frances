@@ -168,6 +168,91 @@ async fn editor_edit_replace_writes_disk() {
 }
 
 #[tokio::test]
+async fn editor_edit_replace_all_writes_disk_and_honors_count() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "old_1\nold_2\nkeep\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        await editor.readFile("file.txt");
+        const diff = await editor.edit({
+            kind: "ReplaceAll",
+            path: "file.txt",
+            find: "old_(\\d)",
+            replacement: "new_$1",
+            count: 2,
+        });
+        transcript.push(new MarkdownFrame({ content: diff }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let diff = text_of(&frames[0]);
+    assert!(diff.contains("§new_1"), "diff missing new_1: {diff}");
+    assert!(diff.contains("§new_2"), "diff missing new_2: {diff}");
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(on_disk, "new_1\nnew_2\nkeep\n");
+}
+
+#[tokio::test]
+async fn replace_all_tool_class_reports_count_cap_error_without_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    std::fs::write(&path, "x\nx\nx\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, ReplaceAll } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        const replace = new ReplaceAll(editor, new Variables());
+        await editor.readFile("file.txt");
+        const result = await replace.handler({
+            call: { id: "c1", name: "file_replace_all",
+                    arguments: { path: "file.txt", find: "x", replacement: "y", count: 2 } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(result) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let result = text_of(&frames[0]);
+    assert!(result.contains(r#""is_error":true"#), "result: {result}");
+    assert!(result.contains("matched 3 times"), "result: {result}");
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(on_disk, "x\nx\nx\n");
+}
+
+#[tokio::test]
 async fn editor_anchor_not_found_throws() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("file.txt"), "a\nb\n").unwrap();

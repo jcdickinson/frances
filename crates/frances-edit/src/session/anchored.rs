@@ -2,6 +2,8 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
+use regex::Regex;
+
 use crate::{
     Anchor, AnchorStore, EditHints, EditOp, FileAnchorState, Pool, Truncated, WorkingFile,
     apply_ops, reconcile, render_diff_block,
@@ -44,6 +46,39 @@ impl<S: AnchorStore> EditSession<S> {
             lines: new_lines,
         };
         self.apply_line_edit(path, working, op, tombstones, on_draft)
+            .await
+    }
+
+    pub(super) async fn apply_replace_all<F>(
+        &mut self,
+        path: &Path,
+        find: &str,
+        replacement: &str,
+        count: Option<usize>,
+        on_draft: &mut F,
+    ) -> EditResult<String>
+    where
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+    {
+        let working = self.cached_working(path)?;
+        let re = Regex::new(find)?;
+        let content = working.lines.join("\n");
+        let actual = re.find_iter(&content).count();
+        if let Some(limit) = count
+            && actual > limit
+        {
+            return Err(EditError::ReplaceAllCountExceeded { actual, limit });
+        }
+        if actual == 0 {
+            return Ok(format!(
+                "No changes: regex matched 0 times in {}",
+                path.display()
+            ));
+        }
+
+        let replaced = re.replace_all(&content, replacement).into_owned();
+        let draft = split_text_to_lines(&replaced);
+        self.apply_draft_edit(path, working, draft, None, on_draft)
             .await
     }
 
@@ -113,15 +148,28 @@ impl<S: AnchorStore> EditSession<S> {
     {
         let ops = [op];
         let draft = apply_ops(&working.state, &working.lines, &ops);
-
+        let hints = EditHints {
+            deleted_anchors: tombstones,
+        };
+        self.apply_draft_edit(path, working, draft, Some(&hints), on_draft)
+            .await
+    }
+    async fn apply_draft_edit<F>(
+        &mut self,
+        path: &Path,
+        working: WorkingFile,
+        draft: Vec<String>,
+        hints: Option<&EditHints>,
+        on_draft: &mut F,
+    ) -> EditResult<String>
+    where
+        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+    {
         let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
 
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
-        let hints = EditHints {
-            deleted_anchors: tombstones,
-        };
-        let outcome = reconcile(&working.state, &post_lines, &mut pool, Some(&hints));
+        let outcome = reconcile(&working.state, &post_lines, &mut pool, hints);
 
         self.engine
             .commit(path, &outcome.state, mtime_ns, size, &outcome.tombstoned)
@@ -447,6 +495,105 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.open_files[&path].lines, vec!["a", "B2", "c"]);
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_regex_happy_path() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("foo1\nfoo2\nbar"), 100, 14)
+            .await
+            .unwrap();
+
+        let block = session
+            .edit(
+                LlmEdit::ReplaceAll {
+                    path: path.clone(),
+                    find: r"foo(\d)".into(),
+                    replacement: "baz$1".into(),
+                    count: None,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        assert!(block.contains("§baz1"), "block: {block}");
+        assert!(block.contains("§baz2"), "block: {block}");
+        assert_eq!(session.open_files[&path].lines, vec!["baz1", "baz2", "bar"]);
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_zero_matches_is_noop() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("alpha\nbeta"), 100, 10)
+            .await
+            .unwrap();
+        let before = session.open_files[&path].clone();
+        let mut wrote = false;
+
+        let msg = session
+            .edit(
+                LlmEdit::ReplaceAll {
+                    path: path.clone(),
+                    find: "gamma".into(),
+                    replacement: "delta".into(),
+                    count: None,
+                },
+                |_path, _draft| {
+                    wrote = true;
+                    no_format(_path, _draft)
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(msg.contains("No changes"), "msg: {msg}");
+        assert!(!wrote, "zero-match replace_all must not write");
+        assert_eq!(session.open_files[&path].lines, before.lines);
+        assert_eq!(session.open_files[&path].state.lines, before.state.lines);
+    }
+
+    #[tokio::test]
+    async fn edit_replace_all_count_cap_errors_without_writing() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\na\na"), 100, 5)
+            .await
+            .unwrap();
+        let before = session.open_files[&path].clone();
+        let mut wrote = false;
+
+        let err = session
+            .edit(
+                LlmEdit::ReplaceAll {
+                    path: path.clone(),
+                    find: "a".into(),
+                    replacement: "b".into(),
+                    count: Some(2),
+                },
+                |_path, _draft| {
+                    wrote = true;
+                    no_format(_path, _draft)
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err,
+            EditError::ReplaceAllCountExceeded {
+                actual: 3,
+                limit: 2
+            }
+        ));
+        assert!(err.to_string().contains("matched 3 times"));
+        assert!(!wrote, "count-cap failure must not write");
+        assert_eq!(session.open_files[&path].lines, before.lines);
     }
 
     #[tokio::test]

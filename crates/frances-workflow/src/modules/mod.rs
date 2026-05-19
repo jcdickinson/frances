@@ -49,7 +49,7 @@
 //! - `frances:v1/tools/shell`    — `Shell` primitive + `Run`/`Wait`/`Kill`
 //!   tool classes.
 //! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`ReplaceLines`/
-//!   `InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
+//!   `ReplaceAll`/`InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
 //! - `frances:v1/tools/file_find_or_grep` — `FileSearch` primitive + `Search`
 //!   tool class. Combined name-pattern lookup, content search, and
 //!   directory listing via the ripgrep crates (`ignore::WalkParallel`

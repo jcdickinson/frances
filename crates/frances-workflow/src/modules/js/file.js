@@ -25,6 +25,7 @@
 //   chat.tools.push(
 //     new Read(editor, vars),
 //     new ReplaceLines(editor, vars),
+//     new ReplaceAll(editor, vars),
 //     new InsertAfter(editor, vars),
 //     new InsertBefore(editor, vars),
 //     new New(editor, vars),
@@ -64,6 +65,22 @@ const REPLACE_SCHEMA = {
     },
   },
   required: ["path", "anchor", "end_anchor"],
+};
+
+const REPLACE_ALL_SCHEMA = {
+  type: "object",
+  properties: {
+    path: { type: "string" },
+    find: { type: "string" },
+    replacement: { type: "string" },
+    count: {
+      type: "integer",
+      minimum: 0,
+      description:
+        "Optional maximum match count. If the regex matches more than this, the edit fails without writing.",
+    },
+  },
+  required: ["path", "find", "replacement"],
 };
 
 const INSERT_SCHEMA = {
@@ -189,6 +206,34 @@ class ReplaceLines {
         anchor: call.arguments.anchor,
         end_anchor: call.arguments.end_anchor,
         text,
+      });
+      return _okResult(call.id, content);
+    } catch (err) {
+      return _errResult(call.id, err);
+    }
+  };
+}
+
+
+class ReplaceAll {
+  static schema = REPLACE_ALL_SCHEMA;
+
+  constructor(editor, vars) {
+    this.editor = editor;
+    this.vars = vars;
+    this.name = "file_replace_all";
+    this.description = desc.file_replace_all;
+    this.parameters = REPLACE_ALL_SCHEMA;
+  }
+
+  handler = async ({ call }) => {
+    try {
+      const content = await this.editor.edit({
+        kind: "ReplaceAll",
+        path: call.arguments.path,
+        find: call.arguments.find,
+        replacement: call.arguments.replacement,
+        count: call.arguments.count,
       });
       return _okResult(call.id, content);
     } catch (err) {
@@ -323,4 +368,13 @@ class Overwrite {
   };
 }
 
-export { Editor, Read, ReplaceLines, InsertAfter, InsertBefore, New, Overwrite };
+export {
+  Editor,
+  Read,
+  ReplaceLines,
+  ReplaceAll,
+  InsertAfter,
+  InsertBefore,
+  New,
+  Overwrite,
+};

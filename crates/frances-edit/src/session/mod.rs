@@ -76,6 +76,15 @@ impl<S: AnchorStore> EditSession<S> {
                 self.apply_replace(&path, &anchor, &end_anchor, &text, &mut on_draft)
                     .await
             }
+            LlmEdit::ReplaceAll {
+                path,
+                find,
+                replacement,
+                count,
+            } => {
+                self.apply_replace_all(&path, &find, &replacement, count, &mut on_draft)
+                    .await
+            }
             LlmEdit::InsertAfter { path, anchor, text } => {
                 self.apply_insert_after(&path, &anchor, &text, &mut on_draft)
                     .await

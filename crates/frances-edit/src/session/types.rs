@@ -31,6 +31,12 @@ pub enum LlmEdit {
         end_anchor: String,
         text: String,
     },
+    ReplaceAll {
+        path: PathBuf,
+        find: String,
+        replacement: String,
+        count: Option<usize>,
+    },
     InsertAfter {
         path: PathBuf,
         anchor: String,
@@ -83,6 +89,12 @@ pub enum EditError {
     NewFileExists { path: PathBuf },
     #[error("{path} is not cached; call file_read first")]
     NotCached { path: PathBuf },
+    #[error(transparent)]
+    Regex(#[from] regex::Error),
+    #[error(
+        "replace_all matched {actual} times, which exceeds count cap {limit}; no changes written"
+    )]
+    ReplaceAllCountExceeded { actual: usize, limit: usize },
     #[error("{path} is not cached; call file_read before 'overwrite'")]
     NotCachedForOverwrite { path: PathBuf },
     #[error(transparent)]
