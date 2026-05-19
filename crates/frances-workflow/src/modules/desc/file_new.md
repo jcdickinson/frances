@@ -9,7 +9,7 @@ Provide exactly one of `text` or `from`:
 
   from:  a Frances variable name. Its value is used as the file's content (string values pass through verbatim; non-string values are JSON-encoded). Use this when the content was prepared via `variable_set` / `variable_assign` / `file_read into:` / `shell_capture`, to avoid re-emitting a long payload in a tool-call.
 
-You do NOT need to call `file_read` first — the file doesn't exist yet. The response echoes the file back with fresh anchors on every line, so subsequent `file_replace` / `file_insert_after` / `file_insert_before` calls against the same path can use those anchors directly without a separate read.
+You do NOT need to call `file_read` first — the file doesn't exist yet. The response echoes the file back with fresh anchors on every line, so subsequent `file_replace_lines` / `file_insert_after` / `file_insert_before` calls against the same path can use those anchors directly without a separate read.
 
 After every edit the file is run through the project formatter and written to disk; the returned content reflects the post-format result.
 

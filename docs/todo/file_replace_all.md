@@ -1,20 +1,13 @@
-# `file_replace_all` (and rename `file_replace` → `file_replace_range`)
+# `file_replace_all` (the `file_replace` → `file_replace_lines` rename is already done)
 
-`file_replace` replaces exactly one anchor-bracketed range (`crates/frances-workflow/src/modules/desc/file_replace.md:1-10`). For a genuinely cross-cutting change — `s/old_name/new_name/g`, swap a recurring import, normalise quoting across a file — the agent has to issue N calls, each requiring a fresh anchor pulled from the last `file_read`. The friction is high enough that the agent reaches for `sed -i 's/.../.../g' file` through the shell tool, which bypasses the anchor cache, bypasses the post-edit formatter pass, and produces an opaque diff. We then have to re-read the file just to get back into the anchor protocol.
+`file_replace_lines` replaces exactly one anchor-bracketed range (`crates/frances-workflow/src/modules/desc/file_replace_lines.md:1-10`). For a genuinely cross-cutting change — `s/old_name/new_name/g`, swap a recurring import, normalise quoting across a file — the agent has to issue N calls, each requiring a fresh anchor pulled from the last `file_read`. The friction is high enough that the agent reaches for `sed -i 's/.../.../g' file` through the shell tool, which bypasses the anchor cache, bypasses the post-edit formatter pass, and produces an opaque diff. We then have to re-read the file just to get back into the anchor protocol.
 
-The fix is to give the agent a sanctioned, unanchored, cross-cutting replace — and to rename `file_replace`, which has been a misnomer since it never actually replaced "all" of anything.
+The fix is to give the agent a sanctioned, unanchored, cross-cutting replace as a sibling to `file_replace_lines`.
 
-## Rename
+## Siblings, after this lands
 
-| Today           | After this change      |
-|-----------------|------------------------|
-| `file_replace`  | `file_replace_range`   |
-| (n/a)           | `file_replace_all`     |
-
-`file_replace_range` is what the existing tool actually does: replace one contiguous range of lines, bracketed by anchors. The rename touches the JS export name, the desc filename, and the descriptions object in `crates/frances-workflow/src/modules/file.rs:56-65`. Worth doing in the same commit as the new tool — the new name makes the family read coherently:
-
-- `file_replace_range` — precision, anchor-bracketed, one range.
-- `file_replace_all`   — cross-cutting, regex, unanchored.
+- `file_replace_lines` — precision, anchor-bracketed, one range. (Exists today.)
+- `file_replace_all`   — cross-cutting, regex, unanchored. (New.)
 
 ## `file_replace_all` proposal
 
@@ -29,7 +22,7 @@ file_replace_all { path, find, replacement, count? }
 
 ### Behaviour
 
-1. Pull the cached file from the edit session (same lookup as `file_replace` today).
+1. Pull the cached file from the edit session (same lookup as `file_replace_lines`).
 2. Compile `find` once. If invalid, return the `regex` error verbatim.
 3. Run `Regex::replace_all` against the full file text.
 4. If `count` is set and the match count exceeds it, return an error including the count; do not write.
@@ -45,14 +38,14 @@ file_replace_all { path, find, replacement, count? }
 
 ## Critical files
 
-- `crates/frances-workflow/src/modules/file.rs` — register the new export alongside `file_replace_range`, share the post-edit formatter + re-anchor tail with the existing path.
+- `crates/frances-workflow/src/modules/file.rs` — register the new export alongside `file_replace_lines`, share the post-edit formatter + re-anchor tail with the existing path.
 - `crates/frances-workflow/src/modules/desc/file_replace_all.md` (new) — describe the tool, the regex template syntax, and the `count` safety hatch. Include a worked example.
-- `crates/frances-workflow/src/modules/desc/file_replace.md` → rename to `desc/file_replace_range.md`. Update the body's "Replace one contiguous range" leader to make the name self-evident.
-- `crates/frances-workflow/src/modules/js/`  — wherever the JS bindings export the edit family; rename the symbol.
+- `crates/frances-workflow/src/modules/js/file.js` — add a `ReplaceAll` class alongside `ReplaceLines`. Dispatches as `{ kind: "ReplaceAll", ... }` to the Rust side.
+- `crates/frances-edit/src/session/types.rs` — add `LlmEdit::ReplaceAll { path, find, replacement, count }`. The matching match arm in `session/mod.rs` calls a new `apply_replace_all`.
 - `crates/frances/src/edit_session.rs` — confirm the write path can be invoked without an anchor pair as input.
 
 ## Out of scope
 
 - Multi-file replace (one path per call; the agent can loop).
-- Replacing into a variable instead of writing the file (we don't have `into` on `file_replace` either; symmetry can wait).
+- Replacing into a variable instead of writing the file (we don't have `into` on `file_replace_lines` either; symmetry can wait).
 - Smarter conflict reporting against concurrent external edits — same drift-reconcile story as the rest of the edit family.

@@ -17,7 +17,7 @@ file_read { path, ranges?: [[start, end], ...], into? }
 
 ## Anchors are still whole-file
 
-The crucial invariant: even when the caller asks for a slice, the editor session anchors **every line of the file**, not just the returned ones. This is already what `read_file_inner` does (`crates/frances-workflow/src/modules/file.rs:159-165` — it passes the full `lines` vector to `sess.read_file`); we just don't expose any of the lines beyond the slice. The cost is per-line hashing, bounded by file size, and it means a subsequent `file_replace`/`file_insert_*` at a line *outside* the returned slice still resolves its anchor without a re-read.
+The crucial invariant: even when the caller asks for a slice, the editor session anchors **every line of the file**, not just the returned ones. This is already what `read_file_inner` does (`crates/frances-workflow/src/modules/file.rs:159-165` — it passes the full `lines` vector to `sess.read_file`); we just don't expose any of the lines beyond the slice. The cost is per-line hashing, bounded by file size, and it means a subsequent `file_replace_lines`/`file_insert_*` at a line *outside* the returned slice still resolves its anchor without a re-read.
 
 Document this explicitly in `desc/file_read.md` so the agent understands that ranges are a *display* filter, not a baseline filter — reading lines 460-640 still licenses edits at line 200.
 

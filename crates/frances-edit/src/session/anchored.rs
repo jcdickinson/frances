@@ -232,7 +232,7 @@ mod tests {
 
         let block = session
             .edit(
-                LlmEdit::Replace {
+                LlmEdit::ReplaceLines {
                     path: path.clone(),
                     anchor: target.clone(),
                     end_anchor: target,
@@ -336,7 +336,7 @@ mod tests {
         let trimmed_match = format!("{anchor_word}§hello");
         session
             .edit(
-                LlmEdit::Replace {
+                LlmEdit::ReplaceLines {
                     path: path.clone(),
                     anchor: trimmed_match.clone(),
                     end_anchor: trimmed_match,
@@ -357,7 +357,7 @@ mod tests {
         let wrong = format!("{anchor_word}§not the real content");
         let err = session
             .edit(
-                LlmEdit::Replace {
+                LlmEdit::ReplaceLines {
                     path: path.clone(),
                     anchor: wrong.clone(),
                     end_anchor: wrong,
@@ -436,7 +436,7 @@ mod tests {
         let target = anchor_field(&session, &path, 1);
         session
             .edit(
-                LlmEdit::Replace {
+                LlmEdit::ReplaceLines {
                     path: path.clone(),
                     anchor: target.clone(),
                     end_anchor: target,
@@ -461,7 +461,7 @@ mod tests {
 
         session
             .edit(
-                LlmEdit::Replace {
+                LlmEdit::ReplaceLines {
                     path: path.clone(),
                     anchor: target.clone(),
                     end_anchor: target,

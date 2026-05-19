@@ -48,7 +48,7 @@
 //!   per-entity migrations declared in `[workflows.<id>].migrations`.
 //! - `frances:v1/tools/shell`    — `Shell` primitive + `Run`/`Wait`/`Kill`
 //!   tool classes.
-//! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`Replace`/
+//! - `frances:v1/tools/file`     — `Editor` primitive + `Read`/`ReplaceLines`/
 //!   `InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
 //! - `frances:v1/tools/file_find_or_grep` — `FileSearch` primitive + `Search`
 //!   tool class. Combined name-pattern lookup, content search, and

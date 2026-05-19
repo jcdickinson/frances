@@ -67,7 +67,7 @@ impl<S: AnchorStore> EditSession<S> {
             LlmEdit::Overwrite { path, text } => {
                 self.apply_overwrite(&path, &text, &mut on_draft).await
             }
-            LlmEdit::Replace {
+            LlmEdit::ReplaceLines {
                 path,
                 anchor,
                 end_anchor,

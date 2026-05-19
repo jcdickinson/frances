@@ -24,7 +24,7 @@
 //   const vars   = new Variables();
 //   chat.tools.push(
 //     new Read(editor, vars),
-//     new Replace(editor, vars),
+//     new ReplaceLines(editor, vars),
 //     new InsertAfter(editor, vars),
 //     new InsertBefore(editor, vars),
 //     new New(editor, vars),
@@ -164,14 +164,14 @@ class Read {
   };
 }
 
-class Replace {
+class ReplaceLines {
   static schema = REPLACE_SCHEMA;
 
   constructor(editor, vars) {
     this.editor = editor;
     this.vars = vars;
-    this.name = "file_replace";
-    this.description = desc.file_replace;
+    this.name = "file_replace_lines";
+    this.description = desc.file_replace_lines;
     this.parameters = REPLACE_SCHEMA;
   }
 
@@ -184,7 +184,7 @@ class Replace {
     }
     try {
       const content = await this.editor.edit({
-        kind: "Replace",
+        kind: "ReplaceLines",
         path: call.arguments.path,
         anchor: call.arguments.anchor,
         end_anchor: call.arguments.end_anchor,
@@ -323,4 +323,4 @@ class Overwrite {
   };
 }
 
-export { Editor, Read, Replace, InsertAfter, InsertBefore, New, Overwrite };
+export { Editor, Read, ReplaceLines, InsertAfter, InsertBefore, New, Overwrite };

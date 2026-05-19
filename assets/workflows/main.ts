@@ -37,7 +37,7 @@ import {
 import {
   Editor,
   Read,
-  Replace,
+  ReplaceLines,
   InsertAfter,
   InsertBefore,
   New,
@@ -606,7 +606,7 @@ const tools = [
   new ShellSet(sh, vars),
   new ShellCapture(sh, vars),
   new Read(editor, vars),
-  new Replace(editor, vars),
+  new ReplaceLines(editor, vars),
   new InsertAfter(editor, vars),
   new InsertBefore(editor, vars),
   new New(editor, vars),

@@ -12,7 +12,7 @@
 //!   cached anchor state, return the anchored render. Throws on disk
 //!   error or unknown anchor.
 //! - `edit(value)` — apply one structured edit. `value` is a tagged
-//!   object: `{ kind: "Replace"|"InsertAfter"|"InsertBefore"|"New"|
+//!   object: `{ kind: "ReplaceLines"|"InsertAfter"|"InsertBefore"|"New"|
 //!   "Overwrite", path, ... }`. Returns the diff block (or full
 //!   anchored file for `New`).
 //!
@@ -53,7 +53,7 @@ pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     )
 }
 
-/// Builds the `{ file_read, file_replace, ... }` descriptions object
+/// Builds the `{ file_read, file_replace_lines, ... }` descriptions object
 /// for the stash. JS doesn't have verbatim string literals, so we keep
 /// the LLM-facing markdown next to the module under `desc/` and inline
 /// it via `include_str!` instead of fighting backtick escaping in
@@ -61,7 +61,10 @@ pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
 pub(crate) fn build_descriptions<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
     let obj = Object::new(ctx.clone())?;
     obj.set("file_read", include_str!("desc/file_read.md"))?;
-    obj.set("file_replace", include_str!("desc/file_replace.md"))?;
+    obj.set(
+        "file_replace_lines",
+        include_str!("desc/file_replace_lines.md"),
+    )?;
     obj.set(
         "file_insert_after",
         include_str!("desc/file_insert_after.md"),
@@ -179,7 +182,7 @@ async fn edit_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Result
 
 fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
     let path = match edit {
-        LlmEdit::Replace { path, .. }
+        LlmEdit::ReplaceLines { path, .. }
         | LlmEdit::InsertAfter { path, .. }
         | LlmEdit::InsertBefore { path, .. }
         | LlmEdit::New { path, .. }

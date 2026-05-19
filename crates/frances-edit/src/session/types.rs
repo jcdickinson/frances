@@ -20,12 +20,12 @@ use crate::{AnchorParseError, StoreError, Truncated};
 /// `serde_json::from_value`):
 ///
 /// ```json
-/// { "kind": "Replace", "path": "...", "anchor": "...", "end_anchor": "...", "text": "..." }
+/// { "kind": "ReplaceLines", "path": "...", "anchor": "...", "end_anchor": "...", "text": "..." }
 /// ```
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind")]
 pub enum LlmEdit {
-    Replace {
+    ReplaceLines {
         path: PathBuf,
         anchor: String,
         end_anchor: String,

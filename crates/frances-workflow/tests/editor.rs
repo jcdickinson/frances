@@ -140,7 +140,7 @@ async fn editor_edit_replace_writes_disk() {
         // Pick the second line's full anchor field (Word§b).
         const line_b = read.split("\n")[1];
         const diff = await editor.edit({
-            kind: "Replace",
+            kind: "ReplaceLines",
             path: "file.txt",
             anchor: line_b,
             end_anchor: line_b,
@@ -222,14 +222,14 @@ async fn read_into_var_stores_raw_and_skips_registration() {
     let rt = Runtime::new(deps).unwrap();
     let file = write_source(
         r#"
-        import { Editor, Read, Replace } from "frances:v1/tools/file";
+        import { Editor, Read, ReplaceLines } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, MarkdownFrame } from "frances:v1/frames";
 
         const editor = new Editor();
         const vars = new Variables();
         const read = new Read(editor, vars);
-        const replace = new Replace(editor, vars);
+        const replace = new ReplaceLines(editor, vars);
 
         const r = await read.handler({
             call: { id: "c1", name: "file_read", arguments: { path: "note.txt", into: "blob" } },
@@ -238,9 +238,9 @@ async fn read_into_var_stores_raw_and_skips_registration() {
         transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
         transcript.push(new MarkdownFrame({ content: vars.get("blob") }));
 
-        // The into-read did NOT register the file. file_replace should fail.
+        // The into-read did NOT register the file. file_replace_lines should fail.
         const edit = await replace.handler({
-            call: { id: "c2", name: "file_replace",
+            call: { id: "c2", name: "file_replace_lines",
                     arguments: { path: "note.txt",
                                  anchor: "Apple§alpha",
                                  end_anchor: "Apple§alpha",
