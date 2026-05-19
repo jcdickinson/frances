@@ -660,12 +660,21 @@ impl ScrollbackContainer {
 
         // Render the active stack (display order). Each entry gets the
         // spinner overlay (if enabled) so the user can see at a glance
-        // which blocks are still open.
+        // which blocks are still open — except entries already flagged
+        // `safe_to_commit`. Those are done; they're sitting in
+        // `active_order` only because an older entry hasn't drained yet,
+        // and painting the spinner over them would misrepresent them as
+        // still in flight.
         let spinner_frame = self.spinner_frame;
         for &id in self.active_order.iter() {
             let entry = match self.active.get_mut(id) {
                 Some(e) => e,
                 None => continue,
+            };
+            let entry_spinner = if entry.safe_to_commit {
+                None
+            } else {
+                spinner_frame
             };
             render_or_skip_entry(
                 &mut entry.block,
@@ -676,7 +685,7 @@ impl ScrollbackContainer {
                 &mut cursor,
                 self.cumulative_scrolls,
                 &mut force_cascade,
-                spinner_frame,
+                entry_spinner,
             )?;
         }
 
@@ -978,7 +987,10 @@ impl ScrollbackContainer {
             backend.newline()?;
         }
 
-        // 3. Visible active blocks (oldest visible to newest).
+        // 3. Visible active blocks (oldest visible to newest). The
+        // spinner is suppressed on entries already flagged
+        // `safe_to_commit` (same reasoning as the natural-scroll path
+        // above).
         let spinner_frame = self.spinner_frame;
         for (i, id) in visible_active_ids.iter().enumerate() {
             let entry = match self.active.get(*id) {
@@ -992,7 +1004,12 @@ impl ScrollbackContainer {
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
             entry.block.render(area, &mut buf);
-            if let Some(frame) = spinner_frame {
+            let entry_spinner = if entry.safe_to_commit {
+                None
+            } else {
+                spinner_frame
+            };
+            if let Some(frame) = entry_spinner {
                 overlay_spinner(&mut buf, area, frame);
             }
             let skip = if i == 0 { boundary_skip_rows } else { 0 };
@@ -1364,23 +1381,27 @@ where
     Ok(())
 }
 
-/// Paint the active-block spinner glyph over the rightmost non-blank
-/// cell of `area`'s last row. If every cell on the last row is blank
-/// the glyph lands at the leftmost column instead, so an empty block
-/// is still visibly tagged as open.
+/// Paint the active-block spinner glyph just after the last non-blank
+/// cell of `area`'s last row. If the row's content already runs to the
+/// right edge there's no room for a trailing cell, so the glyph
+/// overwrites the final character instead. An entirely blank row puts
+/// the glyph at the leftmost column so an empty block is still visibly
+/// tagged as open.
 fn overlay_spinner(buf: &mut Buffer, area: Rect, frame: u8) {
     if area.height == 0 || area.width == 0 {
         return;
     }
     let last_y = area.y + area.height - 1;
-    let mut glyph_x = area.x;
-    for x in (area.x..area.x + area.width).rev() {
+    let right_edge = area.x + area.width - 1;
+    let last_content_x = (area.x..=right_edge).rev().find(|&x| {
         let sym = buf[(x, last_y)].symbol();
-        if !sym.is_empty() && sym != " " {
-            glyph_x = x;
-            break;
-        }
-    }
+        !sym.is_empty() && sym != " "
+    });
+    let glyph_x = match last_content_x {
+        None => area.x,
+        Some(x) if x < right_edge => x + 1,
+        Some(_) => right_edge,
+    };
     let glyph = SPINNER_FRAMES[(frame as usize) % SPINNER_FRAMES.len()];
     let cell = &mut buf[(glyph_x, last_y)];
     cell.set_symbol(glyph);
@@ -2926,9 +2947,9 @@ mod tests {
     }
 
     /// With the spinner enabled, every active block gets a single
-    /// braille glyph painted over the rightmost non-blank cell of its
+    /// braille glyph painted just after its last non-blank cell on its
     /// last row. Once the block is marked safe and promoted out of
-    /// active, the next draw repaints it with its real last char.
+    /// active, the next draw repaints the row without the glyph.
     #[test]
     fn enabled_spinner_overlays_active_block_and_clears_on_mark_safe() {
         let mut terminal = mk_term_terminal(80, 5);
@@ -2939,8 +2960,8 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         assert_eq!(
             terminal.backend().inner().screen_row(0),
-            "hell⠋",
-            "active block's last char is replaced by the frame-0 glyph",
+            "hello⠋",
+            "spinner glyph appears immediately after the content",
         );
 
         container.mark_safe(id);
@@ -2953,7 +2974,8 @@ mod tests {
     }
 
     /// `bump_spinner` advances the glyph and marks every active entry
-    /// damaged, so the next draw repaints with the new frame.
+    /// damaged, so the next draw repaints with the new frame in the
+    /// trailing slot.
     #[test]
     fn bump_spinner_advances_glyph_on_next_draw() {
         let mut terminal = mk_term_terminal(80, 5);
@@ -2962,11 +2984,29 @@ mod tests {
         container.push_active(multi_text(&["hi"]));
 
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "h⠋");
+        assert_eq!(terminal.backend().inner().screen_row(0), "hi⠋");
 
         container.bump_spinner();
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "h⠙");
+        assert_eq!(terminal.backend().inner().screen_row(0), "hi⠙");
+    }
+
+    /// When the last row's content already fills the row to the right
+    /// edge there's no trailing slot to paint into — the spinner falls
+    /// back to overwriting the final character.
+    #[test]
+    fn spinner_overwrites_last_char_when_content_fills_row() {
+        let mut terminal = mk_term_terminal(5, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["foot."]), 0);
+        container.enable_spinner();
+
+        container.push_active(multi_text(&["hello"]));
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(
+            terminal.backend().inner().screen_row(0),
+            "hell⠋",
+            "content reaches the right edge, so the spinner overwrites the last char",
+        );
     }
 
     /// Spinner stays off by default — existing callers and tests see
@@ -2978,5 +3018,43 @@ mod tests {
         container.push_active(multi_text(&["hello"]));
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "hello");
+    }
+
+    /// An entry flagged `safe_to_commit` that's still pinned in
+    /// `active_order` behind an older, still-streaming entry must NOT
+    /// receive the spinner overlay — it's logically done, just waiting
+    /// for the contiguous prefix to drain.
+    #[test]
+    fn spinner_skips_safe_flagged_entry_pinned_behind_older_active() {
+        let mut terminal = mk_term_terminal(80, 5);
+        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        container.enable_spinner();
+
+        let older = container.push_active(multi_text(&["older"]));
+        let newer = container.push_active(multi_text(&["newer"]));
+
+        // Mark only the newer entry safe. The older one is still
+        // streaming, so the contiguous-prefix rule keeps both in
+        // `active_order`.
+        container.mark_safe(newer);
+        container.draw(&mut terminal).unwrap();
+
+        assert_eq!(
+            terminal.backend().inner().screen_row(0),
+            "older⠋",
+            "older still-active entry keeps the spinner glyph",
+        );
+        assert_eq!(
+            terminal.backend().inner().screen_row(1),
+            "newer",
+            "newer safe-flagged entry renders verbatim — no spinner overlay",
+        );
+
+        // Promoting the older entry drains both into safe, both
+        // rendering as their real last char.
+        container.mark_safe(older);
+        container.draw(&mut terminal).unwrap();
+        assert_eq!(terminal.backend().inner().screen_row(0), "older");
+        assert_eq!(terminal.backend().inner().screen_row(1), "newer");
     }
 }

@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
-use rquickjs::function::{Constructor, This};
+use rquickjs::function::{Constructor, Opt, This};
 use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as JsResult, Value};
 
 type Ctor<'js> = Constructor<'js>;
@@ -185,10 +185,14 @@ fn push_frame<'js>(
         return Ok(());
     }
     if let Some(tu) = as_frame::<ToolUseFrame>(&frame) {
+        let borrow = tu.borrow();
+        if borrow.hidden {
+            return Ok(());
+        }
         let new_id = state.assign_id();
-        tu.borrow().id.store(new_id, Ordering::Release);
+        borrow.id.store(new_id, Ordering::Release);
         let kind = FrameKind::ToolUse {
-            name: tu.borrow().name.clone(),
+            name: borrow.name.clone(),
         };
         let _ = state.tx.send(HostFrame::Push(FramePush {
             id: FrameId(new_id),
@@ -450,6 +454,10 @@ pub struct ToolUseFrame {
     state: Arc<FramesState>,
     id: AtomicU64,
     name: String,
+    /// When `true`, `transcript.push` skips the frame entirely — no
+    /// wire `Push` is emitted. Sourced from `tool.hidden` at
+    /// construction so callers can pass the unmodified call+tool pair.
+    hidden: bool,
 }
 
 impl<'js> Trace<'js> for ToolUseFrame {
@@ -478,19 +486,34 @@ impl<'js> JsClass<'js> for ToolUseFrame {
 fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ToolUseFrame, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Value<'js>| {
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let Some(obj) = arg.as_object() else {
-                return throw_type(&ctx, "new ToolUseFrame: expected { name: string }");
+                return throw_type(
+                    &ctx,
+                    "new ToolUseFrame: expected { call: { name: string }, tool? }",
+                );
             };
-            let name: String = obj
-                .get("name")
-                .map_err(|_| throw_err(&ctx, "new ToolUseFrame: missing or non-string `name`"))?;
+            let call: Object<'js> = obj
+                .get("call")
+                .map_err(|_| throw_err(&ctx, "new ToolUseFrame: missing object `call`"))?;
+            let name: String = call.get("name").map_err(|_| {
+                throw_err(&ctx, "new ToolUseFrame: missing or non-string `call.name`")
+            })?;
+            let hidden = match obj.get::<_, Value<'js>>("tool") {
+                Ok(v) if v.is_object() => v
+                    .as_object()
+                    .and_then(|t| t.get::<_, bool>("hidden").ok())
+                    .unwrap_or(false),
+                _ => false,
+            };
             Class::instance(
                 ctx.clone(),
                 ToolUseFrame {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     name,
+                    hidden,
                 },
             )
         },
@@ -680,7 +703,8 @@ fn set_shell_state<'js>(
 fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<MarkdownFrame, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Value<'js>| {
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let (content, sender, closed) = parse_markdown_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
@@ -699,7 +723,8 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
 fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ErrorFrame, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Value<'js>| {
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let content = parse_content_arg(&ctx, &arg, "ErrorFrame")?;
             Class::instance(
                 ctx.clone(),
@@ -714,43 +739,48 @@ fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ct
 }
 
 fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<JsonFrame, _, _>(ctx.clone(), move |ctx: Ctx<'js>, arg: Value<'js>| {
-        let Some(obj) = arg.as_object() else {
-            return throw_type(&ctx, "new JsonFrame: expected { tag, value }");
-        };
-        let tag: String = obj
-            .get("tag")
-            .map_err(|_| throw_err(&ctx, "new JsonFrame: missing or non-string `tag`"))?;
-        let value: Value<'js> = obj
-            .get("value")
-            .map_err(|_| throw_err(&ctx, "new JsonFrame: missing `value`"))?;
+    Constructor::new_class::<JsonFrame, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+            let Some(obj) = arg.as_object() else {
+                return throw_type(&ctx, "new JsonFrame: expected { tag, value }");
+            };
+            let tag: String = obj
+                .get("tag")
+                .map_err(|_| throw_err(&ctx, "new JsonFrame: missing or non-string `tag`"))?;
+            let value: Value<'js> = obj
+                .get("value")
+                .map_err(|_| throw_err(&ctx, "new JsonFrame: missing `value`"))?;
 
-        // Round-trip the JS value through JSON to get a serde_json::Value.
-        // Mirrors the old `workflow.frame.json` behaviour: silently drop
-        // values that don't JSON-encode (use `null`).
-        let json_str: String = ctx
-            .json_stringify(value)?
-            .and_then(|s| s.to_string().ok())
-            .unwrap_or_else(|| "null".to_string());
-        let parsed: serde_json::Value =
-            serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
+            // Round-trip the JS value through JSON to get a serde_json::Value.
+            // Mirrors the old `workflow.frame.json` behaviour: silently drop
+            // values that don't JSON-encode (use `null`).
+            let json_str: String = ctx
+                .json_stringify(value)?
+                .and_then(|s| s.to_string().ok())
+                .unwrap_or_else(|| "null".to_string());
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
 
-        Class::instance(
-            ctx.clone(),
-            JsonFrame {
-                state: state.clone(),
-                id: AtomicU64::new(0),
-                tag,
-                value: parsed,
-            },
-        )
-    })
+            Class::instance(
+                ctx.clone(),
+                JsonFrame {
+                    state: state.clone(),
+                    id: AtomicU64::new(0),
+                    tag,
+                    value: parsed,
+                },
+            )
+        },
+    )
 }
 
 fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ShellOutputFrame, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Value<'js>| {
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let (cmd, content, closed) = parse_shell_output_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),

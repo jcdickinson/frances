@@ -1,13 +1,14 @@
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::time::timeout;
 
 use crate::proto::{Sentinel, SentinelMatch};
 
 const READ_CHUNK: usize = 4096;
 
-enum ReadEvent {
+enum ReadLoopEvent {
     Read(usize),
     Timer,
 }
@@ -33,10 +34,39 @@ pub enum QuietReason {
     MaxElapsed,
 }
 
+/// Discrete events delivered through an [`OutputReader`]'s sink. A
+/// command run produces zero or more `Output` events as bytes arrive
+/// (the sentinel itself is never shipped), terminated by exactly one
+/// of `Quiet { reason }`, `Done { exit_code }`, or `Dead`. The
+/// terminal event always corresponds to the [`ReadOutcome`] the same
+/// `read_until_sentinel` call is about to return, so consumers can
+/// drive frame-close logic off the event alone without a separate
+/// barrier.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadEvent {
+    Output(Vec<u8>),
+    Quiet { reason: QuietReason },
+    Done { exit_code: i32 },
+    Dead,
+}
+
 pub struct OutputReader<R> {
     reader: R,
     sentinel: Sentinel,
     buf: Vec<u8>,
+    /// Optional event stream. When `Some`, every read ships
+    /// safe-not-sentinel bytes through the channel as `Output` events,
+    /// and every terminal (sentinel/quiet/eof) ships its matching
+    /// `Done`/`Quiet`/`Dead` event before `read_until_sentinel`
+    /// returns. Bytes stay in `buf` too so `ReadOutcome::*` payloads
+    /// — and therefore direct callers of [`Shell::run`] — keep seeing
+    /// the full output unchanged. `shipped` tracks how many bytes
+    /// have already been emitted to avoid double-sending.
+    sink: Option<UnboundedSender<ReadEvent>>,
+    /// Byte index into `buf` past which every byte has already been
+    /// shipped as an `Output` event. Reset to 0 by every `take_*`
+    /// finaliser, which also drains `buf`.
+    shipped: usize,
 }
 
 impl<R: AsyncRead + Unpin> OutputReader<R> {
@@ -45,7 +75,50 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
             reader,
             sentinel,
             buf: Vec::with_capacity(READ_CHUNK),
+            sink: None,
+            shipped: 0,
         }
+    }
+
+    /// Install (or remove) the event sink. Resets `shipped` so the
+    /// next ship starts from the head of `buf`.
+    pub fn set_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>) {
+        self.sink = sink;
+        self.shipped = 0;
+    }
+
+    /// Emit `buf[shipped..end]` as an `Output` event if there's
+    /// anything new. Bytes remain in `buf`; only `shipped` moves
+    /// forward. No-op when no sink is attached or when there's nothing
+    /// new to send.
+    fn ship(&mut self, end: usize) {
+        let Some(sink) = self.sink.as_ref() else {
+            return;
+        };
+        if end <= self.shipped {
+            return;
+        }
+        let chunk = self.buf[self.shipped..end].to_vec();
+        self.shipped = end;
+        let _ = sink.send(ReadEvent::Output(chunk));
+    }
+
+    /// Emit a terminal event if a sink is attached. Called from
+    /// `take_match` / `take_quiet` / `take_eof` after their final ship.
+    fn emit_terminal(&mut self, event: ReadEvent) {
+        if let Some(sink) = self.sink.as_ref() {
+            let _ = sink.send(event);
+        }
+    }
+
+    /// Ship every byte we've confirmed is not part of an in-flight
+    /// sentinel match — i.e. all but the trailing
+    /// `sentinel.max_match_len()` slack we hold back for cross-read
+    /// detection. Used inside the read loop after each successful read.
+    fn ship_safe(&mut self) {
+        let reserve = self.sentinel.max_match_len();
+        let safe_end = self.buf.len().saturating_sub(reserve);
+        self.ship(safe_end);
     }
 
     /// Read until the sentinel marker is found, EOF, or one of the
@@ -80,31 +153,29 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
             let next = deadlines.into_iter().min();
 
             let event = match next {
-                Some(d) if d.is_zero() => ReadEvent::Timer,
+                Some(d) if d.is_zero() => ReadLoopEvent::Timer,
                 Some(d) => match timeout(d, self.reader.read(&mut chunk)).await {
-                    Ok(Ok(n)) => ReadEvent::Read(n),
+                    Ok(Ok(n)) => ReadLoopEvent::Read(n),
                     Ok(Err(e)) => return Err(e),
-                    Err(_) => ReadEvent::Timer,
+                    Err(_) => ReadLoopEvent::Timer,
                 },
                 None => match self.reader.read(&mut chunk).await {
-                    Ok(n) => ReadEvent::Read(n),
+                    Ok(n) => ReadLoopEvent::Read(n),
                     Err(e) => return Err(e),
                 },
             };
 
             match event {
-                ReadEvent::Read(0) => {
-                    let leftover = std::mem::take(&mut self.buf);
-                    return Ok(ReadOutcome::Eof { output: leftover });
-                }
-                ReadEvent::Read(n) => {
+                ReadLoopEvent::Read(0) => return Ok(self.take_eof()),
+                ReadLoopEvent::Read(n) => {
                     last_byte_at = Instant::now();
                     self.buf.extend_from_slice(&chunk[..n]);
                     if let Some(m) = self.sentinel.find(&self.buf) {
                         return Ok(self.take_match(m));
                     }
+                    self.ship_safe();
                 }
-                ReadEvent::Timer => {
+                ReadLoopEvent::Timer => {
                     if let Some(q) = quiet
                         && last_byte_at.elapsed() >= q
                     {
@@ -123,8 +194,15 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
     }
 
     fn take_match(&mut self, m: SentinelMatch) -> ReadOutcome {
+        // Ship every output byte before the sentinel, then drop the
+        // sentinel itself (which never goes to JS).
+        self.ship(m.output_len);
+        self.emit_terminal(ReadEvent::Done {
+            exit_code: m.exit_code,
+        });
         let output = self.buf[..m.output_len].to_vec();
         self.buf.drain(..m.consumed);
+        self.shipped = 0;
         ReadOutcome::Done {
             output,
             exit_code: m.exit_code,
@@ -132,8 +210,21 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
     }
 
     fn take_quiet(&mut self, reason: QuietReason) -> ReadOutcome {
+        let len = self.buf.len();
+        self.ship(len);
+        self.emit_terminal(ReadEvent::Quiet { reason });
         let output = std::mem::take(&mut self.buf);
+        self.shipped = 0;
         ReadOutcome::Quiet { output, reason }
+    }
+
+    fn take_eof(&mut self) -> ReadOutcome {
+        let len = self.buf.len();
+        self.ship(len);
+        self.emit_terminal(ReadEvent::Dead);
+        let output = std::mem::take(&mut self.buf);
+        self.shipped = 0;
+        ReadOutcome::Eof { output }
     }
 }
 
@@ -278,6 +369,103 @@ mod tests {
             }
             other => panic!("unexpected: {other:?}"),
         }
+    }
+
+    /// Helper: drain everything pending on the event channel without
+    /// blocking. Mimics what a JS consumer's `nextEvent`-loop would see
+    /// after the call has settled.
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<ReadEvent>) -> Vec<ReadEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn sink_emits_quiet_terminal_when_output_is_empty() {
+        let (client, _server) = tokio::io::duplex(64);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut r = OutputReader::new(client, Sentinel::new(nonce()));
+        r.set_sink(Some(tx));
+        let out = r
+            .read_until_sentinel(Some(Duration::from_millis(30)), None)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReadOutcome::Quiet { .. }));
+        assert_eq!(
+            drain(&mut rx),
+            vec![ReadEvent::Quiet {
+                reason: QuietReason::NoOutput,
+            }],
+        );
+    }
+
+    #[tokio::test]
+    async fn sink_streams_output_then_done_when_command_finishes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        // Plenty of leading output (> max_match_len) so ship_safe trips
+        // on the first read, before the sentinel arrives.
+        let leading: String = std::iter::repeat_n('x', 200).collect();
+        let stream = format!("{leading}{}", marker(0));
+        let mut r = from_bytes(stream.as_bytes());
+        r.set_sink(Some(tx));
+        let out = r.read_until_sentinel(None, None).await.unwrap();
+        match out {
+            ReadOutcome::Done { output, exit_code } => {
+                assert_eq!(output, leading.as_bytes());
+                assert_eq!(exit_code, 0);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let events = drain(&mut rx);
+        let last = events.last().expect("at least one event");
+        assert_eq!(last, &ReadEvent::Done { exit_code: 0 });
+        let mut concat = Vec::new();
+        for ev in &events[..events.len() - 1] {
+            match ev {
+                ReadEvent::Output(bytes) => concat.extend_from_slice(bytes),
+                other => panic!("unexpected mid-stream event: {other:?}"),
+            }
+        }
+        assert_eq!(concat, leading.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn sink_never_ships_sentinel_bytes_when_split_across_reads() {
+        let (client, mut server) = tokio::io::duplex(64);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut r = OutputReader::new(client, Sentinel::new(nonce()));
+        r.set_sink(Some(tx));
+
+        let producer = tokio::spawn(async move {
+            server.write_all(b"hi\n__F_").await.unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            let rest = format!("{}_5__\n", nonce());
+            server.write_all(rest.as_bytes()).await.unwrap();
+        });
+
+        let out = r.read_until_sentinel(None, None).await.unwrap();
+        producer.await.unwrap();
+
+        match out {
+            ReadOutcome::Done { output, exit_code } => {
+                assert_eq!(output, b"hi");
+                assert_eq!(exit_code, 5);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        let events = drain(&mut rx);
+        let mut shipped = Vec::new();
+        for ev in &events {
+            match ev {
+                ReadEvent::Output(bytes) => shipped.extend_from_slice(bytes),
+                ReadEvent::Done { exit_code } => assert_eq!(*exit_code, 5),
+                other => panic!("unexpected event: {other:?}"),
+            }
+        }
+        assert_eq!(shipped, b"hi", "sentinel bytes must not leak");
+        assert!(matches!(events.last(), Some(ReadEvent::Done { .. })));
     }
 
     #[tokio::test]

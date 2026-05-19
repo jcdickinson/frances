@@ -117,6 +117,17 @@ impl LiveBlocks {
                     let cid = container
                         .push_active(block_for_kind(entry.kind.clone(), entry.text.clone()));
                     entry.container_id = Some(cid);
+                    // One-shot kinds (no streaming body — `ToolUse` is
+                    // emitted as `BlockDelta` + `BlockStop` back-to-back
+                    // by the daemon) should never carry the in-flight
+                    // spinner. Flag them safe-to-commit immediately so
+                    // they drain together with the next active prefix
+                    // and the renderer suppresses the overlay even
+                    // while they're stuck behind an older streaming
+                    // block (e.g. a running `ShellOutputFrame`).
+                    if matches!(entry.kind, BlockKind::ToolUse { .. }) {
+                        container.mark_safe(cid);
+                    }
                 }
             }
         } else if let Some(cid) = entry.container_id {

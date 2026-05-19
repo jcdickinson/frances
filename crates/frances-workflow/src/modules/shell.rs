@@ -47,8 +47,9 @@ use rquickjs::{
     Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
 };
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use frances_shell::{QuietReason, RunOutcome, Shell, ShellOptions, WaitOpts};
+use frances_shell::{QuietReason, ReadEvent, RunOutcome, Shell, ShellOptions, WaitOpts};
 
 use crate::deps::{ShellFactory, WorkflowDeps};
 
@@ -61,6 +62,7 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
         move |ctx: Ctx<'js>| -> JsResult<Class<'js, ShellJs<D::ShellFactory>>> {
             // Construction is sync; the actual `Shell::spawn` is
             // deferred until the first `runOnce` (which is async).
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
             Class::instance(
                 ctx.clone(),
                 ShellJs {
@@ -69,7 +71,9 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
                         shell: None,
                         running: false,
                         closed: false,
+                        event_tx: Some(event_tx),
                     })),
+                    event_rx: Arc::new(AsyncMutex::new(event_rx)),
                 },
             )
         },
@@ -79,6 +83,11 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
 pub struct ShellJs<F: ShellFactory> {
     factory: F,
     state: Arc<AsyncMutex<ShellState>>,
+    /// Receiver end of the per-shell event stream. JS pulls events
+    /// one at a time via `nextEvent`. Held behind its own mutex so
+    /// pull calls don't contend with the `state` mutex `runOnce` /
+    /// `keepWaiting` hold during a read loop.
+    event_rx: Arc<AsyncMutex<UnboundedReceiver<ReadEvent>>>,
 }
 
 struct ShellState {
@@ -88,6 +97,10 @@ struct ShellState {
     running: bool,
     /// Flipped by `close()` or a Dead outcome. Methods error after.
     closed: bool,
+    /// Sender plumbed into the `Shell`'s `OutputReader` on lazy
+    /// spawn. Dropped on `close()` so the receiver sees the channel
+    /// terminate and `nextEvent` resolves to `null`.
+    event_tx: Option<UnboundedSender<ReadEvent>>,
 }
 
 impl<'js, F: ShellFactory> Trace<'js> for ShellJs<F> {
@@ -147,9 +160,25 @@ impl<'js, F: ShellFactory> JsClass<'js> for ShellJs<F> {
                 let state = this.0.borrow().state.clone();
                 Ok::<_, rquickjs::Error>(Promised::from(async move {
                     let mut guard = state.lock().await;
+                    // Dropping the shell releases its sender; dropping
+                    // `event_tx` releases ours. With both gone the
+                    // receiver sees the channel closing and a pending
+                    // `nextEvent()` resolves to `null`.
                     guard.shell = None;
+                    guard.event_tx = None;
                     guard.running = false;
                     guard.closed = true;
+                }))
+            })?,
+        )?;
+
+        proto.set(
+            "nextEvent",
+            Function::new(ctx.clone(), |this: This<Class<'js, ShellJs<F>>>| {
+                let rx = this.0.borrow().event_rx.clone();
+                Ok::<_, rquickjs::Error>(Promised::from(async move {
+                    let mut guard = rx.lock().await;
+                    NextEventResult(guard.recv().await)
                 }))
             })?,
         )?;
@@ -224,13 +253,7 @@ async fn run_once_inner<F: ShellFactory>(
             "shell is busy; call keepWaiting or kill before issuing a new command".to_owned(),
         );
     }
-    if guard.shell.is_none() {
-        let shell = factory
-            .spawn(ShellOptions::default())
-            .await
-            .map_err(|e| format!("spawn bash: {e}"))?;
-        guard.shell = Some(shell);
-    }
+    ensure_shell(&mut guard, factory).await?;
     let outcome = {
         let shell = guard.shell.as_mut().expect("shell is Some");
         shell
@@ -239,6 +262,27 @@ async fn run_once_inner<F: ShellFactory>(
             .map_err(|e| format!("run: {e}"))?
     };
     Ok(absorb_outcome(&mut guard, outcome))
+}
+
+/// Lazy-spawn helper: on first use, ask the factory for a fresh
+/// `Shell`, attach the per-`ShellJs` output sink so streaming pipes
+/// through, and stash it on `guard`. No-op when a shell already exists.
+async fn ensure_shell<F: ShellFactory>(
+    guard: &mut tokio::sync::MutexGuard<'_, ShellState>,
+    factory: &F,
+) -> Result<(), String> {
+    if guard.shell.is_some() {
+        return Ok(());
+    }
+    let mut shell = factory
+        .spawn(ShellOptions::default())
+        .await
+        .map_err(|e| format!("spawn bash: {e}"))?;
+    if let Some(tx) = guard.event_tx.as_ref() {
+        shell.set_output_sink(Some(tx.clone()));
+    }
+    guard.shell = Some(shell);
+    Ok(())
 }
 
 async fn keep_waiting_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<Outcome, String> {
@@ -360,13 +404,7 @@ async fn run_to_done<F: ShellFactory>(
             "shell is busy; call keepWaiting or kill before issuing a new command".to_owned(),
         );
     }
-    if guard.shell.is_none() {
-        let shell = factory
-            .spawn(ShellOptions::default())
-            .await
-            .map_err(|e| format!("spawn bash: {e}"))?;
-        guard.shell = Some(shell);
-    }
+    ensure_shell(&mut guard, factory).await?;
     let outcome = {
         let shell = guard.shell.as_mut().expect("shell is Some");
         shell
@@ -428,10 +466,7 @@ fn absorb_outcome(state: &mut ShellState, outcome: RunOutcome) -> Outcome {
             state.running = true;
             Outcome::Quiet {
                 output,
-                reason: match reason {
-                    QuietReason::NoOutput => "no_output",
-                    QuietReason::MaxElapsed => "max_elapsed",
-                },
+                reason: quiet_reason_str(reason),
             }
         }
         RunOutcome::Dead { output } => {
@@ -512,6 +547,49 @@ impl<'js> IntoJs<'js> for ShellStringResult {
             Ok(s) => s.into_js(ctx),
             Err(msg) => Err(throw(ctx, &msg)),
         }
+    }
+}
+
+/// Stable string form of [`QuietReason`] used on the JS wire.
+fn quiet_reason_str(reason: QuietReason) -> &'static str {
+    match reason {
+        QuietReason::NoOutput => "no_output",
+        QuietReason::MaxElapsed => "max_elapsed",
+    }
+}
+
+/// Wire form of one `nextEvent` resolution. `None` (all senders gone)
+/// maps to JS `null`. Otherwise:
+/// - `Output(bytes)` → `{ kind: "output", data: string }`
+/// - `Quiet { reason }` → `{ kind: "quiet", reason: "no_output" | "max_elapsed" }`
+/// - `Done { exit_code }` → `{ kind: "done", exit_code }`
+/// - `Dead` → `{ kind: "dead" }`
+struct NextEventResult(Option<ReadEvent>);
+
+impl<'js> IntoJs<'js> for NextEventResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        let Some(event) = self.0 else {
+            return Ok(Value::new_null(ctx.clone()));
+        };
+        let obj = Object::new(ctx.clone())?;
+        match event {
+            ReadEvent::Output(bytes) => {
+                obj.set("kind", "output")?;
+                obj.set("data", String::from_utf8_lossy(&bytes).into_owned())?;
+            }
+            ReadEvent::Quiet { reason } => {
+                obj.set("kind", "quiet")?;
+                obj.set("reason", quiet_reason_str(reason))?;
+            }
+            ReadEvent::Done { exit_code } => {
+                obj.set("kind", "done")?;
+                obj.set("exit_code", exit_code)?;
+            }
+            ReadEvent::Dead => {
+                obj.set("kind", "dead")?;
+            }
+        }
+        Ok(obj.into_value())
     }
 }
 

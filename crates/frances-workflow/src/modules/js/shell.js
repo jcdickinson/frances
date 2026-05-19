@@ -112,6 +112,38 @@ function _errResult(call_id, err) {
   };
 }
 
+// Run `op` (a `runOnce`/`keepWaiting` invocation) while concurrently
+// pulling discrete `ReadEvent`s off the shell's event stream. Output
+// events go straight to the open frame's writer as they arrive; the
+// terminal event (`done` / `quiet` / `dead`) ends the loop and the
+// matching outcome is resolved by `op`'s promise.
+async function _streamUntilSettled(shell, op) {
+  const opPromise = op();
+  while (true) {
+    const event = await shell.nextEvent();
+    if (event === null) {
+      // All senders gone — shell was closed mid-call. Fall through
+      // and let `op` resolve with whatever error/outcome Rust returns.
+      break;
+    }
+    if (event.kind === "output") {
+      const writer = shell._writer;
+      if (writer) {
+        try {
+          await writer.write(event.data);
+        } catch (_) {
+          // Writer closed/errored — drop silently.
+        }
+      }
+      continue;
+    }
+    // Terminal: "done" / "quiet" / "dead". `op` will resolve with the
+    // matching `Outcome` immediately after.
+    break;
+  }
+  return await opPromise;
+}
+
 // The visible frame for the currently-running shell command — Run
 // pushes it, Wait/Kill append to it. A Shell instance only runs one
 // command at a time so a single slot is enough.
@@ -133,17 +165,15 @@ function _openShellFrame(shell, cmd) {
   return { frame, writer };
 }
 
-// Append `text` to the open shell frame. No-op if no frame is open
-// (e.g. Wait was called before Run; the caller's tool_result will
-// surface the protocol violation).
+// Append `text` to the open shell frame. The pump owns bash output;
+// this is for synthetic JS-side text (e.g. the "(killed)" tail).
+// No-op if no frame is open.
 async function _appendShellOutput(shell, text) {
   if (!shell._writer || !text) return;
   try {
     await shell._writer.write(text);
   } catch (_) {
-    // Writer is closed/errored — drop the chunk silently. The body
-    // already on the frame remains; subsequent calls will discover
-    // shell._writer is gone and skip too.
+    // Writer closed/errored — drop silently.
   }
 }
 
@@ -177,33 +207,27 @@ async function _closeShellFrame(shell, terminal) {
   }
 }
 
-// Given a `runOnce`/`keepWaiting` outcome, append its captured output
-// to the frame and, if terminal (Done/Dead), close the frame with the
-// matching state. Returns the same outcome so the caller can chain.
+// Finalise the frame for a `runOnce`/`keepWaiting` outcome. The pump
+// has already streamed `outcome.output` into the frame as bytes
+// arrived; this function only handles the per-outcome epilogue
+// (terminal-state transition + close, optional synthetic "killed"
+// tail). Quiet leaves the frame open. Returns the outcome unchanged.
 async function _frameOutcome(shell, outcome, killedSuffix) {
+  if (killedSuffix) {
+    await _appendShellOutput(shell, killedSuffix);
+  }
   if (outcome.kind === "done") {
-    await _appendShellOutput(shell, outcome.output);
-    if (killedSuffix) {
-      await _appendShellOutput(shell, killedSuffix);
-    }
     await _closeShellFrame(
       shell,
       outcome.exit_code === 0 ? "success" : { exit: outcome.exit_code },
     );
   } else if (outcome.kind === "dead") {
-    await _appendShellOutput(shell, outcome.output);
-    if (killedSuffix) {
-      await _appendShellOutput(shell, killedSuffix);
-    }
     // Bash itself exited. We don't know the cause; use -1 as a
     // sentinel so the TUI renders it red without colliding with a
     // typical exit code.
     await _closeShellFrame(shell, { exit: -1 });
-  } else {
-    // Quiet — leave the frame open. The output captured up to this
-    // point still goes into the body so the user sees progress.
-    await _appendShellOutput(shell, outcome.output);
   }
+  // Quiet — leave the frame open.
   return outcome;
 }
 
@@ -277,7 +301,9 @@ class Run {
     _openShellFrame(this.shell, call.arguments.cmd);
     let outcome;
     try {
-      outcome = await this.shell.runOnce(call.arguments.cmd);
+      outcome = await _streamUntilSettled(this.shell, () =>
+        this.shell.runOnce(call.arguments.cmd),
+      );
     } catch (err) {
       // The frame is open but the command never produced an outcome;
       // close it as exit(-1) so the user sees a terminal state.
@@ -311,7 +337,7 @@ class Run {
       let scoldsRemaining = maxScolds;
       while (await shell.isRunning()) {
         // Render the inner round's LLM text into a frame.
-        const out = new MarkdownFrame({ content: "" });
+        const out = new MarkdownFrame();
         transcript.push(out);
         const r = await scope.stream();
         await r.text.pipeTo(out.writable);
@@ -338,7 +364,9 @@ class Run {
             // Already settled — fine.
           }
           try {
-            const drained = await shell.keepWaiting();
+            const drained = await _streamUntilSettled(shell, () =>
+              shell.keepWaiting(),
+            );
             await _frameOutcome(shell, drained, "\n(killed)");
           } catch (_) {
             // Already idle — close the frame defensively if anyone
@@ -378,11 +406,14 @@ class Wait {
     this.description =
       "Continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
     this.parameters = WAIT_SCHEMA;
+    this.hidden = true;
   }
 
   handler = async ({ call }) => {
     try {
-      const outcome = await this.shell.keepWaiting();
+      const outcome = await _streamUntilSettled(this.shell, () =>
+        this.shell.keepWaiting(),
+      );
       await _frameOutcome(this.shell, outcome);
       return _format(call.id, outcome);
     } catch (err) {
@@ -408,7 +439,9 @@ class Kill {
       // sees the final exit status.
       let final;
       try {
-        final = await this.shell.keepWaiting();
+        final = await _streamUntilSettled(this.shell, () =>
+          this.shell.keepWaiting(),
+        );
       } catch (_) {
         // Nothing in flight — already idle, no drain needed.
       }

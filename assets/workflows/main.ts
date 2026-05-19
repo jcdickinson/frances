@@ -622,7 +622,7 @@ const tools = [
 for (const tool of tools) {
   const original = tool.handler.bind(tool);
   tool.handler = async ({ call, scope }: any) => {
-    transcript.push(new ToolUseFrame({ name: call.name }));
+    transcript.push(new ToolUseFrame({ call, tool }));
     recordStepTranscript(
       `Tool call: ${call.name}`,
       `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,

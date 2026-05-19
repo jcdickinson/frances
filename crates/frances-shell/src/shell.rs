@@ -7,10 +7,13 @@ use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
+use tokio::sync::mpsc::UnboundedSender;
+
 use crate::child::{list_children, signal_pid};
 use crate::error::{ShellError, ShellResult};
 use crate::proto::{Sentinel, handshake_bytes, make_nonce, wrapper_bytes};
-use crate::reader::{OutputReader, QuietReason as ReaderQuietReason, ReadOutcome};
+pub use crate::reader::QuietReason;
+use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
 
 const DEFAULT_QUIET: Duration = Duration::from_secs(1);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -76,15 +79,6 @@ pub struct WaitOpts {
     /// Return [`RunOutcome::Quiet`] after this much wall-clock time has
     /// elapsed since the call started, regardless of streaming activity.
     pub max: Option<Duration>,
-}
-
-/// Why a [`RunOutcome::Quiet`] was emitted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QuietReason {
-    /// No bytes arrived for the configured `quiet` window.
-    NoOutput,
-    /// `max` wall-clock elapsed before the command finished.
-    MaxElapsed,
 }
 
 /// Result of a [`Shell::run`] / [`Shell::keep_waiting`] call.
@@ -221,6 +215,19 @@ impl Shell {
         self.alive
     }
 
+    /// Attach (or detach) a streaming event sink. While set, every
+    /// `run` / `keep_waiting` ships safe-not-sentinel output bytes
+    /// through the channel as [`ReadEvent::Output`] events, and emits
+    /// exactly one terminal [`ReadEvent::Done`] / `Quiet` / `Dead`
+    /// before returning. `RunOutcome::*` payloads still carry the
+    /// full output bytes so direct callers don't need to consume the
+    /// channel.
+    pub fn set_output_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>) {
+        if let Some(reader) = self.reader.as_mut() {
+            reader.set_sink(sink);
+        }
+    }
+
     /// Submit `cmd` to the shell and read until the sentinel, an output
     /// silence of `wait.quiet`, or `wait.max` wall-clock — whichever fires
     /// first.
@@ -310,10 +317,7 @@ impl Shell {
             }
             ReadOutcome::Quiet { output, reason } => RunOutcome::Quiet {
                 output: String::from_utf8_lossy(&output).into_owned(),
-                reason: match reason {
-                    ReaderQuietReason::NoOutput => QuietReason::NoOutput,
-                    ReaderQuietReason::MaxElapsed => QuietReason::MaxElapsed,
-                },
+                reason,
             },
             ReadOutcome::Eof { output } => {
                 self.alive = false;

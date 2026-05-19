@@ -34,6 +34,17 @@ impl Sentinel {
         }
     }
 
+    /// Upper bound (in bytes) on a complete sentinel match, including
+    /// the leading `\n`. Streaming consumers use this to know how many
+    /// trailing buffer bytes must be held back from "safe" delivery so
+    /// they don't ship the start of an in-progress sentinel as output.
+    /// The digit count is bounded by the longest `i32` decimal
+    /// representation (`-2147483648`, 11 bytes).
+    pub fn max_match_len(&self) -> usize {
+        const MAX_EXIT_DIGITS: usize = 11;
+        1 + self.prefix.len() + MAX_EXIT_DIGITS + self.suffix.len()
+    }
+
     pub fn find(&self, buf: &[u8]) -> Option<SentinelMatch> {
         let mut i = 0;
         while i + 1 + self.prefix.len() <= buf.len() {
