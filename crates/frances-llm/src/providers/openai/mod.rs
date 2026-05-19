@@ -207,6 +207,11 @@ impl provider::Provider for Provider {
 
         let mut text = String::new();
         let mut accumulator = ToolCallAccumulator::new();
+        // Running record of every tool call the accumulator has
+        // released — both during the stream (eager) and at end-of-stream
+        // (`finalize`). Used to build the consolidated assistant
+        // `History` payload and the returned `CompletionOutcome`.
+        let mut tool_calls: Vec<ToolCall> = Vec::new();
 
         loop {
             let chunk = tokio::select! {
@@ -244,7 +249,10 @@ impl provider::Provider for Provider {
                         on_event(StreamEvent::TextDelta(delta.to_owned()))?;
                     }
                     for tcd in sse::chunk_tool_call_deltas(&value) {
-                        accumulator.push(tcd)?;
+                        for completed in accumulator.push(tcd)? {
+                            on_event(StreamEvent::ToolCall(completed.clone()))?;
+                            tool_calls.push(completed);
+                        }
                     }
                     if let Some(usage) = sse::chunk_usage(&value) {
                         on_event(StreamEvent::Usage(usage))?;
@@ -253,15 +261,16 @@ impl provider::Provider for Provider {
             }
         }
 
-        let tool_calls = accumulator.finalize()?;
-        // Emit one consolidated assistant History event covering the text
-        // and any tool_calls. (For OpenAI's wire, all of these belong to
-        // a single assistant message.)
+        for trailing in accumulator.finalize()? {
+            on_event(StreamEvent::ToolCall(trailing.clone()))?;
+            tool_calls.push(trailing);
+        }
+        // Consolidated assistant History event covering the text and
+        // every tool_call. Emitted *after* the eager `ToolCall` events
+        // so that any consumer relying on "History is the last frame of
+        // the turn" still sees that property.
         let assistant_payload = build_assistant_payload(&text, &tool_calls);
         on_event(StreamEvent::History(assistant_payload))?;
-        for call in &tool_calls {
-            on_event(StreamEvent::ToolCall(call.clone()))?;
-        }
         Ok(CompletionOutcome { text, tool_calls })
     }
 }

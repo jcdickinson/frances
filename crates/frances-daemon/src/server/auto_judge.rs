@@ -23,8 +23,9 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use frances_llm::CompleteRequest;
+use frances_models_llm::chat::ChatError;
 use frances_models_llm::wire::{
-    CompletionOutcome, HistoryInput, ToolChoice, ToolDef, ToolFunction,
+    HistoryInput, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolFunction,
 };
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
@@ -139,30 +140,15 @@ pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest)
         },
     ];
 
-    let first = match state
-        .chat
-        .complete(CompleteRequest {
-            intents: INTENTS,
-            session_id: &session_id,
-            env: &env,
-            history: &[],
-            new_inputs: &inputs,
-            tools: &tools,
-            tool_choice: Some(&ToolChoice::Required),
-            cancel: CancellationToken::new(),
-        })
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            warn!(%error, id = %request.id, "auto-judge: chat.complete failed");
-            return JudgeOutcome::Indeterminate {
-                reason: format!("chat.complete failed: {error}"),
-            };
+    let first = match run_round(state, &session_id, &env, &inputs, &tools).await {
+        RoundOutcome::Parsed(parse) => parse,
+        RoundOutcome::Errored(reason) => {
+            warn!(%reason, id = %request.id, "auto-judge: chat.complete failed");
+            return JudgeOutcome::Indeterminate { reason };
         }
     };
 
-    match parse_outcome(&first) {
+    match first {
         ParseResult::Approve { reason } => return JudgeOutcome::Approve { reason },
         ParseResult::Reject { reason } => return JudgeOutcome::Reject { reason },
         ParseResult::Malformed { detail } => {
@@ -177,30 +163,17 @@ Try once more — call exactly one of the two tools with a one-sentence reason."
     let mut retry_inputs = inputs.clone();
     retry_inputs.push(HistoryInput::User { text: scold });
 
-    let second = match state
-        .chat
-        .complete(CompleteRequest {
-            intents: INTENTS,
-            session_id: &session_id,
-            env: &env,
-            history: &[],
-            new_inputs: &retry_inputs,
-            tools: &tools,
-            tool_choice: Some(&ToolChoice::Required),
-            cancel: CancellationToken::new(),
-        })
-        .await
-    {
-        Ok(outcome) => outcome,
-        Err(error) => {
-            warn!(%error, id = %request.id, "auto-judge: retry chat.complete failed");
+    let second = match run_round(state, &session_id, &env, &retry_inputs, &tools).await {
+        RoundOutcome::Parsed(parse) => parse,
+        RoundOutcome::Errored(reason) => {
+            warn!(%reason, id = %request.id, "auto-judge: retry chat.complete failed");
             return JudgeOutcome::Indeterminate {
-                reason: format!("retry chat.complete failed: {error}"),
+                reason: format!("retry chat.complete failed: {reason}"),
             };
         }
     };
 
-    match parse_outcome(&second) {
+    match second {
         ParseResult::Approve { reason } => JudgeOutcome::Approve { reason },
         ParseResult::Reject { reason } => JudgeOutcome::Reject { reason },
         ParseResult::Malformed { detail } => JudgeOutcome::Indeterminate {
@@ -209,11 +182,78 @@ Try once more — call exactly one of the two tools with a one-sentence reason."
     }
 }
 
-/// Pure parser over `CompletionOutcome`. Decision is the chosen tool
-/// name; reason is `arguments.reason` if present and a string,
-/// otherwise a default.
-fn parse_outcome(outcome: &CompletionOutcome) -> ParseResult {
-    match outcome.tool_calls.as_slice() {
+/// One round-trip wrapped so both the initial call and the retry share
+/// the same eager-cancel + parse logic. `Errored` carries the
+/// already-formatted error string; `Parsed` carries the parser verdict
+/// over whatever tool calls were observed (including the early-bail
+/// case where we self-cancelled at the 2nd `StreamEvent::ToolCall`).
+enum RoundOutcome {
+    Parsed(ParseResult),
+    Errored(String),
+}
+
+async fn run_round(
+    state: &Arc<ServerState>,
+    session_id: &str,
+    env: &std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+    inputs: &[HistoryInput<'_>],
+    tools: &[ToolDef],
+) -> RoundOutcome {
+    let cancel = CancellationToken::new();
+    let mut collected: Vec<ToolCall> = Vec::new();
+
+    // Inner block so the closure's mutable borrow of `collected` ends
+    // before we read `collected` below.
+    let result = {
+        let cancel_for_cb = cancel.clone();
+        let mut on_event = |ev: StreamEvent| {
+            if let StreamEvent::ToolCall(call) = ev {
+                collected.push(call);
+                if collected.len() >= 2 {
+                    // Second call: `parse_calls` already returns
+                    // `Malformed` for any count other than 1, so
+                    // further chunks can't change the verdict. Fire
+                    // the cancel token — the SSE drain's
+                    // `tokio::select!` drops the in-flight HTTP
+                    // request and the provider stops generating.
+                    cancel_for_cb.cancel();
+                }
+            }
+        };
+
+        let req = CompleteRequest {
+            intents: INTENTS,
+            session_id,
+            env,
+            history: &[],
+            new_inputs: inputs,
+            tools,
+            tool_choice: Some(&ToolChoice::Required),
+            cancel: cancel.clone(),
+        };
+
+        state.chat.complete_with_events(req, &mut on_event).await
+    };
+
+    match result {
+        Ok(_) => RoundOutcome::Parsed(parse_calls(&collected)),
+        // Self-cancel: we fired the token from the callback because we
+        // saw `>= 2` tool calls. The verdict is whatever
+        // `parse_calls(&collected)` says — i.e. `Malformed`. Fall
+        // through to the same path as a normal completion so the
+        // retry/Indeterminate logic upstream is uniform.
+        Err(ChatError::Cancelled) if cancel.is_cancelled() => {
+            RoundOutcome::Parsed(parse_calls(&collected))
+        }
+        Err(error) => RoundOutcome::Errored(format!("chat.complete failed: {error}")),
+    }
+}
+
+/// Pure parser over the tool calls the judge produced. Decision is the
+/// chosen tool name; reason is `arguments.reason` if present and a
+/// string, otherwise a default.
+fn parse_calls(calls: &[ToolCall]) -> ParseResult {
+    match calls {
         [call] => {
             let reason = call
                 .arguments
@@ -241,24 +281,20 @@ fn parse_outcome(outcome: &CompletionOutcome) -> ParseResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frances_models_llm::wire::ToolCall;
     use serde_json::json;
 
-    fn outcome_with_call(name: &str, args: serde_json::Value) -> CompletionOutcome {
-        CompletionOutcome {
-            text: String::new(),
-            tool_calls: vec![ToolCall {
-                id: "1".into(),
-                name: name.into(),
-                arguments: args,
-            }],
+    fn call(name: &str, args: serde_json::Value) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: name.into(),
+            arguments: args,
         }
     }
 
     #[test]
     fn parses_approve() {
-        let outcome = outcome_with_call("approve", json!({ "reason": "looks fine" }));
-        match parse_outcome(&outcome) {
+        let calls = [call("approve", json!({ "reason": "looks fine" }))];
+        match parse_calls(&calls) {
             ParseResult::Approve { reason } => assert_eq!(reason, "looks fine"),
             other => panic!("expected Approve, got {other:?}"),
         }
@@ -266,8 +302,8 @@ mod tests {
 
     #[test]
     fn parses_reject() {
-        let outcome = outcome_with_call("reject", json!({ "reason": "rm -rf is sketchy" }));
-        match parse_outcome(&outcome) {
+        let calls = [call("reject", json!({ "reason": "rm -rf is sketchy" }))];
+        match parse_calls(&calls) {
             ParseResult::Reject { reason } => assert_eq!(reason, "rm -rf is sketchy"),
             other => panic!("expected Reject, got {other:?}"),
         }
@@ -275,8 +311,8 @@ mod tests {
 
     #[test]
     fn missing_reason_defaults() {
-        let outcome = outcome_with_call("approve", json!({}));
-        match parse_outcome(&outcome) {
+        let calls = [call("approve", json!({}))];
+        match parse_calls(&calls) {
             ParseResult::Approve { reason } => assert_eq!(reason, DEFAULT_REASON),
             other => panic!("expected Approve, got {other:?}"),
         }
@@ -284,8 +320,8 @@ mod tests {
 
     #[test]
     fn non_string_reason_defaults() {
-        let outcome = outcome_with_call("reject", json!({ "reason": 42 }));
-        match parse_outcome(&outcome) {
+        let calls = [call("reject", json!({ "reason": 42 }))];
+        match parse_calls(&calls) {
             ParseResult::Reject { reason } => assert_eq!(reason, DEFAULT_REASON),
             other => panic!("expected Reject, got {other:?}"),
         }
@@ -293,45 +329,21 @@ mod tests {
 
     #[test]
     fn unknown_tool_is_malformed() {
-        let outcome = outcome_with_call("decide", json!({ "reason": "x" }));
-        assert!(matches!(
-            parse_outcome(&outcome),
-            ParseResult::Malformed { .. }
-        ));
+        let calls = [call("decide", json!({ "reason": "x" }))];
+        assert!(matches!(parse_calls(&calls), ParseResult::Malformed { .. }));
     }
 
     #[test]
     fn zero_calls_is_malformed() {
-        let outcome = CompletionOutcome {
-            text: String::new(),
-            tool_calls: vec![],
-        };
-        assert!(matches!(
-            parse_outcome(&outcome),
-            ParseResult::Malformed { .. }
-        ));
+        assert!(matches!(parse_calls(&[]), ParseResult::Malformed { .. }));
     }
 
     #[test]
     fn two_calls_is_malformed() {
-        let outcome = CompletionOutcome {
-            text: String::new(),
-            tool_calls: vec![
-                ToolCall {
-                    id: "1".into(),
-                    name: "approve".into(),
-                    arguments: json!({ "reason": "a" }),
-                },
-                ToolCall {
-                    id: "2".into(),
-                    name: "reject".into(),
-                    arguments: json!({ "reason": "b" }),
-                },
-            ],
-        };
-        assert!(matches!(
-            parse_outcome(&outcome),
-            ParseResult::Malformed { .. }
-        ));
+        let calls = [
+            call("approve", json!({ "reason": "a" })),
+            call("reject", json!({ "reason": "b" })),
+        ];
+        assert!(matches!(parse_calls(&calls), ParseResult::Malformed { .. }));
     }
 }

@@ -9,7 +9,9 @@ use frances_models_llm::chat::{
     ChatSessionRow,
 };
 use frances_models_llm::config::ModelConfig;
-use frances_models_llm::wire::{CompletionOutcome, ErasedError, HistoryInput, ToolChoice, ToolDef};
+use frances_models_llm::wire::{
+    CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolChoice, ToolDef,
+};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -120,6 +122,19 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
     /// the history store. Used by tools that need an LLM but aren't
     /// part of a persistent conversation (e.g. the shell classifier).
     pub async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome, ChatError> {
+        self.complete_with_events(req, &mut |_| {}).await
+    }
+
+    /// Same as [`complete`](Self::complete), but the caller observes
+    /// every `StreamEvent` the provider emits. The callback is the
+    /// auto-judge's lever for cancelling after the 2nd
+    /// `StreamEvent::ToolCall`; see
+    /// `crates/frances-daemon/src/server/auto_judge.rs`.
+    pub async fn complete_with_events(
+        &self,
+        req: CompleteRequest<'_>,
+        on_event: &mut (dyn FnMut(StreamEvent) + Send),
+    ) -> Result<CompletionOutcome, ChatError> {
         let model = self.resolve_model(req.intents);
         let provider_id = model.model_provider.clone();
         let provider = self
@@ -137,7 +152,14 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             tool_choice: req.tool_choice,
             env: req.env,
         };
-        match provider.complete(provider_req, cancel.clone()).await {
+        let mut wrapped = |ev: StreamEvent| -> Result<(), ErasedError> {
+            on_event(ev);
+            Ok(())
+        };
+        match provider
+            .stream(provider_req, cancel.clone(), &mut wrapped)
+            .await
+        {
             Ok(c) => Ok(c),
             Err(_) if cancel.is_cancelled() => Err(ChatError::Cancelled),
             Err(source) => Err(log_and_typed(&provider_id, source)),
