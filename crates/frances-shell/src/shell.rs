@@ -118,6 +118,20 @@ impl Shell {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // Plain-output hygiene: the TUI shows shell stdout as text, so
+        // ANSI colour sequences are noise at best and broken at worst.
+        // `TERM=dumb` makes terminfo-aware tools emit no escapes;
+        // `NO_COLOR=1` is the no-color.org standard honoured by ripgrep,
+        // cargo, bat, jq, gcc, ls --color=auto, etc.; `CLICOLOR=0` and
+        // `FORCE_COLOR=0` cover the BSD- and Node-flavoured holdouts;
+        // `PAGER=cat` keeps less from grabbing the pty for things like
+        // `git log`. Applied before `opts.env` so callers can override
+        // any of them per-shell.
+        cmd.env("TERM", "dumb")
+            .env("NO_COLOR", "1")
+            .env("CLICOLOR", "0")
+            .env("FORCE_COLOR", "0")
+            .env("PAGER", "cat");
         if let Some(cwd) = &opts.cwd {
             cmd.current_dir(cwd);
         }
