@@ -205,6 +205,7 @@ impl App<'_> {
                 textarea_lines: vec![String::new()],
                 placeholder: String::new(),
                 status: None,
+                token_status: None,
             }),
             cursor_row,
         );
@@ -225,6 +226,7 @@ impl App<'_> {
         let mut events = EventStream::new();
         let mut streaming = false;
         let mut replay_mode = false;
+        let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
@@ -258,7 +260,13 @@ impl App<'_> {
         });
 
         loop {
-            redraw(&mut terminal, &mut container, &textarea, streaming)?;
+            redraw(
+                &mut terminal,
+                &mut container,
+                &textarea,
+                streaming,
+                latest_usage.as_ref(),
+            )?;
 
             tokio::select! {
                 Some(event) = events.next() => {
@@ -383,6 +391,7 @@ impl App<'_> {
                         &mut state,
                         &mut replay_mode,
                         frame,
+                        &mut latest_usage,
                     )? {
                         textarea.set_placeholder(PERMISSION_PLACEHOLDER);
                         pending_approval = Some(req);
@@ -409,6 +418,7 @@ fn redraw(
     container: &mut ScrollbackContainer,
     textarea: &Textarea,
     streaming: bool,
+    latest_usage: Option<&Usage>,
 ) -> std::io::Result<()> {
     container.set_footer(Box::new(FooterBlock {
         textarea_lines: textarea.lines_snapshot(),
@@ -418,6 +428,7 @@ fn redraw(
         } else {
             None
         },
+        token_status: latest_usage.map(format_token_status),
     }));
 
     if container.scrollback() {
@@ -466,6 +477,7 @@ fn handle_frame(
     state: &mut LiveBlocks,
     replay_mode: &mut bool,
     frame: StreamFrame,
+    latest_usage: &mut Option<Usage>,
 ) -> Result<Option<PermissionRequest>> {
     if *replay_mode {
         return handle_replay_frame(terminal, container, replay_mode, frame);
@@ -503,6 +515,7 @@ fn handle_frame(
             }
         }
         StreamFrame::Usage(usage) => {
+            *latest_usage = Some(usage.clone());
             container.push(Box::new(RawBlock::single_styled(
                 format_usage(&usage),
                 Style::default().fg(Color::DarkGray),
@@ -668,6 +681,13 @@ fn format_usage(usage: &Usage) -> String {
     )
 }
 
+fn format_token_status(usage: &Usage) -> String {
+    format!(
+        "tokens: {} total · {} prompt ({} cached) · {} completion",
+        usage.total_tokens, usage.prompt_tokens, usage.cached_input_tokens, usage.completion_tokens
+    )
+}
+
 fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -706,8 +726,8 @@ fn classify_scrollback_key(key: &KeyEvent, page: u16) -> ScrollbackAction {
 /// visible content above/below the new window so the user can see
 /// where they came from.
 fn scrollback_page(terminal_h: u16) -> u16 {
-    // Content area = terminal_h - 2 status bars - footer (typically 3-row textarea).
-    terminal_h.saturating_sub(6).max(1)
+    // Content area = terminal_h - 2 status bars - footer (textarea + token row).
+    terminal_h.saturating_sub(7).max(1)
 }
 
 fn enter_scrollback(terminal: &mut AppTerminal) -> Result<()> {

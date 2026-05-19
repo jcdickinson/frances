@@ -9,6 +9,8 @@ use unicode_width::UnicodeWidthChar;
 
 use super::textarea::INPUT_HEIGHT;
 
+const TOKEN_STATUS_HEIGHT: u16 = 1;
+
 /// Maximum body lines (post trailing-newline strip) shown for a shell
 /// output block. Earlier lines are collapsed into a single `… [N earlier
 /// lines]` marker so the visible tail tracks the action.
@@ -233,20 +235,22 @@ impl Block for RawBlock {
     }
 }
 
-/// Footer block: a bordered textarea snapshot. The cursor inside the
-/// textarea is positioned separately by the main loop, after the
-/// container draw. `status`, when present, is rendered inside the
-/// top border as `┌─ {status} ──…─┐` — used to surface a streaming
-/// indicator while an LLM stream is in flight.
+/// Footer block: a bordered textarea snapshot followed by a one-row
+/// token status area below the input. The cursor inside the textarea is
+/// positioned separately by the main loop, after the container draw.
+/// `status`, when present, is rendered inside the top border as
+/// `┌─ {status} ──…─┐` — used to surface a streaming indicator while
+/// an LLM stream is in flight.
 pub struct FooterBlock {
     pub textarea_lines: Vec<String>,
     pub placeholder: String,
     pub status: Option<String>,
+    pub token_status: Option<String>,
 }
 
 impl Block for FooterBlock {
     fn measure(&self, _width: u16) -> u16 {
-        INPUT_HEIGHT
+        INPUT_HEIGHT + TOKEN_STATUS_HEIGHT
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
@@ -305,6 +309,18 @@ impl Block for FooterBlock {
             };
             buf.set_string(area.x + 1, row, &line_str, line_style);
             buf.set_string(area.x + 1 + inner_w as u16, row, "│", Style::default());
+        }
+
+        let status_row = area.y + textarea_h;
+        if status_row < area.y + area.height {
+            let text = self.token_status.as_deref().unwrap_or("tokens: —");
+            let status = pad_to_width(text, area.width as usize);
+            buf.set_string(
+                area.x,
+                status_row,
+                status,
+                Style::default().fg(Color::DarkGray),
+            );
         }
     }
 }
