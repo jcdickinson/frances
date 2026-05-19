@@ -429,6 +429,13 @@ class PlanUpdate {
     "Call this before doing work if there is no active step, and any time the plan should change.";
   parameters = PLAN_UPDATE_SCHEMA;
 
+  describe(call: any) {
+    const a = call.arguments || {};
+    if (typeof a.title === "string" && a.title.length > 0) return a.title;
+    if (a.current_step !== undefined) return `→ ${a.current_step}`;
+    return "";
+  }
+
   handler = async ({ call }: any) => {
     try {
       const args = call.arguments || {};
@@ -490,6 +497,11 @@ class TaskComplete {
     "Signal that the active plan step is complete. Include outcome, summary, and proof. " +
     "This does not directly advance the plan; a referee model must approve it first.";
   parameters = TASK_COMPLETE_SCHEMA;
+
+  describe(call: any) {
+    const a = call.arguments || {};
+    return typeof a.outcome === "string" ? a.outcome : "";
+  }
 
   handler = async ({ call }: any) => {
     const args = call.arguments || {};

@@ -699,11 +699,13 @@ async fn emit(
                 state.persist_error(&content).await?;
                 write_message(stream, &StreamFrame::Error(content)).await?;
             }
-            FrameKind::ToolUse { name } => {
+            FrameKind::ToolUse { name, detail } => {
                 let block = state.alloc();
                 let name_arc: Arc<str> = Arc::from(name);
+                let detail_arc: Option<Arc<str>> = detail.map(Arc::from);
                 let kind = BlockKind::ToolUse {
                     name: name_arc.clone(),
+                    detail: detail_arc,
                 };
                 write_message(
                     stream,

@@ -4,7 +4,7 @@ use frances_daemon::protocol::{BlockKind, ShellState};
 use frances_tui::Block;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use unicode_width::UnicodeWidthChar;
 
 use super::textarea::INPUT_HEIGHT;
@@ -23,6 +23,10 @@ const SHELL_TAIL_LINES: usize = 10;
 pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
     match kind {
         BlockKind::ShellOutput { state, cmd } => Box::new(ShellOutputBlock::new(state, cmd, text)),
+        BlockKind::ToolUse {
+            name,
+            detail: Some(detail),
+        } => Box::new(ToolUseBlock::new(name, detail)),
         other => Box::new(LabelledBlock::new(other, text)),
     }
 }
@@ -183,6 +187,80 @@ impl Block for ShellOutputBlock {
     }
 }
 
+/// History row for a one-shot tool call with a detail suffix. Renders
+/// as `→ {name}  {detail}` on one line — the prefix in yellow, the
+/// detail in dim — wrapping `detail` to subsequent rows (still dim,
+/// indented to match the prefix column) when the line overflows.
+///
+/// The plain `BlockKind::ToolUse` variant (no detail) still routes
+/// through [`LabelledBlock`]; only the `Some(detail)` shape comes here.
+pub struct ToolUseBlock {
+    name: Arc<str>,
+    detail: Arc<str>,
+}
+
+impl ToolUseBlock {
+    pub fn new(name: Arc<str>, detail: Arc<str>) -> Self {
+        Self { name, detail }
+    }
+
+    fn name_prefix(&self) -> String {
+        format!("→ {}  ", self.name)
+    }
+
+    fn wrapped_lines(&self, width: u16) -> Vec<String> {
+        let max = width.max(1) as usize;
+        let prefix = self.name_prefix();
+        let indent = " ".repeat(display_width(&prefix));
+        let mut out = Vec::new();
+        for (i, source_line) in self.detail.split('\n').enumerate() {
+            let lead = if i == 0 {
+                prefix.as_str()
+            } else {
+                indent.as_str()
+            };
+            wrap_into(lead, source_line, max, &mut out);
+        }
+        if out.is_empty() {
+            out.push(prefix);
+        }
+        out
+    }
+}
+
+impl Block for ToolUseBlock {
+    fn measure(&self, width: u16) -> u16 {
+        self.wrapped_lines(width).len() as u16
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let lines = self.wrapped_lines(area.width);
+        let prefix = self.name_prefix();
+        // Split the prefix into the colored arrow+name segment (yellow)
+        // and the trailing two spaces that bridge into the dim detail.
+        // The arrow+name byte count is `prefix.len() - 2` because the
+        // suffix is exactly `"  "` (two ASCII spaces).
+        let arrow_bytes = prefix.len() - 2;
+        let prefix_cols = display_width(&prefix) as u16;
+        let arrow_style = Style::default().fg(Color::Yellow);
+        let dim_style = Style::default().add_modifier(Modifier::DIM);
+        for (i, line) in lines.iter().enumerate() {
+            if i as u16 >= area.height {
+                break;
+            }
+            let y = area.y + i as u16;
+            if i == 0 && line.starts_with(&prefix) {
+                buf.set_string(area.x, y, &line[..arrow_bytes], arrow_style);
+                if line.len() > prefix.len() {
+                    buf.set_string(area.x + prefix_cols, y, &line[prefix.len()..], dim_style);
+                }
+            } else {
+                buf.set_string(area.x, y, line, dim_style);
+            }
+        }
+    }
+}
+
 fn shell_state_prefix(state: &ShellState) -> String {
     match state {
         ShellState::Running => "[…] ".to_string(),
@@ -329,7 +407,9 @@ pub fn prefix_for(kind: &BlockKind) -> String {
     match kind {
         BlockKind::Text { sender: Some(s) } => format!("{s}: "),
         BlockKind::Text { sender: None } => String::new(),
-        BlockKind::ToolUse { name } => format!("→ {name}"),
+        // The `detail`-bearing variant routes through `ToolUseBlock`; the
+        // `LabelledBlock` path only sees plain tool-use markers.
+        BlockKind::ToolUse { name, .. } => format!("→ {name}"),
         BlockKind::ShellOutput { .. } => {
             // ShellOutput renders through ShellOutputBlock, which owns
             // its own prefix; LabelledBlock should never see this kind.

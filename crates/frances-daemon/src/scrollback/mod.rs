@@ -111,11 +111,16 @@ struct TextPayload {
     text: String,
 }
 
-/// On-disk JSON shape for `kind` = 'tool_use' rows.
+/// On-disk JSON shape for `kind` = 'tool_use' rows. `detail` is the
+/// optional human-readable suffix produced by the tool's
+/// `describe(call)` method; it was added after the initial schema, so
+/// older rows decode with `detail = None` via `#[serde(default)]`.
 #[derive(Serialize, Deserialize)]
 struct ToolUsePayload {
     name: Arc<str>,
     text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    detail: Option<Arc<str>>,
 }
 
 /// On-disk JSON shape for `kind` = 'shell_output' rows.
@@ -347,11 +352,12 @@ fn encode_block(
             })
             .map_err(ScrollbackError::Encode)?,
         ),
-        BlockKind::ToolUse { name } => (
+        BlockKind::ToolUse { name, detail } => (
             "tool_use",
             serde_json::to_value(ToolUsePayload {
                 name: name.clone(),
                 text: text.to_owned(),
+                detail: detail.clone(),
             })
             .map_err(ScrollbackError::Encode)?,
         ),
@@ -394,7 +400,10 @@ fn decode_row(
                     source,
                 })?;
             Ok(StoredRow::Block {
-                kind: BlockKind::ToolUse { name: p.name },
+                kind: BlockKind::ToolUse {
+                    name: p.name,
+                    detail: p.detail,
+                },
                 text: p.text,
                 truncated,
             })
@@ -484,6 +493,7 @@ mod tests {
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
+                detail: None,
             },
             "ls /",
             true,
@@ -495,7 +505,8 @@ mod tests {
             rows,
             vec![StoredRow::Block {
                 kind: BlockKind::ToolUse {
-                    name: "shell".into()
+                    name: "shell".into(),
+                    detail: None,
                 },
                 text: "ls /".into(),
                 truncated: true,
@@ -613,6 +624,7 @@ mod tests {
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
+                detail: None,
             },
             "ls",
             true,
@@ -667,6 +679,7 @@ mod tests {
             instance,
             &BlockKind::ToolUse {
                 name: "shell".into(),
+                detail: None,
             },
             "ls /",
             false,
@@ -682,7 +695,7 @@ mod tests {
         }
         match &frames[1] {
             StreamFrame::BlockDelta {
-                kind: BlockKind::ToolUse { name },
+                kind: BlockKind::ToolUse { name, .. },
                 text,
                 ..
             } => {

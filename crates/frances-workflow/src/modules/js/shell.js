@@ -292,6 +292,11 @@ class Run {
     this.parameters = RUN_SCHEMA;
   }
 
+  describe(call) {
+    const cmd = call.arguments && call.arguments.cmd;
+    return typeof cmd === "string" ? cmd : "";
+  }
+
   handler = async ({ call, scope }) => {
     if (this.requireApproval) {
       const gate = await _askApproval(call);
@@ -519,6 +524,14 @@ class Set {
     this.parameters = SET_SCHEMA;
   }
 
+  describe(call) {
+    const a = call.arguments || {};
+    const target = a.export || a.set;
+    if (!target) return "";
+    const from = a.from ? ` ← ${a.from}` : "";
+    return `$${target}${from}`;
+  }
+
   handler = async ({ call }) => {
     const args = call.arguments;
     const hasSet = typeof args.set === "string" && args.set.length > 0;
@@ -565,6 +578,12 @@ class Capture {
     this.name = "shell_capture";
     this.description = shellDesc.shell_capture;
     this.parameters = CAPTURE_SCHEMA;
+  }
+
+  describe(call) {
+    const a = call.arguments || {};
+    if (!a.name || !a.from) return a.name || "";
+    return `${a.name} ← $${a.from}`;
   }
 
   handler = async ({ call }) => {

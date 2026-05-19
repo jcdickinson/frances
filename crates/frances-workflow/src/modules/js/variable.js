@@ -123,6 +123,10 @@ class Get {
     this.parameters = GET_SCHEMA;
   }
 
+  describe(call) {
+    return (call.arguments && call.arguments.name) || "";
+  }
+
   handler = async ({ call }) => {
     const { name } = call.arguments;
     if (!this.vars.has(name)) {
@@ -142,6 +146,10 @@ class Set {
     this.parameters = SET_SCHEMA;
   }
 
+  describe(call) {
+    return (call.arguments && call.arguments.name) || "";
+  }
+
   handler = async ({ call }) => {
     const { name, value } = call.arguments;
     this.vars.set(name, value);
@@ -157,6 +165,10 @@ class Assign {
     this.name = "variable_assign";
     this.description = desc.variable_assign;
     this.parameters = ASSIGN_SCHEMA;
+  }
+
+  describe(call) {
+    return (call.arguments && call.arguments.name) || "";
   }
 
   handler = async ({ call }) => {

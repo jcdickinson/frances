@@ -153,11 +153,13 @@ pub enum BlockKind {
     /// front of the body when `None`. Workflows pick the sender via
     /// `new MarkdownFrame({ content, sender })` — there is no
     /// host-side meaning beyond the label.
-    Text {
-        sender: Option<Arc<str>>,
-    },
+    Text { sender: Option<Arc<str>> },
+    /// `detail` is an optional human-readable suffix sourced from the
+    /// tool's `describe(call)` method (e.g. the file path + ranges for
+    /// `file_read`). The TUI renders it after `name` in a dim style.
     ToolUse {
         name: Arc<str>,
+        detail: Option<Arc<str>>,
     },
     /// Streaming output from a shell command. The body carries the
     /// accumulated stdout; `cmd` is the bash source that produced it,
@@ -165,10 +167,7 @@ pub enum BlockKind {
     /// the body is truncated. `state` advances from `Running` to
     /// `Success`/`Exit(N)` as the command completes, with the TUI
     /// re-rendering on each transition.
-    ShellOutput {
-        state: ShellState,
-        cmd: Arc<str>,
-    },
+    ShellOutput { state: ShellState, cmd: Arc<str> },
 }
 
 /// Terminal-status enum for [`BlockKind::ShellOutput`]. Carried on

@@ -193,6 +193,7 @@ fn push_frame<'js>(
         borrow.id.store(new_id, Ordering::Release);
         let kind = FrameKind::ToolUse {
             name: borrow.name.clone(),
+            detail: borrow.detail.clone(),
         };
         let _ = state.tx.send(HostFrame::Push(FramePush {
             id: FrameId(new_id),
@@ -446,6 +447,13 @@ impl<'js> JsClass<'js> for JsonFrame {
 // ToolUseFrame — one-shot "→ tool_name" marker
 // ---------------------------------------------------------------------
 
+/// Hard cap on the length of the `detail` string returned by a tool's
+/// `describe(call)`. The detail rides on every tool-call wire frame and
+/// is shown inline in the TUI; an unbounded value could flood the
+/// scrollback row or push the whole block off-screen. Anything past the
+/// cap is truncated with a trailing `…`.
+const TOOL_DETAIL_MAX: usize = 160;
+
 pub struct ToolUseFrame {
     #[expect(
         dead_code,
@@ -458,6 +466,11 @@ pub struct ToolUseFrame {
     /// wire `Push` is emitted. Sourced from `tool.hidden` at
     /// construction so callers can pass the unmodified call+tool pair.
     hidden: bool,
+    /// Optional human-readable suffix produced by `tool.describe(call)`
+    /// (e.g. the file path + ranges for `file_read`). `None` when the
+    /// tool didn't provide a `describe`, when it returned a non-string,
+    /// or when it threw.
+    detail: Option<String>,
 }
 
 impl<'js> Trace<'js> for ToolUseFrame {
@@ -483,6 +496,41 @@ impl<'js> JsClass<'js> for ToolUseFrame {
     }
 }
 
+/// Call `tool.describe(call)` if `tool` exposes a callable `describe`.
+/// Returns the raw string the function produced, or `None` if there is
+/// no `describe`, the property is not callable, it threw, or it
+/// returned a non-string. Errors are swallowed by design — a broken
+/// `describe` must never break the tool-call flow.
+fn invoke_describe<'js>(tool: &Object<'js>, call: &Object<'js>) -> Option<String> {
+    let describe = tool.get::<_, Function<'js>>("describe").ok()?;
+    let result: Value<'js> = describe.call((call.clone(),)).ok()?;
+    if result.is_string() {
+        result.get::<String>().ok()
+    } else {
+        None
+    }
+}
+
+/// Trim whitespace, collapse to `None` when empty, and truncate to
+/// `TOOL_DETAIL_MAX` characters (replacing the tail with `…`). The cap
+/// is enforced on Unicode scalar values, not bytes, so multi-byte
+/// characters don't silently push the result past the limit.
+fn normalise_detail(raw: String) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len().min(TOOL_DETAIL_MAX * 4));
+    for (i, ch) in trimmed.chars().enumerate() {
+        if i >= TOOL_DETAIL_MAX {
+            out.push('…');
+            return Some(out);
+        }
+        out.push(ch);
+    }
+    Some(out)
+}
+
 fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ToolUseFrame, _, _>(
         ctx.clone(),
@@ -500,13 +548,18 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
             let name: String = call.get("name").map_err(|_| {
                 throw_err(&ctx, "new ToolUseFrame: missing or non-string `call.name`")
             })?;
-            let hidden = match obj.get::<_, Value<'js>>("tool") {
-                Ok(v) if v.is_object() => v
-                    .as_object()
-                    .and_then(|t| t.get::<_, bool>("hidden").ok())
-                    .unwrap_or(false),
-                _ => false,
+            let tool: Option<Object<'js>> = match obj.get::<_, Value<'js>>("tool") {
+                Ok(v) if v.is_object() => v.into_object(),
+                _ => None,
             };
+            let hidden = tool
+                .as_ref()
+                .and_then(|t| t.get::<_, bool>("hidden").ok())
+                .unwrap_or(false);
+            let detail = tool
+                .as_ref()
+                .and_then(|t| invoke_describe(t, &call))
+                .and_then(normalise_detail);
             Class::instance(
                 ctx.clone(),
                 ToolUseFrame {
@@ -514,6 +567,7 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
                     id: AtomicU64::new(0),
                     name,
                     hidden,
+                    detail,
                 },
             )
         },

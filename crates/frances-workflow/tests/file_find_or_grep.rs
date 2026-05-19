@@ -65,7 +65,10 @@ fn text_of(frame: &HostFrame) -> String {
         HostFrame::Push(p) => match &p.kind {
             FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
             FrameKind::Error { content } => content.clone(),
-            FrameKind::ToolUse { name } => format!("→ {name}"),
+            FrameKind::ToolUse { name, detail } => match detail {
+                Some(d) => format!("→ {name}  {d}"),
+                None => format!("→ {name}"),
+            },
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
             FrameKind::ShellOutput {
                 state,

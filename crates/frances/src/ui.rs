@@ -773,6 +773,7 @@ mod tests {
         };
         let kind_b = BlockKind::ToolUse {
             name: "shell".into(),
+            detail: None,
         };
 
         // Open id 1.

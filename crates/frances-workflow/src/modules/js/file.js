@@ -162,6 +162,22 @@ function _resolveText(args, vars) {
   return args.text;
 }
 
+// Format a list of [start, end] line-range pairs as `[1-50, 100]`, with
+// single-line ranges collapsed to one number. Returns `null` if the
+// shape isn't an array of `[number, number]` so describe() can fall
+// back gracefully on malformed input.
+function _formatRanges(ranges) {
+  if (!Array.isArray(ranges) || ranges.length === 0) return null;
+  const parts = [];
+  for (const r of ranges) {
+    if (!Array.isArray(r) || r.length !== 2) return null;
+    const [a, b] = r;
+    if (typeof a !== "number" || typeof b !== "number") return null;
+    parts.push(a === b ? String(a) : `${a}-${b}`);
+  }
+  return `[${parts.join(", ")}]`;
+}
+
 // ---- tool classes ---------------------------------------------------------
 
 class Read {
@@ -173,6 +189,14 @@ class Read {
     this.name = "file_read";
     this.description = desc.file_read;
     this.parameters = READ_SCHEMA;
+  }
+
+  describe(call) {
+    const { path, into, ranges } = call.arguments || {};
+    if (!path) return "";
+    if (into) return `${path} → ${into}`;
+    const fmt = _formatRanges(ranges);
+    return fmt ? `${path} ${fmt}` : path;
   }
 
   handler = async ({ call }) => {
@@ -209,6 +233,10 @@ class ReplaceLines {
     this.parameters = REPLACE_SCHEMA;
   }
 
+  describe(call) {
+    return (call.arguments && call.arguments.path) || "";
+  }
+
   handler = async ({ call }) => {
     let text;
     try {
@@ -243,6 +271,12 @@ class ReplaceAll {
     this.parameters = REPLACE_ALL_SCHEMA;
   }
 
+  describe(call) {
+    const a = call.arguments || {};
+    if (!a.path) return "";
+    return typeof a.count === "number" ? `${a.path} ×${a.count}` : a.path;
+  }
+
   handler = async ({ call }) => {
     try {
       const content = await this.editor.edit({
@@ -268,6 +302,10 @@ class InsertAfter {
     this.name = "file_insert_after";
     this.description = desc.file_insert_after;
     this.parameters = INSERT_SCHEMA;
+  }
+
+  describe(call) {
+    return (call.arguments && call.arguments.path) || "";
   }
 
   handler = async ({ call }) => {
@@ -302,6 +340,10 @@ class InsertBefore {
     this.parameters = INSERT_SCHEMA;
   }
 
+  describe(call) {
+    return (call.arguments && call.arguments.path) || "";
+  }
+
   handler = async ({ call }) => {
     let text;
     try {
@@ -334,6 +376,10 @@ class New {
     this.parameters = WHOLE_FILE_SCHEMA;
   }
 
+  describe(call) {
+    return (call.arguments && call.arguments.path) || "";
+  }
+
   handler = async ({ call }) => {
     let text;
     try {
@@ -363,6 +409,10 @@ class Overwrite {
     this.name = "file_overwrite";
     this.description = desc.file_overwrite;
     this.parameters = WHOLE_FILE_SCHEMA;
+  }
+
+  describe(call) {
+    return (call.arguments && call.arguments.path) || "";
   }
 
   handler = async ({ call }) => {

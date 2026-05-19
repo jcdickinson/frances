@@ -107,8 +107,13 @@ pub enum FrameKind {
     /// `ToolUseFrame` — one-shot marker that names a tool the workflow
     /// is about to invoke. The host renders this as a small "→ name"
     /// row so the user can see the tool being called even when the
-    /// tool itself emits no other frames.
-    ToolUse { name: String },
+    /// tool itself emits no other frames. `detail` is an optional
+    /// human-readable suffix produced by the tool's `describe(call)`
+    /// method (e.g. the file path + ranges for `file_read`).
+    ToolUse {
+        name: String,
+        detail: Option<String>,
+    },
     /// `JsonFrame` — single tagged JSON value. Immutable after push.
     Json {
         tag: String,
@@ -916,7 +921,10 @@ mod tests {
             HostFrame::Push(p) => match &p.kind {
                 FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
                 FrameKind::Error { content } => content.clone(),
-                FrameKind::ToolUse { name } => format!("→ {name}"),
+                FrameKind::ToolUse { name, detail } => match detail {
+                    Some(d) => format!("→ {name}  {d}"),
+                    None => format!("→ {name}"),
+                },
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
                 FrameKind::ShellOutput {
                     state,
