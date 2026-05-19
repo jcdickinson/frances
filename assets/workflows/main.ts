@@ -58,6 +58,7 @@ type PlanStep = {
   summary?: string;
   outcome?: StepOutcome;
   proof?: unknown;
+  transcript_summary?: string;
 };
 
 type Plan = {
@@ -74,6 +75,7 @@ type CompletionSignal = {
   proof: unknown;
   findings?: unknown;
   decisions?: unknown;
+  transcript_summary?: string;
   open_questions?: unknown;
   artifacts?: unknown;
 };
@@ -150,6 +152,10 @@ function normalizeStep(raw: any, idx: number): PlanStep {
       ? raw.outcome
       : undefined,
     proof: raw?.proof,
+    transcript_summary:
+      typeof raw?.transcript_summary === "string"
+        ? raw.transcript_summary
+        : undefined,
   };
 }
 
@@ -176,10 +182,106 @@ function stepNumber(step: PlanStep): number {
   return plan.steps.findIndex((s) => s.id === step.id) + 1;
 }
 
+function textToString(value: unknown): string {
+  if (value === undefined || value === null) return "";
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function truncateForTranscript(value: unknown, max = 4000): string {
+  const text = textToString(value);
+  if (text.length <= max) return text;
+  return text.slice(0, max) + `\n… [truncated ${text.length - max} chars]`;
+}
+
+function recordStepTranscript(label: string, content: unknown, max?: number): void {
+  const text = truncateForTranscript(content, max).trim();
+  if (!text) return;
+  stepTranscriptEntries.push(`## ${label}\n${text}`);
+}
+
 function proofToString(proof: unknown): string {
   if (proof === undefined || proof === null || proof === "") return "(none)";
   if (typeof proof === "string") return proof;
   return JSON.stringify(proof, null, 2);
+}
+
+async function summarizeStepTranscript(signal: CompletionSignal): Promise<string> {
+  if (stepTranscriptSummary) return stepTranscriptSummary;
+
+  const transcriptText = stepTranscriptEntries.join("\n\n---\n\n");
+  if (!transcriptText.trim()) {
+    stepTranscriptSummary = "No transcript entries were captured for this step.";
+    return stepTranscriptSummary;
+  }
+
+  const step = currentStep();
+  const summarizer = new ChatSession({
+    model_intents: ["cheap", "chat"],
+    ephemeral: true,
+  });
+  summarizer.push({
+    role: "system",
+    content:
+      "You summarize one completed workflow step for future agent context. " +
+      "Be concise but specific. Preserve important file paths, commands, tool results, " +
+      "errors, decisions, and facts learned. Do not invent details. Return only the summary.",
+  });
+  summarizer.push({
+    role: "user",
+    content:
+      `Current step: ${step ? `${step.title} (id: ${step.id})` : "(none)"}\n` +
+      `Step body: ${step?.body || "(empty)"}\n\n` +
+      `Completion signal:\n${JSON.stringify(signal, null, 2)}\n\n` +
+      `Transcript to summarize:\n${truncateForTranscript(transcriptText, 30000)}`,
+  });
+
+  try {
+    const response = await summarizer.stream();
+    const completed = await response.completed;
+    stepTranscriptSummary =
+      typeof completed.text === "string" && completed.text.trim()
+        ? completed.text.trim()
+        : truncateForTranscript(transcriptText, 2000);
+  } catch (_) {
+    stepTranscriptSummary = truncateForTranscript(transcriptText, 2000);
+  }
+  return stepTranscriptSummary;
+}
+
+function resetStepTranscript(): void {
+  stepTranscriptEntries.length = 0;
+  stepTranscriptSummary = null;
+}
+
+async function pipeAssistantTextToFrame(
+  text: ReadableStream<string>,
+  out: MarkdownFrame,
+): Promise<string> {
+  const reader = text.getReader();
+  const writer = out.writable.getWriter();
+  const chunks: string[] = [];
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      await writer.write(value);
+    }
+    await writer.close();
+  } catch (err) {
+    try {
+      await writer.abort(err);
+    } catch (_) {
+      // Ignore abort failures; surface the original stream error.
+    }
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
+  const textOut = chunks.join("");
+  recordStepTranscript("Assistant", textOut);
+  return textOut;
 }
 
 function renderPlanForPrompt(): string {
@@ -201,6 +303,9 @@ function renderPlanForPrompt(): string {
       lines.push(`     outcome: ${step.outcome || "succeeded"}`);
       if (step.summary) lines.push(`     summary: ${step.summary}`);
       lines.push(`     proof: ${proofToString(step.proof)}`);
+      if (step.transcript_summary) {
+        lines.push(`     transcript_summary: ${step.transcript_summary}`);
+      }
     }
   }
   const active = currentStep();
@@ -243,6 +348,7 @@ function markCompletion(signal: CompletionSignal): PlanStep {
   step.outcome = signal.outcome;
   step.summary = signal.summary;
   step.proof = signal.proof;
+  step.transcript_summary = signal.transcript_summary;
   const next = plan.steps.find((s) => s.status === "pending");
   if (next) next.status = "active";
   plan.updatedAt = now();
@@ -271,7 +377,7 @@ const PLAN_UPDATE_SCHEMA = {
     steps: {
       type: "array",
       description:
-        "Full ordered replacement list of steps. Each step is {id?, title, body, status?, summary?, outcome?, proof?}.",
+        "Full ordered replacement list of steps. Each step is {id?, title, body, status?, summary?, outcome?, proof?, transcript_summary?}.",
       items: {
         type: "object",
         properties: {
@@ -288,6 +394,11 @@ const PLAN_UPDATE_SCHEMA = {
             enum: ["succeeded", "partial", "failed", "abandoned"],
           },
           proof: {},
+          transcript_summary: {
+            type: "string",
+            description:
+              "Workflow-generated summary of the transcript for this step.",
+          },
         },
         required: ["title", "body"],
       },
@@ -352,6 +463,11 @@ const TASK_COMPLETE_SCHEMA = {
     decisions: { description: "Optional decisions made during the step." },
     open_questions: { description: "Optional unresolved questions." },
     artifacts: { description: "Optional files, commands, turn notes, etc." },
+    transcript_summary: {
+      type: "string",
+      description:
+        "Workflow-populated summary of the step transcript; agents normally omit this.",
+    },
   },
   required: ["outcome", "summary", "proof"],
 };
@@ -376,6 +492,10 @@ class TaskComplete {
       findings: args.findings,
       decisions: args.decisions,
       open_questions: args.open_questions,
+      transcript_summary:
+        typeof args.transcript_summary === "string"
+          ? args.transcript_summary
+          : undefined,
       artifacts: args.artifacts,
     };
     return _okResult(
@@ -471,6 +591,8 @@ const wait = new Wait(sh);
 const kill = new Kill(sh);
 const editor = new Editor();
 const fileSearch = new FileSearch();
+const stepTranscriptEntries: string[] = [];
+let stepTranscriptSummary: string | null = null;
 const vars = new Variables();
 const tools = [
   new Run(sh, { wait, kill }),
@@ -491,6 +613,24 @@ const tools = [
   new PlanUpdate(),
   new TaskComplete(),
 ];
+
+for (const tool of tools) {
+  const original = tool.handler.bind(tool);
+  tool.handler = async ({ call, scope }: any) => {
+    recordStepTranscript(
+      `Tool call: ${call.name}`,
+      `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,
+      4000,
+    );
+    const result = await original({ call, scope });
+    recordStepTranscript(
+      `Tool result: ${call.name}`,
+      `id: ${call.id}\nis_error: ${Boolean(result?.is_error)}\ncontent:\n${textToString(result?.content)}`,
+      8000,
+    );
+    return result;
+  };
+}
 
 function newAgentChat(seed?: string): ChatSession {
   const session = new ChatSession({ model_intents: ["chat"] });
@@ -521,6 +661,7 @@ async function handlePendingCompletion(): Promise<boolean> {
 
   let completed: PlanStep;
   try {
+    signal.transcript_summary = await summarizeStepTranscript(signal);
     completed = markCompletion(signal);
   } catch (err) {
     chat.push({
@@ -536,11 +677,13 @@ async function handlePendingCompletion(): Promise<boolean> {
       content:
         `Step ${stepNumber(completed)} completed: **${completed.title}**\n\n` +
         `Outcome: ${completed.outcome}\n\n` +
-        `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\``,
+        `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\`\n\n` +
+        `Transcript summary:\n\n${completed.transcript_summary || "(none)"}`,
       sender: "frances",
       closed: true,
     }),
   );
+  resetStepTranscript();
   chat = newAgentChat(contextAfterCompletion(completed));
   return true;
 }
@@ -555,7 +698,7 @@ async function runAgentUntilIdle(): Promise<void> {
     // round therefore leaves no empty `frances:` row in the transcript.
     const out = new MarkdownFrame({ sender: "frances" });
     transcript.push(out);
-    await r.text.pipeTo(out.writable);
+    await pipeAssistantTextToFrame(r.text, out);
     const { tool_calls } = await r.completed;
     if (pendingCompletion) {
       const reset = await handlePendingCompletion();
@@ -590,6 +733,7 @@ try {
     transcript.push(
       new MarkdownFrame({ content: msg, sender: "you", closed: true }),
     );
+    recordStepTranscript("User", msg);
     if (msg === "quit") {
       transcript.push(
         new MarkdownFrame({ content: "bye", sender: "frances", closed: true }),
