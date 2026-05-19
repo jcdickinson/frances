@@ -519,7 +519,11 @@ async fn editor_new_creates_parent_directory() {
 #[tokio::test]
 async fn editor_read_ranges_returns_disjoint_anchored_lines() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("ranges.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+    std::fs::write(
+        dir.path().join("ranges.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )
+    .unwrap();
 
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let rt = Runtime::new(deps).unwrap();
@@ -553,7 +557,7 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
 
     let rendered = text_of(&frames[0]);
     let lines: Vec<&str> = rendered.lines().collect();
-    
+
     // 1, 2, separator, 8, 9, 10 -> 6 lines total
     assert_eq!(lines.len(), 6, "got: {rendered:?}");
     assert!(lines[0].ends_with("§1"), "line 0: {}", lines[0]);
@@ -600,7 +604,10 @@ async fn read_into_and_ranges_mutually_exclusive() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
     let rendered = text_of(&frames[0]);
-    assert!(rendered.contains(r#""is_error":true"#), "rendered: {rendered}");
+    assert!(
+        rendered.contains(r#""is_error":true"#),
+        "rendered: {rendered}"
+    );
     assert!(
         rendered.contains("provide exactly one of `into` or `ranges`, not both"),
         "rendered: {rendered}"
@@ -643,6 +650,12 @@ async fn editor_read_ranges_reversed_throws() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
     let rendered = text_of(&frames[0]);
-    assert!(rendered.contains(r#""is_error":true"#), "rendered: {rendered}");
-    assert!(rendered.contains("must be <= end") || rendered.contains("reverse range"), "rendered: {rendered}");
+    assert!(
+        rendered.contains(r#""is_error":true"#),
+        "rendered: {rendered}"
+    );
+    assert!(
+        rendered.contains("must be <= end") || rendered.contains("reverse range"),
+        "rendered: {rendered}"
+    );
 }

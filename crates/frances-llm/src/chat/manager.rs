@@ -12,6 +12,7 @@ use frances_models_llm::config::ModelConfig;
 use frances_models_llm::wire::{CompletionOutcome, ErasedError, HistoryInput, ToolChoice, ToolDef};
 use serde::Deserialize;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::chat::deps::ChatManagerDeps;
@@ -41,6 +42,10 @@ pub struct CompleteRequest<'a> {
     pub new_inputs: &'a [HistoryInput<'a>],
     pub tools: &'a [ToolDef],
     pub tool_choice: Option<&'a ToolChoice>,
+    /// Firing cancels the in-flight provider stream. Pass
+    /// `CancellationToken::new()` (never fires) when the caller has no
+    /// upstream abort source.
+    pub cancel: CancellationToken,
 }
 
 /// Concrete chat-session manager. Clone-by-value handle; complex state
@@ -122,6 +127,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             .cache
             .get(&provider_id)
             .ok_or_else(|| ChatError::ProviderUnavailable(provider_id.clone()))?;
+        let cancel = req.cancel.clone();
         let provider_req = ProviderRequest {
             session_id: req.session_id,
             model: &model,
@@ -131,10 +137,11 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             tool_choice: req.tool_choice,
             env: req.env,
         };
-        provider
-            .complete(provider_req)
-            .await
-            .map_err(|source| log_and_typed(&provider_id, source))
+        match provider.complete(provider_req, cancel.clone()).await {
+            Ok(c) => Ok(c),
+            Err(_) if cancel.is_cancelled() => Err(ChatError::Cancelled),
+            Err(source) => Err(log_and_typed(&provider_id, source)),
+        }
     }
 }
 

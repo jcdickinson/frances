@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::Value;
 use thiserror::Error as ThisError;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
 use frances_models_llm::config::{ProviderConfig, ResponsesModelExtras};
@@ -53,6 +54,8 @@ pub enum Error {
     OnEvent(ErasedError),
     #[error("tool call accumulator: {0}")]
     Accumulator(#[from] ToolCallError),
+    #[error("cancelled")]
+    Cancelled,
 }
 
 impl From<ErasedError> for Error {
@@ -130,9 +133,13 @@ impl provider::Provider for Provider {
     async fn stream(
         &self,
         req: ProviderRequest<'_>,
+        cancel: CancellationToken,
         on_event: &mut (dyn FnMut(StreamEvent) -> std::result::Result<(), Error> + Send),
     ) -> std::result::Result<CompletionOutcome, Error> {
         let _ = req.session_id; // OpenAI auto-caches; we don't need to thread the id today.
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
         let plan = RequestPlan::build(&self.provider_config, &self.extras, req.model, req.env)?;
 
         // Forge new_inputs upfront, emit one History event per output, then
@@ -182,7 +189,11 @@ impl provider::Provider for Provider {
             request = request.header(k, v);
         }
 
-        let response = request.send().await.map_err(Error::Http)?;
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(Error::Cancelled),
+            res = request.send() => res.map_err(Error::Http)?,
+        };
         trace!(status = %response.status(), headers = ?response.headers(), "chat completions response head");
 
         if !response.status().is_success() {
@@ -197,9 +208,16 @@ impl provider::Provider for Provider {
         let mut text = String::new();
         let mut accumulator = ToolCallAccumulator::new();
 
-        while let Some(chunk) = bytes.next().await {
-            let bytes = chunk.map_err(Error::StreamChunk)?;
-            buffer.push_str(&String::from_utf8_lossy(&bytes));
+        loop {
+            let chunk = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(Error::Cancelled),
+                next = bytes.next() => match next {
+                    Some(c) => c.map_err(Error::StreamChunk)?,
+                    None => break,
+                },
+            };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
 
             while let Some(idx) = buffer.find("\n\n") {
                 let frame: String = buffer.drain(..idx + 2).collect();

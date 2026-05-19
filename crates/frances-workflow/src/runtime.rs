@@ -826,8 +826,12 @@ pub mod test_deps {
             _env: HashMap<OsString, OsString>,
             _tools: Vec<ToolDef>,
             _tool_choice: Option<ToolChoice>,
+            cancel: tokio_util::sync::CancellationToken,
             mut on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
         ) -> Result<CompletionOutcome, ChatError> {
+            if cancel.is_cancelled() {
+                return Err(ChatError::Cancelled);
+            }
             let script = self.next_script.lock().pop_front();
             match script {
                 Some(s) => {

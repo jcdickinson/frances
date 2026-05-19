@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use futures::future::BoxFuture;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::config::{ModelConfig, ProviderConfig};
 use frances_models_llm::wire::{
@@ -70,16 +71,24 @@ pub trait Provider: Send + Sync {
     /// Drive a single chat call. Typed `StreamEvent`s are delivered to
     /// `on_event` synchronously as they're parsed; the call's full result
     /// (concatenated text + finalised tool calls) is returned at the end.
+    ///
+    /// Firing `cancel` mid-stream aborts the in-flight HTTP request and
+    /// returns a provider-specific cancellation error.
     async fn stream(
         &self,
         req: ProviderRequest<'_>,
+        cancel: CancellationToken,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), Self::Error> + Send),
     ) -> Result<CompletionOutcome, Self::Error>;
 
     /// Convenience: same as `stream` with a no-op event handler. Override
     /// only if you can be cheaper than the default.
-    async fn complete(&self, req: ProviderRequest<'_>) -> Result<CompletionOutcome, Self::Error> {
-        self.stream(req, &mut |_| Ok(())).await
+    async fn complete(
+        &self,
+        req: ProviderRequest<'_>,
+        cancel: CancellationToken,
+    ) -> Result<CompletionOutcome, Self::Error> {
+        self.stream(req, cancel, &mut |_| Ok(())).await
     }
 }
 
@@ -97,12 +106,14 @@ trait ErasedInner: Send + Sync {
     fn stream<'a>(
         &'a self,
         req: ProviderRequest<'a>,
+        cancel: CancellationToken,
         on_event: &'a mut (dyn FnMut(StreamEvent) -> ErasedResult<()> + Send),
     ) -> BoxFuture<'a, ErasedResult<CompletionOutcome>>;
 
     fn complete<'a>(
         &'a self,
         req: ProviderRequest<'a>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, ErasedResult<CompletionOutcome>>;
 }
 
@@ -122,6 +133,7 @@ where
     fn stream<'a>(
         &'a self,
         req: ProviderRequest<'a>,
+        cancel: CancellationToken,
         on_event: &'a mut (dyn FnMut(StreamEvent) -> ErasedResult<()> + Send),
     ) -> BoxFuture<'a, ErasedResult<CompletionOutcome>> {
         Box::pin(async move {
@@ -136,7 +148,7 @@ where
                     }
                 }
             };
-            let res = self.stream(req, &mut wrapped).await;
+            let res = self.stream(req, cancel, &mut wrapped).await;
             if let Some(e) = event_err {
                 return Err(e);
             }
@@ -147,8 +159,9 @@ where
     fn complete<'a>(
         &'a self,
         req: ProviderRequest<'a>,
+        cancel: CancellationToken,
     ) -> BoxFuture<'a, ErasedResult<CompletionOutcome>> {
-        Box::pin(async move { self.complete(req).await.map_err(P::Error::into) })
+        Box::pin(async move { self.complete(req, cancel).await.map_err(P::Error::into) })
     }
 }
 
@@ -172,13 +185,18 @@ impl ErasedProvider {
     pub async fn stream(
         &self,
         req: ProviderRequest<'_>,
+        cancel: CancellationToken,
         on_event: &mut (dyn FnMut(StreamEvent) -> ErasedResult<()> + Send),
     ) -> ErasedResult<CompletionOutcome> {
-        self.inner.stream(req, on_event).await
+        self.inner.stream(req, cancel, on_event).await
     }
 
-    pub async fn complete(&self, req: ProviderRequest<'_>) -> ErasedResult<CompletionOutcome> {
-        self.inner.complete(req).await
+    pub async fn complete(
+        &self,
+        req: ProviderRequest<'_>,
+        cancel: CancellationToken,
+    ) -> ErasedResult<CompletionOutcome> {
+        self.inner.complete(req, cancel).await
     }
 }
 

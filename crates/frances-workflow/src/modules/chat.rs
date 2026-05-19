@@ -52,6 +52,7 @@ use std::collections::HashSet;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::chat::{
     ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
@@ -451,6 +452,9 @@ fn start_stream<'js, D: WorkflowDeps>(
     let usage_capture: Arc<parking_lot::Mutex<Option<frances_models_llm::wire::Usage>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
+    let cancel = CancellationToken::new();
+    let cancel_for_task = cancel.clone();
+
     tokio::spawn({
         let usage_capture = usage_capture.clone();
         async move {
@@ -464,7 +468,9 @@ fn start_stream<'js, D: WorkflowDeps>(
                     let _ = tx_for_callback.send(event);
                     Ok(())
                 });
-            let result = handle.run(env, tool_defs, None, on_event).await;
+            let result = handle
+                .run(env, tool_defs, None, cancel_for_task, on_event)
+                .await;
             let usage = usage_capture.lock().take();
             drop(event_tx);
             let mapped = result.map(|outcome| CompletedJs {
@@ -483,9 +489,16 @@ fn start_stream<'js, D: WorkflowDeps>(
         },
     )?;
 
+    let cancel_class = Class::instance(ctx.clone(), CancelHandle { token: cancel })?;
+
     let completed_promise = Promised::from(async move {
         match completed_rx.await {
             Ok(Ok(c)) => CompletionResult(Ok(c)),
+            // Sentinel string the JS wrapper (`chat.js`) pattern-matches
+            // to convert into `throw signal.reason`, so all three
+            // observables (`events`, `text`, `completed`) reject with
+            // the user's abort reason uniformly.
+            Ok(Err(ChatError::Cancelled)) => CompletionResult(Err("__cancelled__".to_owned())),
             Ok(Err(e)) => CompletionResult(Err(format!("chat stream failed: {e}"))),
             Err(_) => CompletionResult(Err("chat stream task aborted".to_owned())),
         }
@@ -494,7 +507,53 @@ fn start_stream<'js, D: WorkflowDeps>(
     let obj = Object::new(ctx.clone())?;
     obj.set("events", events_class)?;
     obj.set("completed", completed_promise)?;
+    obj.set("cancel", cancel_class)?;
     Ok(obj.into_value())
+}
+
+/// JS-held handle that fires a `CancellationToken` either explicitly (via
+/// `fire()`) or implicitly on GC. The Rust task spawned by `start_stream`
+/// holds a clone of the same token; firing aborts its in-flight provider
+/// stream. Mirrors the `SleepToken` precedent in
+/// `crates/frances-workflow/src/modules/io.rs`.
+pub struct CancelHandle {
+    token: CancellationToken,
+}
+
+impl Drop for CancelHandle {
+    fn drop(&mut self) {
+        // Idempotent: a cancel after the stream has settled is a no-op.
+        self.token.cancel();
+    }
+}
+
+impl<'js> Trace<'js> for CancelHandle {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for CancelHandle {
+    type Changed<'to> = CancelHandle;
+}
+
+impl<'js> JsClass<'js> for CancelHandle {
+    const NAME: &'static str = "CancelHandle";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        let proto = Object::new(ctx.clone())?;
+        proto.set(
+            "fire",
+            Function::new(ctx.clone(), |this: This<Class<'js, CancelHandle>>| {
+                this.0.borrow().token.cancel();
+                Ok::<_, rquickjs::Error>(())
+            })?,
+        )?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
 }
 
 /// Async-iterable wrapper around the stream-event receiver. Lifted from

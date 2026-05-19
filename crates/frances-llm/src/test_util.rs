@@ -12,6 +12,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::chat::OwnedHistoryInput;
 use frances_models_llm::config::ProviderConfig;
@@ -132,8 +133,14 @@ impl Provider for StubProvider {
     async fn stream(
         &self,
         req: ProviderRequest<'_>,
+        cancel: CancellationToken,
         on_event: &mut (dyn FnMut(StreamEvent) -> Result<(), Self::Error> + Send),
     ) -> Result<CompletionOutcome, Self::Error> {
+        if cancel.is_cancelled() {
+            return Err(Box::<dyn std::error::Error + Send + Sync>::from(
+                "stub provider: cancelled before stream",
+            ));
+        }
         self.requests.lock().push(CapturedRequest {
             session_id: req.session_id.to_owned(),
             history: req.history.to_vec(),

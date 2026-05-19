@@ -112,7 +112,14 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                                 Err(_) => {
                                     // Fallback for when the args is just a string (the path) which was the old behavior
                                     if let Some(path_str) = v.as_str() {
-                                        read_file_inner(&deps, ReadFileArgs { path: path_str.to_string(), ranges: None }).await
+                                        read_file_inner(
+                                            &deps,
+                                            ReadFileArgs {
+                                                path: path_str.to_string(),
+                                                ranges: None,
+                                            },
+                                        )
+                                        .await
                                     } else {
                                         Err(format!("parse readFile args: invalid arg shape"))
                                     }
@@ -191,7 +198,8 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
     let session: Arc<_> = deps.editor_factory().session();
     let mut sess = session.lock().await;
 
-    let full_rendered = sess.read_file(resolved, lines, mtime_ns, size)
+    let full_rendered = sess
+        .read_file(resolved, lines, mtime_ns, size)
         .await
         .map_err(|e| e.to_string())?;
 
@@ -212,7 +220,7 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
             }
             final_ranges.push([start, actual_end]);
         }
-        
+
         final_ranges.sort_unstable_by_key(|r| r[0]);
         let mut merged = Vec::new();
         for r in final_ranges {

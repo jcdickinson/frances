@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
 
@@ -23,11 +24,16 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
 
     /// Drive one provider call: drain pending, write primitives, load
     /// history, stream, persist `History` payloads + the assistant reply.
+    ///
+    /// Firing `cancel` aborts the in-flight provider request; the call
+    /// returns `Err(ChatError::Cancelled)` and the underlying HTTP
+    /// connection is dropped so the provider stops generating.
     async fn run(
         &self,
         env: HashMap<OsString, OsString>,
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
+        cancel: CancellationToken,
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError>;
 }

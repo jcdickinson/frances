@@ -27,6 +27,7 @@ use frances_models_llm::wire::{
     CompletionOutcome, HistoryInput, ToolChoice, ToolDef, ToolFunction,
 };
 use serde_json::json;
+use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::protocol::PermissionRequest;
@@ -148,6 +149,7 @@ pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest)
             new_inputs: &inputs,
             tools: &tools,
             tool_choice: Some(&ToolChoice::Required),
+            cancel: CancellationToken::new(),
         })
         .await
     {
@@ -185,6 +187,7 @@ Try once more — call exactly one of the two tools with a one-sentence reason."
             new_inputs: &retry_inputs,
             tools: &tools,
             tool_choice: Some(&ToolChoice::Required),
+            cancel: CancellationToken::new(),
         })
         .await
     {

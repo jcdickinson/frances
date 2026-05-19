@@ -28,6 +28,7 @@ serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio.workspace = true
+tokio-util.workspace = true
 shell-words.workspace = true
 thiserror.workspace = true
 turso.workspace = true

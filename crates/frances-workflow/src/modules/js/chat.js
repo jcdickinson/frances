@@ -89,6 +89,12 @@ async function _streamWithDispatch(chat, opts, getHook) {
 
   if (signal) {
     const onAbort = () => {
+      // Fire Rust cancel first — that drops the in-flight HTTP request
+      // so the provider stops generating. Erroring the local stream
+      // only unblocks JS-side readers.
+      try {
+        inner.cancel.fire();
+      } catch (_) {}
       try {
         streamController.error(signal.reason);
       } catch (_) {
@@ -100,7 +106,17 @@ async function _streamWithDispatch(chat, opts, getHook) {
   }
 
   const completed = (async () => {
-    const raw = await inner.completed;
+    let raw;
+    try {
+      raw = await inner.completed;
+    } catch (err) {
+      // The Rust side rejects with the `__cancelled__` sentinel on
+      // `ChatError::Cancelled`. Either way, if the user aborted, the
+      // user-visible rejection should match `events`/`text`: throw
+      // `signal.reason`, not the internal error string.
+      if (signal && signal.aborted) throw signal.reason;
+      throw err;
+    }
     const hook = getHook();
     const session = {
       slots: raw.tool_calls.map(() => ({

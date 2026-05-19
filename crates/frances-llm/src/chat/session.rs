@@ -10,6 +10,7 @@ use frances_models_llm::chat::{
 use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
 use parking_lot::Mutex;
 use serde_json::Value;
+use tokio_util::sync::CancellationToken;
 
 use crate::chat::deps::ChatManagerDeps;
 use crate::chat::manager::{ChatSessionManager, log_and_typed};
@@ -154,6 +155,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         env: HashMap<OsString, OsString>,
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
+        cancel: CancellationToken,
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError> {
         let mut on_event = on_event;
@@ -210,10 +212,11 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             other => on_event(other).map_err(into_erased),
         };
 
-        let completion = provider
-            .stream(req, &mut wrapped)
-            .await
-            .map_err(|source| log_and_typed(&provider_id, source))?;
+        let completion = match provider.stream(req, cancel.clone(), &mut wrapped).await {
+            Ok(c) => c,
+            Err(_) if cancel.is_cancelled() => return Err(ChatError::Cancelled),
+            Err(source) => return Err(log_and_typed(&provider_id, source)),
+        };
 
         if let Some(id) = id {
             store
@@ -451,6 +454,7 @@ mod tests {
                 std::collections::HashMap::new(),
                 Vec::new(),
                 None,
+                tokio_util::sync::CancellationToken::new(),
                 Box::new(|_| Ok(())),
             )
             .await
@@ -553,5 +557,44 @@ mod tests {
         assert_eq!(store.append_primitive_assistant.load(Ordering::Relaxed), 2);
         assert_eq!(store.loaded_history.load(Ordering::Relaxed), 2);
         assert_eq!(store.append_history.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_token_returns_chaterror_cancelled() {
+        use frances_models_llm::chat::ChatError;
+        use tokio_util::sync::CancellationToken;
+
+        let (manager, _store, stub) = build_manager().await;
+        // Script a successful turn that the provider should *never* see.
+        stub.push_script(assistant_script("should not be reached"));
+
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        session.push(OwnedHistoryInput::User {
+            text: "doomed".to_owned(),
+        });
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let result = session
+            .run(
+                std::collections::HashMap::new(),
+                Vec::new(),
+                None,
+                cancel,
+                Box::new(|_| Ok(())),
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ChatError::Cancelled)),
+            "expected Cancelled, got {result:?}",
+        );
+        // Provider never observed the request — the stub's bail check
+        // fires before it pushes onto `requests`.
+        assert!(
+            stub.captured().is_empty(),
+            "provider should not have been invoked once token was pre-cancelled",
+        );
     }
 }
