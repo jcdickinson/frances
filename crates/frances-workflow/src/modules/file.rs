@@ -36,8 +36,9 @@ use rquickjs::promise::Promised;
 use rquickjs::{
     Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
 };
+use twox_hash::XxHash3_64;
 
-use frances_edit::LlmEdit;
+use frances_edit::{LlmEdit, LoopKey};
 
 use crate::deps::{EditorFactory, WorkflowDeps};
 
@@ -140,7 +141,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                 |this: This<Class<'js, EditorJs<D>>>, path: String| {
                     let deps = this.0.borrow().deps.clone();
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        EditorStringResult(read_raw_inner(&deps, path))
+                        EditorStringResult(read_raw_inner(&deps, path).await)
                     }))
                 },
             )?,
@@ -173,13 +174,32 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
 }
 
 /// Disk-only read. Returns the file as-is, with no `EditSession`
-/// interaction — so the path is *not* registered for editing and the
-/// caller doesn't get anchors. Used by `Read` when the LLM asks for the
-/// content to land in a Frances variable instead of in tool-result
-/// text.
-fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
+/// interaction for anchors — so the path is *not* registered for
+/// editing and the caller doesn't get anchors. Used by `Read` when the
+/// LLM asks for the content to land in a Frances variable instead of
+/// in tool-result text. Still consults the session's loop guard so a
+/// `readRaw` immediately following an identical `readRaw` on an
+/// unchanged file trips the same guard as `file_read`.
+async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
-    fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))
+    let (mtime_ns, size) =
+        stat_file(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let key = LoopKey::Read {
+        args_hash: hash_read_raw_args(&path),
+        mtime_ns,
+        size,
+    };
+
+    let session = deps.editor_factory().session();
+    let mut sess = session.lock().await;
+    if sess.is_loop(&key) {
+        return Err(loop_error_read(&path));
+    }
+
+    let content =
+        fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    sess.record_loop(key);
+    Ok(content)
 }
 
 use serde::Deserialize;
@@ -192,16 +212,28 @@ struct ReadFileArgs {
 
 async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&args.path));
-    let (lines, mtime_ns, size) =
-        read_file_from_disk(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
-    let total_lines = lines.len();
+    let (mtime_ns, size) =
+        stat_file(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let key = LoopKey::Read {
+        args_hash: hash_read_file_args(&args),
+        mtime_ns,
+        size,
+    };
+
     let session: Arc<_> = deps.editor_factory().session();
     let mut sess = session.lock().await;
+    if sess.is_loop(&key) {
+        return Err(loop_error_read(&args.path));
+    }
+
+    let lines = read_file_lines(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let total_lines = lines.len();
 
     let full_rendered = sess
         .read_file(resolved, lines, mtime_ns, size)
         .await
         .map_err(|e| e.to_string())?;
+    sess.record_loop(key);
 
     if let Some(ranges) = args.ranges {
         // filter out zero, wait 1-indexed so 0 is invalid anyway.
@@ -276,12 +308,51 @@ fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
     *path = resolve_path(cwd, path);
 }
 
-fn read_file_from_disk(path: &Path) -> io::Result<(Vec<String>, i64, u64)> {
-    let content = fs::read_to_string(path)?;
+/// Stat without reading content — cheap, used by the loop guard so it
+/// can answer "same file, same mtime+size?" before deciding to read.
+fn stat_file(path: &Path) -> io::Result<(i64, u64)> {
     let meta = fs::metadata(path)?;
     let mtime_ns = mtime_ns_from(&meta)?;
-    let size = meta.len();
-    Ok((split_lines(&content), mtime_ns, size))
+    Ok((mtime_ns, meta.len()))
+}
+
+/// Read content as lines. Caller has typically already stat'd the
+/// file (and used the result to seed the loop-guard key), so we don't
+/// re-stat here.
+fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
+    let content = fs::read_to_string(path)?;
+    Ok(split_lines(&content))
+}
+
+fn hash_read_file_args(args: &ReadFileArgs) -> u64 {
+    let mut buf = Vec::with_capacity(64);
+    // Discriminator so file_read and readRaw on the same path don't
+    // collide; their result shapes are different.
+    buf.push(0u8);
+    buf.extend_from_slice(args.path.as_bytes());
+    buf.push(0);
+    if let Some(ranges) = &args.ranges {
+        for r in ranges {
+            buf.extend_from_slice(&r[0].to_le_bytes());
+            buf.extend_from_slice(&r[1].to_le_bytes());
+        }
+    }
+    XxHash3_64::oneshot(&buf)
+}
+
+fn hash_read_raw_args(path: &str) -> u64 {
+    let mut buf = Vec::with_capacity(path.len() + 1);
+    buf.push(1u8);
+    buf.extend_from_slice(path.as_bytes());
+    XxHash3_64::oneshot(&buf)
+}
+
+fn loop_error_read(path: &str) -> String {
+    format!(
+        "loop guard: this exact read was just performed and {path} has not \
+         changed since. you already have the result. do something different \
+         — change the path, the ranges, or the tool, or move on."
+    )
 }
 
 fn write_draft(path: &Path, draft: &[String]) -> io::Result<(Vec<String>, i64, u64)> {

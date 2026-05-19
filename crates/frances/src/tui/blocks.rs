@@ -74,9 +74,10 @@ impl Block for DiffBlock {
                     a.to_string(),
                     Style::default().bg(Color::Green).fg(Color::Black),
                 ),
-                frances_daemon::protocol::DiffLine::Removed(r) => {
-                    (r.to_string(), Style::default().bg(Color::Red).fg(Color::Black))
-                }
+                frances_daemon::protocol::DiffLine::Removed(r) => (
+                    r.to_string(),
+                    Style::default().bg(Color::Red).fg(Color::Black),
+                ),
             };
 
             let mut out = Vec::new();

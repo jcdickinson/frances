@@ -2,7 +2,8 @@ use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::{AnchorStore, EditEngine, WorkingFile, render_file};
+use crate::loop_guard::LoopSet;
+use crate::{AnchorStore, EditEngine, LoopKey, WorkingFile, render_file};
 
 mod anchored;
 mod types;
@@ -18,6 +19,7 @@ const DIFF_CONTEXT: usize = 2;
 pub struct EditSession<S: AnchorStore> {
     engine: EditEngine<S>,
     open_files: HashMap<PathBuf, WorkingFile>,
+    loop_set: LoopSet,
 }
 
 impl<S: AnchorStore> EditSession<S> {
@@ -25,7 +27,22 @@ impl<S: AnchorStore> EditSession<S> {
         Self {
             engine,
             open_files: HashMap::new(),
+            loop_set: LoopSet::default(),
         }
+    }
+
+    /// True if `key` matches an entry recorded since the last write.
+    /// Read-style tools call this before doing work and bail with an
+    /// error when it returns `true`.
+    pub fn is_loop(&self, key: &LoopKey) -> bool {
+        self.loop_set.contains(key)
+    }
+
+    /// Insert `key` into the loop-guard set. Read-style tools call
+    /// this after a successful execution so the next identical call
+    /// (with unchanged on-disk state, for `Read`) trips the guard.
+    pub fn record_loop(&mut self, key: LoopKey) {
+        self.loop_set.record(key);
     }
 
     /// Tool: file_read. Caller supplies the file's current content;
@@ -62,6 +79,11 @@ impl<S: AnchorStore> EditSession<S> {
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
+        // Any edit mutates the workspace; previously-cached read/search
+        // results are no longer the source of truth, so the loop-guard
+        // set resets here. Cleared up front so a failed edit still
+        // unblocks subsequent reads — failure is itself new information.
+        self.loop_set.clear();
         match edit {
             LlmEdit::New { path, text } => self.apply_new(&path, &text, &mut on_draft).await,
             LlmEdit::Overwrite { path, text } => {

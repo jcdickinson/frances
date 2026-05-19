@@ -23,6 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use frances_core::JsonRepair;
+use frances_edit::LoopKey;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Sink, SinkMatch};
@@ -35,8 +36,9 @@ use rquickjs::{
     Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
 };
 use serde::{Deserialize, Serialize};
+use twox_hash::XxHash3_64;
 
-use crate::deps::WorkflowDeps;
+use crate::deps::{EditorFactory, WorkflowDeps};
 
 /// Hard cap on result entries. Workers atomically reserve a slot before
 /// pushing; the (cap+1)-th reservation flips a sticky `truncated` flag
@@ -143,10 +145,65 @@ async fn search_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Resu
     let args = JsonRepair::<FileSearchArgs>::from_value(raw)
         .map_err(|e| format!("parse args: {e}"))?
         .into_inner();
+    let key = LoopKey::Search {
+        args_hash: hash_search_args(&args),
+    };
+
+    let session = deps.editor_factory().session();
+    if session.lock().await.is_loop(&key) {
+        return Err(loop_error_search().to_string());
+    }
+
     let cwd = deps.current_cwd();
-    tokio::task::spawn_blocking(move || do_search(args, cwd.as_deref()))
+    let result = tokio::task::spawn_blocking(move || do_search(args, cwd.as_deref()))
         .await
-        .map_err(|e| format!("join: {e}"))?
+        .map_err(|e| format!("join: {e}"))??;
+    session.lock().await.record_loop(key);
+    Ok(result)
+}
+
+fn hash_search_args(args: &FileSearchArgs) -> u64 {
+    // Hand-pack a canonical byte sequence rather than serde_json so
+    // the layout is fixed regardless of field-order drift in
+    // `FileSearchArgs`. Order matches the struct fields.
+    let mut buf = Vec::with_capacity(64);
+    // Discriminator — keeps file_find_or_grep keys from colliding with
+    // anything else that might one day land in this hasher.
+    buf.push(2u8);
+    push_str_list_sorted(&mut buf, args.paths.as_deref());
+    buf.push(0xFE);
+    if let Some(s) = &args.search {
+        buf.extend_from_slice(s.as_bytes());
+    }
+    buf.push(0xFE);
+    push_str_list_sorted(&mut buf, args.exclude.as_deref());
+    buf.push(0xFE);
+    buf.push(u8::from(args.ignore));
+    buf.push(u8::from(args.hidden));
+    if let Some(d) = args.depth {
+        buf.extend_from_slice(&d.to_le_bytes());
+    }
+    buf.push(0xFE);
+    buf.push(u8::from(args.paths_only));
+    XxHash3_64::oneshot(&buf)
+}
+
+fn push_str_list_sorted(buf: &mut Vec<u8>, items: Option<&[String]>) {
+    let Some(items) = items else {
+        return;
+    };
+    let mut sorted: Vec<&String> = items.iter().collect();
+    sorted.sort();
+    for item in sorted {
+        buf.extend_from_slice(item.as_bytes());
+        buf.push(0);
+    }
+}
+
+fn loop_error_search() -> &'static str {
+    "loop guard: this exact search was just performed and the workspace has \
+     not changed since. you already have the result. do something different \
+     — change the query, the paths, or the tool, or move on."
 }
 
 #[derive(Serialize, Debug)]

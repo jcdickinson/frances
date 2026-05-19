@@ -98,14 +98,7 @@ pub fn render_diff_block(
     out
 }
 
-
-fn emit_line(
-    out: &mut String,
-    prefix: char,
-    anchor: &Anchor,
-    content: &str,
-    line: usize,
-) {
+fn emit_line(out: &mut String, prefix: char, anchor: &Anchor, content: &str, line: usize) {
     write!(out, "{prefix} {line:4} {anchor}{ANCHOR_SEP}{content}").expect("write to String");
     out.push('\n');
 }

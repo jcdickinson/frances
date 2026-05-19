@@ -405,3 +405,89 @@ async fn search_tool_without_into_returns_compact_text() {
         "expected inline match line, got: {tool_result}"
     );
 }
+
+#[tokio::test]
+async fn loop_guard_blocks_identical_search() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+
+    let deps = StubDeps::default();
+    deps.set_cwd(dir.path().to_path_buf());
+    let script = r#"
+        import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const fs = new FileSearch();
+        await fs.search({ search: "hello" });
+        let caught = "no-throw";
+        try {
+            await fs.search({ search: "hello" });
+        } catch (e) {
+            caught = String((e && e.message) || e);
+        }
+        transcript.push(new MarkdownFrame({ content: caught }));
+    "#;
+    let frames = run_script(deps, script).await;
+    let msg = text_of(&frames[0]);
+    assert!(
+        msg.contains("loop guard"),
+        "expected loop guard error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_search_clears_after_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+
+    let deps = StubDeps::default();
+    deps.set_cwd(dir.path().to_path_buf());
+    let script = r#"
+        import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const fs = new FileSearch();
+        const editor = new Editor();
+        await fs.search({ search: "hello" });
+        // Touch the workspace via an edit — should clear the search ring.
+        const read = await editor.readFile("a.txt");
+        const line_b = read.split("\n")[1];
+        await editor.edit({
+            kind: "ReplaceLines",
+            path: "a.txt",
+            anchor: line_b,
+            end_anchor: line_b,
+            text: "WORLD",
+        });
+        // Same search args as before — but the edit cleared the ring,
+        // so this should succeed.
+        const second = await fs.search({ search: "hello" });
+        transcript.push(new MarkdownFrame({ content: second }));
+    "#;
+    let frames = run_script(deps, script).await;
+    let payload = text_of(&frames[0]);
+    assert!(
+        payload.contains("a.txt"),
+        "expected hit after clear, got: {payload}"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_search_distinguishes_query() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.txt"), "hello\nworld\n").unwrap();
+
+    let deps = StubDeps::default();
+    deps.set_cwd(dir.path().to_path_buf());
+    let script = r#"
+        import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const fs = new FileSearch();
+        await fs.search({ search: "hello" });
+        // Different query → different args hash → no collision.
+        const second = await fs.search({ search: "world" });
+        transcript.push(new MarkdownFrame({ content: second }));
+    "#;
+    let frames = run_script(deps, script).await;
+    let payload = text_of(&frames[0]);
+    assert!(payload.contains("a.txt"), "expected hit, got: {payload}");
+}

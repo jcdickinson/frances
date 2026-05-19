@@ -662,3 +662,185 @@ async fn editor_read_ranges_reversed_throws() {
         "rendered: {rendered}"
     );
 }
+
+#[tokio::test]
+async fn loop_guard_blocks_identical_read_on_unchanged_file() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("loop.txt"), "a\nb\nc\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        await editor.readFile("loop.txt");
+        let caught = "no-throw";
+        try {
+            await editor.readFile("loop.txt");
+        } catch (e) {
+            caught = String((e && e.message) || e);
+        }
+        transcript.push(new MarkdownFrame({ content: caught }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let msg = text_of(&frames[0]);
+    assert!(
+        msg.contains("loop guard"),
+        "expected loop guard error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_clears_after_edit() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("loop.txt"), "a\nb\nc\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        const first = await editor.readFile("loop.txt");
+        const line_b = first.split("\n")[1];
+        await editor.edit({
+            kind: "ReplaceLines",
+            path: "loop.txt",
+            anchor: line_b,
+            end_anchor: line_b,
+            text: "B2",
+        });
+        // Same args as the first read — but the edit cleared the ring,
+        // so this should succeed rather than tripping the guard.
+        const second = await editor.readFile("loop.txt");
+        transcript.push(new MarkdownFrame({ content: second }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let rendered = text_of(&frames[0]);
+    assert!(
+        rendered.contains("§B2"),
+        "expected post-edit content, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_lets_through_after_size_change() {
+    // The LoopKey::Read includes both mtime and size; changing content
+    // size (which our `fs::write` does) is enough to miss the ring,
+    // independent of filesystem mtime resolution.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("loop.txt");
+    std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        const first = await editor.readFile("loop.txt");
+        transcript.push(new MarkdownFrame({ content: first }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    // Replace with a different-sized payload — size delta forces a ring miss.
+    std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").unwrap();
+
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        const second = await editor.readFile("loop.txt");
+        transcript.push(new MarkdownFrame({ content: second }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let rendered = text_of(&frames[0]);
+    assert!(
+        rendered.contains("§alpha"),
+        "expected post-write content, got: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn loop_guard_distinguishes_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("ranges.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )
+    .unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        const editor = new Editor();
+        const a = await editor.readFile({ path: "ranges.txt", ranges: [[1, 2]] });
+        // Different ranges → different args hash → no collision.
+        const b = await editor.readFile({ path: "ranges.txt", ranges: [[5, 6]] });
+        transcript.push(new MarkdownFrame({ content: a + "|||" + b }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let rendered = text_of(&frames[0]);
+    let parts: Vec<&str> = rendered.split("|||").collect();
+    assert_eq!(parts.len(), 2, "rendered: {rendered}");
+    assert!(parts[0].contains("§1"), "first range: {}", parts[0]);
+    assert!(parts[1].contains("§5"), "second range: {}", parts[1]);
+}
