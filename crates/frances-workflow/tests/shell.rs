@@ -623,3 +623,66 @@ async fn shell_run_approve_false_skips_gate() {
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("no-gate"), "got `{out}`");
 }
+
+#[tokio::test]
+async fn shell_kill_after_quiet_does_not_return_still_running() {
+    // Regression: when shell_kill was called on a Quiet command, the
+    // handler used to do one keepWaiting pass and, if that also went
+    // Quiet, return a "Still running … call shell_kill to stop" tool
+    // result. The model would then call shell_kill again, spin
+    // forever, and the frame would fill with `(killed)` lines. The
+    // fix loops kill+drain a few times so the post-source sentinel
+    // always lands, and as a last-resort closes the shell rather than
+    // returning a quiet outcome.
+    let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
+    let file = write_source(
+        r#"
+        import { Shell, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const sh = new Shell();
+        const kill = new Kill(sh);
+
+        // Long sleep — runOnce returns Quiet after the default 1s
+        // silence window.
+        const r1 = await sh.runOnce("sleep 30");
+
+        // Now drive the Kill tool the same way the workflow runtime
+        // would.
+        const result = await kill.handler({
+            call: { id: "k1", name: "shell_kill", arguments: {} },
+            scope: null,
+        });
+
+        // The shell should be idle after Kill finishes — the post-
+        // source sentinel fires once the SIGKILL'd sleep is reaped.
+        const stillRunning = await sh.isRunning();
+
+        await sh.close();
+        transcript.push(new MarkdownFrame({
+            content: `r1Kind=${r1.kind} isErr=${result.is_error} hasStillRunning=${result.content.includes("Still running")} running=${stillRunning} content=${JSON.stringify(result.content)}`,
+        }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let pushes = markdown_pushes(&frames);
+    let summary = pushes.last().expect("summary frame");
+    assert!(summary.contains("r1Kind=quiet"), "got `{summary}`");
+    assert!(
+        summary.contains("hasStillRunning=false"),
+        "Kill must not return a `Still running` tool result: `{summary}`",
+    );
+    assert!(
+        summary.contains("running=false"),
+        "shell must be idle after Kill drained: `{summary}`",
+    );
+}

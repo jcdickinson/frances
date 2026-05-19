@@ -131,6 +131,12 @@ struct ShellOutputPayload {
     text: String,
 }
 
+#[derive(Serialize, Deserialize)]
+struct DiffPayload {
+    lines: Vec<crate::protocol::DiffLine>,
+    text: String,
+}
+
 /// On-disk JSON shape for `kind` = 'error' rows.
 #[derive(Serialize, Deserialize)]
 struct ErrorPayload {
@@ -419,6 +425,18 @@ fn decode_row(
                     state: p.state,
                     cmd: p.cmd,
                 },
+                text: p.text,
+                truncated,
+            })
+        }
+        "diff" => {
+            let p: DiffPayload =
+                serde_json::from_str(payload_text).map_err(|source| ScrollbackError::Decode {
+                    kind: kind.to_owned(),
+                    source,
+                })?;
+            Ok(StoredRow::Block {
+                kind: BlockKind::Diff { lines: p.lines },
                 text: p.text,
                 truncated,
             })

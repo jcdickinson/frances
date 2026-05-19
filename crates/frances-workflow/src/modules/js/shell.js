@@ -439,29 +439,71 @@ class Kill {
 
   handler = async ({ call }) => {
     try {
-      await this.shell.kill();
-      // After kill, drain so the shell returns to idle and the model
-      // sees the final exit status.
-      let final;
-      try {
-        final = await _streamUntilSettled(this.shell, () =>
-          this.shell.keepWaiting(),
-        );
-      } catch (_) {
-        // Nothing in flight — already idle, no drain needed.
+      // Drain after SIGKILL. Loop a few attempts with re-kills between
+      // them: in the common case bash flushes its "Killed" notice and
+      // the wrapper's post-source sentinel well within one wait. We
+      // retry because a single Quiet here is what used to drive the
+      // model into a `shell_kill` loop (Quiet formats as "Still
+      // running … call shell_kill to stop").
+      let final = null;
+      let drained = false;
+      const MAX_ATTEMPTS = 3;
+      for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt += 1) {
+        // `shell.kill()` only throws when the shell is closed —
+        // surface that to the model via the outer catch instead of
+        // swallowing it.
+        await this.shell.kill();
+        if (!(await this.shell.isRunning())) {
+          drained = true;
+          break;
+        }
+        try {
+          final = await _streamUntilSettled(this.shell, () =>
+            this.shell.keepWaiting(),
+          );
+        } catch (_) {
+          // Rust says no command in flight — already idle.
+          final = null;
+          drained = true;
+          break;
+        }
+        if (final.kind !== "quiet") {
+          drained = true;
+          break;
+        }
       }
-      if (final) {
+      if (drained && final) {
         await _frameOutcome(this.shell, final, "\n(killed)");
         return _format(call.id, final);
       }
-      // Nothing was in flight. Close any leftover frame so the row
-      // gets persisted; the LLM gets a plain "killed" tool_result.
+      if (drained) {
+        // Nothing was in flight by the time we got here.
+        await _closeShellFrame(this.shell, { exit: -1 });
+        return {
+          role: "tool",
+          call_id: call.id,
+          content: "killed (no in-flight command).",
+          is_error: false,
+        };
+      }
+      // Bash didn't return to idle after MAX_ATTEMPTS rounds of
+      // SIGKILL + drain. Slam the door: close the shell so future
+      // shell_run calls fail loudly instead of inheriting a wedged
+      // bash, and tell the model directly so it doesn't fire another
+      // shell_kill.
+      await _appendShellOutput(this.shell, "\n(killed; shell closed)");
       await _closeShellFrame(this.shell, { exit: -1 });
+      try {
+        await this.shell.close();
+      } catch (_) {
+        // Already closed — fine.
+      }
       return {
         role: "tool",
         call_id: call.id,
-        content: "killed (no in-flight command).",
-        is_error: false,
+        content:
+          "SIGKILL sent but bash did not return to idle after several attempts. Closed the shell. Further shell_run / shell_wait / shell_kill calls on it will error.",
+        is_error: true,
       };
     } catch (err) {
       return _errResult(call.id, err);

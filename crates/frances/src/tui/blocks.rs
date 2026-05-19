@@ -31,6 +31,71 @@ pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
     }
 }
 
+pub struct DiffBlock {
+    lines: Vec<frances_daemon::protocol::DiffLine>,
+}
+
+impl DiffBlock {
+    pub fn new(lines: Vec<frances_daemon::protocol::DiffLine>) -> Self {
+        Self { lines }
+    }
+}
+
+impl Block for DiffBlock {
+    fn measure(&self, width: u16) -> u16 {
+        let max = width.max(1) as usize;
+        let mut count = 0;
+        for line in &self.lines {
+            let content = match line {
+                frances_daemon::protocol::DiffLine::Context(c) => c.as_ref(),
+                frances_daemon::protocol::DiffLine::Added(a) => a.as_ref(),
+                frances_daemon::protocol::DiffLine::Removed(r) => r.as_ref(),
+            };
+            let mut out = Vec::new();
+            wrap_into("", content, max, &mut out);
+            count += out.len().max(1) as u16;
+        }
+        count
+    }
+
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let mut row = 0u16;
+        let max = area.width.max(1) as usize;
+        for line in &self.lines {
+            let (content, style) = match line {
+                frances_daemon::protocol::DiffLine::Context(c) => (c.as_ref(), Style::default()),
+                frances_daemon::protocol::DiffLine::Added(a) => (
+                    a.as_ref(),
+                    Style::default().bg(Color::Green).fg(Color::Black),
+                ),
+                frances_daemon::protocol::DiffLine::Removed(r) => {
+                    (r.as_ref(), Style::default().bg(Color::Red).fg(Color::Black))
+                }
+            };
+
+            let mut out = Vec::new();
+            wrap_into("", content, max, &mut out);
+
+            for wrapped_line in out {
+                if row >= area.height {
+                    return;
+                }
+                buf.set_string(area.x, area.y + row, &wrapped_line, style);
+                let w = display_width(&wrapped_line) as u16;
+                if w < area.width {
+                    buf.set_string(
+                        area.x + w,
+                        area.y + row,
+                        " ".repeat((area.width - w) as usize),
+                        style,
+                    );
+                }
+                row += 1;
+            }
+        }
+    }
+}
+
 /// History row for a labelled (kind + text) block. Wraps to the
 /// available width with the kind prefix on the first row and a
 /// matching-width indent on continuation rows.
