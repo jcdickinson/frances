@@ -515,3 +515,134 @@ async fn editor_new_creates_parent_directory() {
     assert!(diff.contains("§hello"), "missing §hello in: {diff}");
     assert!(diff.contains("§world"), "missing §world in: {diff}");
 }
+
+#[tokio::test]
+async fn editor_read_ranges_returns_disjoint_anchored_lines() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ranges.txt"), "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, Read } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        
+        const editor = new Editor();
+        const vars = new Variables();
+        const read = new Read(editor, vars);
+        
+        const r = await read.handler({
+            call: { id: "c1", name: "file_read", arguments: { path: "ranges.txt", ranges: [[1, 2], [8, 12]] } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: r.content || JSON.stringify(r) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    let lines: Vec<&str> = rendered.lines().collect();
+    
+    // 1, 2, separator, 8, 9, 10 -> 6 lines total
+    assert_eq!(lines.len(), 6, "got: {rendered:?}");
+    assert!(lines[0].ends_with("§1"), "line 0: {}", lines[0]);
+    assert!(lines[1].ends_with("§2"), "line 1: {}", lines[1]);
+    assert!(lines[2] == "…§", "line 2: {}", lines[2]);
+    assert!(lines[3].ends_with("§8"), "line 3: {}", lines[3]);
+    assert!(lines[4].ends_with("§9"), "line 4: {}", lines[4]);
+    assert!(lines[5].ends_with("§10"), "line 5: {}", lines[5]);
+}
+
+#[tokio::test]
+async fn read_into_and_ranges_mutually_exclusive() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("mut.txt"), "1\n2\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, Read } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        
+        const editor = new Editor();
+        const vars = new Variables();
+        const read = new Read(editor, vars);
+        
+        const r = await read.handler({
+            call: { id: "c1", name: "file_read", arguments: { path: "mut.txt", into: "blob", ranges: [[1, 2]] } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    assert!(rendered.contains(r#""is_error":true"#), "rendered: {rendered}");
+    assert!(
+        rendered.contains("provide exactly one of `into` or `ranges`, not both"),
+        "rendered: {rendered}"
+    );
+}
+
+#[tokio::test]
+async fn editor_read_ranges_reversed_throws() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("ranges.txt"), "1\n2\n3\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, Read } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        
+        const editor = new Editor();
+        const vars = new Variables();
+        const read = new Read(editor, vars);
+        
+        const r = await read.handler({
+            call: { id: "c1", name: "file_read", arguments: { path: "ranges.txt", ranges: [[2, 1]] } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    assert!(rendered.contains(r#""is_error":true"#), "rendered: {rendered}");
+    assert!(rendered.contains("must be <= end") || rendered.contains("reverse range"), "rendered: {rendered}");
+}

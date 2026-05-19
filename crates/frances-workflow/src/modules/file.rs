@@ -102,10 +102,25 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
             "readFile",
             Function::new(
                 ctx.clone(),
-                |this: This<Class<'js, EditorJs<D>>>, path: String| {
+                |this: This<Class<'js, EditorJs<D>>>, value: Value<'js>| {
+                    let raw = super::rquickjs_to_json(&value);
                     let deps = this.0.borrow().deps.clone();
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        EditorStringResult(read_file_inner(&deps, path).await)
+                        let result = match raw {
+                            Ok(v) => match serde_json::from_value::<ReadFileArgs>(v.clone()) {
+                                Ok(args) => read_file_inner(&deps, args).await,
+                                Err(_) => {
+                                    // Fallback for when the args is just a string (the path) which was the old behavior
+                                    if let Some(path_str) = v.as_str() {
+                                        read_file_inner(&deps, ReadFileArgs { path: path_str.to_string(), ranges: None }).await
+                                    } else {
+                                        Err(format!("parse readFile args: invalid arg shape"))
+                                    }
+                                }
+                            },
+                            Err(msg) => Err(msg),
+                        };
+                        EditorStringResult(result)
                     }))
                 },
             )?,
@@ -160,15 +175,75 @@ fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, Str
     fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))
 }
 
-async fn read_file_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
-    let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
+use serde::Deserialize;
+
+#[derive(Debug, Deserialize)]
+struct ReadFileArgs {
+    path: String,
+    ranges: Option<Vec<[usize; 2]>>,
+}
+
+async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Result<String, String> {
+    let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&args.path));
     let (lines, mtime_ns, size) =
         read_file_from_disk(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let total_lines = lines.len();
     let session: Arc<_> = deps.editor_factory().session();
     let mut sess = session.lock().await;
-    sess.read_file(resolved, lines, mtime_ns, size)
+
+    let full_rendered = sess.read_file(resolved, lines, mtime_ns, size)
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+
+    if let Some(ranges) = args.ranges {
+        // filter out zero, wait 1-indexed so 0 is invalid anyway.
+        // wait, let's normalize, sort, and merge overlapping.
+        let mut final_ranges = Vec::new();
+        for [start, end] in ranges {
+            if end < start {
+                return Err(format!("reverse range [{}, {}]", start, end));
+            }
+            if start == 0 {
+                return Err(format!("ranges are 1-indexed, got start=0"));
+            }
+            let actual_end = std::cmp::min(end, total_lines);
+            if start > total_lines {
+                continue; // completely out of bounds
+            }
+            final_ranges.push([start, actual_end]);
+        }
+        
+        final_ranges.sort_unstable_by_key(|r| r[0]);
+        let mut merged = Vec::new();
+        for r in final_ranges {
+            if merged.is_empty() {
+                merged.push(r);
+            } else {
+                let last = merged.last_mut().unwrap();
+                if r[0] <= last[1] + 1 {
+                    last[1] = std::cmp::max(last[1], r[1]);
+                } else {
+                    merged.push(r);
+                }
+            }
+        }
+
+        let mut output = String::new();
+        let rendered_lines: Vec<_> = full_rendered.lines().collect();
+
+        for (i, [start, end]) in merged.iter().enumerate() {
+            if i > 0 {
+                output.push_str("…§\n");
+            }
+            for line_idx in (*start - 1)..*end {
+                output.push_str(rendered_lines[line_idx]);
+                output.push('\n');
+            }
+        }
+        Ok(output)
+    } else {
+        Ok(full_rendered)
+    }
 }
 
 async fn edit_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Result<String, String> {

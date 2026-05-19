@@ -40,12 +40,22 @@ const READ_SCHEMA = {
   type: "object",
   properties: {
     path: { type: "string" },
+    ranges: {
+      type: "array",
+      description: "Optional list of 1-indexed, inclusive [start, end] pairs. Returned output concatenates the requested ranges with separator `…§`. Muxually exclusive with `into`.",
+      items: {
+        type: "array",
+        items: { type: "integer" },
+        minItems: 2,
+        maxItems: 2,
+      },
+    },
     into: {
       type: "string",
       description:
         "Optional Frances variable name to store the file's raw bytes into. " +
         "Bypasses anchors and does NOT count as a read for editing — call " +
-        "file_read without `into` if you intend to edit the file afterwards.",
+        "file_read without `into` if you intend to edit the file afterwards. Mutually exclusive with `ranges`.",
     },
   },
   required: ["path"],
@@ -166,14 +176,21 @@ class Read {
   }
 
   handler = async ({ call }) => {
-    const { path, into } = call.arguments;
+    const { path, into, ranges } = call.arguments;
     try {
+      if (into && ranges) {
+        return _errResult(call.id, new Error("provide exactly one of `into` or `ranges`, not both"));
+      }
       if (into) {
         const raw = await this.editor.readRaw(path);
         this.vars.set(into, raw);
         return _okResult(call.id, `${into} = string`);
       }
-      const content = await this.editor.readFile(path);
+      const args = { path };
+      if (ranges) {
+        args.ranges = ranges;
+      }
+      const content = await this.editor.readFile(args);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
