@@ -54,6 +54,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+use frances_core::Truncated;
 use frances_models_llm::chat::{
     ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
     ChatSessionManager as ChatSessionManagerTrait, ModelIntents, OwnedHistoryInput,
@@ -295,6 +296,13 @@ fn push_message<'js, D: WorkflowDeps>(
                     "session.push: tool message missing or non-boolean `is_error`",
                 )
             })?;
+            if is_error {
+                tracing::warn!(
+                    call_id = %call_id,
+                    content = %Truncated::<100>::new(content.as_str()),
+                    "tool call returned is_error",
+                );
+            }
             OwnedHistoryInput::ToolResult {
                 call_id,
                 content,

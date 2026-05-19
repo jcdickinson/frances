@@ -1,7 +1,7 @@
-//! Shared utilities used across the Frances workspace. Currently just the
-//! `JsonRepair` newtype, which absorbs a model bug where array tool-call
-//! arguments arrive double-encoded as JSON strings.
+//! Shared utilities used across the Frances workspace.
 
 pub mod json_repair;
+pub mod log_fmt;
 
 pub use json_repair::JsonRepair;
+pub use log_fmt::Truncated;

@@ -8,6 +8,7 @@ use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace};
 
+use frances_core::Truncated;
 use frances_models_llm::config::{ProviderConfig, ResponsesModelExtras};
 use frances_models_llm::wire::{
     CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolCall,
@@ -178,7 +179,7 @@ impl provider::Provider for Provider {
             model = %plan.model.id,
             "calling chat completions"
         );
-        trace!(body = %body, "chat completions request body");
+        trace!(body = %Truncated::<100>::new(body.to_string()), "chat completions request body");
 
         let mut request = self
             .http

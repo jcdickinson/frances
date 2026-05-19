@@ -15,6 +15,7 @@ test-util = []
 async-trait.workspace = true
 dashmap.workspace = true
 frances-config.workspace = true
+frances-core.workspace = true
 frances-models-llm.workspace = true
 futures.workspace = true
 futures-util.workspace = true

@@ -102,10 +102,7 @@ let nextStepId = 1;
 let pendingCompletion: CompletionSignal | null = null;
 
 const SYSTEM_PROMPT =
-  "You are an agentic coding assistant. Use shell_run to execute bash. " +
-  "If a command's output goes quiet before it finishes, decide whether to " +
-  "keep waiting (shell_wait) or stop it (shell_kill). Shell state (cwd, env, " +
-  "functions) persists across commands.\n\n" +
+  "You are an agentic coding assistant. " +
   "You are running inside a rudimentary structured agentic loop. Maintain a " +
   "typed plan with the `plan_update` tool. The plan is living state: update " +
   "titles, bodies, ordering, and the current step whenever reality changes. " +
