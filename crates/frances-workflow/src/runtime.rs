@@ -827,6 +827,7 @@ pub mod test_deps {
             _tools: Vec<ToolDef>,
             _tool_choice: Option<ToolChoice>,
             cancel: tokio_util::sync::CancellationToken,
+            _max_tool_calls: Option<usize>,
             mut on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
         ) -> Result<CompletionOutcome, ChatError> {
             if cancel.is_cancelled() {

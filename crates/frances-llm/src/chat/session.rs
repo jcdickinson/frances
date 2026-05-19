@@ -156,6 +156,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
         cancel: CancellationToken,
+        max_tool_calls: Option<usize>,
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError> {
         let mut on_event = on_event;
@@ -201,6 +202,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             tools: &tools,
             tool_choice: tool_choice.as_ref(),
             env: &env,
+            max_tool_calls,
         };
 
         let mut emitted_payloads: Vec<Value> = Vec::new();
@@ -455,6 +457,7 @@ mod tests {
                 Vec::new(),
                 None,
                 tokio_util::sync::CancellationToken::new(),
+                None,
                 Box::new(|_| Ok(())),
             )
             .await
@@ -560,6 +563,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cap_truncates_outcome_to_first_n_calls() {
+        let (manager, _store, stub) = build_manager().await;
+        // A script that wants to emit three tool calls.
+        let three_calls = StubScript {
+            events: vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "a".into(),
+                    arguments: json!({"i": 1}),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c2".into(),
+                    name: "b".into(),
+                    arguments: json!({"i": 2}),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c3".into(),
+                    name: "c".into(),
+                    arguments: json!({"i": 3}),
+                }),
+            ],
+            outcome: CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "a".into(),
+                        arguments: json!({"i": 1}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "b".into(),
+                        arguments: json!({"i": 2}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "c".into(),
+                        arguments: json!({"i": 3}),
+                    },
+                ],
+            },
+        };
+        stub.push_script(three_calls);
+
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        let outcome = session
+            .run(
+                std::collections::HashMap::new(),
+                Vec::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                Some(2),
+                Box::new(|_| Ok(())),
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(outcome.tool_calls.len(), 2);
+        assert_eq!(outcome.tool_calls[0].id, "c1");
+        assert_eq!(outcome.tool_calls[1].id, "c2");
+    }
+
+    #[tokio::test]
+    async fn no_cap_preserves_all_calls() {
+        let (manager, _store, stub) = build_manager().await;
+        let three_calls = StubScript {
+            events: vec![
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c1".into(),
+                    name: "a".into(),
+                    arguments: json!({}),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c2".into(),
+                    name: "b".into(),
+                    arguments: json!({}),
+                }),
+                StreamEvent::ToolCall(ToolCall {
+                    id: "c3".into(),
+                    name: "c".into(),
+                    arguments: json!({}),
+                }),
+            ],
+            outcome: CompletionOutcome {
+                text: String::new(),
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "a".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "b".into(),
+                        arguments: json!({}),
+                    },
+                    ToolCall {
+                        id: "c3".into(),
+                        name: "c".into(),
+                        arguments: json!({}),
+                    },
+                ],
+            },
+        };
+        stub.push_script(three_calls);
+
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        let outcome = session
+            .run(
+                std::collections::HashMap::new(),
+                Vec::new(),
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                Box::new(|_| Ok(())),
+            )
+            .await
+            .expect("run should succeed");
+        assert_eq!(outcome.tool_calls.len(), 3);
+    }
+
+    #[tokio::test]
     async fn pre_cancelled_token_returns_chaterror_cancelled() {
         use frances_models_llm::chat::ChatError;
         use tokio_util::sync::CancellationToken;
@@ -582,6 +706,7 @@ mod tests {
                 Vec::new(),
                 None,
                 cancel,
+                None,
                 Box::new(|_| Ok(())),
             )
             .await;

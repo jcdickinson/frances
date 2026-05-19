@@ -140,6 +140,7 @@ impl provider::Provider for Provider {
         if cancel.is_cancelled() {
             return Err(Error::Cancelled);
         }
+        let max_tool_calls = req.max_tool_calls;
         let plan = RequestPlan::build(&self.provider_config, &self.extras, req.model, req.env)?;
 
         // Forge new_inputs upfront, emit one History event per output, then
@@ -252,6 +253,21 @@ impl provider::Provider for Provider {
                         for completed in accumulator.push(tcd)? {
                             on_event(StreamEvent::ToolCall(completed.clone()))?;
                             tool_calls.push(completed);
+                            if let Some(cap) = max_tool_calls
+                                && tool_calls.len() >= cap
+                            {
+                                // Truncation: we've kept exactly `cap`
+                                // calls. Emit the consolidated History
+                                // (so the wire-history invariant
+                                // holds) and return Ok. The local
+                                // `bytes`/`response` are dropped on
+                                // return — reqwest closes the
+                                // connection, the provider stops
+                                // generating.
+                                let assistant_payload = build_assistant_payload(&text, &tool_calls);
+                                on_event(StreamEvent::History(assistant_payload))?;
+                                return Ok(CompletionOutcome { text, tool_calls });
+                            }
                         }
                     }
                     if let Some(usage) = sse::chunk_usage(&value) {

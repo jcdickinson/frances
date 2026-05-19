@@ -9,7 +9,12 @@
 //     session never reads or writes `chat_sessions`/`chat_messages`.
 //     The provider sees only what was pushed since the last stream().
 //
-// `stream({ signal })` returns a `StreamingResponse`:
+// `stream({ signal, maxToolCalls })` returns a `StreamingResponse`.
+// `maxToolCalls` is an optional non-negative integer cap on the number
+// of tool calls retained from this round; further calls are dropped at
+// the wire and the stream is closed gracefully (returns `Ok` with the
+// first `maxToolCalls`). Useful to bound runaway models.
+//
 //   - `events`:    ReadableStream<StreamEvent> — raw provider events.
 //   - `text`:      ReadableStream<string>      — text deltas only,
 //                                                 lazily derived from
@@ -73,7 +78,8 @@ ChatSession.prototype.stream = function stream(opts) {
 // called and `completed` being awaited.
 async function _streamWithDispatch(chat, opts, getHook) {
   const signal = opts && opts.signal;
-  const inner = await _innerStream.call(chat);
+  const maxToolCalls = opts && opts.maxToolCalls;
+  const inner = await _innerStream.call(chat, { maxToolCalls });
 
   let streamController;
   const events = new ReadableStream({

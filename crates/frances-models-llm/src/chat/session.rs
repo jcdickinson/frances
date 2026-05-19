@@ -28,12 +28,17 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
     /// Firing `cancel` aborts the in-flight provider request; the call
     /// returns `Err(ChatError::Cancelled)` and the underlying HTTP
     /// connection is dropped so the provider stops generating.
+    ///
+    /// `max_tool_calls` caps how many tool calls the provider will
+    /// retain — see `ProviderRequest::max_tool_calls` in `frances-llm`.
+    /// `None` is unbounded.
     async fn run(
         &self,
         env: HashMap<OsString, OsString>,
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
         cancel: CancellationToken,
+        max_tool_calls: Option<usize>,
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError>;
 }

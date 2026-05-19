@@ -100,8 +100,12 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
 
     let inner_stream = Function::new(
         ctx.clone(),
-        |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
-            start_stream::<D>(&ctx, &this.0)
+        |ctx: Ctx<'js>,
+         this: This<Class<'js, ChatSessionJs<D>>>,
+         opts: rquickjs::function::Opt<Value<'js>>|
+         -> JsResult<Value<'js>> {
+            let max_tool_calls = parse_stream_opts(&ctx, opts.0.as_ref())?;
+            start_stream::<D>(&ctx, &this.0, max_tool_calls)
         },
     )?;
 
@@ -204,6 +208,39 @@ fn parse_chat_options<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<ChatOpt
         intents: Cow::Owned(intents),
         ephemeral,
     })
+}
+
+/// Parse the optional `{ maxToolCalls }` object that JS passes to
+/// `_innerStream.call(chat, opts)`. Returns `None` when the option is
+/// missing or the whole opts argument is undefined; throws a JS
+/// `TypeError`-shaped exception for non-objects or invalid values.
+fn parse_stream_opts<'js>(ctx: &Ctx<'js>, opts: Option<&Value<'js>>) -> JsResult<Option<usize>> {
+    let Some(opts) = opts else { return Ok(None) };
+    if opts.is_undefined() || opts.is_null() {
+        return Ok(None);
+    }
+    let Some(obj) = opts.as_object() else {
+        return Err(throw(
+            ctx,
+            "chat.stream: expected an options object or `undefined`",
+        ));
+    };
+    let val: Value<'js> = obj
+        .get("maxToolCalls")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if val.is_undefined() || val.is_null() {
+        return Ok(None);
+    }
+    let n = val
+        .as_number()
+        .ok_or_else(|| throw(ctx, "chat.stream: `maxToolCalls` must be a number"))?;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+        return Err(throw(
+            ctx,
+            "chat.stream: `maxToolCalls` must be a non-negative integer",
+        ));
+    }
+    Ok(Some(n as usize))
 }
 
 fn push_message<'js, D: WorkflowDeps>(
@@ -437,6 +474,7 @@ fn json_value_into_js<'js>(ctx: &Ctx<'js>, value: &JsonValue) -> JsResult<Value<
 fn start_stream<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     session: &Class<'js, ChatSessionJs<D>>,
+    max_tool_calls: Option<usize>,
 ) -> JsResult<Value<'js>> {
     let tool_defs = snapshot_tools::<D>(ctx, session)?;
     let (handle, env) = {
@@ -469,7 +507,14 @@ fn start_stream<'js, D: WorkflowDeps>(
                     Ok(())
                 });
             let result = handle
-                .run(env, tool_defs, None, cancel_for_task, on_event)
+                .run(
+                    env,
+                    tool_defs,
+                    None,
+                    cancel_for_task,
+                    max_tool_calls,
+                    on_event,
+                )
                 .await;
             let usage = usage_capture.lock().take();
             drop(event_tx);

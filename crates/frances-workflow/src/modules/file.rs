@@ -121,7 +121,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                                         )
                                         .await
                                     } else {
-                                        Err(format!("parse readFile args: invalid arg shape"))
+                                        Err("parse readFile args: invalid arg shape".to_owned())
                                     }
                                 }
                             },
@@ -212,7 +212,7 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
                 return Err(format!("reverse range [{}, {}]", start, end));
             }
             if start == 0 {
-                return Err(format!("ranges are 1-indexed, got start=0"));
+                return Err("ranges are 1-indexed, got start=0".to_owned());
             }
             let actual_end = std::cmp::min(end, total_lines);
             if start > total_lines {
@@ -243,8 +243,8 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
             if i > 0 {
                 output.push_str("…§\n");
             }
-            for line_idx in (*start - 1)..*end {
-                output.push_str(rendered_lines[line_idx]);
+            for line in &rendered_lines[(*start - 1)..*end] {
+                output.push_str(line);
                 output.push('\n');
             }
         }

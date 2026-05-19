@@ -38,6 +38,11 @@ pub struct ProviderRequest<'a> {
     pub tools: &'a [ToolDef],
     pub tool_choice: Option<&'a ToolChoice>,
     pub env: &'a HashMap<OsString, OsString>,
+    /// Per-request cap on the number of tool calls the provider will
+    /// surface. `None` = unbounded (today's behaviour). `Some(n)` =
+    /// keep up to `n`, drop any further calls and close the stream
+    /// early with an `Ok` outcome containing the first `n`.
+    pub max_tool_calls: Option<usize>,
 }
 
 /// Concrete provider trait. Each impl knows one wire (OpenAI chat

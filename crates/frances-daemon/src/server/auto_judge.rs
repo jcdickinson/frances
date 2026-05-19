@@ -23,10 +23,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 
 use frances_llm::CompleteRequest;
-use frances_models_llm::chat::ChatError;
-use frances_models_llm::wire::{
-    HistoryInput, StreamEvent, ToolCall, ToolChoice, ToolDef, ToolFunction,
-};
+use frances_models_llm::wire::{HistoryInput, ToolCall, ToolChoice, ToolDef, ToolFunction};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -183,10 +180,9 @@ Try once more — call exactly one of the two tools with a one-sentence reason."
 }
 
 /// One round-trip wrapped so both the initial call and the retry share
-/// the same eager-cancel + parse logic. `Errored` carries the
-/// already-formatted error string; `Parsed` carries the parser verdict
-/// over whatever tool calls were observed (including the early-bail
-/// case where we self-cancelled at the 2nd `StreamEvent::ToolCall`).
+/// the same cap-and-parse logic. `Errored` carries the already-formatted
+/// error string; `Parsed` carries the parser verdict over whatever tool
+/// calls the (cap-truncated) outcome contains.
 enum RoundOutcome {
     Parsed(ParseResult),
     Errored(String),
@@ -199,52 +195,27 @@ async fn run_round(
     inputs: &[HistoryInput<'_>],
     tools: &[ToolDef],
 ) -> RoundOutcome {
-    let cancel = CancellationToken::new();
-    let mut collected: Vec<ToolCall> = Vec::new();
-
-    // Inner block so the closure's mutable borrow of `collected` ends
-    // before we read `collected` below.
-    let result = {
-        let cancel_for_cb = cancel.clone();
-        let mut on_event = |ev: StreamEvent| {
-            if let StreamEvent::ToolCall(call) = ev {
-                collected.push(call);
-                if collected.len() >= 2 {
-                    // Second call: `parse_calls` already returns
-                    // `Malformed` for any count other than 1, so
-                    // further chunks can't change the verdict. Fire
-                    // the cancel token — the SSE drain's
-                    // `tokio::select!` drops the in-flight HTTP
-                    // request and the provider stops generating.
-                    cancel_for_cb.cancel();
-                }
-            }
-        };
-
-        let req = CompleteRequest {
-            intents: INTENTS,
-            session_id,
-            env,
-            history: &[],
-            new_inputs: inputs,
-            tools,
-            tool_choice: Some(&ToolChoice::Required),
-            cancel: cancel.clone(),
-        };
-
-        state.chat.complete_with_events(req, &mut on_event).await
+    let req = CompleteRequest {
+        intents: INTENTS,
+        session_id,
+        env,
+        history: &[],
+        new_inputs: inputs,
+        tools,
+        tool_choice: Some(&ToolChoice::Required),
+        cancel: CancellationToken::new(),
+        // Cap at 1 — the judge prompt asks for exactly one tool call.
+        // A misbehaving model that emits more gets truncated to the
+        // first; we take it and proceed rather than discarding to ask
+        // the user (cheaper, and the first answer is committed by the
+        // model anyway). The 0-call case still falls through to
+        // `Malformed("no tool calls")` → retry → Indeterminate, which
+        // is the genuine "no decision" signal worth preserving.
+        max_tool_calls: Some(1),
     };
 
-    match result {
-        Ok(_) => RoundOutcome::Parsed(parse_calls(&collected)),
-        // Self-cancel: we fired the token from the callback because we
-        // saw `>= 2` tool calls. The verdict is whatever
-        // `parse_calls(&collected)` says — i.e. `Malformed`. Fall
-        // through to the same path as a normal completion so the
-        // retry/Indeterminate logic upstream is uniform.
-        Err(ChatError::Cancelled) if cancel.is_cancelled() => {
-            RoundOutcome::Parsed(parse_calls(&collected))
-        }
+    match state.chat.complete(req).await {
+        Ok(outcome) => RoundOutcome::Parsed(parse_calls(&outcome.tool_calls)),
         Err(error) => RoundOutcome::Errored(format!("chat.complete failed: {error}")),
     }
 }

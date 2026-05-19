@@ -199,7 +199,11 @@ function truncateForTranscript(value: unknown, max = 4000): string {
   return text.slice(0, max) + `\n… [truncated ${text.length - max} chars]`;
 }
 
-function recordStepTranscript(label: string, content: unknown, max?: number): void {
+function recordStepTranscript(
+  label: string,
+  content: unknown,
+  max?: number,
+): void {
   const text = truncateForTranscript(content, max).trim();
   if (!text) return;
   stepTranscriptEntries.push(`## ${label}\n${text}`);
@@ -211,12 +215,15 @@ function proofToString(proof: unknown): string {
   return JSON.stringify(proof, null, 2);
 }
 
-async function summarizeStepTranscript(signal: CompletionSignal): Promise<string> {
+async function summarizeStepTranscript(
+  signal: CompletionSignal,
+): Promise<string> {
   if (stepTranscriptSummary) return stepTranscriptSummary;
 
   const transcriptText = stepTranscriptEntries.join("\n\n---\n\n");
   if (!transcriptText.trim()) {
-    stepTranscriptSummary = "No transcript entries were captured for this step.";
+    stepTranscriptSummary =
+      "No transcript entries were captured for this step.";
     return stepTranscriptSummary;
   }
 
@@ -523,12 +530,13 @@ const DECLINE_SCHEMA = {
   required: ["message"],
 };
 
-async function referee(signal: CompletionSignal): Promise<
-  | { type: "approve" }
-  | { type: "decline"; message: string }
-> {
-  let decision: { type: "approve" } | { type: "decline"; message: string } | null =
-    null;
+async function referee(
+  signal: CompletionSignal,
+): Promise<{ type: "approve" } | { type: "decline"; message: string }> {
+  let decision:
+    | { type: "approve" }
+    | { type: "decline"; message: string }
+    | null = null;
   const approveTool = {
     name: "approve",
     description:
@@ -575,7 +583,7 @@ async function referee(signal: CompletionSignal): Promise<
   });
 
   for (let i = 0; i < 3; i++) {
-    const r = await judge.stream();
+    const r = await judge.stream({ maxToolCalls: 1 });
     const { tool_calls } = await r.completed;
     if (decision) return decision;
     if (!tool_calls || tool_calls.length === 0) {
@@ -697,7 +705,7 @@ async function handlePendingCompletion(): Promise<boolean> {
 async function runAgentUntilIdle(): Promise<void> {
   let resetCount = 0;
   while (true) {
-    const r = await chat.stream();
+    const r = await chat.stream({ maxToolCalls: 8 });
     // Push the `frances:` frame eagerly with no content — the TUI tracks
     // the id but defers measure / render, and the daemon skips persistence,
     // until the first text delta materialises the block. A tool_call-only
@@ -758,4 +766,3 @@ try {
 } finally {
   await sh.close();
 }
-

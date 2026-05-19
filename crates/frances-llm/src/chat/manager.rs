@@ -48,6 +48,8 @@ pub struct CompleteRequest<'a> {
     /// `CancellationToken::new()` (never fires) when the caller has no
     /// upstream abort source.
     pub cancel: CancellationToken,
+    /// Optional cap on tool calls. See `ProviderRequest::max_tool_calls`.
+    pub max_tool_calls: Option<usize>,
 }
 
 /// Concrete chat-session manager. Clone-by-value handle; complex state
@@ -151,6 +153,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             tools: req.tools,
             tool_choice: req.tool_choice,
             env: req.env,
+            max_tool_calls: req.max_tool_calls,
         };
         let mut wrapped = |ev: StreamEvent| -> Result<(), ErasedError> {
             on_event(ev);

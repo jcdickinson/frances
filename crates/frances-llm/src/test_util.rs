@@ -159,8 +159,31 @@ impl Provider for StubProvider {
                     "StubProvider::stream called with no script queued",
                 )
             })?;
+        let cap = req.max_tool_calls;
+        let mut emitted_calls: Vec<frances_models_llm::wire::ToolCall> = Vec::new();
         for ev in script.events {
+            // Mirror the OpenAI provider's truncation: once we've
+            // emitted `cap` tool calls, drop everything further on the
+            // floor and return Ok with what we have. Lets tests
+            // exercise the cap path without standing up a real wire.
+            if let Some(cap) = cap
+                && emitted_calls.len() >= cap
+            {
+                break;
+            }
+            if let StreamEvent::ToolCall(call) = &ev {
+                emitted_calls.push(call.clone());
+            }
             on_event(ev)?;
+        }
+        if let Some(cap) = cap
+            && script.outcome.tool_calls.len() > cap
+        {
+            // Match the SSE-loop's contract: outcome.tool_calls
+            // reflects only what we actually emitted.
+            let mut truncated = script.outcome;
+            truncated.tool_calls.truncate(cap);
+            return Ok(truncated);
         }
         Ok(script.outcome)
     }
