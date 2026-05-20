@@ -13,7 +13,7 @@ pub use chat::{
     ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager, ChatSessionRow,
     HistoryError, OwnedHistoryInput, RowId, RowSeq,
 };
-pub use config::{AuthCommand, AuthMethod, ModelConfig, ProviderConfig, ResponsesModelExtras};
+pub use config::{AuthCommand, AuthMethod, GenAIExtras, ModelConfig, ProviderConfig};
 pub use wire::{
     ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent, ToolCall,
     ToolChoice, ToolDef, ToolFunction, Usage,

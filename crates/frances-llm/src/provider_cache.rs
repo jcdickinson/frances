@@ -25,11 +25,11 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::warn;
 
-use frances_models_llm::config::{ProviderConfig, ResponsesModelExtras};
+use frances_models_llm::config::{GenAIExtras, ProviderConfig};
 use frances_models_llm::wire::ErasedError;
 
 use crate::provider::{ErasedProvider, Provider, erase};
-use crate::providers::openai;
+use crate::providers::genai;
 
 #[derive(Debug, Error)]
 pub enum ProviderCacheError {
@@ -111,7 +111,7 @@ impl ProviderCache {
 
     /// Test-only: shove a pre-built provider into the cache keyed by
     /// `id`. The next `get(id)` call returns it directly, bypassing the
-    /// hard-coded OpenAI build path. The entry has a no-op refresh
+    /// hard-coded OpenRouter build path. The entry has a no-op refresh
     /// closure so config churn never replaces it.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_stub<P>(&self, id: &str, provider: Arc<P>)
@@ -156,11 +156,11 @@ impl ProviderCache {
     }
 
     /// Build a new entry for `id_lc`. Hard-coded match-per-kind: today
-    /// every id resolves to the OpenAI wire impl. Adding a new provider
-    /// is a one-line addition here (key it on a provider-name field on
-    /// `ProviderConfig` once that exists).
+    /// every id resolves to the OpenRouter Responses-API impl. Adding a
+    /// new provider is a one-line addition here (key it on a
+    /// provider-name field on `ProviderConfig` once that exists).
     fn try_build(&self, id_lc: &str) -> Option<Arc<ErasedProvider>> {
-        let entry = match build_openai_entry(&self.inner.handle, id_lc) {
+        let entry = match build_genai_entry(&self.inner.handle, id_lc) {
             Ok(entry) => entry,
             Err(e) => {
                 warn!(provider = %id_lc, error = %e, "provider build failed");
@@ -175,7 +175,7 @@ impl ProviderCache {
     }
 }
 
-fn build_openai_entry(
+fn build_genai_entry(
     handle: &ConfigHandle,
     id: &str,
 ) -> std::result::Result<Entry, ProviderCacheError> {
@@ -186,13 +186,13 @@ fn build_openai_entry(
             source,
         })?;
     let ex = handle
-        .bind::<ResponsesModelExtras>(["model_provider_extensions", id])
+        .bind::<GenAIExtras>(["model_provider_extensions", id])
         .map_err(|source| ProviderCacheError::Bind {
             path: format!("model_provider_extensions::{id}"),
             source,
         })?;
 
-    let initial = build_provider::<openai::Provider>(&pc, &ex)?;
+    let initial = build_provider::<genai::Provider>(&pc, &ex)?;
 
     let mut pc_stream = pc.subscribe();
     let mut ex_stream = ex.subscribe();
@@ -204,7 +204,7 @@ fn build_openai_entry(
         if !pc_fired && !ex_fired {
             return None;
         }
-        match build_provider::<openai::Provider>(&pc_for_refresh, &ex_for_refresh) {
+        match build_provider::<genai::Provider>(&pc_for_refresh, &ex_for_refresh) {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "provider rebuild failed; retaining previous");

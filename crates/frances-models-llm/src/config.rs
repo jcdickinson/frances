@@ -9,6 +9,13 @@ use url::Url;
 /// table in the config tree. The `id` itself is the binding key, not a field.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProviderConfig {
+    /// Wire-name selector. Identifies which provider wire shape the
+    /// `Provider` impl should drive — e.g. `"openai-chat"`,
+    /// `"openai-responses"`, `"anthropic"`, `"gemini"`, `"openrouter"`,
+    /// `"zai"`, `"moonshot"`, `"deepseek"`, `"ollama"`. The string is
+    /// validated at provider-build time and surfaces as `Provider::kind()`
+    /// (so every persisted history row carries it). Required.
+    pub kind: String,
     /// Human-facing display name; not yet surfaced in the TUI.
     #[serde(default)]
     pub name: Option<String>,
@@ -79,28 +86,25 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_model_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
-    /// 0..=100 → provider-specific scale not implemented yet.
+    /// 0..=100 → mapped to the provider's reasoning-effort scale at request
+    /// time. The OpenRouter Responses provider maps this onto the
+    /// `low`/`medium`/`high` effort enum.
     #[serde(default)]
     pub reasoning_effort: Option<u8>,
-    /// 0..=100 → provider-specific scale not implemented yet.
+    /// 0..=100 → mapped to a provider service-tier label at request time.
+    /// The OpenRouter Responses provider maps to `flex`/`default`/`priority`.
     #[serde(default)]
     pub service_tier: Option<u8>,
 }
 
-/// Wire-specific extras for the OpenAI chat-completions wire. Bound by
-/// the `ProviderCache` at `model_provider_extensions::<provider_id>` and
+/// Wire-specific extras for the genai-backed provider. Bound by the
+/// `ProviderCache` at `model_provider_extensions::<provider_id>` and
 /// passed by value to the provider impl's `new` as its associated
-/// `Extras` type. Other wires' implementations carry their own extras
-/// type; the cache deserialises whichever shape the impl declares.
+/// `Extras` type. Empty today — the wire selector lives on
+/// `ProviderConfig.kind`, not here. Kept as the binding target so
+/// config tables continue to round-trip and new knobs have a home.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct ResponsesModelExtras {
-    /// JSON-encoded object. Shallow-merged into the chat-completion body
-    /// at request time; keys here override our built-ins. Intended for
-    /// vendor-specific knobs (e.g. OpenRouter's
-    /// `{"provider": {"order": [...]}}`).
-    #[serde(default)]
-    pub extra_completion_properties: Option<String>,
-}
+pub struct GenAIExtras {}
 
 fn default_request_max_retries() -> u32 {
     4

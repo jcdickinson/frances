@@ -19,6 +19,7 @@ frances-core.workspace = true
 frances-models-llm.workspace = true
 futures.workspace = true
 futures-util.workspace = true
+genai.workspace = true
 parking_lot.workspace = true
 reqwest.workspace = true
 serde.workspace = true
