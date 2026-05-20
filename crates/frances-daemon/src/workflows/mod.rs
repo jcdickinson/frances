@@ -811,6 +811,9 @@ async fn emit(
         HostFrame::Close { id: frame_id } => {
             state.close_one(stream, frame_id).await?;
         }
+        HostFrame::Usage(usage) => {
+            write_message(stream, &StreamFrame::Usage(usage)).await?;
+        }
         HostFrame::Permission {
             request,
             allow_auto,

@@ -111,7 +111,9 @@ const SYSTEM_PROMPT =
   "`task_complete` with an outcome, summary, and concrete proof. A separate " +
   "referee model will approve or decline the completion. On approval, your " +
   "conversation context is cleared and you are restarted with the whole plan " +
-  "(each step title, body, and completed proof) plus the current location.";
+  "(each step title, body, and completed proof) plus the current location." +
+  "Occassionally provide updates on what you are trying to do, don't just " +
+  "present the user with a stream of tool calls.";
 
 function _okResult(call_id: string, content: string): ToolResult {
   return { role: "tool", call_id, content, is_error: false };

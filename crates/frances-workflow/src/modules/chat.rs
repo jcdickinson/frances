@@ -50,7 +50,7 @@ use rquickjs::{
 use serde_json::Value as JsonValue;
 use std::collections::HashSet;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::sync::mpsc::{self, UnboundedReceiver};
+use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +62,7 @@ use frances_models_llm::chat::{
 use frances_models_llm::wire::{StreamEvent, ToolCall, ToolDef, ToolFunction};
 
 use crate::deps::WorkflowDeps;
+use crate::runtime::HostFrame;
 
 type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManagerTrait>::Session;
 
@@ -74,7 +75,9 @@ type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManager
 pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
+    frames_tx: UnboundedSender<HostFrame>,
 ) -> JsResult<(Constructor<'js>, Function<'js>)> {
+    let ctor_frames_tx = frames_tx.clone();
     let ctor = Constructor::new_class::<ChatSessionJs<D>, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| -> JsResult<Class<'js, ChatSessionJs<D>>> {
@@ -88,6 +91,7 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
                 ChatSessionJs::<D> {
                     handle,
                     deps: deps.clone(),
+                    frames_tx: ctor_frames_tx.clone(),
                     system_locked: AtomicBool::new(false),
                 },
             )?;
@@ -118,6 +122,10 @@ pub struct ChatSessionJs<D: WorkflowDeps> {
     /// Captured at construction so each `stream()` call can resolve env
     /// vars (auth, etc.) against the latest client attach snapshot.
     deps: D,
+    /// Side-channel for emitting `HostFrame::Usage` when the LLM
+    /// stream reports token usage. Independent of the JS-visible
+    /// event stream so workflows don't have to remember to forward it.
+    frames_tx: UnboundedSender<HostFrame>,
     /// Flipped once the first `user` message is pushed. After that,
     /// `system` pushes throw.
     system_locked: AtomicBool,
@@ -485,9 +493,13 @@ fn start_stream<'js, D: WorkflowDeps>(
     max_tool_calls: Option<usize>,
 ) -> JsResult<Value<'js>> {
     let tool_defs = snapshot_tools::<D>(ctx, session)?;
-    let (handle, env) = {
+    let (handle, env, frames_tx) = {
         let borrow = session.borrow();
-        (borrow.handle.clone(), borrow.deps.current_env())
+        (
+            borrow.handle.clone(),
+            borrow.deps.current_env(),
+            borrow.frames_tx.clone(),
+        )
     };
 
     let (event_tx, event_rx) = mpsc::unbounded_channel::<StreamEvent>();
@@ -506,10 +518,15 @@ fn start_stream<'js, D: WorkflowDeps>(
         async move {
             let tx_for_callback = event_tx.clone();
             let usage_for_callback = usage_capture.clone();
+            let frames_for_callback = frames_tx;
             let on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send> =
                 Box::new(move |event| {
                     if let StreamEvent::Usage(u) = &event {
                         *usage_for_callback.lock() = Some(u.clone());
+                        // Side-channel to the host so the TUI footer
+                        // updates. Best-effort: if the host is gone the
+                        // workflow is shutting down anyway.
+                        let _ = frames_for_callback.send(HostFrame::Usage(u.clone()));
                     }
                     let _ = tx_for_callback.send(event);
                     Ok(())

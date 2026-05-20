@@ -73,6 +73,11 @@ pub enum HostFrame {
         request: PermissionRequest,
         allow_auto: bool,
     },
+    /// Token usage for the just-finished LLM turn. The daemon
+    /// translates this to `StreamFrame::Usage`; it opens / closes
+    /// no block and is not persisted (the TUI drops `Usage` during
+    /// replay, so persisting it would only re-render stale numbers).
+    Usage(frances_models_llm::wire::Usage),
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -940,6 +945,7 @@ mod tests {
             HostFrame::Permission { request, .. } => {
                 format!("[approval:{}] {}", request.id, request.prompt)
             }
+            HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
         }
     }
 
