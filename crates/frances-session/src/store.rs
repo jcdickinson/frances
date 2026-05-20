@@ -1,9 +1,9 @@
-//! Daemon-side wiring around the workspace-shared [`Database`].
+//! Session-runtime wiring around the workspace-shared [`Database`].
 //!
 //! [`Database`] itself lives in `frances-storage` so that crates
-//! outside the daemon (the workflow runtime, in particular) hold the
+//! outside the session runtime (the workflow runtime, in particular) hold the
 //! same lock when they touch the per-session turso connection. This
-//! module just exposes the daemon's open-and-migrate flow plus an
+//! module just exposes the runtime's open-and-migrate flow plus an
 //! in-memory variant for tests.
 
 use frances_storage::MigrationError;
@@ -21,7 +21,7 @@ pub enum DatabaseError {
     Migration(#[from] MigrationError),
 }
 
-/// Open the per-session database and run every daemon-side schema.
+/// Open the per-session database and run every session-runtime schema.
 pub async fn open(session: &Session) -> std::result::Result<Database, DatabaseError> {
     let path = session.database_path();
     trace!(path = %path.display(), "opening turso database");
@@ -32,7 +32,7 @@ pub async fn open(session: &Session) -> std::result::Result<Database, DatabaseEr
     Ok(db)
 }
 
-/// Build a fresh in-memory database with all daemon schemas applied.
+/// Build a fresh in-memory database with all session-runtime schemas applied.
 /// Test fixtures want a turso connection with no on-disk state — using
 /// `":memory:"` keeps everything in-process: no tempdir, no I/O.
 #[cfg(test)]

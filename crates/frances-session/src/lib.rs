@@ -4,12 +4,10 @@ mod error;
 pub mod events;
 pub mod history;
 pub mod llm;
-pub mod protocol;
 pub mod runtime;
 pub mod scrollback;
 pub mod session;
 pub mod store;
-pub mod transport;
 pub mod tty;
 pub mod workflows;
 

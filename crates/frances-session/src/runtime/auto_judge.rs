@@ -1,16 +1,16 @@
 //! LLM-backed auto-approver for permission gates flagged with
 //! `allow_auto = true`.
 //!
-//! When a workflow opts a gate into auto, the daemon's emit loop
+//! When a workflow opts a gate into auto, the runtime's emit loop
 //! calls [`judge`] before forwarding the request to the TUI. The
 //! judge walks the model-intent fallback `["auto", "referee", "cheap"]`
 //! and gives the chosen model two tools — `approve` and `reject`,
 //! each taking a single `reason` string. The decision is the *tool
 //! the model picked*; the reason is informational.
 //!
-//! On `Approve` the daemon resolves the permission's oneshot
+//! On `Approve` the runtime resolves the permission's oneshot
 //! directly and the TUI never sees the prompt. On `Reject` or
-//! `Indeterminate` the daemon falls through to the user — the
+//! `Indeterminate` the runtime falls through to the user — the
 //! judge is an opt-in fast path, not an authority on denial.
 //!
 //! The judge does not see history. It does not see the structured

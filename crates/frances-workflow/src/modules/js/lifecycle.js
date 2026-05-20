@@ -7,7 +7,7 @@
 //
 // The module body kicks off a background async IIFE that awaits the
 // host's shutdown signal (either `workflow.exit()` or a dehydrate
-// request from the daemon). When the signal fires, the IIFE runs the
+// request from the runtime). When the signal fires, the IIFE runs the
 // registered handler (if any) and then closes the inbox so any
 // `for await (const input of inbox)` loop in user code unwinds.
 

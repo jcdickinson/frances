@@ -329,7 +329,7 @@ impl ScrollbackContainer {
     /// invisible to the live viewport (this is the alt-screen
     /// inspector's content only).
     ///
-    /// Used by the daemon-driven scrollback replay path: each restored
+    /// Used by the runtime-driven scrollback replay path: each restored
     /// block is built the same way a live one would be, then handed to
     /// `push_committed` so the inspector shows it without the TUI ever
     /// painting it on the live screen.
@@ -368,7 +368,7 @@ impl ScrollbackContainer {
         let footer_anchor_before = self.next_y;
 
         // Drop every in-memory deque. The alt-screen inspector will be
-        // re-seeded from the daemon's replay burst that follows.
+        // re-seeded from the runtime's replay burst that follows.
         self.committed.clear();
         self.safe.clear();
         self.active.clear();

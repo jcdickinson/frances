@@ -32,7 +32,7 @@ on so far for the new TUI — the terminal rendering layer that lives in the
 └─────────────────────────────────────┘
 ```
 
-`frances-blocks` is shared with `frances-daemon`: the daemon decides what
+`frances-blocks` is shared with `frances-session`: the session runtime decides what
 blocks to emit, the TUI renders them. No deps trait — pure data types and
 render impls.
 
@@ -73,7 +73,7 @@ pub enum Block {
 ```
 
 Application-specific concepts (tool calls, agent messages, …) are *not*
-block variants — they're composed at the daemon layer from these
+block variants — they're composed at the session-runtime layer from these
 primitives. Keeping the block set small and generic is what lets the
 protocol stay clean.
 
@@ -91,7 +91,7 @@ chat sessions with thousands of blocks cost the same as ten.
 
 ### IDs and streaming updates
 
-Blocks have IDs. The daemon issues `push(id, block)` to create and
+Blocks have IDs. The session runtime issues `push(id, block)` to create and
 `update(id, block)` to replace (or `append(id, fragment)` for streaming
 text into an existing block — see open questions). Updates that target
 the visible window re-render the tail from that block down. Updates
@@ -101,7 +101,7 @@ are silently dropped — the terminal owns those cells.
 ### Frames
 
 A `Frame` is an addressable group of child blocks rendered contiguously.
-The daemon protocol references frames by ID; child blocks are internal.
+The runtime references frames by ID; child blocks are internal.
 This is what makes "the LLM is streaming and just added a code block in
 the middle of its message" expressible: update the frame's children.
 
@@ -146,7 +146,7 @@ This is what we plan to implement next — a separate doc / plan.
 - **UI widgets** for the viewport (input area, dialog widgets,
   status bar). They live in the viewport, are stateful, and don't enter
   history. They'll likely share the same scripting protocol as blocks
-  (so the daemon can script both uniformly), but the rendering paths are
+  (so the runtime can script both uniformly), but the rendering paths are
   different.
 - Image / sixel / kitty graphics in blocks. Punt until needed; render a
   placeholder if encountered.

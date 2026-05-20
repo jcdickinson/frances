@@ -30,24 +30,24 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
 
     /// Factory for the `frances:v1/tools/shell` `Shell` primitive. The
-    /// daemon impl wraps `frances_shell::Shell::spawn` with whatever cwd
+    /// session-runtime impl wraps `frances_shell::Shell::spawn` with whatever cwd
     /// / env / init-script policy it cares about; tests stub it out.
     fn shell_factory(&self) -> &Self::ShellFactory;
 
     /// Factory for the `frances:v1/tools/file` `Editor` primitive. Hands
     /// out a clone of the host's session-scoped `EditSession` so all
-    /// workflow invocations within the same daemon session see the same
+    /// workflow invocations within the same runtime see the same
     /// anchor cache.
     fn editor_factory(&self) -> &Self::EditorFactory;
 
     /// Gateway for the `frances:v1/approval` `approve()` function. The
-    /// daemon impl bridges to the TUI; tests stub it.
+    /// session-runtime impl bridges to the TUI; tests stub it.
     fn permissions(&self) -> &Self::Permissions;
 
     /// Snapshot of the most recently attached client's environment.
     /// Used by `ChatSession.stream()` so the provider can resolve auth
     /// env vars (e.g. `OPENROUTER_API_KEY`) against the client process,
-    /// not the daemon process. Returns an empty map if no client has
+    /// not the session-runtime process. Returns an empty map if no client has
     /// attached yet.
     fn current_env(&self) -> HashMap<OsString, OsString>;
 
@@ -79,7 +79,7 @@ pub trait ShellFactory: Clone + Send + Sync + 'static {
     fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send;
 }
 
-/// Hands out the host's session-scoped `EditSession`. The daemon's impl
+/// Hands out the host's session-scoped `EditSession`. The runtime's impl
 /// returns clones of an `Arc` to the singleton stored on `ServerState`;
 /// tests construct fresh sessions with a `FakeStore`.
 pub trait EditorFactory: Clone + Send + Sync + 'static {

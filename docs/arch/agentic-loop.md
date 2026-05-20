@@ -11,7 +11,7 @@ The default agentic loop most tools ship — single rolling transcript, time- or
 - **The plan becomes gospel.** Once the original reasoning is compacted away, the agent can no longer judge whether the plan is still right — it just executes.
 - **Knowledge dies at session end.** Anything learned about the codebase is gone next time you run the tool.
 
-Frances has substrate that fixes most of this — a per-session libsql DB that already persists every turn, a daemon that owns the lifecycle, an existing word-anchor system. The design here leans on that substrate to build something better than the default.
+Frances has substrate that fixes most of this — a per-session libsql DB that already persists every turn, an in-process session runtime that owns the lifecycle, an existing word-anchor system. The design here leans on that substrate to build something better than the default.
 
 ## Shape, end to end
 
@@ -44,4 +44,4 @@ Layer 1 should be designed *anticipating* layers 2 and 3: stable IDs on findings
 
 ## What this replaces
 
-The current `frances` binary has none of this — there's a session, a streaming LLM call, an edit tool, and a transcript. There's no plan structure, no step concept, no checkpoint, no recall, no project knowledge. This design is greenfield within the existing daemon/session/edit-session scaffolding; it does not require rewriting [`docs/arch/daemon.md`](daemon.md) or [`docs/arch/edit-engine.md`](edit-engine.md), only building on top of them.
+The current `frances` binary has none of this — there's a session, a streaming LLM call, an edit tool, and a transcript. There's no plan structure, no step concept, no checkpoint, no recall, no project knowledge. This design is greenfield within the existing session-runtime/edit-session scaffolding; it does not require rewriting [`docs/arch/session-runtime.md`](session-runtime.md) or [`docs/arch/edit-engine.md`](edit-engine.md), only building on top of them.

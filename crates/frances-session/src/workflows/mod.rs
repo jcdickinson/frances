@@ -48,7 +48,6 @@ use crate::events::{BlockId, BlockKind, StreamFrame};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
-
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
     FrameId, FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle,
@@ -103,7 +102,7 @@ pub struct WorkflowStack {
 
 impl WorkflowStack {
     /// Builds an empty in-memory stack bound to `db`. Layering across
-    /// daemon restarts lives entirely in the per-session
+    /// process restarts lives entirely in the per-session
     /// `workflow_stack` table on this database.
     pub fn new(db: Database) -> Self {
         Self {
@@ -112,7 +111,7 @@ impl WorkflowStack {
         }
     }
 
-    /// Per-session [`Database`] handle. Same lock the rest of the daemon
+    /// Per-session [`Database`] handle. Same lock the rest of the runtime
     /// uses; cheap clone for callers (like scrollback replay) that want
     /// to issue SQL against it without going through the stack itself.
     pub fn db(&self) -> &Database {
@@ -279,7 +278,7 @@ impl EmitState {
     }
 
     /// Persist an error row alongside the in-flight stream's `Error`
-    /// frame so it survives daemon restarts and workflow switches.
+    /// frame so it survives process restarts and workflow switches.
     async fn persist_error(&self, text: &str) -> Result<()> {
         crate::scrollback::persist_error(&self.db, self.instance_id, text).await?;
         Ok(())
@@ -291,10 +290,7 @@ impl EmitState {
 /// to the topmost workflow. Always finishes one "cycle" — i.e. drives
 /// the topmost workflow until it parks waiting for input or
 /// terminates.
-pub(crate) async fn cycle(
-    runtime: &Arc<SessionRuntime>,
-    text: &str,
-) -> Result<()> {
+pub(crate) async fn cycle(runtime: &Arc<SessionRuntime>, text: &str) -> Result<()> {
     match parse_slash_command(text) {
         Ok(Some((name, args))) => push_and_drive(runtime, name, args).await,
         Ok(None) => dispatch_topmost(runtime, text).await,
@@ -314,7 +310,7 @@ pub(crate) async fn cycle(
 ///
 /// Errors during hydration (missing config, migration drift, runtime
 /// error) cascade through [`drop_active_and_promote`] until a row
-/// hydrates cleanly or the live stack is exhausted. The daemon is
+/// hydrates cleanly or the live stack is exhausted. The runtime is
 /// always usable when this returns.
 pub(crate) async fn restore_or_seed(runtime: &Arc<SessionRuntime>) -> Result<()> {
     let db = &runtime.workflow_stack.db;
@@ -399,7 +395,9 @@ async fn push_and_drive(
     let migrations = match load_migrations(cfg).await {
         Ok(m) => m,
         Err(error) => {
-            runtime.events.send(StreamFrame::Error(format!("workflow: {error}")));
+            runtime
+                .events
+                .send(StreamFrame::Error(format!("workflow: {error}")));
             return Ok(());
         }
     };
@@ -418,7 +416,9 @@ async fn push_and_drive(
     let handle = match runtime.workflow_runtime.start(invocation).await {
         Ok(handle) => handle,
         Err(error) => {
-            runtime.events.send(StreamFrame::Error(format!("workflow: {error}")));
+            runtime
+                .events
+                .send(StreamFrame::Error(format!("workflow: {error}")));
             return Ok(());
         }
     };
@@ -439,7 +439,8 @@ async fn push_and_drive(
     // and replay the new active instance's (empty on a fresh push, but
     // we run the burst anyway for protocol uniformity — and for the
     // future "resume previously-popped" case which would have rows).
-    crate::scrollback::replay_to_channel(&runtime.events, &runtime.workflow_stack.db, instance_id).await?;
+    crate::scrollback::replay_to_channel(&runtime.events, &runtime.workflow_stack.db, instance_id)
+        .await?;
 
     let mut new_instance = WorkflowInstance {
         handle,
@@ -460,10 +461,7 @@ async fn push_and_drive(
 
 /// Hand `text` to the topmost workflow's inbox and drive a cycle. On
 /// exit, tombstone the row and rehydrate the next live row (if any).
-async fn dispatch_topmost(
-    runtime: &Arc<SessionRuntime>,
-    text: &str,
-) -> Result<()> {
+async fn dispatch_topmost(runtime: &Arc<SessionRuntime>, text: &str) -> Result<()> {
     let mut top = match runtime.workflow_stack.top.lock().await.take() {
         Some(top) => top,
         None => {
@@ -535,10 +533,7 @@ async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, Workflo
 /// Dropping `instance` at the end aborts the spawned task as a final
 /// fallback — but in practice the body has already exited by the time
 /// we get here unless the timeout fired.
-async fn dehydrate(
-    runtime: &Arc<SessionRuntime>,
-    mut instance: WorkflowInstance,
-) -> Result<()> {
+async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance) -> Result<()> {
     instance.handle.request_shutdown();
     let deadline = tokio::time::sleep(DEHYDRATE_TIMEOUT);
     tokio::pin!(deadline);
@@ -586,10 +581,7 @@ async fn dehydrate(
 /// Drains the instance's host-frame channel until the body either
 /// parks waiting for input or terminates. Returns `true` if the body
 /// exited.
-async fn drive(
-    runtime: &Arc<SessionRuntime>,
-    instance: &mut WorkflowInstance,
-) -> Result<bool> {
+async fn drive(runtime: &Arc<SessionRuntime>, instance: &mut WorkflowInstance) -> Result<bool> {
     loop {
         while let Ok(host_frame) = instance.handle.frames.try_recv() {
             emit(runtime, &mut instance.emit, host_frame).await?;
@@ -853,10 +845,7 @@ fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::event
 /// memory (if any). If hydration fails, recurse — tombstoning the
 /// failed row's branch — until either a row hydrates cleanly or the
 /// live stack is exhausted (top stays `None`).
-async fn drop_active_and_promote(
-    runtime: &Arc<SessionRuntime>,
-    instance_id: Uuid,
-) -> Result<()> {
+async fn drop_active_and_promote(runtime: &Arc<SessionRuntime>, instance_id: Uuid) -> Result<()> {
     mark_completed_and_promote(&runtime.workflow_stack.db, instance_id).await?;
     hydrate_active_or_cascade(runtime).await?;
     // Tell the TUI to clear scrollback and replay the newly-promoted
@@ -1158,7 +1147,7 @@ mod tests {
     //! These exercise the SQL layer in isolation against a fresh
     //! in-memory turso connection — no runtime, no `ServerState`. The
     //! end-to-end hydrate/dehydrate path is covered by the workflow
-    //! runtime's own test suite plus exercises the daemon's other
+    //! runtime's own test suite plus exercises the rest of the session's other
     //! integration tests indirectly.
     use super::*;
     use frances_storage::run_all;
@@ -1291,7 +1280,7 @@ mod tests {
         insert_pushed_row(&db, "b", b, &[]).await.unwrap();
 
         // Forcibly clear `active` from B without tombstoning it. This
-        // simulates a crash where the daemon went down mid-pop after
+        // simulates a crash where the runtime went down mid-pop after
         // clearing active but before setting completed_at.
         {
             let conn = db.connect().await;

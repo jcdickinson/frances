@@ -278,22 +278,6 @@ impl Paths {
 }
 
 impl Session {
-    pub fn control_socket_path(&self) -> PathBuf {
-        self.runtime_dir.join("control.sock")
-    }
-
-    pub fn client_socket_path(&self) -> PathBuf {
-        self.runtime_dir.join("client.sock")
-    }
-
-    pub fn events_socket_path(&self) -> PathBuf {
-        self.runtime_dir.join("events.sock")
-    }
-
-    pub fn pid_path(&self) -> PathBuf {
-        self.runtime_dir.join("daemon.pid")
-    }
-
     pub fn metadata_path(&self) -> PathBuf {
         self.dir.join(METADATA_FILE)
     }

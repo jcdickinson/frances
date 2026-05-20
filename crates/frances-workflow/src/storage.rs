@@ -1,9 +1,9 @@
 //! Per-workflow SQL surface.
 //!
 //! Each workflow declares migrations under its [`Uuid`] in TOML; the
-//! daemon applies them on first touch and hands back a [`WorkflowDb`]
+//! runtime applies them on first touch and hands back a [`WorkflowDb`]
 //! handle. Tables live in the per-session turso database alongside the
-//! daemon's own; no row-level partitioning — the workflow owns its
+//! runtime's own; no row-level partitioning — the workflow owns its
 //! table names.
 //!
 //! `WorkflowDb` exposes a minimal async surface: `exec`, `query`,

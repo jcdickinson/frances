@@ -41,10 +41,8 @@ async fn real_main() -> Result<()> {
     let tty_key = tty::controlling_tty_key()?;
     let paths = Paths::discover()?;
 
-    if matches!(cli.command, Some(Command::New)) {
-        if paths.resolve_tty_link(&tty_key)?.is_some() {
-            paths.unlink_tty(&tty_key)?;
-        }
+    if matches!(cli.command, Some(Command::New)) && paths.resolve_tty_link(&tty_key)?.is_some() {
+        paths.unlink_tty(&tty_key)?;
     }
 
     let invocation = InvocationContext::capture(Some(tty_key.clone()));

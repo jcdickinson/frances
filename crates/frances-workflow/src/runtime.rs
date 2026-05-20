@@ -39,7 +39,7 @@ use crate::transpile::{SourceKind, ts_to_js};
 /// `frances:v1/*` namespace so the two don't visually clash.
 const USER_MODULE_NAME: &str = "frances:user-script";
 
-/// Frames a workflow can emit during a turn. The daemon receiver maps
+/// Frames a workflow can emit during a turn. The host receiver maps
 /// these onto the wire `StreamFrame` protocol; this enum is the
 /// host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
@@ -67,13 +67,13 @@ pub enum HostFrame {
     ///
     /// `allow_auto` flags the gate as eligible for the host's
     /// auto-approver. It rides on the host frame (not on the wire
-    /// `PermissionRequest`) so the daemon's emit loop can read it
+    /// `PermissionRequest`) so the runtime's emit loop can read it
     /// without a side lookup, and so it never leaks to the TUI.
     Permission {
         request: PermissionRequest,
         allow_auto: bool,
     },
-    /// Token usage for the just-finished LLM turn. The daemon
+    /// Token usage for the just-finished LLM turn. The runtime
     /// translates this to `StreamFrame::Usage`; it opens / closes
     /// no block and is not persisted (the TUI drops `Usage` during
     /// replay, so persisting it would only re-render stale numbers).
@@ -99,7 +99,7 @@ pub enum FrameKind {
     /// renders it as a block prefix. `None` ⇒ no prefix.
     ///
     /// `content` is `None` when the workflow constructed the frame
-    /// without an initial body — the daemon sends a `BlockDelta` with
+    /// without an initial body — the runtime sends a `BlockDelta` with
     /// `text: None`, the client tracks the id but doesn't measure or
     /// render it. The first `append` materialises the block.
     Markdown {
@@ -167,7 +167,7 @@ impl<'js> IntoJs<'js> for UserInput {
     }
 }
 
-/// Inputs the daemon supplies for one workflow invocation.
+/// Inputs the runtime supplies for one workflow invocation.
 #[derive(Default)]
 pub struct Invocation {
     pub source_path: PathBuf,
@@ -177,7 +177,7 @@ pub struct Invocation {
     /// tests don't care about storage.
     pub entity: uuid::Uuid,
     /// Per-invocation instance uuid exposed to JS as
-    /// `import.meta.instance`. The daemon allocates one fresh on a new
+    /// `import.meta.instance`. The runtime allocates one fresh on a new
     /// push and round-trips it through `workflow_stack` so a restored
     /// instance reads the same value out of `import.meta.instance`.
     /// [`uuid::Uuid::nil`] when tests don't care.
@@ -187,7 +187,7 @@ pub struct Invocation {
     pub migrations: Vec<frances_storage::Migration>,
 }
 
-/// Handle to a running workflow. The daemon owns this; it delivers user
+/// Handle to a running workflow. The session runtime owns this; it delivers user
 /// input via [`Self::input_tx`], drains frames from [`Self::frames`],
 /// and learns about lifecycle transitions through [`Self::parked`] and
 /// [`Self::done`].
@@ -198,7 +198,7 @@ pub struct WorkflowHandle {
     pub frames: UnboundedReceiver<HostFrame>,
     /// Notified each time the body suspends on `inbox.next()` with an
     /// empty queue — i.e. the body is parked waiting for input. One
-    /// pulse per park; the daemon uses this to detect end-of-cycle.
+    /// pulse per park; the runtime uses this to detect end-of-cycle.
     pub parked: Arc<Notify>,
     /// Resolves when the workflow terminates (body settled or `exit()`
     /// called). The inner result mirrors the body's outcome.
@@ -218,7 +218,7 @@ pub struct WorkflowHandle {
 impl WorkflowHandle {
     /// Pulse the shutdown signal. The body's
     /// `lifecycle.shutdown` hook fires (if registered), then the inbox
-    /// closes; the daemon drains remaining frames and awaits
+    /// closes; the runtime drains remaining frames and awaits
     /// [`Self::done`] to complete the wind-down. Idempotent — repeated
     /// calls are no-ops because `Notify` only delivers to currently-
     /// registered waiters and the lifecycle IIFE waits exactly once.
@@ -227,7 +227,7 @@ impl WorkflowHandle {
     }
 }
 
-/// Workflow script runtime. One per daemon; cheap to share via `Arc`.
+/// Workflow script runtime. One per runtime; cheap to share via `Arc`.
 pub struct Runtime<D: WorkflowDeps> {
     js: AsyncRuntime,
     transpile_cache: Arc<StdMutex<TranspileCache>>,
@@ -253,7 +253,7 @@ impl<D: WorkflowDeps> Runtime<D> {
     /// Start a workflow. Reads + transpiles the source, resolves the
     /// per-workflow [`WorkflowDb`] handle (applying migrations on first
     /// touch), then spawns the body on a Tokio task and returns a
-    /// handle the daemon uses to drive it.
+    /// handle the host uses to drive it.
     ///
     /// Async because [`WorkflowDeps::workflow_db`] is async — both the
     /// migrator and the cache lookup go through it.
@@ -1407,7 +1407,7 @@ mod tests {
     }
 
     /// Pushing an empty-content frame and never writing to it produces
-    /// `Push` + `Close` only — no `Append` in between. The daemon side
+    /// `Push` + `Close` only — no `Append` in between. The runtime side
     /// uses this signal to skip persisting the row and the client uses
     /// the absent body delta to skip rendering.
     #[tokio::test]

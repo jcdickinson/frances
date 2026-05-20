@@ -1,7 +1,7 @@
 // `frances:v1/tools/file` — anchor-aware Editor primitive + per-op
 // tool classes for `chat.tools.push(...)`.
 //
-// `Editor` is a Rust-backed handle on the daemon's session-scoped
+// `Editor` is a Rust-backed handle on the runtime's session-scoped
 // `EditSession`. Each `new Editor()` returns a clone of the same
 // underlying session so the anchor cache is shared across a workflow.
 // The tool classes are thin JS wrappers around Editor's three methods

@@ -130,7 +130,7 @@ impl provider::Provider for Provider {
         let plan = RequestPlan::build(&self.provider_config, req.model, req.env)?;
 
         // Trace incoming tool-related inputs before forge so the round-
-        // trip with the model is visible in the daemon trace stream.
+        // trip with the model is visible in the session runtime trace stream.
         for input in req.new_inputs {
             match input {
                 HistoryInput::ToolCall {

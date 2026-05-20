@@ -34,7 +34,7 @@ pub trait Block {
 /// Wraps another [`Block`] with a dim "(truncated)" indicator on the
 /// row below. Used by the container's `clear` path to mark in-flight
 /// active blocks before they're moved into native scrollback, and by
-/// the daemon's replay path for blocks whose workflow was dehydrated
+/// the runtime's replay path for blocks whose workflow was dehydrated
 /// mid-stream (received as `StreamFrame::BlockTruncated`).
 ///
 /// The wrapped block keeps its full row count; the indicator adds

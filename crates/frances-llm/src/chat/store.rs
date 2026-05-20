@@ -7,7 +7,7 @@ use frances_models_llm::chat::{
     ChatSessionId, ChatSessionRow, HistoryError, OwnedHistoryInput, RowId,
 };
 
-/// Persistence boundary for chat sessions. The daemon impls this on its
+/// Persistence boundary for chat sessions. The session-runtime impls this on its
 /// turso-backed store; tests can mock it.
 #[async_trait]
 pub trait HistoryStore: Send + Sync + 'static {

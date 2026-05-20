@@ -39,7 +39,7 @@ pub enum HistoryInput<'a> {
 /// `History` events carry the wire-shape JSON the provider would put back
 /// into the next request. The provider emits one (or more) per
 /// `req.new_inputs` entry it forges, plus one (or more) for the assistant
-/// turn it just produced. The daemon caches them verbatim.
+/// turn it just produced. The runtime caches them verbatim.
 ///
 /// `ToolCall` events are emitted once each as a fully-parsed [`ToolCall`].
 /// OpenAI-shaped wires can't reliably mark per-call completion mid-stream,

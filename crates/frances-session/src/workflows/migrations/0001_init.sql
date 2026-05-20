@@ -11,7 +11,7 @@ CREATE TABLE IF NOT EXISTS workflow_stack (
     -- entry to look up when rehydrating.
     config_key   TEXT    NOT NULL,
     -- Instance UUID exposed to JS as `import.meta.instance`. Stable
-    -- across daemon restarts; allocated once per push.
+    -- across process restarts; allocated once per push.
     instance_id  BLOB    NOT NULL UNIQUE,
     -- Args this instance was invoked with. JSON array of strings,
     -- stored as TEXT (we never query into the array — it round-trips

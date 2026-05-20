@@ -198,7 +198,7 @@ async function _closeShellFrame(shell, terminal) {
       // Already closed/errored — fine.
     }
   } else {
-    // No writer? Close the frame directly so the daemon gets a Close.
+    // No writer? Close the frame directly so the runtime gets a Close.
     try {
       frame.close();
     } catch (_) {
@@ -246,9 +246,9 @@ async function _askApproval(call) {
     choice = await approve({
       prompt,
       toolCall: { id: call.id, name: call.name, arguments: call.arguments },
-      // Opt this gate into the daemon's auto-judge. If `models.auto`
+      // Opt this gate into the runtime's auto-judge. If `models.auto`
       // (with fallback `referee`, then `cheap`) is configured, the
-      // daemon may approve without showing the user a prompt. On
+      // runtime may approve without showing the user a prompt. On
       // judge reject / error the request falls through to the user
       // exactly as if `allowAuto` were false.
       allowAuto: true,
@@ -257,7 +257,7 @@ async function _askApproval(call) {
     return _errResult(call.id, err);
   }
   if (choice.type === "yes") return null;
-  // `No` — either the user said no, or the daemon translated a
+  // `No` — either the user said no, or the runtime translated a
   // chat-redirect into a `No` (the user's text is dispatched as a
   // fresh prompt; we just return a denied tool_result here).
   const reason = choice.details ? ` Reason: ${choice.details}` : "";

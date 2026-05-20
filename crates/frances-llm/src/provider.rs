@@ -66,7 +66,7 @@ pub trait Provider: Send + Sync {
     where
         Self: Sized;
 
-    /// Batch wire-encoder. Used **only** at swap time, when the daemon
+    /// Batch wire-encoder. Used **only** at swap time, when the runtime
     /// rebuilds the entire history cache from primitive rows under a new
     /// provider's tag. The output `Vec` may be a different length than
     /// `inputs` — a provider can map one primitive to several wire

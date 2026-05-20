@@ -2,19 +2,19 @@
 //!
 //! A workflow asks the user "may I do this?" and waits for an answer.
 //! The shapes live in this crate because both the JS module
-//! (`frances:v1/approval`) and the host emit/consume them; the daemon
+//! (`frances:v1/approval`) and the host emit/consume them; the runtime
 //! re-exports `PermissionRequest` / `PermissionResponseWire` over its
 //! wire protocol verbatim.
 //!
 //! The wire response (`PermissionResponseWire`) and the workflow-facing
 //! response (`PermissionResponse`) deliberately differ. The wire form
 //! includes `RedirectToChat { content }` for the case where the user
-//! types text instead of yes/no; the daemon strips that variant — the
+//! types text instead of yes/no; the runtime strips that variant — the
 //! workflow only ever sees `Yes` / `No`. Keeping the two types separate
 //! means a script can never be handed a "response" it can't sanely
 //! consume.
 //!
-//! Serialization note: the daemon ↔ TUI wire is bincode, whose serde
+//! Serialization note: the runtime ↔ TUI wire is bincode, whose serde
 //! adapter is not self-describing and rejects internally-tagged enums
 //! (`#[serde(tag = "...")]`) with `Serde(AnyNotSupported)`. So the
 //! enums here use externally-tagged form (serde's default). The JS
@@ -51,7 +51,7 @@ pub struct PermissionRequest {
 }
 
 /// What the TUI sends back over the wire. Three variants: yes / no /
-/// user-redirected-to-chat. The daemon strips `RedirectToChat` before
+/// user-redirected-to-chat. The runtime strips `RedirectToChat` before
 /// resolving the workflow's oneshot.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PermissionResponseWire {
@@ -61,7 +61,7 @@ pub enum PermissionResponseWire {
 }
 
 /// What the workflow's oneshot resolves to. Just yes/no — redirect is
-/// handled daemon-side.
+/// handled session-runtime-side.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PermissionResponse {
     Yes { details: Option<String> },
@@ -81,7 +81,7 @@ pub trait Permissions: Clone + Send + Sync + 'static {
     ///
     /// `allow_auto` is not handled here — it rides on the
     /// `HostFrame::Permission` variant the caller emits, since only
-    /// the host frame's consumer (the daemon's emit loop) reads it.
+    /// the host frame's consumer (the runtime's emit loop) reads it.
     fn allocate(
         &self,
         prompt: String,

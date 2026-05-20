@@ -1,8 +1,8 @@
 //! `frances:v1/tools/file` — anchor-aware file editor primitive.
 //!
-//! `new Editor()` represents the daemon's session-scoped editor. Each
+//! `new Editor()` represents the session-scoped editor. Each
 //! construction returns a handle backed by the *same* `EditSession`
-//! held by the daemon, so all reads/edits across a workflow share the
+//! held by the runtime, so all reads/edits across a workflow share the
 //! anchor cache. The Rust side owns I/O (disk read, write, stat) and
 //! delegates anchor work to `frances_edit::EditSession`.
 //!
@@ -16,7 +16,7 @@
 //!   "Overwrite", path, ... }`. Returns the diff block (or full
 //!   anchored file for `New`).
 //!
-//! Paths are resolved against the daemon's most-recently-attached
+//! Paths are resolved against the runtime's most-recently-attached
 //! client cwd (`WorkflowDeps::current_cwd`) on every call, so re-attach
 //! with a new cwd takes effect immediately.
 //!

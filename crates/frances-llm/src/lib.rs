@@ -3,7 +3,7 @@
 //! Value types + workflow-facing traits live in `frances-models-llm`.
 //! This crate holds the concrete `Provider` impl(s), the
 //! `ProviderCache`, and the concrete `ChatSession`/`ChatSessionManager`
-//! that workflow and daemon use.
+//! that workflow and runtime use.
 
 pub mod chat;
 pub mod provider;

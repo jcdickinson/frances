@@ -17,7 +17,7 @@
 //! Rust does the work behind a single primitive `_approve(options)` on
 //! the install stash: parse the options object, allocate a
 //! `PermissionId` via the gateway, emit a `HostFrame::Permission(req)`
-//! so the daemon can forward it to the TUI, then await the gateway's
+//! so the runtime can forward it to the TUI, then await the gateway's
 //! response oneshot. If the workflow shuts down first, the await
 //! resolves to a synthetic `No { details: None }` so the JS body can
 //! unwind cleanly without throwing.
@@ -60,12 +60,12 @@ pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
             let (request, rx) = gateway.allocate(prompt, tool_call);
 
             // Best-effort emit; the receiver side is a tokio mpsc that
-            // outlives the workflow body (owned by the daemon's drive
+            // outlives the workflow body (owned by the runtime's drive
             // loop), so a closed channel here means the host is gone
             // and there's nothing to do but resolve the promise.
             //
             // `allow_auto` rides on the host frame, not on the wire
-            // `PermissionRequest` — the daemon's emit loop reads it
+            // `PermissionRequest` — the runtime's emit loop reads it
             // and either consults the auto-judge or forwards to the
             // TUI; the TUI never sees the flag.
             let _ = frames_tx.send(HostFrame::Permission {

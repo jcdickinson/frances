@@ -6,7 +6,7 @@
 //! [`Database`] wraps the underlying connection in an
 //! [`AsyncMutex`](tokio::sync::Mutex) — turso's `Connection` returns
 //! `Misuse("concurrent use forbidden")` if it sees overlapping calls
-//! from cloned handles, so every caller in the daemon, the workflow
+//! from cloned handles, so every caller in the session runtime, the workflow
 //! runtime, the LLM history store, and so on goes through
 //! [`Database::connect`] to acquire an [`ActiveDatabase`] guard. The
 //! guard dereferences to `&Connection` and releases the lock on drop
@@ -128,7 +128,7 @@ impl Drop for ActiveDatabase {
 /// One forward-only migration. `name` is the filename (or any stable
 /// label) and is shown in error messages; `sql` is its body.
 ///
-/// Both fields are [`Cow<'static, str>`] so daemon-side schemas can
+/// Both fields are [`Cow<'static, str>`] so session-runtime-side schemas can
 /// stay zero-copy on `include_str!` constants while workflow code
 /// constructs migrations from bytes read at runtime.
 #[derive(Clone)]
@@ -142,7 +142,7 @@ pub struct Migration {
 /// part of the public API of the subsystem — changing it orphans the
 /// existing tables.
 ///
-/// `migrations` is a [`Cow`] so the daemon's static schemas can stay
+/// `migrations` is a [`Cow`] so the runtime's static schemas can stay
 /// const-constructible (`Cow::Borrowed(&'static [..])`, instantiated
 /// as `EntitySchema<'static>`) while workflow code loaded at runtime
 /// can hand in either an owned [`Vec`] or a borrowed slice with a
@@ -582,7 +582,7 @@ mod tests {
 
     /// Workflow migrations are built from bytes loaded at runtime —
     /// proves an `EntitySchema` made entirely of owned `String`s
-    /// applies identically to the borrowed daemon-side flavor.
+    /// applies identically to the borrowed session-runtime-side flavor.
     #[tokio::test]
     async fn owned_schema_applies() {
         let conn = fresh_conn().await;

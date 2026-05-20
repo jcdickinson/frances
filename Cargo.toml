@@ -56,7 +56,6 @@ shellexpand = "3"
 similar = { version = "3.1", default-features = false }
 slotmap = "1"
 smallvec = "1"
-tarpc = { version = "0.37", features = ["tokio1", "serde1", "serde-transport", "serde-transport-bincode", "unix"] }
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

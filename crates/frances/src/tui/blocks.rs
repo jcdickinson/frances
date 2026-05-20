@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use frances_session::protocol::{BlockKind, ShellState};
+use frances_session::events::{BlockKind, ShellState};
 use frances_tui::Block;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -33,11 +33,11 @@ pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
 }
 
 pub struct DiffBlock {
-    lines: Vec<frances_session::protocol::DiffLine>,
+    lines: Vec<frances_session::events::DiffLine>,
 }
 
 impl DiffBlock {
-    pub fn new(lines: Vec<frances_session::protocol::DiffLine>) -> Self {
+    pub fn new(lines: Vec<frances_session::events::DiffLine>) -> Self {
         Self { lines }
     }
 }
@@ -48,11 +48,11 @@ impl Block for DiffBlock {
         let mut count = 0;
         for line in &self.lines {
             let content = match line {
-                frances_session::protocol::DiffLine::Context { text: c, line: l } => {
+                frances_session::events::DiffLine::Context { text: c, line: l } => {
                     format!("{:4} {}", l, c)
                 }
-                frances_session::protocol::DiffLine::Added(a) => a.to_string(),
-                frances_session::protocol::DiffLine::Removed(r) => r.to_string(),
+                frances_session::events::DiffLine::Added(a) => a.to_string(),
+                frances_session::events::DiffLine::Removed(r) => r.to_string(),
             };
             let mut out = Vec::new();
             wrap_into("", &content, max, &mut out);
@@ -66,15 +66,15 @@ impl Block for DiffBlock {
         let max = area.width.max(1) as usize;
         for line in &self.lines {
             let (content, style) = match line {
-                frances_session::protocol::DiffLine::Context { text: c, line: l } => {
+                frances_session::events::DiffLine::Context { text: c, line: l } => {
                     let formatted = format!("{:4} {}", l, c);
                     (formatted, Style::default())
                 }
-                frances_session::protocol::DiffLine::Added(a) => (
+                frances_session::events::DiffLine::Added(a) => (
                     a.to_string(),
                     Style::default().bg(Color::Green).fg(Color::Black),
                 ),
-                frances_session::protocol::DiffLine::Removed(r) => (
+                frances_session::events::DiffLine::Removed(r) => (
                     r.to_string(),
                     Style::default().bg(Color::Red).fg(Color::Black),
                 ),
@@ -352,7 +352,7 @@ fn shell_state_prefix_style(state: &ShellState) -> Style {
 /// History row that holds raw, pre-formatted lines and renders them
 /// verbatim (no kind prefix, no re-wrap). Used for banner rows, usage
 /// summaries, error / approval messages — anything not driven by the
-/// daemon's [`BlockKind`] protocol that still wants to live in the
+/// runtime's [`BlockKind`] vocabulary that still wants to live in the
 /// container's scrollback. `style` paints the whole block uniformly;
 /// ANSI variants only by convention (RGB stays available for future
 /// syntax-highlighted block types).

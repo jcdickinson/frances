@@ -2,7 +2,7 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     -- Opaque per-session identifier (UUID). Threaded into
     -- `ProviderRequest::session_id` so token caching scopes to this chat
-    -- and not the whole daemon.
+    -- and not the whole session runtime.
     session_id TEXT NOT NULL UNIQUE,
     -- JSON array of model intent names. Each entry keys into a
     -- `models::<intent>` config table; the session walks them in order

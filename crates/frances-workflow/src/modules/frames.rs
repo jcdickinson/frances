@@ -205,7 +205,7 @@ fn push_frame<'js>(
             id: FrameId(new_id),
             kind,
         }));
-        // One-shot: the daemon closes + persists this frame on its end
+        // One-shot: the runtime closes + persists this frame on its end
         // (see emit() for FrameKind::ToolUse). No HostFrame::Close from
         // the workflow side — keeps the JS API simple.
         return Ok(());
@@ -220,7 +220,7 @@ fn push_frame<'js>(
             id: FrameId(new_id),
             kind,
         }));
-        // One-shot — daemon seals on its side. Same shape as ToolUseFrame.
+        // One-shot — runtime seals on its side. Same shape as ToolUseFrame.
         return Ok(());
     }
     if let Some(json) = as_frame::<JsonFrame>(&frame) {
@@ -505,7 +505,7 @@ impl<'js> JsClass<'js> for ToolUseFrame {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `write` / `close` — one-shot, sealed on the daemon side.
+        // No `write` / `close` — one-shot, sealed on the runtime side.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -598,9 +598,9 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
 // ---------------------------------------------------------------------
 
 /// One-shot frame carrying a unified-diff payload. Constructed by the
-/// JS file tools after a successful mutation; the daemon translates each
+/// JS file tools after a successful mutation; the runtime translates each
 /// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff`
-/// block. Like `ToolUseFrame`, the daemon seals and persists the block
+/// block. Like `ToolUseFrame`, the runtime seals and persists the block
 /// — there is no `write` / `close` on the JS side.
 pub struct DiffFrame {
     #[expect(
@@ -628,7 +628,7 @@ impl<'js> JsClass<'js> for DiffFrame {
     type Mutable = rquickjs::class::Writable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `write` / `close` — one-shot, sealed daemon-side.
+        // No `write` / `close` — one-shot, sealed runtime-side.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -859,7 +859,7 @@ fn set_shell_state<'js>(
         );
     }
     state_atom.store(encode_shell_state(&new_state), Ordering::Release);
-    // Content is empty here — the daemon's UpdateKind handler emits a
+    // Content is empty here — the runtime's UpdateKind handler emits a
     // no-text BlockDelta carrying just the new kind. `cmd` rides along
     // because the wire `BlockKind::ShellOutput` carries it on every
     // delta.

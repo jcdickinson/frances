@@ -21,9 +21,7 @@ use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
-use frances_session::events::{
-    BlockKind, PermissionRequest, PermissionResponseWire, StreamFrame,
-};
+use frances_session::events::{BlockKind, PermissionRequest, PermissionResponseWire, StreamFrame};
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
@@ -118,7 +116,7 @@ impl LiveBlocks {
                     entry.container_id = Some(cid);
                     // One-shot kinds (no streaming body — `ToolUse` is
                     // emitted as `BlockDelta` + `BlockStop` back-to-back
-                    // by the daemon) should never carry the in-flight
+                    // by the runtime) should never carry the in-flight
                     // spinner. Flag them safe-to-commit immediately so
                     // they drain together with the next active prefix
                     // and the renderer suppresses the overlay even
@@ -139,7 +137,7 @@ impl LiveBlocks {
     /// Mark the block at `id` ready to commit. Returns the container
     /// slot if the block was ever materialised; an unmaterialised
     /// block (only ever saw `text: None`) returns `None` silently.
-    /// A `BlockStop` for a completely-unknown id is a daemon-side
+    /// A `BlockStop` for a completely-unknown id is a runtime-side
     /// protocol bug — we warn and return `None`.
     fn stop_or_recover(
         &mut self,
@@ -422,7 +420,7 @@ fn redraw(
 }
 
 /// Per-replay scratchpad: the same {id, kind, accumulated text}
-/// triple the daemon uses, mirrored on the TUI side. Carried in
+/// triple the runtime uses, mirrored on the TUI side. Carried in
 /// `App` state for the lifetime of one replay burst (between
 /// `ScrollbackReset` and `ScrollbackReplayEnd`).
 struct ReplayBlock {
@@ -532,7 +530,7 @@ fn handle_replay_frame(
             container.clear(terminal)?;
         }
         StreamFrame::ScrollbackReplayEnd => {
-            // Any half-built block at end is just dropped; the daemon
+            // Any half-built block at end is just dropped; the runtime
             // is expected to close every block it opens.
             REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
             *replay_mode = false;
@@ -554,7 +552,7 @@ fn handle_replay_frame(
                     }
                     _ => {
                         // Either nothing open, or a new id: drop any
-                        // orphan (the daemon is expected to close
+                        // orphan (the runtime is expected to close
                         // every block it opens) and start fresh.
                         *guard = Some(ReplayBlock {
                             id,
@@ -774,7 +772,7 @@ mod tests {
     }
 
     /// `BlockStop` for an id we don't have open is a protocol bug on
-    /// the daemon side. The TUI should not bail back to the CLI — it
+    /// the runtime side. The TUI should not bail back to the CLI — it
     /// should log and continue. `stop_or_recover` returns `None`.
     #[test]
     fn block_stop_for_unknown_id_does_not_bail() {
@@ -825,10 +823,30 @@ mod tests {
 
         // None-content frames in between: mixed senders, some closed,
         // some still tracked when block B opens.
-        state.delta(&mut container, frances_session::events::BlockId(2), frances(), None);
-        state.delta(&mut container, frances_session::events::BlockId(3), bare(), None);
-        state.delta(&mut container, frances_session::events::BlockId(4), you(), None);
-        state.delta(&mut container, frances_session::events::BlockId(5), bare(), None);
+        state.delta(
+            &mut container,
+            frances_session::events::BlockId(2),
+            frances(),
+            None,
+        );
+        state.delta(
+            &mut container,
+            frances_session::events::BlockId(3),
+            bare(),
+            None,
+        );
+        state.delta(
+            &mut container,
+            frances_session::events::BlockId(4),
+            you(),
+            None,
+        );
+        state.delta(
+            &mut container,
+            frances_session::events::BlockId(5),
+            bare(),
+            None,
+        );
         assert_eq!(
             container.active_count(),
             0,

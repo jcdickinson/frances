@@ -6,7 +6,7 @@ use uuid::Uuid;
 /// One row of the `workflows` config table.
 ///
 /// Each workflow owns a chunk of the per-session DB schema via the
-/// daemon's migration system: `id` is its stable [`Uuid`] entity, and
+/// runtime's migration system: `id` is its stable [`Uuid`] entity, and
 /// `migrations` lists the SQL files in apply order. Migration paths are
 /// resolved **relative to `file`'s parent directory** — co-locate
 /// `0001_init.sql` with the script and refer to it as

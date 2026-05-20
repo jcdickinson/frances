@@ -6,7 +6,7 @@ This is layer 3 in the staged rollout (see [agentic-loop.md](../agentic-loop.md)
 
 ## Why this layer is separate
 
-Frances's existing design pin: per-session DBs, no `session_id` columns, sessions isolated at the file level. That decision was made to avoid cross-daemon file-lock contention on a global DB ([daemon.md](../daemon.md) calls this out explicitly). Cross-session knowledge cannot live in the per-session DBs without breaking that design.
+Frances's existing design pin: per-session DBs, no `session_id` columns, sessions isolated at the file level. That decision was made to avoid cross-daemon file-lock contention on a global DB ([session-runtime.md](../session-runtime.md) calls this out explicitly). Cross-session knowledge cannot live in the per-session DBs without breaking that design.
 
 Three options were considered:
 

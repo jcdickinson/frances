@@ -131,7 +131,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
     /// every `StreamEvent` the provider emits. The callback is the
     /// auto-judge's lever for cancelling after the 2nd
     /// `StreamEvent::ToolCall`; see
-    /// `crates/frances-daemon/src/server/auto_judge.rs`.
+    /// `crates/frances-session/src/runtime/auto_judge.rs`.
     pub async fn complete_with_events(
         &self,
         req: CompleteRequest<'_>,

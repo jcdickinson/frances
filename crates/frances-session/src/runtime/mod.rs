@@ -297,7 +297,8 @@ impl SessionRuntime {
         let chat_deps = ChatDepsImpl {
             history: history.clone(),
         };
-        let chat = ChatSessionManager::new(chat_deps, config.clone(), default_model, cache.clone())?;
+        let chat =
+            ChatSessionManager::new(chat_deps, config.clone(), default_model, cache.clone())?;
 
         let invocation = Arc::new(StdMutex::new(invocation));
         let editor_factory = SessionEditorFactory {
@@ -356,12 +357,9 @@ impl SessionRuntime {
     /// `ScrollbackReplayEnd` burst into the events channel.
     pub async fn replay_initial_scrollback(self: &Arc<Self>) {
         let active_instance = self.workflow_stack.active_instance().await;
-        if let Err(error) = replay::write_initial_replay(
-            &self.events,
-            self.workflow_stack.db(),
-            active_instance,
-        )
-        .await
+        if let Err(error) =
+            replay::write_initial_replay(&self.events, self.workflow_stack.db(), active_instance)
+                .await
         {
             warn!(%error, "initial scrollback replay failed");
         }

@@ -128,7 +128,7 @@ These exceptions exist because full-auto's promise is "trust me when things are 
 ## What is *not* a gate
 
 - Mid-step pauses for the user to clarify ambiguity. Those are tool calls (the model asks a question, the user answers, the model continues — all within the current step).
-- Tool authorization prompts. Those are orthogonal — they live in the daemon's permission layer, not the plan layer.
+- Tool authorization prompts. Those are orthogonal — they live in the session runtime's permission layer, not the plan layer.
 - Compaction of the agent's context. That happens transparently at every step boundary regardless of gate vs full-auto. The gate is about user steering; compaction is about prompt management.
 
 ## Implementation hooks
@@ -139,9 +139,9 @@ The TUI needs:
 - The discuss overlay
 - Plan editor for replan
 
-The daemon needs:
-- A protocol message for "step completed, here's the event"
-- A protocol message for "user chose action X" (and any structural changes from discuss)
+The session runtime needs:
+- An event variant for "step completed, here's the event"
+- A method for "user chose action X" (and any structural changes from discuss)
 - Persistence of all of the above through the existing per-session DB
 
 See [recall.md](recall.md) for how the post-gate state feeds the next step's prompt.

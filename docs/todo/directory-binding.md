@@ -63,7 +63,7 @@ None => {
 }
 ```
 
-Lock detection reuses the existing `AttachResponse::Busy` machinery (`crates/frances-daemon/src/server/client_rpc.rs:23-40`, `crates/frances-daemon/src/protocol.rs:90-92`). No new server-side state required.
+Lock detection: pre-rip this rode on the daemon's `AttachResponse::Busy` machinery. With the in-process model there's no "second client" to detect — a second `frances` invocation against the same session_dir is just another process opening the same turso DB. Needs a separate lockfile (e.g. `runtime_dir/lock` + `flock`) before this design can ship.
 
 Identifying *which* TTY holds the lock is a nice-to-have: scan `runtime_root/tty-links/` for any link pointing at this session_dir whose key differs from ours. Not required for v1.
 

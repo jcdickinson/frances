@@ -10,11 +10,11 @@
 //!   path inside `workflows::emit`.
 //! - **Dehydrate-interrupted close**: same call with `truncated = true`.
 //!   Triggered when a workflow is pushed off the top with an open
-//!   in-flight block — the daemon never gets to emit `BlockStop`, but
+//!   in-flight block — the runtime never gets to emit `BlockStop`, but
 //!   the row goes in marked truncated so the replay can surface that
 //!   to the user.
 //! - **Error frames**: [`persist_error`] writes a row with
-//!   `kind = 'error'` whenever the daemon emits a
+//!   `kind = 'error'` whenever the runtime emits a
 //!   [`StreamFrame::Error`]. `truncated` is ignored for these.
 //!
 //! ## Reads

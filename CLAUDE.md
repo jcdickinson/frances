@@ -11,13 +11,15 @@ wasn't created.
 
 ## Project
 
-Frances is an agentic coding tool. The `frances` binary is a TUI front-end that talks to a per-TTY background daemon over Unix sockets; the daemon owns the session, persists history to a per-session turso (libsql) database, and streams LLM completions via OpenRouter.
+Frances is an agentic coding tool. The `frances` binary is a single-process TUI: it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens a per-session turso (libsql) database, constructs an in-process `SessionRuntime`, and runs the TUI directly against it. LLM completions stream via OpenRouter.
 
 ## Workspace layout
 
-Three crates under `crates/`:
+The interesting crates under `crates/`:
 
-- **`frances`** — the binary. Daemon (`src/daemon/`), TUI (`src/tui/`, `src/ui.rs`), session/path management (`src/session.rs`), turso wrapper (`src/store.rs`), LLM client (`src/llm.rs`), edit-tool plumbing (`src/edit_session.rs`, `src/anchor_store.rs`).
+- **`frances`** — the binary. TUI (`src/tui/`, `src/ui.rs`), TTY identification (`src/tty.rs`), `main.rs` wires the runtime to the TUI.
+- **`frances-session`** — session runtime: per-session DB handle, workflow stack, history, scrollback persistence, anchor store, llm session provider, events channel into the TUI.
+- **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat sessions and tool calls.
 - **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
 - **`frances-anchors`** — anchor word dictionary plus line hashing and word↔index encoding.
 
@@ -27,7 +29,7 @@ Workspace pins a single Rust toolchain in `rust-toolchain.toml` (1.95.0, edition
 
 Read these before changing the relevant area:
 
-- [`docs/arch/daemon.md`](docs/arch/daemon.md) — daemon/session/TTY model, socket layout, protocol versioning, per-session database.
+- [`docs/arch/session-runtime.md`](docs/arch/session-runtime.md) — in-process runtime model, session/TTY layout, per-session database.
 - [`docs/arch/edit-engine.md`](docs/arch/edit-engine.md) — how `frances-edit` and `frances-anchors` are wired into the binary.
 - [`docs/arch/anchors.md`](docs/arch/anchors.md) — full anchor system design (line anchors, reconciliation, word pool, edit tool flow).
 
@@ -48,10 +50,8 @@ The user runs the dev shell via `nix develop` (provides toolchain + `rust-analyz
 
 `frances` subcommands:
 
-- `frances` — attach to (or create) the daemon for the current TTY and open the TUI.
-- `frances new` — stop the daemon for this TTY and unlink it, so the next run starts a fresh session.
-- `frances daemon status` / `frances daemon stop` — inspect/stop the daemon for this TTY.
-- `frances --daemon <session_id>` — internal flag the binary uses to re-exec itself as the daemon; don't invoke directly.
+- `frances` — open the TUI against the current TTY's session, creating one if none is linked.
+- `frances new` — unlink the current TTY's session so the next run creates a fresh session. The old session's state on disk is left intact.
 
 ## Code style and conventions
 
