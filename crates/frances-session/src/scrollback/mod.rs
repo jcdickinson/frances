@@ -53,7 +53,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::protocol::{BlockId, BlockKind, StreamFrame};
+use crate::events::{BlockId, BlockKind, StreamFrame};
 use crate::transport::write_message;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
@@ -126,14 +126,14 @@ struct ToolUsePayload {
 /// On-disk JSON shape for `kind` = 'shell_output' rows.
 #[derive(Serialize, Deserialize)]
 struct ShellOutputPayload {
-    state: crate::protocol::ShellState,
+    state: crate::events::ShellState,
     cmd: Arc<str>,
     text: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct DiffPayload {
-    lines: Vec<crate::protocol::DiffLine>,
+    lines: Vec<crate::events::DiffLine>,
     text: String,
 }
 
@@ -543,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn shell_output_round_trips_each_state() {
-        use crate::protocol::ShellState;
+        use crate::events::ShellState;
         let db = fresh_db().await;
         let instance = Uuid::new_v4();
         for (state, cmd, body) in [

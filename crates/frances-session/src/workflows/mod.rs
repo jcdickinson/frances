@@ -44,7 +44,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::protocol::{BlockId, BlockKind, StreamFrame};
+use crate::events::{BlockId, BlockKind, StreamFrame};
 use crate::server::ServerState;
 use crate::store::Database;
 use crate::transport::write_message;
@@ -745,7 +745,7 @@ async fn emit(
                     .await?;
             }
             FrameKind::Diff { lines } => {
-                let wire_lines: Vec<crate::protocol::DiffLine> =
+                let wire_lines: Vec<crate::events::DiffLine> =
                     lines.into_iter().map(diff_op_to_protocol).collect();
                 let block = state.alloc();
                 let kind = BlockKind::Diff { lines: wire_lines };
@@ -867,24 +867,24 @@ async fn emit(
     Ok(())
 }
 
-fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::protocol::DiffLine {
+fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::events::DiffLine {
     use frances_edit::DiffOp;
     match op {
-        DiffOp::Context { text, line } => crate::protocol::DiffLine::Context {
+        DiffOp::Context { text, line } => crate::events::DiffLine::Context {
             text: Arc::from(text),
             line,
         },
-        DiffOp::Added(t) => crate::protocol::DiffLine::Added(Arc::from(t)),
-        DiffOp::Removed(t) => crate::protocol::DiffLine::Removed(Arc::from(t)),
+        DiffOp::Added(t) => crate::events::DiffLine::Added(Arc::from(t)),
+        DiffOp::Removed(t) => crate::events::DiffLine::Removed(Arc::from(t)),
     }
 }
 
-fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::protocol::ShellState {
+fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::events::ShellState {
     use frances_workflow::ShellState as W;
     match state {
-        W::Running => crate::protocol::ShellState::Running,
-        W::Success => crate::protocol::ShellState::Success,
-        W::Exit(n) => crate::protocol::ShellState::Exit(*n),
+        W::Running => crate::events::ShellState::Running,
+        W::Success => crate::events::ShellState::Success,
+        W::Exit(n) => crate::events::ShellState::Exit(*n),
     }
 }
 

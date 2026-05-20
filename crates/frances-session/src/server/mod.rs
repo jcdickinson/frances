@@ -11,7 +11,7 @@ use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
 use crate::history::TursoHistoryStore;
 use crate::llm::SessionConfigWriter;
-use crate::protocol::{PermissionId, PermissionRequest};
+use crate::events::{PermissionId, PermissionRequest};
 use crate::session::Session;
 use crate::workflows::{WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle};

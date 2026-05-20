@@ -1,6 +1,7 @@
 pub mod anchor_store;
 pub mod context;
 mod error;
+pub mod events;
 pub mod history;
 pub mod llm;
 pub mod protocol;

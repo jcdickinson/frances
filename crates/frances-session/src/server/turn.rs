@@ -4,7 +4,7 @@ use tokio::net::UnixStream;
 use tracing::{trace, warn};
 
 use crate::Result;
-use crate::protocol::StreamFrame;
+use crate::events::StreamFrame;
 use crate::transport::write_message;
 use crate::workflows;
 

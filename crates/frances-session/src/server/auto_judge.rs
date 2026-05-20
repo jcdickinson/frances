@@ -28,7 +28,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
-use crate::protocol::PermissionRequest;
+use crate::events::PermissionRequest;
 
 use super::ServerState;
 
