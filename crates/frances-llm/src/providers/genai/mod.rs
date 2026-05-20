@@ -129,6 +129,34 @@ impl provider::Provider for Provider {
         let max_tool_calls = req.max_tool_calls;
         let plan = RequestPlan::build(&self.provider_config, req.model, req.env)?;
 
+        // Trace incoming tool-related inputs before forge so the round-
+        // trip with the model is visible in the daemon trace stream.
+        for input in req.new_inputs {
+            match input {
+                HistoryInput::ToolCall {
+                    id,
+                    name,
+                    arguments,
+                } => trace!(
+                    call_id = %id,
+                    name = %name,
+                    arguments = %arguments,
+                    "tool call to model (forged from primitive)",
+                ),
+                HistoryInput::ToolResult {
+                    call_id,
+                    content,
+                    is_error,
+                } => trace!(
+                    call_id = %call_id,
+                    is_error = %is_error,
+                    content = %content,
+                    "tool result to model",
+                ),
+                _ => {}
+            }
+        }
+
         let forged_new = self.forge_history(req.new_inputs);
         for payload in &forged_new {
             on_event(StreamEvent::History(payload.clone()))?;
@@ -159,7 +187,10 @@ impl provider::Provider for Provider {
             "calling genai chat stream"
         );
         if let Ok(s) = serde_json::to_string(&chat_req) {
-            trace!(body = %Truncated::<100>::new(s), "chat request body");
+            // Cap is large enough that a typical multi-turn body fits
+            // even with several tool messages — the previous 100-char
+            // tail was useless for tool-round-trip debugging.
+            trace!(body = %Truncated::<20000>::new(s), "chat request body");
         }
 
         let response = tokio::select! {
@@ -209,6 +240,12 @@ impl provider::Provider for Provider {
                 ChatStreamEvent::ThoughtSignatureChunk(_) => {}
                 ChatStreamEvent::ToolCallChunk(tc) => {
                     let call = map_tool_call(tc.tool_call);
+                    trace!(
+                        call_id = %call.id,
+                        name = %call.name,
+                        arguments = %call.arguments,
+                        "tool call from model",
+                    );
                     on_event(StreamEvent::ToolCall(call.clone()))?;
                     tool_calls.push(call);
                     if let Some(cap) = max_tool_calls
@@ -324,10 +361,21 @@ fn tool_def_to_genai(td: &ToolDef) -> GenaiTool {
 }
 
 fn map_tool_call(call: GenaiToolCall) -> ToolCall {
+    // genai's OpenAI-shaped streamer (adapter_shared `capture_tool_call`)
+    // accumulates `fn_arguments` as `Value::String(raw_json)` during the
+    // stream — only the post-`[DONE]` `captured_data.tool_calls` path
+    // parses the string into a proper `Value::Object`. Per-event
+    // `ToolCallChunk`s reach us with the unparsed string, so we parse
+    // here. Fall back to the original Value on parse failure (matches
+    // genai's own resilience pattern).
+    let arguments = match call.fn_arguments {
+        Value::String(s) => serde_json::from_str::<Value>(&s).unwrap_or(Value::String(s)),
+        other => other,
+    };
     ToolCall {
         id: call.call_id,
         name: call.fn_name,
-        arguments: call.fn_arguments,
+        arguments,
     }
 }
 
@@ -502,6 +550,46 @@ mod tests {
         let msg: ChatMessage = serde_json::from_value(payload)
             .expect("History payload must deserialise as ChatMessage");
         assert!(matches!(msg.role, ChatRole::Assistant));
+    }
+
+    #[test]
+    fn map_tool_call_parses_string_arguments_into_object() {
+        // genai's OpenAI-shaped streamer hands us `Value::String(raw_json)`
+        // for each ToolCallChunk; downstream consumers expect a parsed
+        // Value::Object. map_tool_call must do that parse — otherwise
+        // workflow tool handlers can't destructure call.arguments fields.
+        let call = GenaiToolCall {
+            call_id: "call_1".into(),
+            fn_name: "file_read".into(),
+            fn_arguments: Value::String("{\"path\":\"README.md\"}".into()),
+            thought_signatures: None,
+        };
+        let mapped = map_tool_call(call);
+        assert_eq!(mapped.arguments, json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn map_tool_call_preserves_already_parsed_arguments() {
+        let call = GenaiToolCall {
+            call_id: "call_1".into(),
+            fn_name: "file_read".into(),
+            fn_arguments: json!({"path": "README.md"}),
+            thought_signatures: None,
+        };
+        let mapped = map_tool_call(call);
+        assert_eq!(mapped.arguments, json!({"path": "README.md"}));
+    }
+
+    #[test]
+    fn map_tool_call_keeps_unparseable_string_as_string() {
+        let call = GenaiToolCall {
+            call_id: "call_1".into(),
+            fn_name: "x".into(),
+            fn_arguments: Value::String("not json".into()),
+            thought_signatures: None,
+        };
+        let mapped = map_tool_call(call);
+        assert_eq!(mapped.arguments, Value::String("not json".into()));
     }
 
     #[test]
