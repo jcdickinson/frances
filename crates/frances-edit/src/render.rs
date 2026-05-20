@@ -19,12 +19,33 @@ pub fn render_file(state: &FileAnchorState, lines: &[String]) -> String {
     out
 }
 
+/// One entry in a structured diff. `Context` carries the post-side line
+/// number (1-based); `Added` / `Removed` carry only the raw line content
+/// because the wire-level `DiffLine` shape doesn't model line numbers for
+/// the changed sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiffOp {
+    Context { text: String, line: u32 },
+    Added(String),
+    Removed(String),
+}
+
+/// Combined output of [`render_diff_block`]: the LLM-facing unified-diff
+/// string (with anchors, sigils, and line numbers) and a structured set
+/// of ops carrying just the raw line content — the latter is what the
+/// TUI consumes via the workflow `DiffFrame`.
+#[derive(Debug, Clone)]
+pub struct DiffRender {
+    pub text: String,
+    pub ops: Vec<DiffOp>,
+}
+
 /// Render a unified-diff-style block summarizing the change from
 /// (`pre_state`, `pre_lines`) to (`post_state`, `post_lines`). The diff is
 /// computed over anchor identities — anchors are unique per file, so this
 /// produces the correct alignment even when multiple lines share content.
 ///
-/// Lines are emitted as:
+/// Text lines are emitted as:
 ///   ` Anchor§content`  — context (carried anchor)
 ///   `-Anchor§content`  — tombstoned (anchor in pre, gone from post)
 ///   `+Anchor§content`  — minted (new anchor in post)
@@ -38,12 +59,13 @@ pub fn render_diff_block(
     post_state: &FileAnchorState,
     post_lines: &[String],
     context: usize,
-) -> String {
+) -> DiffRender {
     let pre_anchors: Vec<&Anchor> = pre_state.lines.iter().map(|le| &le.anchor).collect();
     let post_anchors: Vec<&Anchor> = post_state.lines.iter().map(|le| &le.anchor).collect();
     let ops = capture_diff_slices(Algorithm::Patience, &pre_anchors, &post_anchors);
 
     let mut out = String::new();
+    let mut diff_ops = Vec::new();
 
     for (op_idx, op) in ops.iter().enumerate() {
         let is_first = op_idx == 0;
@@ -58,49 +80,130 @@ pub fn render_diff_block(
 
                 if take_start + take_end >= len {
                     for i in new_range.clone() {
-                        emit_line(&mut out, ' ', post_anchors[i], &post_lines[i], i + 1);
+                        emit_context(
+                            &mut out,
+                            &mut diff_ops,
+                            post_anchors[i],
+                            &post_lines[i],
+                            i + 1,
+                        );
                     }
                 } else {
                     for i in 0..take_start {
                         let idx = new_range.start + i;
-                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx], idx + 1);
+                        emit_context(
+                            &mut out,
+                            &mut diff_ops,
+                            post_anchors[idx],
+                            &post_lines[idx],
+                            idx + 1,
+                        );
                     }
                     if take_start > 0 {
                         out.push('\n');
                     }
                     for i in 0..take_end {
                         let idx = new_range.end - take_end + i;
-                        emit_line(&mut out, ' ', post_anchors[idx], &post_lines[idx], idx + 1);
+                        emit_context(
+                            &mut out,
+                            &mut diff_ops,
+                            post_anchors[idx],
+                            &post_lines[idx],
+                            idx + 1,
+                        );
                     }
                 }
             }
             DiffTag::Delete => {
                 for i in op.old_range() {
-                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i], i + 1);
+                    emit_removed(
+                        &mut out,
+                        &mut diff_ops,
+                        pre_anchors[i],
+                        &pre_lines[i],
+                        i + 1,
+                    );
                 }
             }
             DiffTag::Insert => {
                 for i in op.new_range() {
-                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i], i + 1);
+                    emit_added(
+                        &mut out,
+                        &mut diff_ops,
+                        post_anchors[i],
+                        &post_lines[i],
+                        i + 1,
+                    );
                 }
             }
             DiffTag::Replace => {
                 for i in op.old_range() {
-                    emit_line(&mut out, '-', pre_anchors[i], &pre_lines[i], i + 1);
+                    emit_removed(
+                        &mut out,
+                        &mut diff_ops,
+                        pre_anchors[i],
+                        &pre_lines[i],
+                        i + 1,
+                    );
                 }
                 for i in op.new_range() {
-                    emit_line(&mut out, '+', post_anchors[i], &post_lines[i], i + 1);
+                    emit_added(
+                        &mut out,
+                        &mut diff_ops,
+                        post_anchors[i],
+                        &post_lines[i],
+                        i + 1,
+                    );
                 }
             }
         }
     }
 
-    out
+    DiffRender {
+        text: out,
+        ops: diff_ops,
+    }
 }
 
-fn emit_line(out: &mut String, prefix: char, anchor: &Anchor, content: &str, line: usize) {
+fn write_line(out: &mut String, prefix: char, anchor: &Anchor, content: &str, line: usize) {
     write!(out, "{prefix} {line:4} {anchor}{ANCHOR_SEP}{content}").expect("write to String");
     out.push('\n');
+}
+
+fn emit_context(
+    out: &mut String,
+    ops: &mut Vec<DiffOp>,
+    anchor: &Anchor,
+    content: &str,
+    line: usize,
+) {
+    write_line(out, ' ', anchor, content, line);
+    ops.push(DiffOp::Context {
+        text: content.to_owned(),
+        line: line as u32,
+    });
+}
+
+fn emit_added(
+    out: &mut String,
+    ops: &mut Vec<DiffOp>,
+    anchor: &Anchor,
+    content: &str,
+    line: usize,
+) {
+    write_line(out, '+', anchor, content, line);
+    ops.push(DiffOp::Added(content.to_owned()));
+}
+
+fn emit_removed(
+    out: &mut String,
+    ops: &mut Vec<DiffOp>,
+    anchor: &Anchor,
+    content: &str,
+    line: usize,
+) {
+    write_line(out, '-', anchor, content, line);
+    ops.push(DiffOp::Removed(content.to_owned()));
 }
 
 #[cfg(test)]
@@ -160,8 +263,8 @@ mod tests {
         let (pre_s, pre_l) = make(&[a.clone(), b.clone(), c.clone()], &["foo", "bar", "baz"]);
         let (post_s, post_l) = make(&[a, m, c], &["foo", "qux", "baz"]);
 
-        let out = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
-        let lines: Vec<&str> = out.lines().collect();
+        let render = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
+        let lines: Vec<&str> = render.text.lines().collect();
 
         assert_eq!(lines.len(), 4);
         assert!(lines[0].starts_with(' '));
@@ -172,6 +275,13 @@ mod tests {
         assert!(lines[2].contains("§qux"));
         assert!(lines[3].starts_with(' '));
         assert!(lines[3].contains("§baz"));
+
+        // Structured ops mirror the text: 2 context + 1 removed + 1 added.
+        assert_eq!(render.ops.len(), 4);
+        assert!(matches!(&render.ops[0], DiffOp::Context { text, .. } if text == "foo"));
+        assert!(matches!(&render.ops[1], DiffOp::Removed(t) if t == "bar"));
+        assert!(matches!(&render.ops[2], DiffOp::Added(t) if t == "qux"));
+        assert!(matches!(&render.ops[3], DiffOp::Context { text, .. } if text == "baz"));
     }
 
     #[test]
@@ -181,8 +291,8 @@ mod tests {
         let (pre_s, pre_l) = make(std::slice::from_ref(&a), &["foo"]);
         let (post_s, post_l) = make(&[a, m], &["foo", "bar"]);
 
-        let out = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
-        let lines: Vec<&str> = out.lines().collect();
+        let render = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
+        let lines: Vec<&str> = render.text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with(' '));
         assert!(lines[0].contains("§foo"));
@@ -197,8 +307,8 @@ mod tests {
         let (pre_s, pre_l) = make(&[a, b.clone()], &["foo", "bar"]);
         let (post_s, post_l) = make(&[b], &["bar"]);
 
-        let out = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
-        let lines: Vec<&str> = out.lines().collect();
+        let render = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
+        let lines: Vec<&str> = render.text.lines().collect();
         assert_eq!(lines.len(), 2);
         assert!(lines[0].starts_with('-'));
         assert!(lines[0].contains("§foo"));
@@ -225,13 +335,13 @@ mod tests {
             &["line0", "X1", "line2", "line3", "line4", "Y5", "line6"],
         );
 
-        let out = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
+        let render = render_diff_block(&pre_s, &pre_l, &post_s, &post_l, 1);
         // With context=1, the long Equal middle (line2/line3/line4 = 3 lines)
         // gets split: emit first 1 line, blank separator, last 1 line.
         // Should contain a blank line in the middle.
-        assert!(out.contains("\n\n"));
+        assert!(render.text.contains("\n\n"));
         // Should contain both - and + sigils for both regions.
-        assert_eq!(out.matches('-').count(), 2);
-        assert_eq!(out.matches('+').count(), 2);
+        assert_eq!(render.text.matches('-').count(), 2);
+        assert_eq!(render.text.matches('+').count(), 2);
     }
 }

@@ -33,6 +33,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use frances_edit::DiffOp;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, Opt, This};
 use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as JsResult, Value};
@@ -64,17 +65,20 @@ impl FramesState {
     }
 }
 
+pub(crate) type BuiltFrames<'js> = (
+    Class<'js, TranscriptHandle>,
+    Ctor<'js>, // MarkdownFrame
+    Ctor<'js>, // ErrorFrame
+    Ctor<'js>, // JsonFrame
+    Ctor<'js>, // ShellOutputFrame
+    Ctor<'js>, // ToolUseFrame
+    Ctor<'js>, // DiffFrame
+);
+
 pub(crate) fn build_frames<'js>(
     ctx: &Ctx<'js>,
     tx: UnboundedSender<HostFrame>,
-) -> JsResult<(
-    Class<'js, TranscriptHandle>,
-    Ctor<'js>,
-    Ctor<'js>,
-    Ctor<'js>,
-    Ctor<'js>,
-    Ctor<'js>,
-)> {
+) -> JsResult<BuiltFrames<'js>> {
     let state = FramesState::new(tx);
 
     let transcript = Class::instance(
@@ -88,7 +92,8 @@ pub(crate) fn build_frames<'js>(
     let err_ctor = build_error_ctor(ctx, state.clone())?;
     let json_ctor = build_json_ctor(ctx, state.clone())?;
     let shell_output_ctor = build_shell_output_ctor(ctx, state.clone())?;
-    let tool_use_ctor = build_tool_use_ctor(ctx, state)?;
+    let tool_use_ctor = build_tool_use_ctor(ctx, state.clone())?;
+    let diff_ctor = build_diff_ctor(ctx, state)?;
 
     Ok((
         transcript,
@@ -97,6 +102,7 @@ pub(crate) fn build_frames<'js>(
         json_ctor,
         shell_output_ctor,
         tool_use_ctor,
+        diff_ctor,
     ))
 }
 
@@ -202,6 +208,19 @@ fn push_frame<'js>(
         // One-shot: the daemon closes + persists this frame on its end
         // (see emit() for FrameKind::ToolUse). No HostFrame::Close from
         // the workflow side — keeps the JS API simple.
+        return Ok(());
+    }
+    if let Some(df) = as_frame::<DiffFrame>(&frame) {
+        let mut borrow = df.borrow_mut();
+        let new_id = state.assign_id();
+        borrow.id.store(new_id, Ordering::Release);
+        let ops = std::mem::take(&mut borrow.ops);
+        let kind = FrameKind::Diff { lines: ops };
+        let _ = state.tx.send(HostFrame::Push(FramePush {
+            id: FrameId(new_id),
+            kind,
+        }));
+        // One-shot — daemon seals on its side. Same shape as ToolUseFrame.
         return Ok(());
     }
     if let Some(json) = as_frame::<JsonFrame>(&frame) {
@@ -568,6 +587,117 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
                     name,
                     hidden,
                     detail,
+                },
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------
+// DiffFrame — one-shot structured diff produced by a file-edit tool
+// ---------------------------------------------------------------------
+
+/// One-shot frame carrying a unified-diff payload. Constructed by the
+/// JS file tools after a successful mutation; the daemon translates each
+/// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff`
+/// block. Like `ToolUseFrame`, the daemon seals and persists the block
+/// — there is no `write` / `close` on the JS side.
+pub struct DiffFrame {
+    #[expect(
+        dead_code,
+        reason = "kept for symmetry with the other frame types; never read after construction since DiffFrame is one-shot"
+    )]
+    state: Arc<FramesState>,
+    id: AtomicU64,
+    /// Drained on push — the runtime moves the ops into the wire
+    /// `FrameKind::Diff` rather than cloning, since a `DiffFrame` is
+    /// pushed exactly once.
+    ops: Vec<DiffOp>,
+}
+
+impl<'js> Trace<'js> for DiffFrame {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for DiffFrame {
+    type Changed<'to> = DiffFrame;
+}
+
+impl<'js> JsClass<'js> for DiffFrame {
+    const NAME: &'static str = "DiffFrame";
+    type Mutable = rquickjs::class::Writable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        // No `write` / `close` — one-shot, sealed daemon-side.
+        let proto = Object::new(ctx.clone())?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp>> {
+    let Some(arr) = lines.as_array() else {
+        return throw_type(ctx, "new DiffFrame: `lines` must be an array");
+    };
+    let mut ops = Vec::with_capacity(arr.len());
+    for entry in arr.iter::<Value<'js>>() {
+        let entry = entry?;
+        let Some(obj) = entry.as_object() else {
+            return throw_type(
+                ctx,
+                "new DiffFrame: each `lines` entry must be { kind, text, line? }",
+            );
+        };
+        let kind: String = obj
+            .get("kind")
+            .map_err(|_| throw_err(ctx, "new DiffFrame: missing or non-string `kind`"))?;
+        let text: String = obj
+            .get("text")
+            .map_err(|_| throw_err(ctx, "new DiffFrame: missing or non-string `text`"))?;
+        let op = match kind.as_str() {
+            "context" => {
+                let line: u32 = obj.get("line").map_err(|_| {
+                    throw_err(ctx, "new DiffFrame: context entries require `line: number`")
+                })?;
+                DiffOp::Context { text, line }
+            }
+            "added" => DiffOp::Added(text),
+            "removed" => DiffOp::Removed(text),
+            other => {
+                return throw_type(
+                    ctx,
+                    &format!(
+                        "new DiffFrame: unknown `kind` {other:?}; expected \"context\", \"added\", or \"removed\""
+                    ),
+                );
+            }
+        };
+        ops.push(op);
+    }
+    Ok(ops)
+}
+
+fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<DiffFrame, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+            let Some(obj) = arg.as_object() else {
+                return throw_type(&ctx, "new DiffFrame: expected { lines: Array }");
+            };
+            let lines: Value<'js> = obj
+                .get("lines")
+                .map_err(|_| throw_err(&ctx, "new DiffFrame: missing `lines`"))?;
+            let ops = parse_diff_ops(&ctx, lines)?;
+            Class::instance(
+                ctx.clone(),
+                DiffFrame {
+                    state: state.clone(),
+                    id: AtomicU64::new(0),
+                    ops,
                 },
             )
         },

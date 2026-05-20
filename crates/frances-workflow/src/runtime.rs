@@ -136,6 +136,11 @@ pub enum FrameKind {
         cmd: String,
         content: String,
     },
+    /// `DiffFrame` — one-shot structured diff produced by a file-edit
+    /// tool. `lines` is the unified-diff content with line numbers for
+    /// context rows only; the daemon translates each op to the wire
+    /// `protocol::DiffLine` and emits a `BlockKind::Diff` block.
+    Diff { lines: Vec<frances_edit::DiffOp> },
 }
 
 /// Terminal status for [`FrameKind::ShellOutput`]. Mirrors
@@ -938,6 +943,7 @@ mod tests {
                 } => {
                     format!("[shell:{state:?}] $ {cmd}\n{content}")
                 }
+                FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             },
             HostFrame::Append { delta, .. } => delta.clone(),
             HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),

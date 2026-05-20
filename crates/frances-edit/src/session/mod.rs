@@ -3,6 +3,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::loop_guard::LoopSet;
+use crate::render::DiffRender;
 use crate::{AnchorStore, EditEngine, LoopKey, WorkingFile, render_file};
 
 mod anchored;
@@ -74,8 +75,9 @@ impl<S: AnchorStore> EditSession<S> {
     ///   `on_draft`, then reconcile. Path must be cached via `read_file`.
     ///
     /// Returns the rendered diff block (or full anchored file in the `New`
-    /// case) as plain text.
-    pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<String>
+    /// case) — `DiffRender` carries both the LLM-facing string and the
+    /// structured ops shipped to the TUI.
+    pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {

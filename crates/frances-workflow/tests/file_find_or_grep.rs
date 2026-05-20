@@ -75,6 +75,7 @@ fn text_of(frame: &HostFrame) -> String {
                 cmd,
                 content,
             } => format!("[shell:{state:?}] $ {cmd}\n{content}"),
+            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),

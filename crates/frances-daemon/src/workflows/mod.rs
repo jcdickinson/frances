@@ -744,6 +744,26 @@ async fn emit(
                 crate::scrollback::persist_block(&state.db, state.instance_id, &kind, &text, false)
                     .await?;
             }
+            FrameKind::Diff { lines } => {
+                let wire_lines: Vec<crate::protocol::DiffLine> =
+                    lines.into_iter().map(diff_op_to_protocol).collect();
+                let block = state.alloc();
+                let kind = BlockKind::Diff { lines: wire_lines };
+                write_message(
+                    stream,
+                    &StreamFrame::BlockDelta {
+                        id: block,
+                        kind: kind.clone(),
+                        text: Some(String::new()),
+                    },
+                )
+                .await?;
+                // One-shot like ToolUse / Json — Push + Stop in the
+                // same batch, never enters `state.open`.
+                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
+                    .await?;
+            }
         },
         HostFrame::Append {
             id: frame_id,
@@ -783,9 +803,10 @@ async fn emit(
                     state: shell_state_to_protocol(&shell_state),
                     cmd: Arc::from(cmd),
                 }),
-                FrameKind::Error { .. } | FrameKind::Json { .. } | FrameKind::ToolUse { .. } => {
-                    None
-                }
+                FrameKind::Error { .. }
+                | FrameKind::Json { .. }
+                | FrameKind::ToolUse { .. }
+                | FrameKind::Diff { .. } => None,
             };
             let Some(new_block_kind) = new_block_kind else {
                 return Ok(());
@@ -844,6 +865,18 @@ async fn emit(
         }
     }
     Ok(())
+}
+
+fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::protocol::DiffLine {
+    use frances_edit::DiffOp;
+    match op {
+        DiffOp::Context { text, line } => crate::protocol::DiffLine::Context {
+            text: Arc::from(text),
+            line,
+        },
+        DiffOp::Added(t) => crate::protocol::DiffLine::Added(Arc::from(t)),
+        DiffOp::Removed(t) => crate::protocol::DiffLine::Removed(Arc::from(t)),
+    }
 }
 
 fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::protocol::ShellState {

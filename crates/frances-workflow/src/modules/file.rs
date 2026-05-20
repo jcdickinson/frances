@@ -38,7 +38,7 @@ use rquickjs::{
 };
 use twox_hash::XxHash3_64;
 
-use frances_edit::{LlmEdit, LoopKey};
+use frances_edit::{DiffOp, DiffRender, LlmEdit, LoopKey};
 
 use crate::deps::{EditorFactory, WorkflowDeps};
 
@@ -159,7 +159,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                             Ok(v) => edit_inner(&deps, v).await,
                             Err(msg) => Err(msg),
                         };
-                        EditorStringResult(result)
+                        EditorEditResult(result)
                     }))
                 },
             )?,
@@ -286,7 +286,10 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
     }
 }
 
-async fn edit_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Result<String, String> {
+async fn edit_inner<D: WorkflowDeps>(
+    deps: &D,
+    raw: serde_json::Value,
+) -> Result<DiffRender, String> {
     let mut edit: LlmEdit = serde_json::from_value(raw).map_err(|e| format!("parse edit: {e}"))?;
     resolve_edit_path(&mut edit, deps.current_cwd().as_deref());
     let session = deps.editor_factory().session();
@@ -412,6 +415,50 @@ impl<'js> IntoJs<'js> for EditorStringResult {
             Err(msg) => Err(throw(ctx, &msg)),
         }
     }
+}
+
+/// Promise payload for `editor.edit()`. Resolves to
+/// `{ text: string, diff: Array<{ kind, text, line? }> }` so the JS
+/// caller can both return the LLM-facing string AND push a
+/// `DiffFrame` for the TUI. Rejects with an error message on failure.
+struct EditorEditResult(Result<DiffRender, String>);
+
+impl<'js> IntoJs<'js> for EditorEditResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self.0 {
+            Ok(render) => {
+                let obj = Object::new(ctx.clone())?;
+                obj.set("text", render.text)?;
+                obj.set("diff", diff_ops_to_js(ctx, &render.ops)?)?;
+                Ok(obj.into_value())
+            }
+            Err(msg) => Err(throw(ctx, &msg)),
+        }
+    }
+}
+
+fn diff_ops_to_js<'js>(ctx: &Ctx<'js>, ops: &[DiffOp]) -> JsResult<Value<'js>> {
+    let arr = rquickjs::Array::new(ctx.clone())?;
+    for (i, op) in ops.iter().enumerate() {
+        let entry = Object::new(ctx.clone())?;
+        match op {
+            DiffOp::Context { text, line } => {
+                entry.set("kind", "context")?;
+                entry.set("text", text.as_str())?;
+                entry.set("line", *line)?;
+            }
+            DiffOp::Added(t) => {
+                entry.set("kind", "added")?;
+                entry.set("text", t.as_str())?;
+            }
+            DiffOp::Removed(t) => {
+                entry.set("kind", "removed")?;
+                entry.set("text", t.as_str())?;
+            }
+        }
+        arr.set(i, entry)?;
+    }
+    Ok(arr.into_value())
 }
 
 fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {

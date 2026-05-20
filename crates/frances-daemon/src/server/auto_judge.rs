@@ -51,6 +51,9 @@ irreversible operations on unrelated state, or anything that reads \
 like the agent went off-script. When in doubt, reject and let the \
 user decide.\n\
 \n\
+Don't let the agent avoid using the correct file editing tools by using
+sed or python to do writes. \
+\n\
 Call exactly one tool — `approve` if the action is clearly fine for \
 this project, `reject` otherwise. Either way, supply a one-sentence \
 `reason`.";

@@ -32,7 +32,21 @@
 //     new Overwrite(editor, vars),
 //   );
 
+import { transcript, DiffFrame } from "frances:v1/frames";
+
 const { Editor, EditorDescriptions: desc } = globalThis.__frances_v1_stash__;
+
+// Ship the structured diff portion of `editor.edit()`'s result to the
+// TUI as a one-shot `DiffFrame`. The string portion is returned to the
+// LLM as the tool's content; the structured ops only travel to the
+// transcript. Skips empty payloads so no-op edits (replace_all with
+// zero matches, overwrites that didn't change anything) don't paint a
+// blank diff block.
+function _pushDiffFrame(diff) {
+  if (Array.isArray(diff) && diff.length > 0) {
+    transcript.push(new DiffFrame({ lines: diff }));
+  }
+}
 
 // ---- schemas --------------------------------------------------------------
 
@@ -245,13 +259,14 @@ class ReplaceLines {
       return _errResult(call.id, err);
     }
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "ReplaceLines",
         path: call.arguments.path,
         anchor: call.arguments.anchor,
         end_anchor: call.arguments.end_anchor,
         text,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -279,13 +294,14 @@ class ReplaceAll {
 
   handler = async ({ call }) => {
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "ReplaceAll",
         path: call.arguments.path,
         find: call.arguments.find,
         replacement: call.arguments.replacement,
         count: call.arguments.count,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -316,12 +332,13 @@ class InsertAfter {
       return _errResult(call.id, err);
     }
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "InsertAfter",
         path: call.arguments.path,
         anchor: call.arguments.anchor,
         text,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -352,12 +369,13 @@ class InsertBefore {
       return _errResult(call.id, err);
     }
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "InsertBefore",
         path: call.arguments.path,
         anchor: call.arguments.anchor,
         text,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -388,11 +406,12 @@ class New {
       return _errResult(call.id, err);
     }
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "New",
         path: call.arguments.path,
         text,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -423,11 +442,12 @@ class Overwrite {
       return _errResult(call.id, err);
     }
     try {
-      const content = await this.editor.edit({
+      const { text: content, diff } = await this.editor.edit({
         kind: "Overwrite",
         path: call.arguments.path,
         text,
       });
+      _pushDiffFrame(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);

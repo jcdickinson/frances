@@ -4,9 +4,10 @@ use std::str::FromStr;
 
 use regex::Regex;
 
+use crate::render::{DiffRender, render_diff_block};
 use crate::{
     Anchor, AnchorStore, EditHints, EditOp, FileAnchorState, Pool, Truncated, WorkingFile,
-    apply_ops, reconcile, render_diff_block,
+    apply_ops, reconcile,
 };
 
 use super::types::{EditError, EditResult};
@@ -22,7 +23,7 @@ impl<S: AnchorStore> EditSession<S> {
         end_anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -56,7 +57,7 @@ impl<S: AnchorStore> EditSession<S> {
         replacement: &str,
         count: Option<usize>,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -70,10 +71,10 @@ impl<S: AnchorStore> EditSession<S> {
             return Err(EditError::ReplaceAllCountExceeded { actual, limit });
         }
         if actual == 0 {
-            return Ok(format!(
-                "No changes: regex matched 0 times in {}",
-                path.display()
-            ));
+            return Ok(DiffRender {
+                text: format!("No changes: regex matched 0 times in {}", path.display()),
+                ops: Vec::new(),
+            });
         }
 
         let replaced = re.replace_all(&content, replacement).into_owned();
@@ -88,7 +89,7 @@ impl<S: AnchorStore> EditSession<S> {
         anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -108,7 +109,7 @@ impl<S: AnchorStore> EditSession<S> {
         anchor: &str,
         text: &str,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -142,7 +143,7 @@ impl<S: AnchorStore> EditSession<S> {
         op: EditOp,
         tombstones: Vec<Anchor>,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -161,7 +162,7 @@ impl<S: AnchorStore> EditSession<S> {
         draft: Vec<String>,
         hints: Option<&EditHints>,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -290,7 +291,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert!(block.contains("§B2"));
+        assert!(block.text.contains("§B2"));
         assert_eq!(session.open_files[&path].lines, vec!["a", "B2", "c"]);
     }
 
@@ -519,8 +520,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(block.contains("§baz1"), "block: {block}");
-        assert!(block.contains("§baz2"), "block: {block}");
+        assert!(block.text.contains("§baz1"), "block: {}", block.text);
+        assert!(block.text.contains("§baz2"), "block: {}", block.text);
         assert_eq!(session.open_files[&path].lines, vec!["baz1", "baz2", "bar"]);
     }
 
@@ -551,7 +552,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(msg.contains("No changes"), "msg: {msg}");
+        assert!(msg.text.contains("No changes"), "msg: {}", msg.text);
         assert!(!wrote, "zero-match replace_all must not write");
         assert_eq!(session.open_files[&path].lines, before.lines);
         assert_eq!(session.open_files[&path].state.lines, before.state.lines);

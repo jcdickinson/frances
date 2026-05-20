@@ -75,6 +75,7 @@ fn text_of(frame: &HostFrame) -> String {
                 cmd,
                 content,
             } => format!("[shell:{state:?}] $ {cmd}\n{content}"),
+            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
         HostFrame::Append { delta, .. } => delta.clone(),
         HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
@@ -143,14 +144,14 @@ async fn editor_edit_replace_writes_disk() {
         const read = await editor.readFile("file.txt");
         // Pick the second line's full anchor field (Word§b).
         const line_b = read.split("\n")[1];
-        const diff = await editor.edit({
+        const result = await editor.edit({
             kind: "ReplaceLines",
             path: "file.txt",
             anchor: line_b,
             end_anchor: line_b,
             text: "B2",
         });
-        transcript.push(new MarkdownFrame({ content: diff }));
+        transcript.push(new MarkdownFrame({ content: result.text }));
         "#,
     );
     let mut handle = rt
@@ -185,14 +186,14 @@ async fn editor_edit_replace_all_writes_disk_and_honors_count() {
         import { transcript, MarkdownFrame } from "frances:v1/frames";
         const editor = new Editor();
         await editor.readFile("file.txt");
-        const diff = await editor.edit({
+        const result = await editor.edit({
             kind: "ReplaceAll",
             path: "file.txt",
             find: "old_(\\d)",
             replacement: "new_$1",
             count: 2,
         });
-        transcript.push(new MarkdownFrame({ content: diff }));
+        transcript.push(new MarkdownFrame({ content: result.text }));
         "#,
     );
     let mut handle = rt
@@ -495,7 +496,7 @@ async fn editor_new_creates_parent_directory() {
             path: {path:?},
             text: "hello\nworld",
         }});
-        transcript.push(new MarkdownFrame({{ content: out }}));
+        transcript.push(new MarkdownFrame({{ content: out.text }}));
         "#,
         path = nested_str,
     );

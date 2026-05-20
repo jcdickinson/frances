@@ -1,9 +1,8 @@
 use std::io;
 use std::path::Path;
 
-use crate::{
-    AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile, render_diff_block,
-};
+use crate::render::{DiffRender, render_diff_block};
+use crate::{AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile};
 
 use super::types::{EditError, EditResult};
 use super::{DIFF_CONTEXT, EditSession, split_text_to_lines};
@@ -19,7 +18,7 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         text: &str,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -55,7 +54,7 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         text: &str,
         on_draft: &mut F,
-    ) -> EditResult<String>
+    ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
@@ -138,10 +137,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(block.contains("§alpha"));
-        assert!(block.contains("§beta"));
+        assert!(block.text.contains("§alpha"));
+        assert!(block.text.contains("§beta"));
         // Diff vs empty pre-state ⇒ every line emitted as `+`.
-        let plus_lines = block.lines().filter(|l| l.starts_with('+')).count();
+        let plus_lines = block.text.lines().filter(|l| l.starts_with('+')).count();
         assert_eq!(plus_lines, 2);
 
         let cached = session.open_files.get(&path).expect("cached after new");
