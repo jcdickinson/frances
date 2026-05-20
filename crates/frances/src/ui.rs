@@ -21,11 +21,11 @@ use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
-use frances_daemon::llm::Usage;
-use frances_daemon::protocol::{
+use frances_session::llm::Usage;
+use frances_session::protocol::{
     self, BlockKind, DaemonStatus, PermissionRequest, PermissionResponseWire, StreamFrame,
 };
-use frances_daemon::session::Session;
+use frances_session::session::Session;
 use frances_tui::{
     BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer, TruncatedBlock,
 };
@@ -663,7 +663,7 @@ fn spawn_prompt(session: Session, prompt: String, frame_tx: mpsc::UnboundedSende
 
 fn spawn_permission(
     session: Session,
-    id: frances_daemon::protocol::PermissionId,
+    id: frances_session::protocol::PermissionId,
     response: PermissionResponseWire,
     frame_tx: mpsc::UnboundedSender<StreamFrame>,
 ) {

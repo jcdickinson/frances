@@ -5,7 +5,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use frances_daemon::tty::TtyKey;
+use frances_session::tty::TtyKey;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Pid(pub i32);

@@ -1432,7 +1432,7 @@ dependencies = [
  "bincode 2.0.1",
  "clap",
  "crossterm",
- "frances-daemon",
+ "frances-session",
  "frances-tui",
  "futures",
  "futures-util",
@@ -1481,50 +1481,6 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
-]
-
-[[package]]
-name = "frances-daemon"
-version = "0.1.0"
-dependencies = [
- "arc-swap",
- "async-trait",
- "bincode 2.0.1",
- "dashmap",
- "frances-anchors",
- "frances-config",
- "frances-core",
- "frances-edit",
- "frances-llm",
- "frances-models-llm",
- "frances-shell",
- "frances-storage",
- "frances-workflow",
- "futures",
- "futures-util",
- "getrandom 0.2.17",
- "libc",
- "parking_lot",
- "reqwest 0.12.28",
- "serde",
- "serde_json",
- "sha2",
- "shell-words",
- "shellexpand",
- "similar",
- "smallvec",
- "tarpc",
- "thiserror 2.0.18",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "tracing-subscriber",
- "turso",
- "twox-hash",
- "url",
- "uuid",
- "xdg",
 ]
 
 [[package]]
@@ -1583,6 +1539,50 @@ dependencies = [
  "tokio-util",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "frances-session"
+version = "0.1.0"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "bincode 2.0.1",
+ "dashmap",
+ "frances-anchors",
+ "frances-config",
+ "frances-core",
+ "frances-edit",
+ "frances-llm",
+ "frances-models-llm",
+ "frances-shell",
+ "frances-storage",
+ "frances-workflow",
+ "futures",
+ "futures-util",
+ "getrandom 0.2.17",
+ "libc",
+ "parking_lot",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "sha2",
+ "shell-words",
+ "shellexpand",
+ "similar",
+ "smallvec",
+ "tarpc",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "tracing-subscriber",
+ "turso",
+ "twox-hash",
+ "url",
+ "uuid",
+ "xdg",
 ]
 
 [[package]]

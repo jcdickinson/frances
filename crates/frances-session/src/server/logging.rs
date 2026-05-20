@@ -36,7 +36,7 @@ pub fn install_logging(session: &Session) -> Result<()> {
     // turso/hyper/reqwest internals. Overridable via RUST_LOG.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         tracing_subscriber::EnvFilter::new(
-            "warn,frances=trace,frances_daemon=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
+            "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
         )
     });
     use tracing_subscriber::util::SubscriberInitExt;

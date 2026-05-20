@@ -4,7 +4,7 @@ use std::os::unix::fs::symlink;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use frances_daemon::{session::*, tty::TtyKey};
+use frances_session::{session::*, tty::TtyKey};
 
 fn temp_root(label: &str) -> PathBuf {
     let unique = format!(

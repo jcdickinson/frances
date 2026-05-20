@@ -5,7 +5,7 @@
 //! so the bug only surfaces at runtime on the receiving end — easy to
 //! miss without an explicit round-trip.
 
-use frances_daemon::protocol::{
+use frances_session::protocol::{
     BlockId, BlockKind, PermissionId, PermissionRequest, PermissionResponseWire, StreamFrame,
 };
 use frances_models_llm::wire::ToolCall;

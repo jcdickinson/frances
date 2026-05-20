@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use frances_daemon::protocol::{BlockKind, ShellState};
+use frances_session::protocol::{BlockKind, ShellState};
 use frances_tui::Block;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -33,11 +33,11 @@ pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
 }
 
 pub struct DiffBlock {
-    lines: Vec<frances_daemon::protocol::DiffLine>,
+    lines: Vec<frances_session::protocol::DiffLine>,
 }
 
 impl DiffBlock {
-    pub fn new(lines: Vec<frances_daemon::protocol::DiffLine>) -> Self {
+    pub fn new(lines: Vec<frances_session::protocol::DiffLine>) -> Self {
         Self { lines }
     }
 }
@@ -48,11 +48,11 @@ impl Block for DiffBlock {
         let mut count = 0;
         for line in &self.lines {
             let content = match line {
-                frances_daemon::protocol::DiffLine::Context { text: c, line: l } => {
+                frances_session::protocol::DiffLine::Context { text: c, line: l } => {
                     format!("{:4} {}", l, c)
                 }
-                frances_daemon::protocol::DiffLine::Added(a) => a.to_string(),
-                frances_daemon::protocol::DiffLine::Removed(r) => r.to_string(),
+                frances_session::protocol::DiffLine::Added(a) => a.to_string(),
+                frances_session::protocol::DiffLine::Removed(r) => r.to_string(),
             };
             let mut out = Vec::new();
             wrap_into("", &content, max, &mut out);
@@ -66,15 +66,15 @@ impl Block for DiffBlock {
         let max = area.width.max(1) as usize;
         for line in &self.lines {
             let (content, style) = match line {
-                frances_daemon::protocol::DiffLine::Context { text: c, line: l } => {
+                frances_session::protocol::DiffLine::Context { text: c, line: l } => {
                     let formatted = format!("{:4} {}", l, c);
                     (formatted, Style::default())
                 }
-                frances_daemon::protocol::DiffLine::Added(a) => (
+                frances_session::protocol::DiffLine::Added(a) => (
                     a.to_string(),
                     Style::default().bg(Color::Green).fg(Color::Black),
                 ),
-                frances_daemon::protocol::DiffLine::Removed(r) => (
+                frances_session::protocol::DiffLine::Removed(r) => (
                     r.to_string(),
                     Style::default().bg(Color::Red).fg(Color::Black),
                 ),

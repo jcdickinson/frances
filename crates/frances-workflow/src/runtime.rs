@@ -138,14 +138,14 @@ pub enum FrameKind {
     },
     /// `DiffFrame` — one-shot structured diff produced by a file-edit
     /// tool. `lines` is the unified-diff content with line numbers for
-    /// context rows only; the daemon translates each op to the wire
-    /// `protocol::DiffLine` and emits a `BlockKind::Diff` block.
+    /// context rows only; the session runtime translates each op to
+    /// `events::DiffLine` and emits a `BlockKind::Diff` block.
     Diff { lines: Vec<frances_edit::DiffOp> },
 }
 
 /// Terminal status for [`FrameKind::ShellOutput`]. Mirrors
-/// `frances_daemon::protocol::ShellState`; the daemon translates one
-/// to the other when it emits the wire `BlockKind`.
+/// `frances_session::events::ShellState`; the session runtime translates
+/// one to the other when it emits the matching `BlockKind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ShellState {
     Running,

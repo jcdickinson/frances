@@ -5,9 +5,9 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use tracing::info;
 
-use frances_daemon::protocol::PROTOCOL_VERSION;
-use frances_daemon::session::Session;
-use frances_daemon::transport;
+use frances_session::protocol::PROTOCOL_VERSION;
+use frances_session::session::Session;
+use frances_session::transport;
 
 use crate::client;
 

@@ -6,9 +6,9 @@ mod ui;
 
 use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
-use frances_daemon::context::InvocationContext;
-use frances_daemon::session::{Paths, Session};
-use frances_daemon::{protocol, server, store};
+use frances_session::context::InvocationContext;
+use frances_session::session::{Paths, Session};
+use frances_session::{protocol, server, store};
 use tracing::debug;
 
 use crate::ui::App;
@@ -125,7 +125,7 @@ async fn real_main() -> Result<()> {
 
 fn resolve_existing_session_for_tty(
     paths: &Paths,
-    tty_key: &frances_daemon::tty::TtyKey,
+    tty_key: &frances_session::tty::TtyKey,
 ) -> Result<Session> {
     paths
         .resolve_tty_link(tty_key)?

@@ -1,10 +1,10 @@
-use frances_daemon::context::InvocationContext;
-use frances_daemon::protocol::{
+use frances_session::context::InvocationContext;
+use frances_session::protocol::{
     AttachResponse, ClientClient, DaemonPid, DaemonStatus, PermissionId, PermissionResponseWire,
     SessionId, StreamFrame,
 };
-use frances_daemon::session::Session;
-use frances_daemon::transport::{TransportError, read_message};
+use frances_session::session::Session;
+use frances_session::transport::{TransportError, read_message};
 use tarpc::client::RpcError;
 use tarpc::context;
 use tarpc::tokio_serde::formats::Bincode;
