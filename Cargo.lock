@@ -1429,22 +1429,16 @@ name = "frances"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "bincode 2.0.1",
  "clap",
  "crossterm",
  "frances-session",
  "frances-tui",
- "futures",
  "futures-util",
  "libc",
  "ratatui",
  "ratatui-textarea",
- "serde",
- "tarpc",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
- "tracing-subscriber",
  "unicode-width 0.2.2",
 ]
 

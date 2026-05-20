@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 use crate::llm::session_provider::SessionConfigWriteError;
+use crate::runtime::RuntimeError;
 use crate::scrollback::ScrollbackError;
-use crate::server::ServerError;
 use crate::session::SessionError;
 use crate::store::DatabaseError;
 use crate::workflows::{WorkflowError, WorkflowStackError};
@@ -39,7 +39,7 @@ pub enum Error {
     History(#[from] HistoryError),
 
     #[error(transparent)]
-    Server(#[from] ServerError),
+    Runtime(#[from] RuntimeError),
 
     #[error(transparent)]
     Session(#[from] SessionError),

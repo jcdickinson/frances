@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Stdout, Write, stdout};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -16,32 +17,30 @@ use ratatui::Viewport;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Position, Size};
 use ratatui::style::{Color, Style};
-use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
-use frances_session::llm::Usage;
-use frances_session::protocol::{
-    self, BlockKind, DaemonStatus, PermissionRequest, PermissionResponseWire, StreamFrame,
+use frances_session::events::{
+    BlockKind, PermissionRequest, PermissionResponseWire, StreamFrame,
 };
+use frances_session::llm::Usage;
+use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
 use frances_tui::{
     BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer, TruncatedBlock,
 };
 
-use crate::client;
 use crate::tui::{FooterBlock, INPUT_HEIGHT, RawBlock, Textarea, block_for_kind};
 
 pub struct App<'a> {
     pub session: &'a Session,
-    pub status: &'a DaemonStatus,
-    /// The single daemon-to-client frame stream opened by
-    /// [`crate::client::attach`]. The run loop spawns one reader task
-    /// that pumps frames off it into the dispatch channel; initial
-    /// scrollback, every prompt's frames, and any workflow-switch
-    /// replays all arrive through this socket.
-    pub events: UnixStream,
+    pub runtime: Arc<SessionRuntime>,
+    /// Event receiver paired with the runtime's
+    /// [`frances_session::runtime::EventsChannel`]. Carries initial
+    /// scrollback replay, prompt frames, and any mid-cycle
+    /// workflow-switch replays.
+    pub events: mpsc::UnboundedReceiver<StreamFrame>,
 }
 
 enum KeyAction {
@@ -78,7 +77,7 @@ struct ActiveBlock {
 /// container's local ids plus the accumulated text needed to re-render
 /// on each delta.
 struct LiveBlocks {
-    by_id: HashMap<protocol::BlockId, ActiveBlock>,
+    by_id: HashMap<frances_session::events::BlockId, ActiveBlock>,
 }
 
 impl LiveBlocks {
@@ -98,7 +97,7 @@ impl LiveBlocks {
     fn delta(
         &mut self,
         container: &mut ScrollbackContainer,
-        id: protocol::BlockId,
+        id: frances_session::events::BlockId,
         kind: BlockKind,
         text: Option<String>,
     ) {
@@ -144,7 +143,7 @@ impl LiveBlocks {
     /// protocol bug — we warn and return `None`.
     fn stop_or_recover(
         &mut self,
-        id: protocol::BlockId,
+        id: frances_session::events::BlockId,
         frame_label: &'static str,
     ) -> Option<ContainerBlockId> {
         match self.by_id.remove(&id) {
@@ -222,42 +221,13 @@ impl App<'_> {
         let mut textarea = Textarea::new("type a message…");
         let mut state = LiveBlocks::new();
         let mut pending_approval: Option<PermissionRequest> = None;
-        let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<StreamFrame>();
+        let mut frame_rx = self.events;
         let mut events = EventStream::new();
         let mut streaming = false;
         let mut replay_mode = false;
         let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-        // Single reader task: pumps frames off the per-attach events
-        // socket into `frame_rx`. The socket carries initial replay,
-        // every prompt's frames, and any mid-cycle workflow-switch
-        // replay. On EOF / read error (daemon gone, socket closed)
-        // the task sends one final synthetic `Error` frame so the
-        // user gets a visible "connection to daemon lost" row, then
-        // exits. The dispatch loop keeps running — the user can
-        // still close the TUI on their own time.
-        let events_socket = self.events;
-        let reader_tx = frame_tx.clone();
-        tokio::spawn(async move {
-            let mut stream = events_socket;
-            loop {
-                match client::next_event(&mut stream).await {
-                    Ok(frame) => {
-                        if reader_tx.send(frame).is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => {
-                        let _ = reader_tx.send(StreamFrame::Error(format!(
-                            "connection to daemon lost: {err}"
-                        )));
-                        return;
-                    }
-                }
-            }
-        });
 
         loop {
             redraw(
@@ -314,14 +284,13 @@ impl App<'_> {
                                     textarea.clear();
                                     if let Some(req) = pending_approval.take() {
                                         textarea.set_placeholder("type a message…");
-                                        spawn_permission(
-                                            self.session.clone(),
+                                        respond_permission(
+                                            &self.runtime,
                                             req.id,
                                             PermissionResponseWire::RedirectToChat { content: text },
-                                            frame_tx.clone(),
                                         );
                                     } else {
-                                        spawn_prompt(self.session.clone(), text, frame_tx.clone());
+                                        self.runtime.prompt(text);
                                         streaming = true;
                                     }
                                 }
@@ -340,12 +309,7 @@ impl App<'_> {
                                         }
                                         _ => PermissionResponseWire::No { details },
                                     };
-                                    spawn_permission(
-                                        self.session.clone(),
-                                        req.id,
-                                        response,
-                                        frame_tx.clone(),
-                                    );
+                                    respond_permission(&self.runtime, req.id, response);
                                 }
                                 KeyAction::Edit => textarea.input(key),
                             }
@@ -403,11 +367,7 @@ impl App<'_> {
 
     fn banner_lines(&self) -> Vec<String> {
         vec![
-            format!("frances session {}", self.status.session_id),
-            format!(
-                "  daemon_pid={} protocol=v{:016x}",
-                self.status.daemon_pid, self.status.protocol_version
-            ),
+            format!("frances session {}", self.session.id),
             "  Enter to send. Alt+Enter for newline. Ctrl-O for history. Ctrl-C, Ctrl-D, or Esc to exit.".to_string(),
         ]
     }
@@ -466,7 +426,7 @@ fn redraw(
 /// `App` state for the lifetime of one replay burst (between
 /// `ScrollbackReset` and `ScrollbackReplayEnd`).
 struct ReplayBlock {
-    id: protocol::BlockId,
+    id: frances_session::events::BlockId,
     kind: BlockKind,
     text: String,
 }
@@ -652,26 +612,16 @@ fn handle_replay_frame(
 const PERMISSION_PLACEHOLDER: &str =
     "Alt+Y yes  Alt+N no  Enter chat (text becomes details for yes/no)";
 
-fn spawn_prompt(session: Session, prompt: String, frame_tx: mpsc::UnboundedSender<StreamFrame>) {
-    tokio::spawn(async move {
-        if let Err(error) = client::prompt(&session, prompt).await {
-            let _ = frame_tx.send(StreamFrame::Error(format!("{error:#}")));
-            let _ = frame_tx.send(StreamFrame::Done);
-        }
-    });
-}
-
-fn spawn_permission(
-    session: Session,
-    id: frances_session::protocol::PermissionId,
+fn respond_permission(
+    runtime: &Arc<SessionRuntime>,
+    id: frances_session::events::PermissionId,
     response: PermissionResponseWire,
-    frame_tx: mpsc::UnboundedSender<StreamFrame>,
 ) {
-    tokio::spawn(async move {
-        if let Err(error) = client::respond_permission(&session, id, response).await {
-            let _ = frame_tx.send(StreamFrame::Error(format!("permission: {error:#}")));
-        }
-    });
+    if let Err(error) = runtime.respond_permission(id, response) {
+        runtime
+            .events
+            .send(StreamFrame::Error(format!("permission: {error}")));
+    }
 }
 
 fn format_usage(usage: &Usage) -> String {
@@ -779,7 +729,7 @@ mod tests {
         // Open id 1.
         state.delta(
             &mut container,
-            protocol::BlockId(1),
+            frances_session::events::BlockId(1),
             kind_a.clone(),
             Some("hel".to_owned()),
         );
@@ -788,7 +738,7 @@ mod tests {
         // Same-id append.
         state.delta(
             &mut container,
-            protocol::BlockId(1),
+            frances_session::events::BlockId(1),
             kind_a,
             Some("lo".to_owned()),
         );
@@ -798,7 +748,7 @@ mod tests {
         // first. Neither closes.
         state.delta(
             &mut container,
-            protocol::BlockId(2),
+            frances_session::events::BlockId(2),
             kind_b,
             Some("ls".to_owned()),
         );
@@ -809,13 +759,13 @@ mod tests {
         // but stuck behind id 2 in container order, so it's now also
         // ready to commit (mark_safe drains the contiguous prefix).
         let b_id = state
-            .stop_or_recover(protocol::BlockId(2), "BlockStop")
+            .stop_or_recover(frances_session::events::BlockId(2), "BlockStop")
             .expect("stop id 2");
         container.mark_safe(b_id);
 
         // Close id 1.
         let a_id = state
-            .stop_or_recover(protocol::BlockId(1), "BlockStop")
+            .stop_or_recover(frances_session::events::BlockId(1), "BlockStop")
             .expect("stop id 1");
         container.mark_safe(a_id);
 
@@ -831,7 +781,7 @@ mod tests {
         let container = ScrollbackContainer::new(footer(), 0);
         let mut state = LiveBlocks::new();
 
-        let result = state.stop_or_recover(protocol::BlockId(99), "BlockStop");
+        let result = state.stop_or_recover(frances_session::events::BlockId(99), "BlockStop");
 
         assert!(result.is_none(), "unknown id stop returns None");
         assert_eq!(container.active_count(), 0);
@@ -862,12 +812,12 @@ mod tests {
         // Completed block A.
         state.delta(
             &mut container,
-            protocol::BlockId(1),
+            frances_session::events::BlockId(1),
             frances(),
             Some("first".to_owned()),
         );
         let a_id = state
-            .stop_or_recover(protocol::BlockId(1), "BlockStop")
+            .stop_or_recover(frances_session::events::BlockId(1), "BlockStop")
             .expect("close A");
         container.mark_safe(a_id);
         assert_eq!(container.safe_count(), 1);
@@ -875,10 +825,10 @@ mod tests {
 
         // None-content frames in between: mixed senders, some closed,
         // some still tracked when block B opens.
-        state.delta(&mut container, protocol::BlockId(2), frances(), None);
-        state.delta(&mut container, protocol::BlockId(3), bare(), None);
-        state.delta(&mut container, protocol::BlockId(4), you(), None);
-        state.delta(&mut container, protocol::BlockId(5), bare(), None);
+        state.delta(&mut container, frances_session::events::BlockId(2), frances(), None);
+        state.delta(&mut container, frances_session::events::BlockId(3), bare(), None);
+        state.delta(&mut container, frances_session::events::BlockId(4), you(), None);
+        state.delta(&mut container, frances_session::events::BlockId(5), bare(), None);
         assert_eq!(
             container.active_count(),
             0,
@@ -889,12 +839,12 @@ mod tests {
         // (no container id to mark safe) and not touch the container.
         assert!(
             state
-                .stop_or_recover(protocol::BlockId(2), "BlockStop")
+                .stop_or_recover(frances_session::events::BlockId(2), "BlockStop")
                 .is_none()
         );
         assert!(
             state
-                .stop_or_recover(protocol::BlockId(4), "BlockStop")
+                .stop_or_recover(frances_session::events::BlockId(4), "BlockStop")
                 .is_none()
         );
         assert_eq!(container.active_count(), 0);
@@ -904,12 +854,12 @@ mod tests {
         // unrendered — they must not affect ordering or counts.
         state.delta(
             &mut container,
-            protocol::BlockId(6),
+            frances_session::events::BlockId(6),
             frances(),
             Some("second".to_owned()),
         );
         let b_id = state
-            .stop_or_recover(protocol::BlockId(6), "BlockStop")
+            .stop_or_recover(frances_session::events::BlockId(6), "BlockStop")
             .expect("close B");
         container.mark_safe(b_id);
 
@@ -936,14 +886,14 @@ mod tests {
         // Open id 1.
         state.delta(
             &mut container,
-            protocol::BlockId(1),
+            frances_session::events::BlockId(1),
             kind,
             Some("hi".to_owned()),
         );
         assert_eq!(container.active_count(), 1);
 
         // Stop with id 2 — unknown. Returns None; id 1 stays open.
-        let recovered = state.stop_or_recover(protocol::BlockId(2), "BlockStop");
+        let recovered = state.stop_or_recover(frances_session::events::BlockId(2), "BlockStop");
         assert!(recovered.is_none());
         assert_eq!(container.active_count(), 1);
         assert_eq!(container.safe_count(), 0);

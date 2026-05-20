@@ -30,7 +30,7 @@ use tracing::warn;
 
 use crate::events::PermissionRequest;
 
-use super::ServerState;
+use super::SessionRuntime;
 
 /// Model-intent fallback walked by the judge. Resolved through the
 /// chat manager's standard intent lookup; a missing intent falls
@@ -101,13 +101,11 @@ const DEFAULT_REASON: &str = "(no reason given)";
 
 /// Ask the configured judge model whether to auto-approve `request`.
 /// One retry on malformed output before giving up with `Indeterminate`.
-pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest) -> JudgeOutcome {
-    let env = state
-        .last_context
-        .lock()
-        .as_ref()
-        .map(|ctx| ctx.process.env.clone())
-        .unwrap_or_default();
+pub(crate) async fn judge(
+    runtime: &Arc<SessionRuntime>,
+    request: &PermissionRequest,
+) -> JudgeOutcome {
+    let env = runtime.invocation.lock().process.env.clone();
 
     let session_id = format!("auto-judge:{}", request.id);
     let tools = [APPROVE_TOOL.clone(), REJECT_TOOL.clone()];
@@ -121,7 +119,7 @@ pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest)
         },
     ];
 
-    let first = match run_round(state, &session_id, &env, &inputs, &tools).await {
+    let first = match run_round(runtime, &session_id, &env, &inputs, &tools).await {
         RoundOutcome::Parsed(parse) => parse,
         RoundOutcome::Errored(reason) => {
             warn!(%reason, id = %request.id, "auto-judge: chat.complete failed");
@@ -143,7 +141,7 @@ pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest)
     let mut retry_inputs = inputs.clone();
     retry_inputs.push(HistoryInput::User { text: scold });
 
-    let second = match run_round(state, &session_id, &env, &retry_inputs, &tools).await {
+    let second = match run_round(runtime, &session_id, &env, &retry_inputs, &tools).await {
         RoundOutcome::Parsed(parse) => parse,
         RoundOutcome::Errored(reason) => {
             warn!(%reason, id = %request.id, "auto-judge: retry chat.complete failed");
@@ -172,7 +170,7 @@ enum RoundOutcome {
 }
 
 async fn run_round(
-    state: &Arc<ServerState>,
+    runtime: &Arc<SessionRuntime>,
     session_id: &str,
     env: &std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
     inputs: &[HistoryInput<'_>],
@@ -197,7 +195,7 @@ async fn run_round(
         max_tool_calls: Some(1),
     };
 
-    match state.chat.complete(req).await {
+    match runtime.chat.complete(req).await {
         Ok(outcome) => RoundOutcome::Parsed(parse_calls(&outcome.tool_calls)),
         Err(error) => RoundOutcome::Errored(format!("chat.complete failed: {error}")),
     }

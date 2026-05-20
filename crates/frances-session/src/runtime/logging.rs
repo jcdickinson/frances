@@ -1,35 +1,28 @@
 use std::fs;
-use std::io;
-use std::os::unix::io::AsRawFd;
+use std::sync::Mutex;
 
 use tracing::info;
 
 use crate::Result;
 use crate::session::Session;
 
-use super::ServerError;
+use super::RuntimeError;
 
+/// Wire tracing to write into `session.dir/frances.log`. Stdout / stderr
+/// stay attached to the terminal so the in-process TUI can render
+/// without being trampled by log writes.
 pub fn install_logging(session: &Session) -> Result<()> {
-    let log_path = session.dir.join("daemon.log");
+    let log_path = session.dir.join("frances.log");
     let file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log_path)
-        .map_err(|source| ServerError::OpenDaemonLog {
+        .map_err(|source| RuntimeError::OpenSessionLog {
             path: log_path.clone(),
             source,
         })?;
 
-    let fd = file.as_raw_fd();
-    unsafe {
-        if libc::dup2(fd, libc::STDOUT_FILENO) < 0 {
-            return Err(ServerError::Dup2Stdout(io::Error::last_os_error()).into());
-        }
-        if libc::dup2(fd, libc::STDERR_FILENO) < 0 {
-            return Err(ServerError::Dup2Stderr(io::Error::last_os_error()).into());
-        }
-    }
-    drop(file);
+    let writer = Mutex::new(file);
 
     // Default to warn for the world; raise frances/frances-edit/frances-anchors
     // /frances-config to trace so we can see our own logs without drowning in
@@ -43,11 +36,11 @@ pub fn install_logging(session: &Session) -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_ansi(false)
-        .with_writer(io::stderr)
+        .with_writer(writer)
         .finish()
         .try_init()
-        .map_err(ServerError::InstallSubscriber)?;
+        .map_err(RuntimeError::InstallSubscriber)?;
 
-    info!(session_id = %session.id, log = %log_path.display(), "daemon logging installed");
+    info!(session_id = %session.id, log = %log_path.display(), "session runtime logging installed");
     Ok(())
 }

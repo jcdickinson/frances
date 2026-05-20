@@ -19,7 +19,7 @@
 //!
 //! ## Reads
 //!
-//! [`replay_to_stream`] queries every row for the given workflow
+//! [`replay_to_channel`] queries every row for the given workflow
 //! instance in `id` order and emits a synthetic frame burst on the
 //! supplied unix stream:
 //!
@@ -47,14 +47,13 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::net::UnixStream;
 use uuid::Uuid;
 
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
 use crate::events::{BlockId, BlockKind, StreamFrame};
-use crate::transport::write_message;
+use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
 /// never edit.
@@ -70,8 +69,6 @@ pub static SCHEMA: EntitySchema<'static> = EntitySchema {
 pub enum ScrollbackError {
     #[error("scrollback sql: {0}")]
     Turso(#[from] turso::Error),
-    #[error("scrollback transport: {0}")]
-    Transport(#[from] crate::transport::TransportError),
     #[error("scrollback payload encode: {0}")]
     Encode(serde_json::Error),
     #[error("scrollback payload decode for kind {kind:?}: {source}")]
@@ -237,11 +234,11 @@ pub async fn load_for_instance(
     Ok(out)
 }
 
-/// Replay every stored row for `instance` onto `stream`, bracketed by
+/// Replay every stored row for `instance` into `events`, bracketed by
 /// [`StreamFrame::ScrollbackReset`] and
 /// [`StreamFrame::ScrollbackReplayEnd`].
-pub async fn replay_to_stream(
-    stream: &mut UnixStream,
+pub async fn replay_to_channel(
+    events: &EventsChannel,
     db: &Database,
     instance: Uuid,
 ) -> Result<()> {
@@ -249,13 +246,9 @@ pub async fn replay_to_stream(
         .await
         .map_err(crate::Error::Scrollback)?;
 
-    write_message(
-        stream,
-        &StreamFrame::ScrollbackReset {
-            instance_id: instance,
-        },
-    )
-    .await?;
+    events.send(StreamFrame::ScrollbackReset {
+        instance_id: instance,
+    });
 
     // Local id allocator. Replayed block ids are independent of
     // `EmitState::next_block` — each replayed block opens and closes
@@ -278,32 +271,28 @@ pub async fn replay_to_stream(
                 // blocks are never persisted), so we always send
                 // `text: Some(_)` and the block materialises on the
                 // client.
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id,
-                        kind,
-                        text: Some(text),
-                    },
-                )
-                .await?;
+                events.send(StreamFrame::BlockDelta {
+                    id,
+                    kind,
+                    text: Some(text),
+                });
                 if truncated {
-                    write_message(stream, &StreamFrame::BlockTruncated { id }).await?;
+                    events.send(StreamFrame::BlockTruncated { id });
                 } else {
-                    write_message(stream, &StreamFrame::BlockStop { id }).await?;
+                    events.send(StreamFrame::BlockStop { id });
                 }
             }
             StoredRow::Error { text } => {
-                write_message(stream, &StreamFrame::Error(text)).await?;
+                events.send(StreamFrame::Error(text));
             }
         }
     }
 
-    write_message(stream, &StreamFrame::ScrollbackReplayEnd).await?;
+    events.send(StreamFrame::ScrollbackReplayEnd);
     Ok(())
 }
 
-/// In-process equivalent of [`replay_to_stream`] — produces the same
+/// In-process equivalent of [`replay_to_channel`] — produces the same
 /// frame sequence as a `Vec<StreamFrame>` so it can be bundled into
 /// an `AttachResponse`. The order matches the wire path exactly.
 pub async fn replay_frames(

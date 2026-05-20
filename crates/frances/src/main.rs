@@ -1,14 +1,13 @@
-mod client;
-mod spawn;
 mod tty;
 mod tui;
 mod ui;
 
-use anyhow::{Result, anyhow};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use frances_session::context::InvocationContext;
-use frances_session::session::{Paths, Session};
-use frances_session::{protocol, server, store};
+use frances_session::runtime::{SessionRuntime, install_logging};
+use frances_session::session::Paths;
+use frances_session::store;
 use tracing::debug;
 
 use crate::ui::App;
@@ -16,31 +15,16 @@ use crate::ui::App;
 #[derive(Debug, Parser)]
 #[command(name = "frances")]
 struct Cli {
-    #[arg(long, hide = true)]
-    daemon: Option<String>,
-
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Manage the daemon for the current TTY.
-    Daemon {
-        #[command(subcommand)]
-        action: DaemonAction,
-    },
-    /// Stop the daemon for the current TTY and unlink its session, so the
-    /// next invocation starts a fresh session.
+    /// Unlink the current TTY's session so the next invocation starts
+    /// a fresh session. The old session's state on disk is left intact;
+    /// only the TTY → session link is removed.
     New,
-}
-
-#[derive(Debug, Subcommand)]
-enum DaemonAction {
-    /// Show daemon status for the current TTY.
-    Status,
-    /// Stop the daemon for the current TTY.
-    Stop,
 }
 
 #[tokio::main]
@@ -54,80 +38,32 @@ async fn main() {
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(session_id) = cli.daemon {
-        let paths = Paths::discover()?;
-        let session = paths.load_session(&session_id)?;
-        server::install_logging(&session)?;
-        let db = store::open(&session).await?;
-        return Ok(server::run(session, db).await?);
-    }
-
     let tty_key = tty::controlling_tty_key()?;
     let paths = Paths::discover()?;
 
-    match cli.command {
-        Some(Command::Daemon {
-            action: DaemonAction::Status,
-        }) => {
-            let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-            let status = client::status(&session).await?;
-            println!("session_id={}", status.session_id);
-            println!("daemon_pid={}", status.daemon_pid);
-            println!("client_attached={}", status.client_attached);
-            println!("protocol_version={:016x}", status.protocol_version);
-            return Ok(());
+    if matches!(cli.command, Some(Command::New)) {
+        if paths.resolve_tty_link(&tty_key)?.is_some() {
+            paths.unlink_tty(&tty_key)?;
         }
-        Some(Command::Daemon {
-            action: DaemonAction::Stop,
-        }) => {
-            let session = resolve_existing_session_for_tty(&paths, &tty_key)?;
-            client::stop(&session, false).await?;
-            println!("frances session stopping: {}", session.id);
-            return Ok(());
-        }
-        Some(Command::New) => {
-            if let Some(session) = paths.resolve_tty_link(&tty_key)? {
-                if let Err(error) = client::stop(&session, false).await {
-                    debug!(%error, "stop request failed during `new`; continuing to unlink");
-                }
-                paths.unlink_tty(&tty_key)?;
-            }
-        }
-        None => {}
     }
 
     let invocation = InvocationContext::capture(Some(tty_key.clone()));
     let session = paths.resolve_or_create_for_tty(&tty_key, invocation.process.cwd.clone())?;
 
-    spawn::ensure_daemon(&session).await?;
+    install_logging(&session)?;
+    let db = store::open(&session).await?;
+    let (runtime, events_rx) = SessionRuntime::start(session.clone(), db, invocation).await?;
+    runtime.replay_initial_scrollback().await;
 
-    debug!(session_id = %session.id, "attaching client to daemon");
-    let (response, events) = client::attach(&session, invocation).await?;
-    match response {
-        protocol::AttachResponse::Attached { session_id: _ } => {
-            let status = client::status(&session).await?;
-            App {
-                session: &session,
-                status: &status,
-                events,
-            }
-            .run()
-            .await?;
-            let _ = client::detach(&session).await;
-        }
-        protocol::AttachResponse::Busy => {
-            println!("frances session busy: {}", session.id);
-        }
+    debug!(session_id = %session.id, "starting TUI");
+    let result = App {
+        session: &session,
+        runtime: runtime.clone(),
+        events: events_rx,
     }
+    .run()
+    .await;
 
-    Ok(())
-}
-
-fn resolve_existing_session_for_tty(
-    paths: &Paths,
-    tty_key: &frances_session::tty::TtyKey,
-) -> Result<Session> {
-    paths
-        .resolve_tty_link(tty_key)?
-        .ok_or_else(|| anyhow!("no frances session is linked to the current TTY"))
+    runtime.shutdown();
+    result
 }

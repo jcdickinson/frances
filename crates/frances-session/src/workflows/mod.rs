@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
-use tokio::net::UnixStream;
+
 use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 use turso::Value;
@@ -45,9 +45,9 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::events::{BlockId, BlockKind, StreamFrame};
-use crate::server::ServerState;
+use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
-use crate::transport::write_message;
+
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
@@ -220,11 +220,11 @@ impl EmitState {
     /// Clean close for a single block: emit `BlockStop`, persist a
     /// finished row (if the block ever received body content), drop
     /// the entry. Idempotent on unknown ids.
-    async fn close_one(&mut self, stream: &mut UnixStream, frame_id: FrameId) -> Result<()> {
+    async fn close_one(&mut self, events: &EventsChannel, frame_id: FrameId) -> Result<()> {
         let Some(open) = self.open.remove(&frame_id) else {
             return Ok(());
         };
-        write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
+        events.send(StreamFrame::BlockStop { id: open.id });
         if let Some(text) = open.text {
             crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &text, false)
                 .await?;
@@ -237,10 +237,10 @@ impl EmitState {
     /// opens get a real `BlockStop` so the TUI's per-id active state
     /// drains. Blocks that never received any text are dropped without
     /// being persisted (the client never materialised them either).
-    async fn close_all_stop(&mut self, stream: &mut UnixStream) -> Result<()> {
+    async fn close_all_stop(&mut self, events: &EventsChannel) -> Result<()> {
         let drained: Vec<OpenBlock> = self.open.drain().map(|(_, v)| v).collect();
         for open in drained {
-            write_message(stream, &StreamFrame::BlockStop { id: open.id }).await?;
+            events.send(StreamFrame::BlockStop { id: open.id });
             if let Some(text) = open.text {
                 crate::scrollback::persist_block(
                     &self.db,
@@ -292,19 +292,16 @@ impl EmitState {
 /// the topmost workflow until it parks waiting for input or
 /// terminates.
 pub(crate) async fn cycle(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
+    runtime: &Arc<SessionRuntime>,
     text: &str,
 ) -> Result<()> {
     match parse_slash_command(text) {
-        Ok(Some((name, args))) => push_and_drive(state, stream, name, args).await,
-        Ok(None) => dispatch_topmost(state, stream, text).await,
+        Ok(Some((name, args))) => push_and_drive(runtime, name, args).await,
+        Ok(None) => dispatch_topmost(runtime, text).await,
         Err(error) => {
-            write_message(
-                stream,
-                &StreamFrame::Error(format!("bad workflow args: {error}")),
-            )
-            .await?;
+            runtime
+                .events
+                .send(StreamFrame::Error(format!("bad workflow args: {error}")));
             Ok(())
         }
     }
@@ -319,22 +316,22 @@ pub(crate) async fn cycle(
 /// error) cascade through [`drop_active_and_promote`] until a row
 /// hydrates cleanly or the live stack is exhausted. The daemon is
 /// always usable when this returns.
-pub(crate) async fn restore_or_seed(state: &Arc<ServerState>) -> Result<()> {
-    let db = &state.workflow_stack.db;
+pub(crate) async fn restore_or_seed(runtime: &Arc<SessionRuntime>) -> Result<()> {
+    let db = &runtime.workflow_stack.db;
 
     if row_count(db).await? == 0 {
-        let default_workflow = state.default_workflow.get();
+        let default_workflow = runtime.default_workflow.get();
         let Some(name) = default_workflow.as_deref().and_then(|opt| opt.as_deref()) else {
             return Ok(());
         };
-        match push_default_workflow(state, name).await {
+        match push_default_workflow(runtime, name).await {
             Ok(()) => {}
             Err(error) => warn!(%error, workflow = %name, "default_workflow start failed"),
         }
         return Ok(());
     }
 
-    hydrate_active_or_cascade(state).await
+    hydrate_active_or_cascade(runtime).await
 }
 
 /// Push the configured default workflow with empty args. Used by
@@ -342,8 +339,8 @@ pub(crate) async fn restore_or_seed(state: &Arc<ServerState>) -> Result<()> {
 /// fresh session). Frames the workflow emits during top-level
 /// evaluation buffer in `WorkflowHandle::frames` and flush on the
 /// first prompt cycle — there is no stream to write to here.
-async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<()> {
-    let workflows = state.workflows.get_or_default();
+async fn push_default_workflow(runtime: &Arc<SessionRuntime>, name: &str) -> Result<()> {
+    let workflows = runtime.workflows.get_or_default();
     let Some(cfg) = workflows.get(name) else {
         warn!(
             workflow = name,
@@ -371,11 +368,11 @@ async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<(
         instance_id,
         migrations,
     };
-    let handle = state.workflow_runtime.start(invocation).await?;
-    insert_pushed_row(&state.workflow_stack.db, name, instance_id, &[]).await?;
-    *state.workflow_stack.top.lock().await = Some(WorkflowInstance {
+    let handle = runtime.workflow_runtime.start(invocation).await?;
+    insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &[]).await?;
+    *runtime.workflow_stack.top.lock().await = Some(WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.db.clone(), instance_id),
+        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
     });
     Ok(())
@@ -387,25 +384,22 @@ async fn push_default_workflow(state: &Arc<ServerState>, name: &str) -> Result<(
 /// so the caller never ends up "with no top" purely because the new
 /// workflow returned synchronously.
 async fn push_and_drive(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
+    runtime: &Arc<SessionRuntime>,
     name: &str,
     args: Vec<String>,
 ) -> Result<()> {
-    let workflows = state.workflows.get_or_default();
+    let workflows = runtime.workflows.get_or_default();
     let Some(cfg) = workflows.get(name) else {
-        write_message(
-            stream,
-            &StreamFrame::Error(format!("unknown workflow: {name}")),
-        )
-        .await?;
+        runtime
+            .events
+            .send(StreamFrame::Error(format!("unknown workflow: {name}")));
         return Ok(());
     };
 
     let migrations = match load_migrations(cfg).await {
         Ok(m) => m,
         Err(error) => {
-            write_message(stream, &StreamFrame::Error(format!("workflow: {error}"))).await?;
+            runtime.events.send(StreamFrame::Error(format!("workflow: {error}")));
             return Ok(());
         }
     };
@@ -421,10 +415,10 @@ async fn push_and_drive(
 
     // Start the new runtime BEFORE we touch any state. If it fails,
     // the previous top (if any) keeps running and the DB is unchanged.
-    let handle = match state.workflow_runtime.start(invocation).await {
+    let handle = match runtime.workflow_runtime.start(invocation).await {
         Ok(handle) => handle,
         Err(error) => {
-            write_message(stream, &StreamFrame::Error(format!("workflow: {error}"))).await?;
+            runtime.events.send(StreamFrame::Error(format!("workflow: {error}")));
             return Ok(());
         }
     };
@@ -432,34 +426,34 @@ async fn push_and_drive(
     // Take the old top out of memory (we'll dehydrate it next). The
     // dehydration is bounded by `DEHYDRATE_TIMEOUT`; the JS body's
     // `lifecycle.shutdown` hook (if any) runs first.
-    let old = state.workflow_stack.top.lock().await.take();
+    let old = runtime.workflow_stack.top.lock().await.take();
     if let Some(old) = old {
-        dehydrate(state, old, stream).await?;
+        dehydrate(runtime, old).await?;
     }
 
     // Persist the new row. Truncates any non-completed rows above the
     // (now demoted) current top — defensive against crash-mid-pop.
-    insert_pushed_row(&state.workflow_stack.db, name, instance_id, &args).await?;
+    insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &args).await?;
 
     // Tell the TUI to drop the previous workflow's in-memory scrollback
     // and replay the new active instance's (empty on a fresh push, but
     // we run the burst anyway for protocol uniformity — and for the
     // future "resume previously-popped" case which would have rows).
-    crate::scrollback::replay_to_stream(stream, &state.workflow_stack.db, instance_id).await?;
+    crate::scrollback::replay_to_channel(&runtime.events, &runtime.workflow_stack.db, instance_id).await?;
 
     let mut new_instance = WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.db.clone(), instance_id),
+        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
     };
-    let exited = drive(state, &mut new_instance, stream).await?;
+    let exited = drive(runtime, &mut new_instance).await?;
     if exited {
         // The new workflow ran to completion in its initial cycle.
         // Treat that as an immediate pop: tombstone its row, then
         // rehydrate whatever's underneath.
-        drop_active_and_promote(state, stream, instance_id).await?;
+        drop_active_and_promote(runtime, instance_id).await?;
     } else {
-        *state.workflow_stack.top.lock().await = Some(new_instance);
+        *runtime.workflow_stack.top.lock().await = Some(new_instance);
     }
     Ok(())
 }
@@ -467,22 +461,17 @@ async fn push_and_drive(
 /// Hand `text` to the topmost workflow's inbox and drive a cycle. On
 /// exit, tombstone the row and rehydrate the next live row (if any).
 async fn dispatch_topmost(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
+    runtime: &Arc<SessionRuntime>,
     text: &str,
 ) -> Result<()> {
-    let mut top = match state.workflow_stack.top.lock().await.take() {
+    let mut top = match runtime.workflow_stack.top.lock().await.take() {
         Some(top) => top,
         None => {
-            write_message(
-                stream,
-                &StreamFrame::Error(
-                    "no workflow is active; use a slash command or set \
-                     `default_workflow` in your config"
-                        .to_owned(),
-                ),
-            )
-            .await?;
+            runtime.events.send(StreamFrame::Error(
+                "no workflow is active; use a slash command or set \
+                 `default_workflow` in your config"
+                    .to_owned(),
+            ));
             return Ok(());
         }
     };
@@ -493,15 +482,15 @@ async fn dispatch_topmost(
     let _ = top.handle.input_tx.send(UserInput {
         content: text.to_owned(),
     });
-    let exited = drive(state, &mut top, stream).await?;
+    let exited = drive(runtime, &mut top).await?;
     if exited {
         let instance_id = top.handle.instance;
         // Drop the in-memory state explicitly so its task is gone
         // before we begin rehydrating the next row.
         drop(top);
-        drop_active_and_promote(state, stream, instance_id).await?;
+        drop_active_and_promote(runtime, instance_id).await?;
     } else {
-        *state.workflow_stack.top.lock().await = Some(top);
+        *runtime.workflow_stack.top.lock().await = Some(top);
     }
     Ok(())
 }
@@ -547,9 +536,8 @@ async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, Workflo
 /// fallback — but in practice the body has already exited by the time
 /// we get here unless the timeout fired.
 async fn dehydrate(
-    state: &Arc<ServerState>,
+    runtime: &Arc<SessionRuntime>,
     mut instance: WorkflowInstance,
-    stream: &mut UnixStream,
 ) -> Result<()> {
     instance.handle.request_shutdown();
     let deadline = tokio::time::sleep(DEHYDRATE_TIMEOUT);
@@ -557,26 +545,26 @@ async fn dehydrate(
     loop {
         // Flush anything sitting in the queue first.
         while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(state, stream, &mut instance.emit, host_frame).await?;
+            emit(runtime, &mut instance.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
             Some(host_frame) = instance.handle.frames.recv() => {
-                emit(state, stream, &mut instance.emit, host_frame).await?;
+                emit(runtime, &mut instance.emit, host_frame).await?;
             }
             done = &mut instance.handle.done => {
                 // Drain any tail frames the lifecycle hook pushed
                 // immediately before settling.
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(state, stream, &mut instance.emit, host_frame).await?;
+                    emit(runtime, &mut instance.emit, host_frame).await?;
                 }
                 // Body exited cleanly: every remaining open block gets
                 // a clean BlockStop on the wire and a non-truncated row.
-                instance.emit.close_all_stop(stream).await?;
+                instance.emit.close_all_stop(&runtime.events).await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow shutdown: {error}");
                     instance.emit.persist_error(&msg).await?;
-                    write_message(stream, &StreamFrame::Error(msg)).await?;
+                    runtime.events.send(StreamFrame::Error(msg));
                 }
                 return Ok(());
             }
@@ -599,28 +587,27 @@ async fn dehydrate(
 /// parks waiting for input or terminates. Returns `true` if the body
 /// exited.
 async fn drive(
-    state: &Arc<ServerState>,
+    runtime: &Arc<SessionRuntime>,
     instance: &mut WorkflowInstance,
-    stream: &mut UnixStream,
 ) -> Result<bool> {
     loop {
         while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(state, stream, &mut instance.emit, host_frame).await?;
+            emit(runtime, &mut instance.emit, host_frame).await?;
         }
         tokio::select! {
             biased;
             Some(host_frame) = instance.handle.frames.recv() => {
-                emit(state, stream, &mut instance.emit, host_frame).await?;
+                emit(runtime, &mut instance.emit, host_frame).await?;
             }
             done = &mut instance.handle.done => {
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(state, stream, &mut instance.emit, host_frame).await?;
+                    emit(runtime, &mut instance.emit, host_frame).await?;
                 }
-                instance.emit.close_all_stop(stream).await?;
+                instance.emit.close_all_stop(&runtime.events).await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow: {error}");
                     instance.emit.persist_error(&msg).await?;
-                    write_message(stream, &StreamFrame::Error(msg)).await?;
+                    runtime.events.send(StreamFrame::Error(msg));
                 } else if let Err(error) = done {
                     warn!(%error, "workflow done channel closed without value");
                 }
@@ -628,7 +615,7 @@ async fn drive(
             }
             () = instance.handle.parked.notified() => {
                 while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(state, stream, &mut instance.emit, host_frame).await?;
+                    emit(runtime, &mut instance.emit, host_frame).await?;
                 }
                 return Ok(false);
             }
@@ -637,8 +624,7 @@ async fn drive(
 }
 
 async fn emit(
-    server: &Arc<ServerState>,
-    stream: &mut UnixStream,
+    runtime: &Arc<SessionRuntime>,
     state: &mut EmitState,
     frame: HostFrame,
 ) -> Result<()> {
@@ -649,15 +635,11 @@ async fn emit(
                     sender: sender.map(Arc::from),
                 };
                 let block = state.alloc();
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: block_kind.clone(),
-                        text: content.clone(),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: block_kind.clone(),
+                    text: content.clone(),
+                });
                 state.open.insert(
                     frame_id,
                     OpenBlock {
@@ -677,15 +659,11 @@ async fn emit(
                     cmd: Arc::from(cmd),
                 };
                 let block = state.alloc();
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: block_kind.clone(),
-                        text: Some(content.clone()),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: block_kind.clone(),
+                    text: Some(content.clone()),
+                });
                 state.open.insert(
                     frame_id,
                     OpenBlock {
@@ -697,7 +675,7 @@ async fn emit(
             }
             FrameKind::Error { content } => {
                 state.persist_error(&content).await?;
-                write_message(stream, &StreamFrame::Error(content)).await?;
+                runtime.events.send(StreamFrame::Error(content));
             }
             FrameKind::ToolUse { name, detail } => {
                 let block = state.alloc();
@@ -707,19 +685,15 @@ async fn emit(
                     name: name_arc.clone(),
                     detail: detail_arc,
                 };
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: kind.clone(),
-                        text: Some(String::new()),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: kind.clone(),
+                    text: Some(String::new()),
+                });
                 // One-shot: stop + persist immediately, no entry in
                 // `state.open`. Text is empty — the name lives in the
                 // prefix on the TUI side.
-                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                runtime.events.send(StreamFrame::BlockStop { id: block });
                 crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
                     .await?;
             }
@@ -729,18 +703,14 @@ async fn emit(
                 let block = state.alloc();
                 let kind = BlockKind::Text { sender: None };
                 let text = format!("[{tag}] {body}");
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: kind.clone(),
-                        text: Some(text.clone()),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: kind.clone(),
+                    text: Some(text.clone()),
+                });
                 // Open + persist + close in one go: a JsonFrame is a
                 // one-shot block. It never enters `state.open`.
-                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                runtime.events.send(StreamFrame::BlockStop { id: block });
                 crate::scrollback::persist_block(&state.db, state.instance_id, &kind, &text, false)
                     .await?;
             }
@@ -749,18 +719,14 @@ async fn emit(
                     lines.into_iter().map(diff_op_to_protocol).collect();
                 let block = state.alloc();
                 let kind = BlockKind::Diff { lines: wire_lines };
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: kind.clone(),
-                        text: Some(String::new()),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: kind.clone(),
+                    text: Some(String::new()),
+                });
                 // One-shot like ToolUse / Json — Push + Stop in the
                 // same batch, never enters `state.open`.
-                write_message(stream, &StreamFrame::BlockStop { id: block }).await?;
+                runtime.events.send(StreamFrame::BlockStop { id: block });
                 crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
                     .await?;
             }
@@ -776,15 +742,11 @@ async fn emit(
                 }
                 let block = open.id;
                 let kind = open.kind.clone();
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind,
-                        text: Some(delta),
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind,
+                    text: Some(delta),
+                });
             }
         }
         HostFrame::UpdateKind { id: frame_id, kind } => {
@@ -818,22 +780,18 @@ async fn emit(
                 // updates the kind on a materialised block (re-render)
                 // or, if the block was never materialised, just stores
                 // the new kind for whenever the first body delta lands.
-                write_message(
-                    stream,
-                    &StreamFrame::BlockDelta {
-                        id: block,
-                        kind: new_block_kind,
-                        text: None,
-                    },
-                )
-                .await?;
+                runtime.events.send(StreamFrame::BlockDelta {
+                    id: block,
+                    kind: new_block_kind,
+                    text: None,
+                });
             }
         }
         HostFrame::Close { id: frame_id } => {
-            state.close_one(stream, frame_id).await?;
+            state.close_one(&runtime.events, frame_id).await?;
         }
         HostFrame::Usage(usage) => {
-            write_message(stream, &StreamFrame::Usage(usage)).await?;
+            runtime.events.send(StreamFrame::Usage(usage));
         }
         HostFrame::Permission {
             request,
@@ -841,10 +799,10 @@ async fn emit(
         } => {
             if allow_auto {
                 let id = request.id;
-                let outcome = crate::server::auto_judge::judge(server, &request).await;
+                let outcome = crate::runtime::auto_judge::judge(runtime, &request).await;
                 match outcome {
-                    crate::server::auto_judge::JudgeOutcome::Approve { reason } => {
-                        if let Err(error) = server.permissions.respond(
+                    crate::runtime::auto_judge::JudgeOutcome::Approve { reason } => {
+                        if let Err(error) = runtime.permissions.respond(
                             id,
                             frances_workflow::PermissionResponse::Yes {
                                 details: Some(reason),
@@ -853,14 +811,14 @@ async fn emit(
                             warn!(%error, %id, "auto-judge approve: respond failed");
                         }
                     }
-                    crate::server::auto_judge::JudgeOutcome::Reject { reason }
-                    | crate::server::auto_judge::JudgeOutcome::Indeterminate { reason } => {
+                    crate::runtime::auto_judge::JudgeOutcome::Reject { reason }
+                    | crate::runtime::auto_judge::JudgeOutcome::Indeterminate { reason } => {
                         tracing::debug!(%id, %reason, "auto-judge fell through to user");
-                        write_message(stream, &StreamFrame::Permission(request)).await?;
+                        runtime.events.send(StreamFrame::Permission(request));
                     }
                 }
             } else {
-                write_message(stream, &StreamFrame::Permission(request)).await?;
+                runtime.events.send(StreamFrame::Permission(request));
             }
         }
     }
@@ -896,17 +854,16 @@ fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::event
 /// failed row's branch — until either a row hydrates cleanly or the
 /// live stack is exhausted (top stays `None`).
 async fn drop_active_and_promote(
-    state: &Arc<ServerState>,
-    stream: &mut UnixStream,
+    runtime: &Arc<SessionRuntime>,
     instance_id: Uuid,
 ) -> Result<()> {
-    mark_completed_and_promote(&state.workflow_stack.db, instance_id).await?;
-    hydrate_active_or_cascade(state).await?;
+    mark_completed_and_promote(&runtime.workflow_stack.db, instance_id).await?;
+    hydrate_active_or_cascade(runtime).await?;
     // Tell the TUI to clear scrollback and replay the newly-promoted
     // workflow's history (if any row was promoted). When the stack ran
     // dry there's no instance to replay — we still emit an empty reset
     // so the previous workflow's in-memory scrollback is dropped.
-    let new_top_instance = state
+    let new_top_instance = runtime
         .workflow_stack
         .top
         .lock()
@@ -914,16 +871,17 @@ async fn drop_active_and_promote(
         .as_ref()
         .map(|i| i.handle.instance);
     if let Some(new_instance) = new_top_instance {
-        crate::scrollback::replay_to_stream(stream, &state.workflow_stack.db, new_instance).await?;
-    } else {
-        write_message(
-            stream,
-            &StreamFrame::ScrollbackReset {
-                instance_id: Uuid::nil(),
-            },
+        crate::scrollback::replay_to_channel(
+            &runtime.events,
+            &runtime.workflow_stack.db,
+            new_instance,
         )
         .await?;
-        write_message(stream, &StreamFrame::ScrollbackReplayEnd).await?;
+    } else {
+        runtime.events.send(StreamFrame::ScrollbackReset {
+            instance_id: Uuid::nil(),
+        });
+        runtime.events.send(StreamFrame::ScrollbackReplayEnd);
     }
     Ok(())
 }
@@ -932,17 +890,17 @@ async fn drop_active_and_promote(
 /// On any failure, tombstone the row + everything at or above its
 /// position and promote the next live row; retry. Loops until the
 /// stack hydrates or runs dry.
-async fn hydrate_active_or_cascade(state: &Arc<ServerState>) -> Result<()> {
-    let db = &state.workflow_stack.db;
+async fn hydrate_active_or_cascade(runtime: &Arc<SessionRuntime>) -> Result<()> {
+    let db = &runtime.workflow_stack.db;
     loop {
         let Some(row) = read_active_row(db).await? else {
-            *state.workflow_stack.top.lock().await = None;
+            *runtime.workflow_stack.top.lock().await = None;
             return Ok(());
         };
 
-        match hydrate(state, &row).await {
+        match hydrate(runtime, &row).await {
             Ok(instance) => {
-                *state.workflow_stack.top.lock().await = Some(instance);
+                *runtime.workflow_stack.top.lock().await = Some(instance);
                 return Ok(());
             }
             Err(error) => {
@@ -963,10 +921,10 @@ async fn hydrate_active_or_cascade(state: &Arc<ServerState>) -> Result<()> {
 /// migrations, start the runtime with the row's `instance_id`
 /// preserved.
 async fn hydrate(
-    state: &Arc<ServerState>,
+    runtime: &Arc<SessionRuntime>,
     row: &StackRow,
 ) -> Result<WorkflowInstance, WorkflowError> {
-    let workflows = state.workflows.get_or_default();
+    let workflows = runtime.workflows.get_or_default();
     let cfg = workflows
         .get(&row.config_key)
         .ok_or_else(|| WorkflowError::ScriptCaught {
@@ -981,10 +939,10 @@ async fn hydrate(
         instance_id: row.instance_id,
         migrations,
     };
-    let handle = state.workflow_runtime.start(invocation).await?;
+    let handle = runtime.workflow_runtime.start(invocation).await?;
     Ok(WorkflowInstance {
         handle,
-        emit: EmitState::new(state.workflow_stack.db.clone(), row.instance_id),
+        emit: EmitState::new(runtime.workflow_stack.db.clone(), row.instance_id),
         config_key: row.config_key.clone(),
     })
 }
