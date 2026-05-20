@@ -250,6 +250,14 @@ impl provider::Provider for Provider {
                         text.push_str(delta);
                         on_event(StreamEvent::TextDelta(delta.to_owned()))?;
                     }
+                    // OpenRouter `delta.reasoning` (thinking-token output
+                    // for models like kimi-k2.6 / deepseek-r1) streams as
+                    // TextDelta so the TUI shows live progress, but stays
+                    // out of `text` — the assistant's persisted `content`
+                    // is the response channel only, not the thought channel.
+                    for delta in sse::chunk_reasoning_deltas(&value) {
+                        on_event(StreamEvent::TextDelta(delta.to_owned()))?;
+                    }
                     for tcd in sse::chunk_tool_call_deltas(&value) {
                         for completed in accumulator.push(tcd)? {
                             on_event(StreamEvent::ToolCall(completed.clone()))?;

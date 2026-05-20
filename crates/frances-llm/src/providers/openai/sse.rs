@@ -29,6 +29,28 @@ pub(super) fn chunk_text_deltas(chunk: &Value) -> impl Iterator<Item = &str> {
         .filter(|text| !text.is_empty())
 }
 
+/// OpenRouter's `delta.reasoning` channel: thinking-token output for
+/// models that stream their chain-of-thought separately from `content`
+/// (kimi, deepseek-r1, etc.). The caller surfaces these as live text
+/// deltas to the TUI but should NOT fold them into the assistant's
+/// persisted `content` — reasoning is a separate channel by design,
+/// and replaying it as user-visible chat history would confuse the
+/// next turn.
+pub(super) fn chunk_reasoning_deltas(chunk: &Value) -> impl Iterator<Item = &str> {
+    chunk
+        .get("choices")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| {
+            choice
+                .get("delta")
+                .and_then(|delta| delta.get("reasoning"))
+                .and_then(Value::as_str)
+        })
+        .filter(|text| !text.is_empty())
+}
+
 pub(super) fn chunk_tool_call_deltas(chunk: &Value) -> Vec<ToolCallDelta<'_>> {
     let mut out = Vec::new();
     let Some(choices) = chunk.get("choices").and_then(Value::as_array) else {
@@ -117,6 +139,41 @@ mod tests {
         });
         let texts: Vec<&str> = chunk_text_deltas(&chunk).collect();
         assert!(texts.is_empty());
+    }
+
+    /// `delta.reasoning` is read separately from `content` — content
+    /// stays empty (and so doesn't emit), reasoning rides its own
+    /// iterator.
+    #[test]
+    fn reasoning_only_chunk_yields_reasoning_not_text() {
+        let chunk = json!({
+            "choices": [{
+                "delta": {
+                    "content": "",
+                    "role": "assistant",
+                    "reasoning": " thinking",
+                    "reasoning_details": [{
+                        "type": "reasoning.text",
+                        "text": " thinking",
+                        "format": "unknown",
+                        "index": 0
+                    }]
+                }
+            }]
+        });
+        let texts: Vec<&str> = chunk_text_deltas(&chunk).collect();
+        assert!(texts.is_empty(), "content channel stays empty");
+        let reasoning: Vec<&str> = chunk_reasoning_deltas(&chunk).collect();
+        assert_eq!(reasoning, vec![" thinking"]);
+    }
+
+    #[test]
+    fn reasoning_delta_skips_empty() {
+        let chunk = json!({
+            "choices": [{ "delta": { "reasoning": "" } }]
+        });
+        let reasoning: Vec<&str> = chunk_reasoning_deltas(&chunk).collect();
+        assert!(reasoning.is_empty());
     }
 
     #[test]
