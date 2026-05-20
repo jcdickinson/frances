@@ -37,31 +37,12 @@ use super::ServerState;
 /// through to the next one and ultimately to `models::default`.
 const INTENTS: &[&str] = &["auto", "referee", "cheap"];
 
-const SYSTEM_PROMPT: &str = "\
-You are an auto-approval judge for an agentic coding tool. \
-The user is already collaborating on this project — decide whether \
-the proposed action can run without further human review.\n\
-\n\
-Routine development operations are fine, including deleting files, \
-rewriting code, running tests, and invoking project commands.\n\
-\n\
-Reject actions that look out-of-character for the apparent task: \
-exfiltrating secrets, touching paths well outside the project, \
-irreversible operations on unrelated state, or anything that reads \
-like the agent went off-script. When in doubt, reject and let the \
-user decide.\n\
-\n\
-Don't let the agent avoid using the correct file editing tools by using
-sed or python to do writes. \
-\n\
-Call exactly one tool — `approve` if the action is clearly fine for \
-this project, `reject` otherwise. Either way, supply a one-sentence \
-`reason`.";
+const SYSTEM_PROMPT: &str = include_str!("auto_judge/system_prompt.md");
 
 static APPROVE_TOOL: LazyLock<ToolDef> = LazyLock::new(|| {
     ToolDef::Function(ToolFunction {
         name: "approve".into(),
-        description: "Allow this action to run without user review.".into(),
+        description: include_str!("auto_judge/approve_desc.md").into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -78,7 +59,7 @@ static APPROVE_TOOL: LazyLock<ToolDef> = LazyLock::new(|| {
 static REJECT_TOOL: LazyLock<ToolDef> = LazyLock::new(|| {
     ToolDef::Function(ToolFunction {
         name: "reject".into(),
-        description: "Do not auto-approve; defer to the user.".into(),
+        description: include_str!("auto_judge/reject_desc.md").into(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -158,8 +139,7 @@ pub(crate) async fn judge(state: &Arc<ServerState>, request: &PermissionRequest)
     }
 
     // One retry. Append a scold and try again; same model + tools.
-    let scold = "Your previous response wasn't a single `approve` or `reject` tool call. \
-Try once more — call exactly one of the two tools with a one-sentence reason.";
+    let scold = include_str!("auto_judge/scold.md");
     let mut retry_inputs = inputs.clone();
     retry_inputs.push(HistoryInput::User { text: scold });
 
