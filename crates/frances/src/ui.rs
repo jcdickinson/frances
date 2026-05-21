@@ -473,11 +473,7 @@ fn handle_frame(
             }
         }
         StreamFrame::Usage(usage) => {
-            *latest_usage = Some(usage.clone());
-            container.push(Box::new(RawBlock::single_styled(
-                format_usage(&usage),
-                Style::default().fg(Color::DarkGray),
-            )));
+            *latest_usage = Some(usage);
         }
         StreamFrame::Done => {
             // Done is a transport boundary ("this prompt's stream
@@ -620,13 +616,6 @@ fn respond_permission(
             .events
             .send(StreamFrame::Error(format!("permission: {error}")));
     }
-}
-
-fn format_usage(usage: &Usage) -> String {
-    format!(
-        "  ↳ tokens: prompt={} (cached={}) completion={} total={}",
-        usage.prompt_tokens, usage.cached_input_tokens, usage.completion_tokens, usage.total_tokens
-    )
 }
 
 fn format_token_status(usage: &Usage) -> String {
