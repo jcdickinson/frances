@@ -56,6 +56,7 @@ shellexpand = "3"
 similar = { version = "3.1", default-features = false }
 slotmap = "1"
 smallvec = "1"
+taffy = "0.10"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }

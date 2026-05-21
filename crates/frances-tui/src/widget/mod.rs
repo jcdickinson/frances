@@ -29,16 +29,21 @@
 
 pub mod border;
 pub mod context;
+pub mod flex;
 pub mod focus;
+pub mod grid;
 pub mod hstack;
 pub mod input;
 pub mod para;
+pub mod taffy_util;
 pub mod theme;
 pub mod vstack;
 
 pub use border::Border;
 pub use context::{EventContext, RenderContext};
+pub use flex::{Flex, FlexChild, FlexDirection};
 pub use focus::{Focus, FocusId, FocusManager};
+pub use grid::Grid;
 pub use hstack::HStack;
 pub use input::{EventOutcome, Input};
 pub use para::ParaWidget;
