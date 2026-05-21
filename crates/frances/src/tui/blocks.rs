@@ -1,15 +1,11 @@
 use std::sync::Arc;
 
 use frances_session::events::{BlockKind, ShellState};
-use frances_tui::{Block, MeasuredWidget};
+use frances_tui::Block;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use unicode_width::UnicodeWidthChar;
-
-use super::textarea::INPUT_HEIGHT;
-
-const TOKEN_STATUS_HEIGHT: u16 = 1;
 
 /// Maximum body lines (post trailing-newline strip) shown for a shell
 /// output block. Earlier lines are collapsed into a single `… [N earlier
@@ -385,38 +381,6 @@ impl Block for RawBlock {
     }
 }
 
-/// Footer composite: a bordered textarea snapshot rendered by
-/// `ratatui_textarea` itself, plus a one-row token status below it.
-/// The cursor inside the textarea is positioned separately by the main
-/// loop after the container draw — the widget's own cursor styling is
-/// cleared upstream (see `Textarea::new`).
-pub struct FooterBlock {
-    pub textarea: ratatui_textarea::TextArea<'static>,
-    pub token_status: Option<String>,
-}
-
-impl MeasuredWidget for FooterBlock {
-    fn measure(&self, _width: u16) -> u16 {
-        INPUT_HEIGHT + TOKEN_STATUS_HEIGHT
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        use ratatui::widgets::Widget;
-        let input_area = Rect::new(area.x, area.y, area.width, INPUT_HEIGHT);
-        (&self.textarea).render(input_area, buf);
-
-        let status_row = area.y + INPUT_HEIGHT;
-        let text = self.token_status.as_deref().unwrap_or("tokens: —");
-        let status = pad_to_width(text, area.width as usize);
-        buf.set_string(
-            area.x,
-            status_row,
-            status,
-            Style::default().fg(Color::DarkGray),
-        );
-    }
-}
-
 pub fn prefix_for(kind: &BlockKind) -> String {
     match kind {
         BlockKind::Text { sender: Some(s) } => format!("{s}: "),
@@ -489,23 +453,6 @@ fn display_width(s: &str) -> usize {
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
-}
-
-fn pad_to_width(s: &str, target_width: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0usize;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > target_width {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    if used < target_width {
-        out.push_str(&" ".repeat(target_width - used));
-    }
-    out
 }
 
 #[cfg(test)]

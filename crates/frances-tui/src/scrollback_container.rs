@@ -64,23 +64,44 @@ use ratatui::buffer::{Buffer, Cell};
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Paragraph, Widget as RatatuiWidget};
 use slotmap::{SlotMap, new_key_type};
 
 use crate::block::Block;
-use crate::measured_widget::MeasuredWidget;
 use crate::scrollback_backend::{BackendMode, ScrollbackBackend, SyncGuard};
+use crate::widget::{Focus, RenderContext, Theme, Widget};
 
-/// Adapter: lets ratatui render a `&dyn MeasuredWidget` as a normal
-/// `ratatui::widgets::Widget`. The container hands one of these into
-/// `Frame::render_widget` so the footer paints through ratatui's
-/// buffer-pair diff. Lifetime-bounded to the borrow; consumed by the
-/// `Widget::render` call.
-struct MeasuredWidgetRef<'a>(&'a dyn MeasuredWidget);
+/// Per-frame state the container threads through to the footer
+/// widget's [`Widget::render`]. Bundled so [`ScrollbackContainer::draw`]
+/// and [`ScrollbackContainer::paint_scrollback`] take a single
+/// reference instead of three positional args.
+pub struct DrawContext<'a> {
+    pub theme: &'a Theme,
+    pub focus: &'a Focus,
+    pub frame: u64,
+}
 
-impl<'a> Widget for MeasuredWidgetRef<'a> {
+/// Adapter: lets ratatui render any [`crate::widget::Widget`] through
+/// `Frame::render_widget`. The footer paints through ratatui's
+/// buffer-pair diff this way. Built fresh per draw call;
+/// lifetime-bounded to the borrows it carries.
+struct WidgetRenderAdapter<'a> {
+    widget: &'a dyn Widget,
+    theme: &'a Theme,
+    focus: &'a Focus,
+    frame: u64,
+}
+
+impl<'a> RatatuiWidget for WidgetRenderAdapter<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        self.0.render(area, buf);
+        let mut ctx = RenderContext {
+            area,
+            buf,
+            theme: self.theme,
+            focus: self.focus,
+            frame: self.frame,
+        };
+        self.widget.render(&mut ctx);
     }
 }
 
@@ -152,7 +173,6 @@ pub struct ScrollbackContainer {
     /// Display order for `active`, oldest at the front. Promotion
     /// pops from the front while the head entry is `safe_to_commit`.
     active_order: VecDeque<BlockId>,
-    footer: Box<dyn MeasuredWidget>,
     /// Where the next frame's render starts. Initially = the cursor
     /// row at construction (= the row beneath whatever launched
     /// frances). After each draw it tracks the screen row where the
@@ -218,13 +238,12 @@ pub struct ScrollbackContainer {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl ScrollbackContainer {
-    pub fn new(footer: Box<dyn MeasuredWidget>, initial_y: u16) -> Self {
+    pub fn new(initial_y: u16) -> Self {
         Self {
             committed: VecDeque::new(),
             safe: VecDeque::new(),
             active: SlotMap::with_key(),
             active_order: VecDeque::new(),
-            footer,
             next_y: initial_y,
             cumulative_scrolls: 0,
             prev_footer_anchor_y: None,
@@ -261,10 +280,6 @@ impl ScrollbackContainer {
                 state.damaged = true;
             }
         }
-    }
-
-    pub fn set_footer(&mut self, footer: Box<dyn MeasuredWidget>) {
-        self.footer = footer;
     }
 
     /// Append a block whose content is already final. Routes through
@@ -521,8 +536,8 @@ impl ScrollbackContainer {
     /// block area or more). This lets the user keep their actives on
     /// screen even when partial mark_safe operations have freed some
     /// safe rows.
-    fn classify_layout(&self, width: u16, terminal_h: u16) -> LayoutMode {
-        let footer_h = self.footer.measure(width);
+    fn classify_layout(&self, footer: &dyn Widget, width: u16, terminal_h: u16) -> LayoutMode {
+        let footer_h = footer.measure(width);
         if footer_h >= terminal_h {
             // Footer alone fills (or overflows) the terminal. No room
             // for blocks; the natural-scroll path handles footer
@@ -585,7 +600,12 @@ impl ScrollbackContainer {
     /// that need to commit emit at the top so they scroll into
     /// native scrollback; active rows that don't fit are silently
     /// not emitted.
-    pub fn draw<B>(&mut self, terminal: &mut Terminal<ScrollbackBackend<B>>) -> io::Result<()>
+    pub fn draw<B>(
+        &mut self,
+        terminal: &mut Terminal<ScrollbackBackend<B>>,
+        footer: &mut dyn Widget,
+        ctx: &DrawContext<'_>,
+    ) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
     {
@@ -594,7 +614,7 @@ impl ScrollbackContainer {
         let terminal_h = term_size.height;
         let terminal_resized = self.prev_term_size.is_some_and(|prev| prev != term_size);
 
-        let mode = self.classify_layout(width, terminal_h);
+        let mode = self.classify_layout(footer, width, terminal_h);
         let exiting_active_overflow = self.prev_mode == Some(LayoutMode::ActiveOverflow)
             && mode != LayoutMode::ActiveOverflow;
 
@@ -624,9 +644,17 @@ impl ScrollbackContainer {
         }
 
         if mode == LayoutMode::ActiveOverflow {
-            let footer_h = self.footer.measure(width);
+            let footer_h = footer.measure(width);
             let available_h = terminal_h.saturating_sub(footer_h);
-            self.draw_active_overflow(terminal, width, terminal_h, available_h, footer_h)?;
+            self.draw_active_overflow(
+                terminal,
+                footer,
+                ctx,
+                width,
+                terminal_h,
+                available_h,
+                footer_h,
+            )?;
             self.prev_term_size = Some(term_size);
             self.prev_mode = Some(mode);
             return Ok(());
@@ -719,7 +747,7 @@ impl ScrollbackContainer {
         // before the footer is allowed to move down again. Terminal
         // resize, mid-frame scrolls, or a pinned anchor that no
         // longer fits → fall back to the natural anchor.
-        let footer_h = self.footer.measure(width);
+        let footer_h = footer.measure(width);
         if footer_h > 0 {
             let natural_footer_anchor = cursor.cursor_y;
             let pin_anchor = self.prev_footer_anchor_y.filter(|&prev| {
@@ -799,7 +827,13 @@ impl ScrollbackContainer {
                 terminal.resize(Rect::new(0, 0, width, footer_h))?;
             }
 
-            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            footer.layout(Rect::new(0, 0, width, footer_h));
+            let footer_widget = WidgetRenderAdapter {
+                widget: &*footer,
+                theme: ctx.theme,
+                focus: ctx.focus,
+                frame: ctx.frame,
+            };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
             })?;
@@ -884,9 +918,15 @@ impl ScrollbackContainer {
     /// "paint from row 0 every frame" model rather than the natural-
     /// scroll path's `absolute_y` model). The footer's diff cache is
     /// invalidated so the next frame re-evaluates from scratch.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "active-overflow path threads frame-state by-ref; bundling adds a borrow."
+    )]
     fn draw_active_overflow<B>(
         &mut self,
         terminal: &mut Terminal<ScrollbackBackend<B>>,
+        footer: &mut dyn Widget,
+        ctx: &DrawContext<'_>,
         width: u16,
         terminal_h: u16,
         available_h: u16,
@@ -1044,7 +1084,13 @@ impl ScrollbackContainer {
                 backend.set_mode(BackendMode::Footer);
             }
             terminal.resize(Rect::new(0, 0, width, footer_h))?;
-            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            footer.layout(Rect::new(0, 0, width, footer_h));
+            let footer_widget = WidgetRenderAdapter {
+                widget: &*footer,
+                theme: ctx.theme,
+                focus: ctx.focus,
+                frame: ctx.frame,
+            };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
             })?;
@@ -1126,6 +1172,8 @@ impl ScrollbackContainer {
     pub fn paint_scrollback<B>(
         &mut self,
         terminal: &mut Terminal<ScrollbackBackend<B>>,
+        footer: &mut dyn Widget,
+        ctx: &DrawContext<'_>,
     ) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
@@ -1142,7 +1190,7 @@ impl ScrollbackContainer {
         // When the available slot is shorter than the footer's natural
         // height the container top-clips the footer itself — widgets
         // get an `area` equal to what they measured.
-        let footer_h_natural = self.footer.measure(width);
+        let footer_h_natural = footer.measure(width);
         let footer_h = footer_h_natural.min(height.saturating_sub(2));
         let content_h = height - 2 - footer_h;
         let bottom_bar_y = 1 + content_h;
@@ -1207,7 +1255,13 @@ impl ScrollbackContainer {
                 backend.set_mode(BackendMode::Footer);
             }
             terminal.resize(Rect::new(0, 0, width, footer_h))?;
-            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            footer.layout(Rect::new(0, 0, width, footer_h));
+            let footer_widget = WidgetRenderAdapter {
+                widget: &*footer,
+                theme: ctx.theme,
+                focus: ctx.focus,
+                frame: ctx.frame,
+            };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
             })?;
@@ -1483,6 +1537,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::widget::ParaWidget;
     use ratatui::TerminalOptions;
     use ratatui::Viewport;
     use ratatui::layout::Size;
@@ -1501,9 +1556,87 @@ mod tests {
         Box::new(Paragraph::new(text))
     }
 
+    /// Test rig that bundles a [`ScrollbackContainer`] with its
+    /// caller-owned footer widget + a default [`DrawContext`]. Deref's
+    /// to the container so the existing test calls (`push`,
+    /// `safe_count`, etc.) work unchanged; inherent `draw` /
+    /// `paint_scrollback` / `set_footer` / `clear` shadow the
+    /// container's signatures to thread the footer in.
+    ///
+    /// Construction signature mirrors the old
+    /// `Rig::new(footer, initial_y)` so the test churn
+    /// stays minimal: every `Rig::new(...)` call site
+    /// becomes a `Rig::new(...)` call.
+    struct Rig {
+        container: ScrollbackContainer,
+        footer: ParaWidget,
+        theme: Theme,
+        focus: Focus,
+    }
+
+    impl Rig {
+        fn new(footer: Box<Paragraph<'static>>, initial_y: u16) -> Self {
+            Self {
+                container: ScrollbackContainer::new(initial_y),
+                footer: (*footer).into(),
+                theme: Theme::default(),
+                focus: Focus::new(),
+            }
+        }
+
+        fn draw<B>(&mut self, terminal: &mut Terminal<ScrollbackBackend<B>>) -> io::Result<()>
+        where
+            B: Backend<Error = io::Error> + Write,
+        {
+            // Build DrawContext from disjoint fields so the borrow
+            // checker can let `self.container` + `self.footer` take
+            // mutable borrows alongside the immutable borrows of
+            // `self.theme` / `self.focus`.
+            let ctx = DrawContext {
+                theme: &self.theme,
+                focus: &self.focus,
+                frame: 0,
+            };
+            self.container.draw(terminal, &mut self.footer, &ctx)
+        }
+
+        fn paint_scrollback<B>(
+            &mut self,
+            terminal: &mut Terminal<ScrollbackBackend<B>>,
+        ) -> io::Result<()>
+        where
+            B: Backend<Error = io::Error> + Write,
+        {
+            let ctx = DrawContext {
+                theme: &self.theme,
+                focus: &self.focus,
+                frame: 0,
+            };
+            self.container
+                .paint_scrollback(terminal, &mut self.footer, &ctx)
+        }
+
+        fn set_footer(&mut self, footer: Box<Paragraph<'static>>) {
+            self.footer = (*footer).into();
+        }
+    }
+
+    impl std::ops::Deref for Rig {
+        type Target = ScrollbackContainer;
+        fn deref(&self) -> &ScrollbackContainer {
+            &self.container
+        }
+    }
+
+    impl std::ops::DerefMut for Rig {
+        fn deref_mut(&mut self) -> &mut ScrollbackContainer {
+            &mut self.container
+        }
+    }
+
     #[test]
     fn empty_container_is_empty() {
-        let c = ScrollbackContainer::new(para("footer"), 0);
+        let c = Rig::new(para("footer"), 0);
         assert_eq!(c.committed_count(), 0);
         assert_eq!(c.safe_count(), 0);
         assert_eq!(c.active_count(), 0);
@@ -1511,7 +1644,7 @@ mod tests {
 
     #[test]
     fn push_goes_straight_to_safe() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         c.push(para("hello"));
         assert_eq!(c.safe_count(), 1);
         assert_eq!(c.active_count(), 0);
@@ -1520,7 +1653,7 @@ mod tests {
 
     #[test]
     fn mark_safe_drains_immediately_when_unblocked() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         let id = c.push_active(para("streaming"));
         assert_eq!(c.active_count(), 1);
         assert_eq!(c.safe_count(), 0);
@@ -1534,7 +1667,7 @@ mod tests {
 
     #[test]
     fn update_active_replaces_in_place() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         let id = c.push_active(para("first"));
         c.update_active(id, para("second"));
         // Still one active; the slot is just updated.
@@ -1546,7 +1679,7 @@ mod tests {
     fn out_of_order_finalisation_preserves_display_order() {
         // Two active blocks A then B. Mark B safe first; A must still
         // gate promotion because it's at the front of active_order.
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         let a = c.push_active(para("A"));
         let b = c.push_active(para("B"));
 
@@ -1565,7 +1698,7 @@ mod tests {
 
     #[test]
     fn mark_safe_for_unknown_id_is_noop() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         let id = c.push_active(para("x"));
         c.mark_safe(id);
         c.promote_ready();
@@ -1579,7 +1712,7 @@ mod tests {
     #[test]
     fn multi_row_active_block_counts_against_active_h() {
         // Sanity for the measurement step used during draw.
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         c.push_active(multi(3));
         let active_h: u16 = c
             .active_order
@@ -1778,7 +1911,7 @@ mod tests {
     fn renders_block_by_block_letting_terminal_scroll_naturally() {
         let mut terminal = mk_term_terminal(80, 5);
 
-        let mut container = ScrollbackContainer::new(multi_text(&["bottom"]), 0);
+        let mut container = Rig::new(multi_text(&["bottom"]), 0);
         container.push(multi_text(&["multiline-a", "multiline-b", "multiline-c"]));
         container.push(multi_text(&["singleline"]));
         container.draw(&mut terminal).unwrap();
@@ -1858,7 +1991,7 @@ mod tests {
         let mut terminal = mk_term_terminal(80, 10);
         // 0-row footer keeps the bookkeeping simple — the blocks
         // live at rows 0..n with no trailing footer geometry.
-        let mut container = ScrollbackContainer::new(multi_text(&[]), 0);
+        let mut container = Rig::new(multi_text(&[]), 0);
 
         let _id_a = container.push_active(multi_text(&["block-a"]));
         let id_b = container.push_active(multi_text(&["block-b"]));
@@ -1924,7 +2057,7 @@ mod tests {
     #[test]
     fn scroll_commits_oldest_and_remaining_visible_blocks_skip_repaint() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         for label in ["a", "b", "c", "d"] {
             container.push(multi_text(&[label]));
@@ -1989,7 +2122,7 @@ mod tests {
     #[test]
     fn straddling_multi_row_block_commits_and_visible_remnant_is_orphaned() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         container.push(multi_text(&["multi-1", "multi-2", "multi-3"]));
         container.push(multi_text(&["single1"]));
@@ -2064,7 +2197,7 @@ mod tests {
 
         // Initial 5-row footer. Cursor starts at row 0; container
         // renders the footer at rows 0-4.
-        let mut container = ScrollbackContainer::new(
+        let mut container = Rig::new(
             multi_text(&["footer-1", "footer-2", "footer-3", "footer-4", "footer-5"]),
             0,
         );
@@ -2107,7 +2240,7 @@ mod tests {
     #[test]
     fn unchanged_footer_emits_no_cells() {
         let mut terminal = mk_term_terminal(20, 3);
-        let mut c = ScrollbackContainer::new(multi_text(&["hello"]), 0);
+        let mut c = Rig::new(multi_text(&["hello"]), 0);
         c.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
@@ -2131,7 +2264,7 @@ mod tests {
     #[test]
     fn footer_cell_change_emits_only_the_changed_cells() {
         let mut terminal = mk_term_terminal(20, 3);
-        let mut c = ScrollbackContainer::new(multi_text(&["hello"]), 0);
+        let mut c = Rig::new(multi_text(&["hello"]), 0);
         c.draw(&mut terminal).unwrap();
 
         use std::io::Write;
@@ -2162,7 +2295,7 @@ mod tests {
     #[test]
     fn content_shrink_pins_footer_and_pushes_consume_slack() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         // State 1: 3-row multiline + 1-row other-content + 1-row footer.
         let multi_id =
@@ -2252,7 +2385,7 @@ mod tests {
     /// older still-mutating siblings until they're flagged too.
     #[test]
     fn mark_safe_drains_only_contiguous_front_run() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         let a = c.push_active(para("A"));
         let b = c.push_active(para("B"));
         let _c = c.push_active(para("C"));
@@ -2276,7 +2409,7 @@ mod tests {
     #[test]
     fn push_with_older_active_queues_behind_them() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         // An active block that's still streaming — not yet safe.
         let _streaming = container.push_active(multi_text(&["streaming-0", "streaming-1"]));
@@ -2343,7 +2476,7 @@ mod tests {
     #[test]
     fn oversize_active_block_truncates_and_does_not_leak_to_scrollback() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
         container.push_active(multi_text(&lines));
@@ -2372,7 +2505,7 @@ mod tests {
     #[test]
     fn oversize_active_block_update_does_not_leak_to_scrollback() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
         let id = container.push_active(multi_text(&lines));
@@ -2407,7 +2540,7 @@ mod tests {
     #[test]
     fn oversize_active_block_mark_safe_uses_natural_scroll_commit() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         let lines: Vec<&str> = vec!["L0", "L1", "L2", "L3", "L4", "L5", "L6", "L7", "L8", "L9"];
         let id = container.push_active(multi_text(&lines));
@@ -2445,7 +2578,7 @@ mod tests {
     #[test]
     fn long_active_history_truncates_oldest_actives_and_keeps_newest_updatable() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         // 6 single-line active blocks. Available = 4 rows, ellipsis
         // takes 1, visible block area = 3 → only d, e, f fit.
@@ -2510,7 +2643,7 @@ mod tests {
     #[test]
     fn partial_mark_safe_commits_to_scrollback_then_remaining_overflow_truncates() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         let id_a = container.push_active(multi_text(&["a"]));
         let id_b = container.push_active(multi_text(&["b"]));
@@ -2553,7 +2686,7 @@ mod tests {
 
     #[test]
     fn set_scrollback_toggles_flag() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         assert!(!c.scrollback());
         c.set_scrollback(true);
         assert!(c.scrollback());
@@ -2563,7 +2696,7 @@ mod tests {
 
     #[test]
     fn scroll_up_down_adjust_offset() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         assert_eq!(c.scrollback_offset(), 0);
         c.scroll_up(5);
         assert_eq!(c.scrollback_offset(), 5);
@@ -2580,7 +2713,7 @@ mod tests {
 
     #[test]
     fn set_scrollback_true_on_transition_resets_offset() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         c.scroll_up(10);
         c.set_scrollback(true);
         assert_eq!(c.scrollback_offset(), 0, "transition to true resets");
@@ -2599,7 +2732,7 @@ mod tests {
 
     #[test]
     fn measure_history_sums_all_collections() {
-        let mut c = ScrollbackContainer::new(para("footer"), 0);
+        let mut c = Rig::new(para("footer"), 0);
         c.push(multi(3)); // safe, 3 rows
         c.push(multi(2)); // safe, 2 rows
         c.push_active(multi(4)); // active, 4 rows
@@ -2611,7 +2744,7 @@ mod tests {
     #[test]
     fn paint_scrollback_short_history_bottom_aligns() {
         let mut terminal = mk_term_terminal(40, 10);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         c.push(multi_text(&["one"]));
         c.push(multi_text(&["two"]));
 
@@ -2640,7 +2773,7 @@ mod tests {
     #[test]
     fn paint_scrollback_long_history_shows_above_marker_at_bottom() {
         let mut terminal = mk_term_terminal(40, 7);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         // Content area = 7 - 2 - 1 = 4 rows. Push 6 single-row blocks
         // so total_h = 6 > 4 → 2 rows hidden above.
         for label in ["a", "b", "c", "d", "e", "f"] {
@@ -2674,7 +2807,7 @@ mod tests {
     #[test]
     fn paint_scrollback_scrolled_shows_both_markers() {
         let mut terminal = mk_term_terminal(40, 7);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         for label in ["a", "b", "c", "d", "e", "f"] {
             c.push(multi_text(&[label]));
         }
@@ -2703,7 +2836,7 @@ mod tests {
     #[test]
     fn paint_scrollback_scrolled_to_top_suppresses_above_marker() {
         let mut terminal = mk_term_terminal(40, 7);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         for label in ["a", "b", "c", "d", "e", "f"] {
             c.push(multi_text(&[label]));
         }
@@ -2732,7 +2865,7 @@ mod tests {
     #[test]
     fn paint_scrollback_includes_committed_blocks() {
         let mut terminal = mk_term_terminal(40, 5);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         // Push enough to commit some into native scrollback in live mode.
         for label in ["a", "b", "c", "d", "e", "f"] {
             c.push(multi_text(&[label]));
@@ -2766,7 +2899,7 @@ mod tests {
     #[test]
     fn paint_scrollback_does_not_touch_native_scrollback() {
         let mut terminal = mk_term_terminal(40, 5);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         for label in ["a", "b", "c", "d", "e", "f", "g", "h"] {
             c.push(multi_text(&[label]));
         }
@@ -2795,7 +2928,7 @@ mod tests {
     #[test]
     fn round_trip_through_scrollback_preserves_live_state() {
         let mut terminal = mk_term_terminal(40, 5);
-        let mut c = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut c = Rig::new(multi_text(&["footer"]), 0);
         c.push(multi_text(&["a"]));
         c.push(multi_text(&["b"]));
         c.draw(&mut terminal).unwrap();
@@ -2837,7 +2970,7 @@ mod tests {
     #[test]
     fn clear_preserves_footer_position_and_drops_deques() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         // Build up screen content: one safe + one active (in-flight)
         // block. Draw to land everything in the natural positions and
@@ -2903,7 +3036,7 @@ mod tests {
     #[test]
     fn draw_after_clear_repaints_footer_at_preserved_anchor() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         container.push(multi_text(&["safe-row"]));
         container.draw(&mut terminal).unwrap();
@@ -2927,7 +3060,7 @@ mod tests {
     #[test]
     fn push_after_clear_appears_after_previous_history() {
         let mut terminal = mk_term_terminal(80, 10);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         container.push(multi_text(&["old-row"]));
         container.draw(&mut terminal).unwrap();
@@ -2964,7 +3097,7 @@ mod tests {
     #[test]
     fn push_committed_does_not_touch_live_viewport() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
 
         container.push_committed(multi_text(&["replayed-A"]));
         container.push_committed(multi_text(&["replayed-B"]));
@@ -2998,7 +3131,7 @@ mod tests {
     #[test]
     fn enabled_spinner_overlays_active_block_and_clears_on_mark_safe() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.enable_spinner();
 
         let id = container.push_active(multi_text(&["hello"]));
@@ -3024,7 +3157,7 @@ mod tests {
     #[test]
     fn bump_spinner_advances_glyph_on_next_draw() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.enable_spinner();
         container.push_active(multi_text(&["hi"]));
 
@@ -3042,7 +3175,7 @@ mod tests {
     #[test]
     fn spinner_overwrites_last_char_when_content_fills_row() {
         let mut terminal = mk_term_terminal(5, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["foot."]), 0);
+        let mut container = Rig::new(multi_text(&["foot."]), 0);
         container.enable_spinner();
 
         container.push_active(multi_text(&["hello"]));
@@ -3059,7 +3192,7 @@ mod tests {
     #[test]
     fn spinner_off_by_default_leaves_active_blocks_untouched() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.push_active(multi_text(&["hello"]));
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "hello");
@@ -3072,7 +3205,7 @@ mod tests {
     #[test]
     fn spinner_skips_safe_flagged_entry_pinned_behind_older_active() {
         let mut terminal = mk_term_terminal(80, 5);
-        let mut container = ScrollbackContainer::new(multi_text(&["footer"]), 0);
+        let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.enable_spinner();
 
         let older = container.push_active(multi_text(&["older"]));

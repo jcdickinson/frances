@@ -6,7 +6,7 @@ re-deriving the design. Phase docs are self-contained.
 ## Where we are
 
 - [x] Phase A — ratatui owns the footer rect; drop our own footer diff.
-- [ ] Phase B — widget framework on taffy; `Input` + `Widget` traits;
+- [x] Phase B — widget framework on taffy; `Input` + `Widget` traits;
       footer becomes a widget tree.
 - [ ] Phase C — Block trait refinement (`Input`, `safe_on_push`, serde,
       truncation flag).

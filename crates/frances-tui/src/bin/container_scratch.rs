@@ -34,7 +34,10 @@ use ratatui::text::Line;
 use ratatui::widgets;
 use ratatui::widgets::{Borders, Paragraph};
 
-use frances_tui::{Block, BlockId, ScrollbackBackend, ScrollbackContainer};
+use frances_tui::scrollback_container::DrawContext;
+use frances_tui::{
+    Block, BlockId, Focus, ParaWidget, ScrollbackBackend, ScrollbackContainer, Theme,
+};
 
 const VARSIZE_MAX: u16 = 5;
 
@@ -74,7 +77,12 @@ fn run() -> io::Result<()> {
     )?;
 
     let mut footer_content: u16 = 2;
-    let mut container = ScrollbackContainer::new(footer_block(0, 0, 0, footer_content), cursor_row);
+    let mut container = ScrollbackContainer::new(cursor_row);
+    let theme = Theme::default();
+    let focus = Focus::new();
+    // Declared but uninitialised: every loop iteration overwrites
+    // `footer` before reading it. Rust's CFG accepts this.
+    let mut footer: ParaWidget;
     let mut pushed: u32 = 0;
     // Most recently pushed varsize block — `V` cycles its height
     // through the `update_active` path so the footer-pin behaviour
@@ -82,13 +90,19 @@ fn run() -> io::Result<()> {
     let mut varsize: Option<(BlockId, u32, u16)> = None;
 
     loop {
-        container.set_footer(footer_block(
+        footer = (*footer_block(
             container.safe_count() as u32,
             container.active_count() as u32,
             container.committed_count(),
             footer_content,
-        ));
-        container.draw(&mut terminal)?;
+        ))
+        .into();
+        let ctx = DrawContext {
+            theme: &theme,
+            focus: &focus,
+            frame: 0,
+        };
+        container.draw(&mut terminal, &mut footer, &ctx)?;
 
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -138,7 +152,12 @@ fn run() -> io::Result<()> {
                     let id = container.push_active(Box::new(Paragraph::new(Line::raw(format!(
                         "[active #{pushed:>3}] starting…"
                     )))));
-                    container.draw(&mut terminal)?;
+                    let ctx = DrawContext {
+                        theme: &theme,
+                        focus: &focus,
+                        frame: 0,
+                    };
+                    container.draw(&mut terminal, &mut footer, &ctx)?;
                     container.update_active(
                         id,
                         Box::new(Paragraph::new(Line::raw(format!(

@@ -25,11 +25,13 @@ use frances_session::events::{BlockKind, PermissionRequest, PermissionResponseWi
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
+use frances_tui::scrollback_container::DrawContext;
 use frances_tui::{
-    BlockId as ContainerBlockId, ScrollbackBackend, ScrollbackContainer, TruncatedBlock,
+    BlockId as ContainerBlockId, EventContext, Focus, FocusManager, Input, ScrollbackBackend,
+    ScrollbackContainer, Theme, TruncatedBlock, Widget,
 };
 
-use crate::tui::{FooterBlock, RawBlock, Textarea, block_for_kind};
+use crate::tui::{Footer, RawBlock, block_for_kind};
 
 pub struct App<'a> {
     pub session: &'a Session,
@@ -197,14 +199,12 @@ impl App<'_> {
         )
         .context("init terminal")?;
 
-        let mut textarea = Textarea::new("type a message…");
-        let mut container = ScrollbackContainer::new(
-            Box::new(FooterBlock {
-                textarea: textarea.snapshot_widget(None),
-                token_status: None,
-            }),
-            cursor_row,
-        );
+        let theme = Theme::default();
+        let mut focus_manager = FocusManager::new();
+        let mut focus = Focus::new();
+        let mut footer = Footer::new(&mut focus_manager, "type a message…");
+        let mut frame_counter: u64 = 0;
+        let mut container = ScrollbackContainer::new(cursor_row);
         container.enable_spinner();
         for (i, line) in self.banner_lines().into_iter().enumerate() {
             let style = if i == 0 {
@@ -226,10 +226,14 @@ impl App<'_> {
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
+            frame_counter = frame_counter.wrapping_add(1);
             redraw(
                 &mut terminal,
                 &mut container,
-                &textarea,
+                &mut footer,
+                &theme,
+                &mut focus,
+                frame_counter,
                 streaming,
                 latest_usage.as_ref(),
             )?;
@@ -275,11 +279,11 @@ impl App<'_> {
                                     }
                                 }
                                 KeyAction::Submit => {
-                                    if textarea.is_empty() { continue; }
-                                    let text = textarea.text();
-                                    textarea.clear();
+                                    if footer.input.is_empty() { continue; }
+                                    let text = footer.input.text();
+                                    footer.input.clear();
                                     if let Some(req) = pending_approval.take() {
-                                        textarea.set_placeholder("type a message…");
+                                        footer.input.set_placeholder("type a message…");
                                         respond_permission(
                                             &self.runtime,
                                             req.id,
@@ -292,13 +296,13 @@ impl App<'_> {
                                 }
                                 KeyAction::Approve | KeyAction::Reject => {
                                     let Some(req) = pending_approval.take() else { continue; };
-                                    let details = if textarea.is_empty() {
+                                    let details = if footer.input.is_empty() {
                                         None
                                     } else {
-                                        Some(textarea.text())
+                                        Some(footer.input.text())
                                     };
-                                    textarea.clear();
-                                    textarea.set_placeholder("type a message…");
+                                    footer.input.clear();
+                                    footer.input.set_placeholder("type a message…");
                                     let response = match classify_key(&key, true) {
                                         KeyAction::Approve => {
                                             PermissionResponseWire::Yes { details }
@@ -307,7 +311,14 @@ impl App<'_> {
                                     };
                                     respond_permission(&self.runtime, req.id, response);
                                 }
-                                KeyAction::Edit => textarea.input(key),
+                                KeyAction::Edit => {
+                                    let mut redraw = false;
+                                    let mut ctx = EventContext {
+                                        focus: &mut focus,
+                                        redraw: &mut redraw,
+                                    };
+                                    let _ = footer.handle_event(&mut ctx, &Event::Key(key));
+                                }
                             }
                         }
                         Event::Resize(width, height) => {
@@ -353,7 +364,7 @@ impl App<'_> {
                         frame,
                         &mut latest_usage,
                     )? {
-                        textarea.set_placeholder(PERMISSION_PLACEHOLDER);
+                        footer.input.set_placeholder(PERMISSION_PLACEHOLDER);
                         pending_approval = Some(req);
                     }
                 }
@@ -369,36 +380,51 @@ impl App<'_> {
     }
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "redraw threads frame-state by-ref; bundling into a struct just renames the pain."
+)]
 fn redraw(
     terminal: &mut AppTerminal,
     container: &mut ScrollbackContainer,
-    textarea: &Textarea,
+    footer: &mut Footer,
+    theme: &Theme,
+    focus: &mut Focus,
+    frame: u64,
     streaming: bool,
     latest_usage: Option<&Usage>,
 ) -> std::io::Result<()> {
-    let status = if streaming {
-        Some("streaming…")
-    } else {
-        None
+    footer
+        .input
+        .set_status(streaming.then_some("streaming…").map(str::to_string));
+    let token_text = latest_usage
+        .map(format_token_status)
+        .unwrap_or_else(|| "tokens: —".to_string());
+    footer.status.set_text(token_text);
+
+    // Rebuild focus's tree-order list from this frame's footer
+    // before any event dispatch needs it.
+    focus.refresh(footer as &dyn Widget);
+
+    let ctx = DrawContext {
+        theme,
+        focus,
+        frame,
     };
-    container.set_footer(Box::new(FooterBlock {
-        textarea: textarea.snapshot_widget(status),
-        token_status: latest_usage.map(format_token_status),
-    }));
 
     if container.scrollback() {
-        container.paint_scrollback(terminal)?;
+        container.paint_scrollback(terminal, footer, &ctx)?;
         let backend = terminal.backend_mut();
         backend.hide_cursor()?;
         Backend::flush(backend)?;
         return Ok(());
     }
 
-    container.draw(terminal)?;
+    container.draw(terminal, footer, &ctx)?;
 
-    // The textarea widget paints its own cursor cell (reversed style)
-    // and handles horizontal scroll when the line outgrows the inner
-    // width, so the terminal cursor stays hidden.
+    // The TextInput's underlying TextArea paints its own cursor cell
+    // (reversed style) and handles horizontal scroll when the line
+    // outgrows the inner width, so the terminal cursor stays hidden.
     let backend = terminal.backend_mut();
     backend.hide_cursor()?;
     Backend::flush(backend)?;
@@ -675,12 +701,6 @@ fn leave_scrollback(terminal: &mut AppTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::text::Line;
-    use ratatui::widgets::Paragraph;
-
-    fn footer() -> Box<Paragraph<'static>> {
-        Box::new(Paragraph::new(Line::raw("footer")))
-    }
 
     /// Drives `LiveBlocks::delta` against a real `ScrollbackContainer`.
     /// Verifies that two distinct ids coexist as concurrently-open
@@ -688,7 +708,7 @@ mod tests {
     /// each block closes independently via `stop_or_recover`.
     #[test]
     fn live_blocks_two_ids_coexist_and_close_independently() {
-        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
         let kind_a = BlockKind::Text {
             sender: Some("user".into()),
@@ -750,7 +770,7 @@ mod tests {
     /// should log and continue. `stop_or_recover` returns `None`.
     #[test]
     fn block_stop_for_unknown_id_does_not_bail() {
-        let container = ScrollbackContainer::new(footer(), 0);
+        let container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
 
         let result = state.stop_or_recover(frances_session::events::BlockId(99), "BlockStop");
@@ -771,7 +791,7 @@ mod tests {
     /// either side of it.
     #[test]
     fn none_text_frames_between_completed_blocks_add_no_rows() {
-        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
         let frances = || BlockKind::Text {
             sender: Some("frances".into()),
@@ -869,7 +889,7 @@ mod tests {
     /// stop is a side event, not a "close the current block" signal.
     #[test]
     fn block_stop_with_unknown_id_leaves_others_open() {
-        let mut container = ScrollbackContainer::new(footer(), 0);
+        let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
         let kind = BlockKind::Text {
             sender: Some("user".into()),

@@ -1,5 +1,5 @@
 pub mod blocks;
-pub mod textarea;
+pub mod footer;
 
-pub use blocks::{FooterBlock, RawBlock, block_for_kind};
-pub use textarea::Textarea;
+pub use blocks::{RawBlock, block_for_kind};
+pub use footer::Footer;

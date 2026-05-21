@@ -17,13 +17,11 @@
 //! container's full block history into an alt-screen view.
 
 pub mod block;
-pub mod measured_widget;
 pub mod scrollback_backend;
 pub mod scrollback_container;
 pub mod widget;
 
 pub use block::{Block, TruncatedBlock};
-pub use measured_widget::MeasuredWidget;
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
 pub use widget::{
