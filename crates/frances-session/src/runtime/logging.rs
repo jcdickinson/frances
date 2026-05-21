@@ -2,6 +2,11 @@ use std::fs;
 use std::sync::Mutex;
 
 use tracing::info;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::Layer;
+use tracing_subscriber::fmt;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use crate::Result;
 use crate::session::Session;
@@ -11,36 +16,78 @@ use super::RuntimeError;
 /// Wire tracing to write into `session.dir/frances.log`. Stdout / stderr
 /// stay attached to the terminal so the in-process TUI can render
 /// without being trampled by log writes.
+///
+/// When the environment variable `TUI_TRACE=1` is set, a second layer
+/// also writes to `session.dir/tui.log` with `frances_tui=trace`. The
+/// two logs are independent — the main log only captures `frances_tui`
+/// at the default level (warn) unless the user explicitly raises it
+/// via `RUST_LOG`.
 pub fn install_logging(session: &Session) -> Result<()> {
-    let log_path = session.dir.join("frances.log");
-    let file = fs::OpenOptions::new()
+    let main_path = session.dir.join("frances.log");
+    let main_file = fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(&log_path)
+        .open(&main_path)
         .map_err(|source| RuntimeError::OpenSessionLog {
-            path: log_path.clone(),
+            path: main_path.clone(),
             source,
         })?;
-
-    let writer = Mutex::new(file);
+    let main_writer = Mutex::new(main_file);
 
     // Default to warn for the world; raise frances/frances-edit/frances-anchors
     // /frances-config to trace so we can see our own logs without drowning in
     // turso/hyper/reqwest internals. Overridable via RUST_LOG.
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        tracing_subscriber::EnvFilter::new(
+    let main_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
             "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
         )
     });
-    use tracing_subscriber::util::SubscriberInitExt;
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
+    let main_layer = fmt::layer()
         .with_ansi(false)
-        .with_writer(writer)
-        .finish()
+        .with_writer(main_writer)
+        .with_filter(main_filter);
+
+    let tui_layer = if env_flag("TUI_TRACE") {
+        let tui_path = session.dir.join("tui.log");
+        let tui_file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&tui_path)
+            .map_err(|source| RuntimeError::OpenSessionLog {
+                path: tui_path.clone(),
+                source,
+            })?;
+        let tui_writer = Mutex::new(tui_file);
+        let tui_filter = EnvFilter::new("frances_tui=trace");
+        Some(
+            fmt::layer()
+                .with_ansi(false)
+                .with_writer(tui_writer)
+                .with_filter(tui_filter),
+        )
+    } else {
+        None
+    };
+
+    tracing_subscriber::registry()
+        .with(main_layer)
+        .with(tui_layer)
         .try_init()
         .map_err(RuntimeError::InstallSubscriber)?;
 
-    info!(session_id = %session.id, log = %log_path.display(), "session runtime logging installed");
+    info!(session_id = %session.id, log = %main_path.display(), "session runtime logging installed");
+    if env_flag("TUI_TRACE") {
+        info!(
+            tui_log = %session.dir.join("tui.log").display(),
+            "TUI_TRACE active; frances_tui traces routed to tui.log",
+        );
+    }
     Ok(())
+}
+
+fn env_flag(name: &str) -> bool {
+    matches!(
+        std::env::var(name).as_deref(),
+        Ok("1") | Ok("true") | Ok("yes") | Ok("on")
+    )
 }

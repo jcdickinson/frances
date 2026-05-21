@@ -68,10 +68,14 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
     }
 
     pub(crate) fn set_mode(&mut self, mode: BackendMode) {
+        if self.mode != mode {
+            tracing::trace!(?mode, "backend set_mode");
+        }
         self.mode = mode;
     }
 
     pub(crate) fn set_footer_rect(&mut self, anchor_y: u16, height: u16) {
+        tracing::trace!(anchor_y, height, "backend set_footer_rect");
         self.footer_anchor_y = anchor_y;
         self.footer_height = height;
     }
@@ -85,6 +89,7 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
 
     /// Move the cursor to an absolute screen position.
     pub(crate) fn move_cursor_abs(&mut self, x: u16, y: u16) -> io::Result<()> {
+        tracing::trace!(x, y, "backend move_cursor_abs");
         self.inner.queue(MoveTo(x, y))?;
         Ok(())
     }
@@ -123,6 +128,7 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
     /// being yielded back to the terminal, so they must be blank
     /// rather than stale.
     pub(crate) fn clear_line(&mut self, y: u16) -> io::Result<()> {
+        tracing::trace!(y, "backend clear_line");
         use crossterm::terminal::{Clear, ClearType as CtClearType};
         self.inner.queue(MoveTo(0, y))?;
         self.inner.queue(Clear(CtClearType::CurrentLine))?;
@@ -131,6 +137,11 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
 
     /// React to a terminal-size change.
     pub fn handle_terminal_resize(&mut self, new_size: Size) -> io::Result<()> {
+        tracing::trace!(
+            w = new_size.width,
+            h = new_size.height,
+            "backend handle_terminal_resize",
+        );
         self.terminal_size = new_size;
         Ok(())
     }
@@ -145,6 +156,7 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
     /// the visible screen into scrollback before clearing" — exactly
     /// the leak we're trying to avoid.
     pub(crate) fn clear_below_home(&mut self) -> io::Result<()> {
+        tracing::trace!("backend clear_below_home");
         self.inner.write_all(b"\x1b[H\x1b[J")?;
         Ok(())
     }
@@ -255,6 +267,11 @@ impl<B: Backend<Error = io::Error> + Write> Backend for ScrollbackBackend<B> {
             // moves or changes height). Wiping the whole terminal
             // would take out the scrollback above it.
             (BackendMode::Footer, ClearType::All) => {
+                tracing::trace!(
+                    from_y = self.footer_anchor_y,
+                    to_y_excl = self.footer_anchor_y + self.footer_height,
+                    "backend clear_region(All) in Footer mode",
+                );
                 use crossterm::terminal::{Clear, ClearType as CtClearType};
                 for y in self.footer_anchor_y..(self.footer_anchor_y + self.footer_height) {
                     self.inner.queue(MoveTo(0, y))?;
@@ -262,7 +279,10 @@ impl<B: Backend<Error = io::Error> + Write> Backend for ScrollbackBackend<B> {
                 }
                 Ok(())
             }
-            _ => self.inner.clear_region(clear_type),
+            _ => {
+                tracing::trace!(?clear_type, mode = ?self.mode, "backend clear_region passthrough");
+                self.inner.clear_region(clear_type)
+            }
         }
     }
 

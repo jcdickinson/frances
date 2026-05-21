@@ -291,6 +291,7 @@ impl ScrollbackContainer {
     pub fn push(&mut self, block: Box<dyn Block>) {
         let id = self.push_active(block);
         self.mark_safe(id);
+        tracing::trace!(?id, "push → push_active + mark_safe");
     }
 
     /// Append a block to `active` and return its id. The caller may
@@ -303,6 +304,11 @@ impl ScrollbackContainer {
             render: None,
         });
         self.active_order.push_back(id);
+        tracing::trace!(
+            ?id,
+            active_order_len = self.active_order.len(),
+            "push_active"
+        );
         id
     }
 
@@ -313,9 +319,13 @@ impl ScrollbackContainer {
     pub fn update_active(&mut self, id: BlockId, block: Box<dyn Block>) {
         if let Some(entry) = self.active.get_mut(id) {
             entry.block = block;
+            let was_rendered = entry.render.is_some();
             if let Some(state) = entry.render.as_mut() {
                 state.damaged = true;
             }
+            tracing::trace!(?id, was_rendered, "update_active");
+        } else {
+            tracing::trace!(?id, "update_active for unknown id (no-op)");
         }
     }
 
@@ -326,10 +336,21 @@ impl ScrollbackContainer {
     /// No-op if `id` is unknown (already promoted, or never existed).
     pub fn mark_safe(&mut self, id: BlockId) {
         let Some(entry) = self.active.get_mut(id) else {
+            tracing::trace!(?id, "mark_safe for unknown id (no-op)");
             return;
         };
         entry.safe_to_commit = true;
+        let active_before = self.active_order.len();
+        let safe_before = self.safe.len();
         self.promote_ready();
+        tracing::trace!(
+            ?id,
+            active_before,
+            safe_before,
+            active_after = self.active_order.len(),
+            safe_after = self.safe.len(),
+            "mark_safe",
+        );
     }
 
     /// Absolute screen row where the footer's first row was painted
@@ -358,6 +379,7 @@ impl ScrollbackContainer {
     /// painting it on the live screen.
     pub fn push_committed(&mut self, block: Box<dyn Block>) {
         self.committed.push_back(block);
+        tracing::trace!(committed_len = self.committed.len(), "push_committed");
     }
 
     pub fn safe_count(&self) -> usize {
@@ -389,6 +411,18 @@ impl ScrollbackContainer {
     {
         let term_size = terminal.backend().terminal_size();
         let footer_anchor_before = self.next_y;
+        tracing::trace!(
+            term_w = term_size.width,
+            term_h = term_size.height,
+            footer_anchor_before,
+            committed_len = self.committed.len(),
+            safe_len = self.safe.len(),
+            active_len = self.active_order.len(),
+            cumulative_scrolls = self.cumulative_scrolls,
+            prev_footer_anchor_y = ?self.prev_footer_anchor_y,
+            prev_footer_height = ?self.prev_footer_height,
+            "clear",
+        );
 
         // Drop every in-memory deque. The alt-screen inspector will be
         // re-seeded from the runtime's replay burst that follows.
@@ -427,10 +461,12 @@ impl ScrollbackContainer {
     /// bracket the inspector in alt-screen enter/leave so the main
     /// screen is restored when [`draw`] resumes.
     pub fn set_scrollback(&mut self, enabled: bool) {
+        let prev = self.scrollback_active;
         if enabled && !self.scrollback_active {
             self.scrollback_offset = 0;
         }
         self.scrollback_active = enabled;
+        tracing::trace!(prev, enabled, "set_scrollback");
     }
 
     pub fn scrollback(&self) -> bool {
@@ -443,11 +479,13 @@ impl ScrollbackContainer {
     /// "page up past the top" key still lands cleanly at the top.
     pub fn scroll_up(&mut self, n: u16) {
         self.scrollback_offset = self.scrollback_offset.saturating_add(n);
+        tracing::trace!(n, offset = self.scrollback_offset, "scroll_up");
     }
 
     /// Move the inspector window towards newer content by `n` rows.
     pub fn scroll_down(&mut self, n: u16) {
         self.scrollback_offset = self.scrollback_offset.saturating_sub(n);
+        tracing::trace!(n, offset = self.scrollback_offset, "scroll_down");
     }
 
     pub fn scrollback_offset(&self) -> u16 {
@@ -618,6 +656,23 @@ impl ScrollbackContainer {
         let exiting_active_overflow = self.prev_mode == Some(LayoutMode::ActiveOverflow)
             && mode != LayoutMode::ActiveOverflow;
 
+        tracing::trace!(
+            width,
+            terminal_h,
+            next_y = self.next_y,
+            cumulative_scrolls = self.cumulative_scrolls,
+            terminal_resized,
+            prev_mode = ?self.prev_mode,
+            mode = ?mode,
+            exiting_active_overflow,
+            safe_len = self.safe.len(),
+            active_len = self.active_order.len(),
+            footer_h = footer.measure(width),
+            prev_footer_anchor_y = ?self.prev_footer_anchor_y,
+            prev_footer_height = ?self.prev_footer_height,
+            "draw entry",
+        );
+
         // Bracket the whole frame in DEC 2026 synchronised output.
         let mut guard = SyncGuard::new(terminal)?;
         let terminal = guard.terminal();
@@ -630,6 +685,7 @@ impl ScrollbackContainer {
             // no longer reflect on-screen positions (we painted from
             // row 0 down, ignoring cumulative_scrolls). Reset that
             // state in lockstep with the clear.
+            tracing::trace!("exit active-overflow → clear_below_home + reset render state");
             terminal.backend_mut().clear_below_home()?;
             for entry in self.safe.iter_mut() {
                 entry.render = None;
@@ -748,6 +804,12 @@ impl ScrollbackContainer {
         // resize, mid-frame scrolls, or a pinned anchor that no
         // longer fits → fall back to the natural anchor.
         let footer_h = footer.measure(width);
+        tracing::trace!(
+            cursor_y_after_blocks = cursor.cursor_y,
+            scrolls_so_far = cursor.scrolls,
+            footer_h,
+            "post-block cursor before footer placement",
+        );
         if footer_h > 0 {
             let natural_footer_anchor = cursor.cursor_y;
             let pin_anchor = self.prev_footer_anchor_y.filter(|&prev| {
@@ -771,12 +833,23 @@ impl ScrollbackContainer {
             }
 
             let footer_anchor_y = pin_anchor.unwrap_or(cursor.cursor_y);
+            tracing::trace!(
+                footer_anchor_y,
+                natural_footer_anchor,
+                pin_anchor = ?pin_anchor,
+                "footer anchor decided",
+            );
 
             // Yield slack rows back to the terminal as blank — the
             // rows between content and the pinned footer used to
             // contain bottom rows of the just-shrunken block above
             // and would otherwise show stale paint.
             if let Some(pinned) = pin_anchor {
+                tracing::trace!(
+                    from_y = natural_footer_anchor,
+                    to_y = pinned,
+                    "pin slack clear",
+                );
                 for y in natural_footer_anchor..pinned {
                     terminal.backend_mut().clear_line(y)?;
                 }
@@ -801,6 +874,14 @@ impl ScrollbackContainer {
                 let adjusted_prev_bottom = (prev_bottom as i32 - cursor.scrolls).max(0) as u16;
                 let new_bottom = footer_anchor_y + footer_h - 1;
                 if adjusted_prev_bottom > new_bottom {
+                    tracing::trace!(
+                        from_y = new_bottom + 1,
+                        to_y = adjusted_prev_bottom,
+                        prev_anchor,
+                        prev_height,
+                        cursor_scrolls = cursor.scrolls,
+                        "stranded footer-bottom clear",
+                    );
                     for y in (new_bottom + 1)..=adjusted_prev_bottom {
                         terminal.backend_mut().clear_line(y)?;
                     }
@@ -823,6 +904,7 @@ impl ScrollbackContainer {
             let rect_changed = self.prev_footer_anchor_y != Some(footer_anchor_y)
                 || self.prev_footer_height != Some(footer_h)
                 || cursor.scrolls != 0;
+            tracing::trace!(rect_changed, "footer rect_changed → terminal.resize");
             if rect_changed {
                 terminal.resize(Rect::new(0, 0, width, footer_h))?;
             }
@@ -856,6 +938,12 @@ impl ScrollbackContainer {
         // *first* row so it overwrites the old footer with the new
         // content; that's `footer_h - 1` rows above the cursor.
         self.next_y = cursor.cursor_y.saturating_sub(footer_h.saturating_sub(1));
+        tracing::trace!(
+            next_y = self.next_y,
+            cumulative_scrolls = self.cumulative_scrolls,
+            mode = ?mode,
+            "draw exit (natural path)",
+        );
 
         // Block-level commit: anything whose first row has scrolled
         // off the top moves to `committed`. The remaining still-on-
@@ -935,6 +1023,13 @@ impl ScrollbackContainer {
     where
         B: Backend<Error = io::Error> + Write,
     {
+        tracing::trace!(
+            width,
+            terminal_h,
+            available_h,
+            footer_h,
+            "draw_active_overflow entry",
+        );
         // Reserve the topmost block row for the `•••` indicator.
         let block_area_h = available_h.saturating_sub(1);
 
@@ -1182,6 +1277,7 @@ impl ScrollbackContainer {
         let width = term_size.width;
         let height = term_size.height;
         if width == 0 || height < 2 {
+            tracing::trace!(width, height, "paint_scrollback skipped (degenerate size)");
             return Ok(());
         }
 
@@ -1191,6 +1287,16 @@ impl ScrollbackContainer {
         // height the container top-clips the footer itself — widgets
         // get an `area` equal to what they measured.
         let footer_h_natural = footer.measure(width);
+        tracing::trace!(
+            width,
+            height,
+            offset = self.scrollback_offset,
+            committed_len = self.committed.len(),
+            safe_len = self.safe.len(),
+            active_len = self.active_order.len(),
+            footer_h_natural,
+            "paint_scrollback entry",
+        );
         let footer_h = footer_h_natural.min(height.saturating_sub(2));
         let content_h = height - 2 - footer_h;
         let bottom_bar_y = 1 + content_h;
@@ -1427,6 +1533,7 @@ where
     B: Backend<Error = io::Error> + Write,
 {
     let h = block.measure(width);
+    let prior_state = render.as_ref().map(|s| (s.absolute_y, s.height, s.damaged));
 
     // Decide where this entry's first row should sit on screen. When
     // a block above us already triggered a cascade (it shrank or
@@ -1454,6 +1561,19 @@ where
         *force_cascade = true;
     }
 
+    tracing::trace!(
+        h,
+        expected_y,
+        cursor_y = cursor.cursor_y,
+        cursor_scrolls = cursor.scrolls,
+        cumulative_scrolls,
+        prior = ?prior_state,
+        geometry_changed,
+        force_cascade_in = *force_cascade,
+        needs_redraw,
+        "render_or_skip_entry",
+    );
+
     if needs_redraw {
         let absolute_y_at_start = cumulative_scrolls + cursor.scrolls + cursor.cursor_y as i32;
         if h > 0 {
@@ -1472,11 +1592,22 @@ where
             height: h,
             damaged: false,
         });
+        tracing::trace!(
+            absolute_y = absolute_y_at_start,
+            h,
+            cursor_after = cursor.cursor_y,
+            scrolls_after = cursor.scrolls,
+            "render_or_skip_entry redrew",
+        );
     } else {
         // Skip: cells are still on screen and valid. Step the cursor
         // past the block so the next entry can use its current
         // position as the growing edge. No `\n` — no scrolls.
         cursor.cursor_y = cursor.cursor_y.saturating_add(h);
+        tracing::trace!(
+            cursor_after = cursor.cursor_y,
+            "render_or_skip_entry skipped (cursor stepped past)",
+        );
     }
     Ok(())
 }
