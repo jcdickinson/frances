@@ -27,17 +27,23 @@
 //! on the widget keeps render closures small and lets parent
 //! containers reach into a child's resolved rect when needed.
 
+pub mod border;
 pub mod context;
 pub mod focus;
+pub mod hstack;
 pub mod input;
 pub mod para;
 pub mod theme;
+pub mod vstack;
 
+pub use border::Border;
 pub use context::{EventContext, RenderContext};
 pub use focus::{Focus, FocusId, FocusManager};
+pub use hstack::HStack;
 pub use input::{EventOutcome, Input};
 pub use para::ParaWidget;
 pub use theme::Theme;
+pub use vstack::VStack;
 
 use ratatui::layout::Rect;
 
