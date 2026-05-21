@@ -34,7 +34,7 @@ use ratatui::text::Line;
 use ratatui::widgets;
 use ratatui::widgets::{Borders, Paragraph};
 
-use frances_tui::{Block, BlockId, InlineBackend, ScrollbackContainer};
+use frances_tui::{Block, BlockId, ScrollbackBackend, ScrollbackContainer};
 
 const VARSIZE_MAX: u16 = 5;
 
@@ -59,7 +59,7 @@ fn run() -> io::Result<()> {
     // below whatever the shell printed last. The first container.draw
     // will grow content_h to match its desired layout.
     let (_, cursor_row) = crossterm::cursor::position()?;
-    let backend = InlineBackend::new(CrosstermBackend::new(stdout()), term_size);
+    let backend = ScrollbackBackend::new(CrosstermBackend::new(stdout()), term_size);
     {
         let mut out = stdout();
         out.queue(cursor::Hide)?;

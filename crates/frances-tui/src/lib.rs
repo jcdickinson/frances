@@ -1,6 +1,6 @@
 //! frances-tui — terminal UI building blocks for the frances binary.
 //!
-//! The headline piece is [`InlineBackend`], a `ratatui::backend::Backend`
+//! The headline piece is [`ScrollbackBackend`], a `ratatui::backend::Backend`
 //! wrapper that paints into an inline band of the real terminal whose
 //! height can change at runtime — what `ratatui::Viewport::Inline`
 //! would be if its height weren't fixed at construction. The band is
@@ -17,11 +17,11 @@
 //! container's full block history into an alt-screen view.
 
 pub mod block;
-pub mod inline_backend;
 pub mod measured_widget;
+pub mod scrollback_backend;
 pub mod scrollback_container;
 
 pub use block::{Block, TruncatedBlock};
-pub use inline_backend::{InlineBackend, SyncGuard};
 pub use measured_widget::MeasuredWidget;
+pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};

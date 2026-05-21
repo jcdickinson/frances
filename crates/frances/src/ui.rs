@@ -26,7 +26,7 @@ use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
 use frances_tui::{
-    BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer, TruncatedBlock,
+    BlockId as ContainerBlockId, ScrollbackBackend, ScrollbackContainer, TruncatedBlock,
 };
 
 use crate::tui::{FooterBlock, RawBlock, Textarea, block_for_kind};
@@ -166,7 +166,7 @@ impl LiveBlocks {
     }
 }
 
-type AppTerminal = Terminal<InlineBackend<CrosstermBackend<Stdout>>>;
+type AppTerminal = Terminal<ScrollbackBackend<CrosstermBackend<Stdout>>>;
 
 impl App<'_> {
     pub async fn run(self) -> Result<()> {
@@ -188,7 +188,7 @@ impl App<'_> {
         };
         let (_, cursor_row) = cursor::position().context("query cursor position")?;
 
-        let backend = InlineBackend::new(CrosstermBackend::new(stdout()), term_size);
+        let backend = ScrollbackBackend::new(CrosstermBackend::new(stdout()), term_size);
         let mut terminal = Terminal::with_options(
             backend,
             TerminalOptions {

@@ -3,7 +3,7 @@
 //! whose contents the caller can replace by id, and a single footer
 //! block. The container measures everything, decides which finalised
 //! blocks fit above the active stack + footer, spills the oldest of
-//! the rest into native scrollback, and drives the [`InlineBackend`]
+//! the rest into native scrollback, and drives the [`ScrollbackBackend`]
 //! to grow / shrink the on-screen container area.
 //!
 //! Layout, top to bottom inside the container area:
@@ -68,8 +68,21 @@ use ratatui::widgets::{Paragraph, Widget};
 use slotmap::{SlotMap, new_key_type};
 
 use crate::block::Block;
-use crate::inline_backend::{InlineBackend, SyncGuard};
 use crate::measured_widget::MeasuredWidget;
+use crate::scrollback_backend::{BackendMode, ScrollbackBackend, SyncGuard};
+
+/// Adapter: lets ratatui render a `&dyn MeasuredWidget` as a normal
+/// `ratatui::widgets::Widget`. The container hands one of these into
+/// `Frame::render_widget` so the footer paints through ratatui's
+/// buffer-pair diff. Lifetime-bounded to the borrow; consumed by the
+/// `Widget::render` call.
+struct MeasuredWidgetRef<'a>(&'a dyn MeasuredWidget);
+
+impl<'a> Widget for MeasuredWidgetRef<'a> {
+    fn render(self, area: Rect, buf: &mut Buffer) {
+        self.0.render(area, buf);
+    }
+}
 
 new_key_type! {
     /// Stable id for an entry in the container's `active` collection.
@@ -152,23 +165,18 @@ pub struct ScrollbackContainer {
     /// A block whose first row would be negative has partially
     /// scrolled into native scrollback and is moved to `committed`.
     cumulative_scrolls: i32,
-    /// Screen row where the previous frame's footer ended (its last
-    /// row). When the footer shrinks across frames, any rows between
-    /// the new footer's bottom and this one have stale paint from
-    /// the old footer and need to be cleared so the freed rows are
-    /// blank when the terminal takes them back.
-    prev_footer_bottom_y: Option<u16>,
-    /// The footer's previous-frame [`Buffer`] (always anchored at
-    /// `(0, 0)` — its screen anchor is held in [`prev_footer_anchor_y`]
-    /// rather than in [`Buffer::area`]). Used as the diff base for the
-    /// next frame's footer. When the footer's anchor or size changes
-    /// the cache is invalidated and the next paint is a full row
-    /// repaint; otherwise [`Buffer::diff`] picks out only the cells
-    /// that changed and we emit just those — giving cell-level damage
-    /// tracking so selections overlapping unchanged footer cells
-    /// survive across draws.
-    prev_footer_buf: Option<Buffer>,
+    /// Screen row where the previous frame's footer started, and its
+    /// height. Tracked across frames for two purposes: (1) the pin
+    /// behaviour, which keeps the footer at `prev_footer_anchor_y`
+    /// when content shrinks above it, avoiding jitter; (2) clearing
+    /// stranded rows (cells in the previous footer rect that are
+    /// outside the new one) when the footer's rect changes.
+    ///
+    /// ratatui's `Terminal` owns the buffer-pair diff for the footer
+    /// rect itself — the container never holds a footer buffer of its
+    /// own.
     prev_footer_anchor_y: Option<u16>,
+    prev_footer_height: Option<u16>,
     /// Terminal size as of the previous frame's draw. Used to detect
     /// resizes: footer pinning (see the slack-pin logic in [`draw`])
     /// is only valid when the layout coords from the previous frame
@@ -219,9 +227,8 @@ impl ScrollbackContainer {
             footer,
             next_y: initial_y,
             cumulative_scrolls: 0,
-            prev_footer_bottom_y: None,
-            prev_footer_buf: None,
             prev_footer_anchor_y: None,
+            prev_footer_height: None,
             prev_term_size: None,
             prev_mode: None,
             scrollback_active: false,
@@ -361,7 +368,7 @@ impl ScrollbackContainer {
     /// Footer block reference is preserved (the caller's footer is a
     /// live UI element, not history); its diff caches are flushed so
     /// the next draw repaints it from scratch.
-    pub fn clear<B>(&mut self, terminal: &mut Terminal<InlineBackend<B>>) -> io::Result<()>
+    pub fn clear<B>(&mut self, terminal: &mut Terminal<ScrollbackBackend<B>>) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
     {
@@ -384,9 +391,8 @@ impl ScrollbackContainer {
         // draw fully re-paints.
         self.next_y = footer_anchor_before;
         self.cumulative_scrolls = 0;
-        self.prev_footer_buf = None;
         self.prev_footer_anchor_y = None;
-        self.prev_footer_bottom_y = None;
+        self.prev_footer_height = None;
         self.prev_mode = None;
         self.scrollback_offset = 0;
         self.prev_term_size = Some(term_size);
@@ -546,7 +552,7 @@ impl ScrollbackContainer {
     }
 
     /// Drive one frame against a ratatui `Terminal` wrapping an
-    /// [`InlineBackend`].
+    /// [`ScrollbackBackend`].
     ///
     /// Three render paths share this entry point, dispatched by
     /// [`classify_layout`]:
@@ -579,7 +585,7 @@ impl ScrollbackContainer {
     /// that need to commit emit at the top so they scroll into
     /// native scrollback; active rows that don't fit are silently
     /// not emitted.
-    pub fn draw<B>(&mut self, terminal: &mut Terminal<InlineBackend<B>>) -> io::Result<()>
+    pub fn draw<B>(&mut self, terminal: &mut Terminal<ScrollbackBackend<B>>) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
     {
@@ -613,9 +619,8 @@ impl ScrollbackContainer {
             }
             self.next_y = 0;
             self.cumulative_scrolls = 0;
-            self.prev_footer_buf = None;
             self.prev_footer_anchor_y = None;
-            self.prev_footer_bottom_y = None;
+            self.prev_footer_height = None;
         }
 
         if mode == LayoutMode::ActiveOverflow {
@@ -749,71 +754,67 @@ impl ScrollbackContainer {
                 }
             }
 
-            let local_area = Rect::new(0, 0, width, footer_h);
-            let mut curr_buf = Buffer::empty(local_area);
-            self.footer.render(local_area, &mut curr_buf);
-
-            // The diff cache is only valid if the rows we're about to
-            // paint into are *literally the same rows* the prev footer
-            // was painted into. Any scroll this frame slid the old
-            // footer cells up and overwrote that row range with
-            // scrolled-in block content, so the prev buffer doesn't
-            // match the on-screen state any more — fall back to a
-            // full repaint via the row-by-row path below.
-            let same_layout = cursor.scrolls == 0
-                && self.prev_footer_anchor_y == Some(footer_anchor_y)
-                && self
-                    .prev_footer_buf
-                    .as_ref()
-                    .is_some_and(|b| b.area == local_area);
-            if same_layout {
-                let prev = self.prev_footer_buf.as_ref().unwrap();
-                for (x, y_local, cell) in prev.diff(&curr_buf) {
-                    let screen_y = footer_anchor_y + y_local;
-                    terminal.backend_mut().write_cell(x, screen_y, cell)?;
-                }
-            } else {
-                terminal.backend_mut().move_cursor_abs(0, footer_anchor_y)?;
-                for row_idx in 0..footer_h {
-                    let with_newline = row_idx + 1 < footer_h;
-                    write_row_at_cursor(
-                        terminal.backend_mut(),
-                        &curr_buf,
-                        row_idx,
-                        width,
-                        with_newline,
-                        &mut cursor,
-                        terminal_h,
-                    )?;
+            // Clear stranded rows below the new footer bottom: when
+            // the new footer is shorter than the previous one (or
+            // sits at a higher anchor), the rows in
+            // `(new_bottom, adjusted_prev_bottom]` still display the
+            // old footer's paint. ratatui's diff doesn't reach
+            // outside the current rect, so we wipe them by hand.
+            //
+            // We don't clear rows *above* `footer_anchor_y` here:
+            // the slack-clear loop above handles the pin path, and
+            // content-grow / scroll paths already overwrite those
+            // rows during the block render pass.
+            if let (Some(prev_anchor), Some(prev_height)) =
+                (self.prev_footer_anchor_y, self.prev_footer_height)
+                && prev_height > 0
+            {
+                let prev_bottom = prev_anchor + prev_height - 1;
+                let adjusted_prev_bottom = (prev_bottom as i32 - cursor.scrolls).max(0) as u16;
+                let new_bottom = footer_anchor_y + footer_h - 1;
+                if adjusted_prev_bottom > new_bottom {
+                    for y in (new_bottom + 1)..=adjusted_prev_bottom {
+                        terminal.backend_mut().clear_line(y)?;
+                    }
                 }
             }
-            self.prev_footer_buf = Some(curr_buf);
+
+            // Paint the footer through ratatui: in `Footer` mode the
+            // backend reports the footer rect as its size and offsets
+            // cell writes by `footer_anchor_y`, so ratatui's
+            // buffer-pair diff runs against the right region. When
+            // the rect shifted since last frame, `terminal.resize`
+            // forces a full repaint by resetting ratatui's back
+            // buffer + wiping the new rect on screen.
+            {
+                let backend = terminal.backend_mut();
+                backend.set_footer_rect(footer_anchor_y, footer_h);
+                backend.set_mode(BackendMode::Footer);
+            }
+
+            let rect_changed = self.prev_footer_anchor_y != Some(footer_anchor_y)
+                || self.prev_footer_height != Some(footer_h)
+                || cursor.scrolls != 0;
+            if rect_changed {
+                terminal.resize(Rect::new(0, 0, width, footer_h))?;
+            }
+
+            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            terminal.draw(|frame| {
+                frame.render_widget(footer_widget, frame.area());
+            })?;
+
+            terminal.backend_mut().set_mode(BackendMode::Scrollback);
+
             self.prev_footer_anchor_y = Some(footer_anchor_y);
+            self.prev_footer_height = Some(footer_h);
 
-            // Pin the bookkeeping cursor to the footer's last row —
-            // the diff path doesn't move it; the full paint may land
-            // one row short depending on the last row's `with_newline`.
             cursor.cursor_y = footer_anchor_y + footer_h - 1;
-        }
-        // Yield-back: if this frame's footer is shorter than the
-        // previous one, the rows between the new footer's bottom and
-        // the old footer's bottom (adjusted for any scrolls that
-        // happened this frame) still display the old footer's paint.
-        // Clear them so the terminal sees blank rows in their place.
-        let new_footer_bottom = cursor.cursor_y;
-        if let Some(prev_bottom) = self.prev_footer_bottom_y {
-            let adjusted_prev = (prev_bottom as i32 - cursor.scrolls).max(0) as u16;
-            if adjusted_prev > new_footer_bottom {
-                for y in (new_footer_bottom + 1)..=adjusted_prev {
-                    terminal.backend_mut().clear_line(y)?;
-                }
-            }
         }
 
         Backend::flush(terminal.backend_mut())?;
 
         self.cumulative_scrolls = self.cumulative_scrolls.saturating_add(cursor.scrolls);
-        self.prev_footer_bottom_y = Some(new_footer_bottom);
         self.prev_term_size = Some(term_size);
 
         // After rendering, the cursor sits on the footer's *last*
@@ -885,7 +886,7 @@ impl ScrollbackContainer {
     /// invalidated so the next frame re-evaluates from scratch.
     fn draw_active_overflow<B>(
         &mut self,
-        terminal: &mut Terminal<InlineBackend<B>>,
+        terminal: &mut Terminal<ScrollbackBackend<B>>,
         width: u16,
         terminal_h: u16,
         available_h: u16,
@@ -1024,29 +1025,42 @@ impl ScrollbackContainer {
             }
         }
 
-        // 4. Footer rows.
+        // 4. Footer rows. The content-rows loop above already emitted
+        // a trailing `\n` after the last active row (because
+        // `emitted < total_rows`); we need (footer_h - 1) more `\n`s
+        // to scroll content the rest of the way past the bottom, so
+        // the on-screen state matches what the old all-direct path
+        // produced. Then ratatui paints the footer rect.
         if footer_h > 0 {
-            let area = Rect::new(0, 0, width, footer_h);
-            let mut buf = Buffer::empty(area);
-            self.footer.render(area, &mut buf);
-            for row_idx in 0..footer_h {
-                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-                backend.write_row(cells.into_iter())?;
-                emitted = emitted.saturating_add(1);
-                if emitted < total_rows {
-                    backend.newline()?;
-                }
+            for _ in 1..footer_h {
+                backend.newline()?;
             }
-        }
+            Backend::flush(backend)?;
 
-        Backend::flush(backend)?;
+            let footer_anchor_y = terminal_h.saturating_sub(footer_h);
+            {
+                let backend = terminal.backend_mut();
+                backend.set_footer_rect(footer_anchor_y, footer_h);
+                backend.set_mode(BackendMode::Footer);
+            }
+            terminal.resize(Rect::new(0, 0, width, footer_h))?;
+            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            terminal.draw(|frame| {
+                frame.render_widget(footer_widget, frame.area());
+            })?;
+            terminal.backend_mut().set_mode(BackendMode::Scrollback);
+        } else {
+            Backend::flush(backend)?;
+        }
 
         // === Bookkeeping ===
 
-        // Total `\n`s emitted = emitted_rows - 1 (last row has no
-        // trailing newline). Starting from row 0, each `\n` past the
-        // first `terminal_h - 1` triggers a scroll.
-        let total_newlines = i32::from(emitted).saturating_sub(1).max(0);
+        // Total `\n`s emitted equals (content rows from the loop) +
+        // (footer_h - 1) = total_rows - 1, regardless of how many
+        // actually triggered scrolls in the terminal. Starting from
+        // row 0, each `\n` past the first `terminal_h - 1` triggers a
+        // scroll.
+        let total_newlines = i32::from(total_rows).saturating_sub(1).max(0);
         let scrolls = total_newlines
             .saturating_sub(i32::from(terminal_h).saturating_sub(1))
             .max(0);
@@ -1077,13 +1091,11 @@ impl ScrollbackContainer {
         };
         self.next_y = footer_anchor_y;
 
-        // Invalidate the footer diff cache: the next frame's anchor
-        // / size won't necessarily match what we just painted, and
-        // even if it did, this path doesn't populate prev_footer_buf
-        // consistently with the natural-scroll path.
-        self.prev_footer_buf = None;
+        // Invalidate the footer rect bookkeeping: the next frame's
+        // anchor / height won't necessarily match what we just
+        // painted, so let the next paint treat the rect as new.
         self.prev_footer_anchor_y = None;
-        self.prev_footer_bottom_y = Some(terminal_h.saturating_sub(1));
+        self.prev_footer_height = None;
 
         Ok(())
     }
@@ -1113,7 +1125,7 @@ impl ScrollbackContainer {
     /// branch their render loop.
     pub fn paint_scrollback<B>(
         &mut self,
-        terminal: &mut Terminal<InlineBackend<B>>,
+        terminal: &mut Terminal<ScrollbackBackend<B>>,
     ) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
@@ -1144,10 +1156,12 @@ impl ScrollbackContainer {
         let above = y_offset;
         let below = scroll;
 
-        // Compose the full frame into an off-screen buffer, then emit it
-        // row by row. Keeps the cell-level styling intact without
-        // tangling with ratatui's Terminal diff cache.
-        let area = Rect::new(0, 0, width, height);
+        // Compose the non-footer rows (top status + history + bottom
+        // status) into an off-screen buffer and emit them via
+        // absolute-cursor writes. The footer rect is rendered
+        // separately through ratatui in `Footer` mode so it gets the
+        // buffer-pair diff that the natural-scroll path also uses.
+        let area = Rect::new(0, 0, width, footer_y);
         let mut buf = Buffer::empty(area);
 
         paint_status_bar_top(&mut buf, width, above);
@@ -1166,36 +1180,48 @@ impl ScrollbackContainer {
 
         paint_status_bar_bottom(&mut buf, width, bottom_bar_y, below);
 
-        if footer_h > 0 {
-            if footer_h == footer_h_natural {
-                self.footer
-                    .render(Rect::new(0, footer_y, width, footer_h), &mut buf);
-            } else {
-                tracing::error!(
-                    natural = footer_h_natural,
-                    available = footer_h,
-                    "footer doesn't fit the alt-screen layout; top-clipping",
-                );
-                let full = Rect::new(0, 0, width, footer_h_natural);
-                let mut full_buf = Buffer::empty(full);
-                self.footer.render(full, &mut full_buf);
-                for row_idx in 0..footer_h {
-                    for x in 0..width {
-                        buf[(x, footer_y + row_idx)] = full_buf[(x, row_idx)].clone();
-                    }
-                }
-            }
+        if footer_h < footer_h_natural {
+            tracing::error!(
+                natural = footer_h_natural,
+                available = footer_h,
+                "footer doesn't fit the alt-screen layout; widget gets a clipped area",
+            );
         }
 
         let mut guard = SyncGuard::new(terminal)?;
         let terminal = guard.terminal();
-        let backend = terminal.backend_mut();
-        for row_idx in 0..height {
-            backend.move_cursor_abs(0, row_idx)?;
-            let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-            backend.write_row(cells.into_iter())?;
+        {
+            let backend = terminal.backend_mut();
+            for row_idx in 0..footer_y {
+                backend.move_cursor_abs(0, row_idx)?;
+                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
+                backend.write_row(cells.into_iter())?;
+            }
+            Backend::flush(backend)?;
         }
-        Backend::flush(backend)?;
+
+        if footer_h > 0 {
+            {
+                let backend = terminal.backend_mut();
+                backend.set_footer_rect(footer_y, footer_h);
+                backend.set_mode(BackendMode::Footer);
+            }
+            terminal.resize(Rect::new(0, 0, width, footer_h))?;
+            let footer_widget = MeasuredWidgetRef(self.footer.as_ref());
+            terminal.draw(|frame| {
+                frame.render_widget(footer_widget, frame.area());
+            })?;
+            terminal.backend_mut().set_mode(BackendMode::Scrollback);
+        }
+
+        // The alt-screen frame has its own ratatui state now, so the
+        // natural-scroll path needs to repaint the footer from scratch
+        // when we transition back. The mode-flag flip in
+        // `set_scrollback(false)` handles the broader transition; here
+        // we just invalidate the footer rect bookkeeping the same way
+        // the active-overflow path does.
+        self.prev_footer_anchor_y = None;
+        self.prev_footer_height = None;
 
         Ok(())
     }
@@ -1337,7 +1363,7 @@ fn render_or_skip_entry<B>(
     render: &mut Option<RenderState>,
     width: u16,
     terminal_h: u16,
-    backend: &mut InlineBackend<B>,
+    backend: &mut ScrollbackBackend<B>,
     cursor: &mut CursorState,
     cumulative_scrolls: i32,
     force_cascade: &mut bool,
@@ -1429,7 +1455,7 @@ fn overlay_spinner(buf: &mut Buffer, area: Rect, frame: u8) {
 }
 
 fn write_row_at_cursor<B>(
-    backend: &mut InlineBackend<B>,
+    backend: &mut ScrollbackBackend<B>,
     buf: &Buffer,
     row_idx: u16,
     width: u16,
@@ -1730,9 +1756,9 @@ mod tests {
     fn mk_term_terminal(
         width: u16,
         height: u16,
-    ) -> Terminal<InlineBackend<term_backend::TermBackend>> {
+    ) -> Terminal<ScrollbackBackend<term_backend::TermBackend>> {
         let size = Size { width, height };
-        let backend = InlineBackend::new(term_backend::TermBackend::new(width, height), size);
+        let backend = ScrollbackBackend::new(term_backend::TermBackend::new(width, height), size);
         Terminal::with_options(
             backend,
             TerminalOptions {
@@ -2865,9 +2891,8 @@ mod tests {
 
         // 4: internal bookkeeping is reset to a clean-slate shape.
         assert_eq!(container.cumulative_scrolls, 0);
-        assert!(container.prev_footer_buf.is_none());
         assert!(container.prev_footer_anchor_y.is_none());
-        assert!(container.prev_footer_bottom_y.is_none());
+        assert!(container.prev_footer_height.is_none());
         assert!(container.prev_mode.is_none());
         assert_eq!(container.scrollback_offset, 0);
     }
