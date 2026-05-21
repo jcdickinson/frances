@@ -30,11 +30,13 @@
 pub mod context;
 pub mod focus;
 pub mod input;
+pub mod para;
 pub mod theme;
 
 pub use context::{EventContext, RenderContext};
 pub use focus::{Focus, FocusId, FocusManager};
 pub use input::{EventOutcome, Input};
+pub use para::ParaWidget;
 pub use theme::Theme;
 
 use ratatui::layout::Rect;

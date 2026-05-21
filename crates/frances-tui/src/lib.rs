@@ -27,6 +27,6 @@ pub use measured_widget::MeasuredWidget;
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
 pub use widget::{
-    EventContext, EventOutcome, Focus, FocusId, FocusManager, Input, RenderContext, Theme, Widget,
-    WidgetState,
+    EventContext, EventOutcome, Focus, FocusId, FocusManager, Input, ParaWidget, RenderContext,
+    Theme, Widget, WidgetState,
 };
