@@ -13,6 +13,7 @@ path = "src/lib.rs"
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 slotmap = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 alacritty_terminal = "0.26"

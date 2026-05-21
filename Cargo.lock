@@ -1568,6 +1568,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "slotmap",
+ "tracing",
  "vte",
 ]
 

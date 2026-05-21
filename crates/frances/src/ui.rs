@@ -15,7 +15,7 @@ use ratatui::Terminal;
 use ratatui::TerminalOptions;
 use ratatui::Viewport;
 use ratatui::backend::{Backend, CrosstermBackend};
-use ratatui::layout::{Position, Size};
+use ratatui::layout::Size;
 use ratatui::style::{Color, Style};
 use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
@@ -29,7 +29,7 @@ use frances_tui::{
     BlockId as ContainerBlockId, InlineBackend, ScrollbackContainer, TruncatedBlock,
 };
 
-use crate::tui::{FooterBlock, INPUT_HEIGHT, RawBlock, Textarea, block_for_kind};
+use crate::tui::{FooterBlock, RawBlock, Textarea, block_for_kind};
 
 pub struct App<'a> {
     pub session: &'a Session,
@@ -197,11 +197,10 @@ impl App<'_> {
         )
         .context("init terminal")?;
 
+        let mut textarea = Textarea::new("type a message…");
         let mut container = ScrollbackContainer::new(
             Box::new(FooterBlock {
-                textarea_lines: vec![String::new()],
-                placeholder: String::new(),
-                status: None,
+                textarea: textarea.snapshot_widget(None),
                 token_status: None,
             }),
             cursor_row,
@@ -216,7 +215,6 @@ impl App<'_> {
             container.push(Box::new(RawBlock::single_styled(line, style)));
         }
 
-        let mut textarea = Textarea::new("type a message…");
         let mut state = LiveBlocks::new();
         let mut pending_approval: Option<PermissionRequest> = None;
         let mut frame_rx = self.events;
@@ -378,14 +376,13 @@ fn redraw(
     streaming: bool,
     latest_usage: Option<&Usage>,
 ) -> std::io::Result<()> {
+    let status = if streaming {
+        Some("streaming…")
+    } else {
+        None
+    };
     container.set_footer(Box::new(FooterBlock {
-        textarea_lines: textarea.lines_snapshot(),
-        placeholder: textarea.placeholder().to_string(),
-        status: if streaming {
-            Some("streaming…".to_string())
-        } else {
-            None
-        },
+        textarea: textarea.snapshot_widget(status),
         token_status: latest_usage.map(format_token_status),
     }));
 
@@ -399,22 +396,11 @@ fn redraw(
 
     container.draw(terminal)?;
 
-    // Footer's first row sits at `footer_top_row` on the screen.
-    // The textarea inside has a 1-row top border, then content rows,
-    // then a 1-row bottom border — so the cursor goes at
-    // footer_top + 1 (skip top border) + cursor_row (clamped to the
-    // single visible content row of a 3-row textarea).
+    // The textarea widget paints its own cursor cell (reversed style)
+    // and handles horizontal scroll when the line outgrows the inner
+    // width, so the terminal cursor stays hidden.
     let backend = terminal.backend_mut();
-    let footer_top = container.footer_top_row();
-    let content_rows = INPUT_HEIGHT.saturating_sub(2);
-    let visible_cursor_row = textarea.cursor_row().min(content_rows.saturating_sub(1));
-    let cursor_y = footer_top + 1 + visible_cursor_row;
-    let cursor_x = 1 + textarea.cursor_display_col();
-    backend.set_cursor_position(Position {
-        x: cursor_x,
-        y: cursor_y,
-    })?;
-    backend.show_cursor()?;
+    backend.hide_cursor()?;
     Backend::flush(backend)?;
     Ok(())
 }
@@ -689,11 +675,10 @@ fn leave_scrollback(terminal: &mut AppTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use frances_tui::Block;
     use ratatui::text::Line;
     use ratatui::widgets::Paragraph;
 
-    fn footer() -> Box<dyn Block> {
+    fn footer() -> Box<Paragraph<'static>> {
         Box::new(Paragraph::new(Line::raw("footer")))
     }
 

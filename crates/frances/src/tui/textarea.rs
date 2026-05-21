@@ -1,3 +1,6 @@
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders};
 use ratatui_textarea::TextArea;
 
 pub const INPUT_HEIGHT: u16 = 3;
@@ -10,6 +13,10 @@ impl Textarea {
     pub fn new(placeholder: impl Into<String>) -> Self {
         let mut textarea = TextArea::new(vec![String::new()]);
         textarea.set_placeholder_text(placeholder);
+        // The cursor cell stays at the widget's default reversed
+        // style, but the whole-line underline is too noisy for a
+        // single-row input box.
+        textarea.set_cursor_line_style(Style::default());
         Self { textarea }
     }
 
@@ -21,10 +28,6 @@ impl Textarea {
         self.textarea.set_placeholder_text(placeholder);
     }
 
-    pub fn placeholder(&self) -> String {
-        self.textarea.placeholder().to_string()
-    }
-
     pub fn is_empty(&self) -> bool {
         self.textarea.lines().iter().all(|l| l.is_empty())
     }
@@ -33,16 +36,25 @@ impl Textarea {
         self.textarea.lines().join("\n")
     }
 
-    pub fn lines_snapshot(&self) -> Vec<String> {
-        self.textarea.lines().to_vec()
-    }
-
-    pub fn cursor_row(&self) -> u16 {
-        self.textarea.cursor().0 as u16
-    }
-
-    pub fn cursor_display_col(&self) -> u16 {
-        self.textarea.cursor().1 as u16
+    /// Clone the inner widget with a bordered `Block` applied, plus an
+    /// optional dimmed status inset on the top border (e.g.
+    /// `┌─ streaming… ─────┐`). The clone lets the footer composite
+    /// own a renderable widget snapshot without borrowing from the
+    /// live editor.
+    pub fn snapshot_widget(&self, status: Option<&str>) -> TextArea<'static> {
+        let mut snapshot = self.textarea.clone();
+        let block = match status.filter(|s| !s.is_empty()) {
+            Some(status) => Block::default()
+                .borders(Borders::ALL)
+                .title(Line::from(vec![
+                    Span::raw("─ "),
+                    Span::styled(status.to_string(), Style::default().fg(Color::DarkGray)),
+                    Span::raw(" "),
+                ])),
+            None => Block::default().borders(Borders::ALL),
+        };
+        snapshot.set_block(block);
+        snapshot
     }
 
     pub fn input(&mut self, key: crossterm::event::KeyEvent) {

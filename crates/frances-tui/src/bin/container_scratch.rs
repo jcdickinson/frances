@@ -168,7 +168,12 @@ fn varsize_block(label: u32, lines: u16) -> Box<dyn Block> {
     Box::new(Paragraph::new(body))
 }
 
-fn footer_block(safe: u32, active: u32, committed: usize, content_lines: u16) -> Box<dyn Block> {
+fn footer_block(
+    safe: u32,
+    active: u32,
+    committed: usize,
+    content_lines: u16,
+) -> Box<Paragraph<'static>> {
     let title = format!(
         " container scratch  safe: {safe}  active: {active}  committed: {committed}  footer: {} ",
         content_lines + 2

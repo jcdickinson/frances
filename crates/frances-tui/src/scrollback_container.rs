@@ -69,6 +69,7 @@ use slotmap::{SlotMap, new_key_type};
 
 use crate::block::Block;
 use crate::inline_backend::{InlineBackend, SyncGuard};
+use crate::measured_widget::MeasuredWidget;
 
 new_key_type! {
     /// Stable id for an entry in the container's `active` collection.
@@ -138,7 +139,7 @@ pub struct ScrollbackContainer {
     /// Display order for `active`, oldest at the front. Promotion
     /// pops from the front while the head entry is `safe_to_commit`.
     active_order: VecDeque<BlockId>,
-    footer: Box<dyn Block>,
+    footer: Box<dyn MeasuredWidget>,
     /// Where the next frame's render starts. Initially = the cursor
     /// row at construction (= the row beneath whatever launched
     /// frances). After each draw it tracks the screen row where the
@@ -209,7 +210,7 @@ pub struct ScrollbackContainer {
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 impl ScrollbackContainer {
-    pub fn new(footer: Box<dyn Block>, initial_y: u16) -> Self {
+    pub fn new(footer: Box<dyn MeasuredWidget>, initial_y: u16) -> Self {
         Self {
             committed: VecDeque::new(),
             safe: VecDeque::new(),
@@ -255,7 +256,7 @@ impl ScrollbackContainer {
         }
     }
 
-    pub fn set_footer(&mut self, footer: Box<dyn Block>) {
+    pub fn set_footer(&mut self, footer: Box<dyn MeasuredWidget>) {
         self.footer = footer;
     }
 
@@ -1126,6 +1127,9 @@ impl ScrollbackContainer {
 
         // Layout chunks. Two status bars are mandatory; the footer
         // shrinks first if the terminal can't fit its natural height.
+        // When the available slot is shorter than the footer's natural
+        // height the container top-clips the footer itself — widgets
+        // get an `area` equal to what they measured.
         let footer_h_natural = self.footer.measure(width);
         let footer_h = footer_h_natural.min(height.saturating_sub(2));
         let content_h = height - 2 - footer_h;
@@ -1163,8 +1167,24 @@ impl ScrollbackContainer {
         paint_status_bar_bottom(&mut buf, width, bottom_bar_y, below);
 
         if footer_h > 0 {
-            self.footer
-                .render(Rect::new(0, footer_y, width, footer_h), &mut buf);
+            if footer_h == footer_h_natural {
+                self.footer
+                    .render(Rect::new(0, footer_y, width, footer_h), &mut buf);
+            } else {
+                tracing::error!(
+                    natural = footer_h_natural,
+                    available = footer_h,
+                    "footer doesn't fit the alt-screen layout; top-clipping",
+                );
+                let full = Rect::new(0, 0, width, footer_h_natural);
+                let mut full_buf = Buffer::empty(full);
+                self.footer.render(full, &mut full_buf);
+                for row_idx in 0..footer_h {
+                    for x in 0..width {
+                        buf[(x, footer_y + row_idx)] = full_buf[(x, row_idx)].clone();
+                    }
+                }
+            }
         }
 
         let mut guard = SyncGuard::new(terminal)?;
@@ -1443,11 +1463,11 @@ mod tests {
     use ratatui::text::Line;
     use ratatui::widgets::Paragraph;
 
-    fn para(text: &str) -> Box<dyn Block> {
+    fn para(text: &str) -> Box<Paragraph<'static>> {
         Box::new(Paragraph::new(Line::raw(text.to_string())))
     }
 
-    fn multi(lines: u16) -> Box<dyn Block> {
+    fn multi(lines: u16) -> Box<Paragraph<'static>> {
         let text = (0..lines)
             .map(|i| format!("L{i}"))
             .collect::<Vec<_>>()
@@ -1702,7 +1722,7 @@ mod tests {
         }
     }
 
-    fn multi_text(lines: &[&str]) -> Box<dyn Block> {
+    fn multi_text(lines: &[&str]) -> Box<Paragraph<'static>> {
         let lines: Vec<Line<'static>> = lines.iter().map(|s| Line::raw(s.to_string())).collect();
         Box::new(Paragraph::new(lines))
     }

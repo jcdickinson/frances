@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use frances_session::events::{BlockKind, ShellState};
-use frances_tui::Block;
+use frances_tui::{Block, MeasuredWidget};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -385,93 +385,35 @@ impl Block for RawBlock {
     }
 }
 
-/// Footer block: a bordered textarea snapshot followed by a one-row
-/// token status area below the input. The cursor inside the textarea is
-/// positioned separately by the main loop, after the container draw.
-/// `status`, when present, is rendered inside the top border as
-/// `┌─ {status} ──…─┐` — used to surface a streaming indicator while
-/// an LLM stream is in flight.
+/// Footer composite: a bordered textarea snapshot rendered by
+/// `ratatui_textarea` itself, plus a one-row token status below it.
+/// The cursor inside the textarea is positioned separately by the main
+/// loop after the container draw — the widget's own cursor styling is
+/// cleared upstream (see `Textarea::new`).
 pub struct FooterBlock {
-    pub textarea_lines: Vec<String>,
-    pub placeholder: String,
-    pub status: Option<String>,
+    pub textarea: ratatui_textarea::TextArea<'static>,
     pub token_status: Option<String>,
 }
 
-impl Block for FooterBlock {
+impl MeasuredWidget for FooterBlock {
     fn measure(&self, _width: u16) -> u16 {
         INPUT_HEIGHT + TOKEN_STATUS_HEIGHT
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let textarea_h = INPUT_HEIGHT.min(area.height);
-        if textarea_h < 3 || area.width < 2 {
-            return;
-        }
-        let inner_w = area.width.saturating_sub(2) as usize;
-        // Top border with optional status inset. The status text is
-        // dimmed so it reads as chrome rather than content.
-        buf.set_string(area.x, area.y, "┌", Style::default());
-        buf.set_string(area.x + 1 + inner_w as u16, area.y, "┐", Style::default());
-        if let Some(status) = self.status.as_deref().filter(|s| !s.is_empty()) {
-            // Layout: `─ {status} ` then fill the rest with `─`.
-            // Truncate the status if it wouldn't leave any fill room.
-            let max_status_cols = inner_w.saturating_sub(4); // ` ` + status + ` ` + at least 1 fill
-            let truncated = truncate_to_width(status, max_status_cols);
-            let status_cols = display_width(&truncated);
-            // Leading single `─`, space, status, space, fill `─`s.
-            let mut x = area.x + 1;
-            buf.set_string(x, area.y, "─", Style::default());
-            x += 1;
-            buf.set_string(x, area.y, " ", Style::default());
-            x += 1;
-            buf.set_string(x, area.y, &truncated, Style::default().fg(Color::DarkGray));
-            x += status_cols as u16;
-            buf.set_string(x, area.y, " ", Style::default());
-            x += 1;
-            let consumed = (x - (area.x + 1)) as usize;
-            let fill = inner_w.saturating_sub(consumed);
-            if fill > 0 {
-                buf.set_string(x, area.y, "─".repeat(fill), Style::default());
-            }
-        } else {
-            buf.set_string(area.x + 1, area.y, "─".repeat(inner_w), Style::default());
-        }
-        let bottom = format!("└{}┘", "─".repeat(inner_w));
-        buf.set_string(area.x, area.y + textarea_h - 1, bottom, Style::default());
+        use ratatui::widgets::Widget;
+        let input_area = Rect::new(area.x, area.y, area.width, INPUT_HEIGHT);
+        (&self.textarea).render(input_area, buf);
 
-        let content_rows = textarea_h - 2;
-        let placeholder_active = self.textarea_lines.iter().all(|l| l.is_empty());
-        for i in 0..content_rows {
-            let row = area.y + 1 + i;
-            buf.set_string(area.x, row, "│", Style::default());
-            let line_str = if placeholder_active && i == 0 {
-                pad_to_width(&self.placeholder, inner_w)
-            } else if (i as usize) < self.textarea_lines.len() {
-                pad_to_width(&self.textarea_lines[i as usize], inner_w)
-            } else {
-                " ".repeat(inner_w)
-            };
-            let line_style = if placeholder_active && i == 0 {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            buf.set_string(area.x + 1, row, &line_str, line_style);
-            buf.set_string(area.x + 1 + inner_w as u16, row, "│", Style::default());
-        }
-
-        let status_row = area.y + textarea_h;
-        if status_row < area.y + area.height {
-            let text = self.token_status.as_deref().unwrap_or("tokens: —");
-            let status = pad_to_width(text, area.width as usize);
-            buf.set_string(
-                area.x,
-                status_row,
-                status,
-                Style::default().fg(Color::DarkGray),
-            );
-        }
+        let status_row = area.y + INPUT_HEIGHT;
+        let text = self.token_status.as_deref().unwrap_or("tokens: —");
+        let status = pad_to_width(text, area.width as usize);
+        buf.set_string(
+            area.x,
+            status_row,
+            status,
+            Style::default().fg(Color::DarkGray),
+        );
     }
 }
 
@@ -547,20 +489,6 @@ fn display_width(s: &str) -> usize {
     s.chars()
         .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
         .sum()
-}
-
-fn truncate_to_width(s: &str, max_cols: usize) -> String {
-    let mut out = String::new();
-    let mut used = 0;
-    for c in s.chars() {
-        let w = UnicodeWidthChar::width(c).unwrap_or(0);
-        if used + w > max_cols {
-            break;
-        }
-        out.push(c);
-        used += w;
-    }
-    out
 }
 
 fn pad_to_width(s: &str, target_width: usize) -> String {
