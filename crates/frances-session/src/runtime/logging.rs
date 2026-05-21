@@ -37,9 +37,14 @@ pub fn install_logging(session: &Session) -> Result<()> {
     // Default to warn for the world; raise frances/frances-edit/frances-anchors
     // /frances-config to trace so we can see our own logs without drowning in
     // turso/hyper/reqwest internals. Overridable via RUST_LOG.
+    //
+    // `frances_tui` is held at `warn` explicitly — `EnvFilter` matches
+    // directives by raw string prefix, so `frances=trace` would otherwise
+    // also enable every `frances_tui::*` event. Trace-level TUI events go
+    // exclusively to `tui.log` via the dedicated layer below.
     let main_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         EnvFilter::new(
-            "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
+            "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace,frances_tui=warn",
         )
     });
     let main_layer = fmt::layer()

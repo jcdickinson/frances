@@ -97,17 +97,35 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
     /// Write one terminal row's worth of cells at the current cursor
     /// position, applying each cell's ANSI styling. Does **not** emit
     /// a trailing newline — the caller controls that via [`newline`].
+    ///
+    /// Wide-character handling: when a cell's symbol has display
+    /// width > 1 (an emoji, CJK glyph, etc.), the terminal advances
+    /// the cursor by that many columns when it prints the glyph.
+    /// ratatui's `Buffer::set_string` represents this by storing the
+    /// wide character in the primary cell and resetting the
+    /// continuation cell(s) to `Cell::default()` (symbol `" "`).
+    /// Naively printing every cell would emit an extra space for
+    /// each continuation, shifting all subsequent cells right by one
+    /// — visually corrupting the row and overflowing into the next.
+    /// We skip those continuation cells.
     pub(crate) fn write_row<'a, I>(&mut self, cells: I) -> io::Result<()>
     where
         I: Iterator<Item = &'a Cell>,
     {
         use crossterm::style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+        use unicode_width::UnicodeWidthStr;
+        let mut skip_continuation = 0;
         for cell in cells {
+            if skip_continuation > 0 {
+                skip_continuation -= 1;
+                continue;
+            }
             self.inner
                 .queue(SetForegroundColor(to_crossterm_color(cell.fg)))?;
             self.inner
                 .queue(SetBackgroundColor(to_crossterm_color(cell.bg)))?;
             self.inner.queue(Print(cell.symbol()))?;
+            skip_continuation = UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
         }
         self.inner.queue(ResetColor)?;
         Ok(())

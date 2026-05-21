@@ -2364,6 +2364,384 @@ mod tests {
         );
     }
 
+    /// Same multi-pre-scroll scenario, but the footer is the
+    /// real `TextInput + TextLine` composite — its block borders
+    /// are painted by `ratatui::widgets::Block` rather than literal
+    /// `─` characters, and `Block::render` doesn't necessarily fill
+    /// interior cells when the `style` is default.
+    #[test]
+    fn block_growth_with_text_input_footer_does_not_leak_borders() {
+        use crate::widget::{
+            EventContext, EventOutcome, Focus, FocusId, FocusManager, Input, RenderContext,
+            TextInput, TextLine, Theme, Widget, WidgetState,
+        };
+        use crossterm::event::Event;
+
+        struct TestFooter {
+            input: TextInput,
+            status: TextLine,
+            state: WidgetState,
+        }
+
+        impl Input for TestFooter {
+            fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: &Event) -> EventOutcome {
+                self.input.handle_event(ctx, event)
+            }
+        }
+
+        impl Widget for TestFooter {
+            fn state(&self) -> &WidgetState {
+                &self.state
+            }
+            fn state_mut(&mut self) -> &mut WidgetState {
+                &mut self.state
+            }
+            fn measure(&self, width: u16) -> u16 {
+                self.input.measure(width) + self.status.measure(width)
+            }
+            fn layout(&mut self, area: Rect) {
+                self.state.rect = area;
+                let input_h = self.input.measure(area.width).min(area.height);
+                let input_area = Rect::new(area.x, area.y, area.width, input_h);
+                let remaining = area.height.saturating_sub(input_h);
+                let status_area = Rect::new(area.x, area.y + input_h, area.width, remaining);
+                self.input.layout(input_area);
+                self.status.layout(status_area);
+            }
+            fn render(&self, ctx: &mut RenderContext<'_>) {
+                let mut input_ctx = ctx.with_area(self.input.state().rect);
+                self.input.render(&mut input_ctx);
+                let mut status_ctx = ctx.with_area(self.status.state().rect);
+                self.status.render(&mut status_ctx);
+            }
+            fn collect_focusable(&self, out: &mut Vec<FocusId>) {
+                self.input.collect_focusable(out);
+                self.status.collect_focusable(out);
+            }
+        }
+
+        let mut focus_mgr = FocusManager::new();
+        let mut footer = TestFooter {
+            input: TextInput::new(&mut focus_mgr, "type a message"),
+            status: TextLine::new("status"),
+            state: WidgetState::default(),
+        };
+        footer.input.set_status(Some("streaming"));
+
+        let mut terminal = mk_term_terminal(32, 14);
+        let mut container = ScrollbackContainer::new(5);
+        container.push(multi_text(&["banner"]));
+        let active = container.push_active(multi_text(&["A"]));
+
+        let theme = Theme::default();
+        let focus = Focus::new();
+        let ctx = DrawContext {
+            theme: &theme,
+            focus: &focus,
+            frame: 0,
+        };
+        container.draw(&mut terminal, &mut footer, &ctx).unwrap();
+
+        // Use content that mimics the real LLM response: a long
+        // wrap-spanning paragraph, then bullets, then a final line.
+        // Total of 8 source lines; each just slightly shorter than
+        // width to land in different cell budgets per row.
+        container.update_active(
+            active,
+            multi_text(&[
+                "frances: Hello! 👋  I'm an assistant", // wide char
+                "and I'm here to help with:",
+                "",
+                "  - Reading and writing code",
+                "  - Running commands — useful", // em dash
+                "  - Other tasks",
+                "",
+                "What can I help with today?",
+            ]),
+        );
+        container.draw(&mut terminal, &mut footer, &ctx).unwrap();
+
+        let b = terminal.backend().inner();
+        let mut screen = String::new();
+        for y in 0..14 {
+            screen.push_str(&format!("row {y:>2}: {:?}\n", b.screen_row(y)));
+        }
+        // Rows 2..=9 should be block content (no borders).
+        for y in 2..=9 {
+            let row = b.screen_row(y);
+            assert!(
+                !row.contains('┌')
+                    && !row.contains('┐')
+                    && !row.contains('└')
+                    && !row.contains('┘')
+                    && !row.contains('│'),
+                "row {y} has stranded border chars: {row:?}\n{screen}",
+            );
+        }
+        let top = b.screen_row(10);
+        assert!(
+            top.contains('┌') && top.contains('┐') && top.contains("streaming"),
+            "footer top border at row 10 missing or corrupted: {top:?}\n{screen}",
+        );
+    }
+
+    /// Stress version of the growth scenario: block grows by many
+    /// rows in a single update, forcing block writes to land on rows
+    /// the old footer was occupying, then pre-scrolls shift
+    /// everything up. Matches the h=7 → h=9 transition in the real
+    /// session's `tui.log`, where `bottom_naive=49 > terminal_h=47`
+    /// produced 2 pre-scrolls in one frame.
+    #[test]
+    fn block_growth_with_multiple_pre_scrolls_does_not_leak_footer() {
+        // 4-line footer matching the real `Footer { TextInput(3) +
+        // TextLine(1) }` shape — `ParaWidget::measure(32) == 4`.
+        let footer = || {
+            multi_text(&[
+                "┌─ streaming ──────────────────┐",
+                "│body                          │",
+                "└──────────────────────────────┘",
+                "status                          ",
+            ])
+        };
+
+        // terminal_h=14: total content (1 banner + 8 active + 4
+        // footer = 13) fits, so `classify_layout` picks Normal mode
+        // (the path the real session uses), not ActiveOverflow. But
+        // the block's write cursor still overruns the visible area
+        // after `cursor + footer_h > terminal_h`, forcing pre-scrolls.
+        let mut terminal = mk_term_terminal(32, 14);
+        let mut rig = Rig::new(footer(), 5);
+        rig.push(multi_text(&["banner"]));
+
+        let active = rig.push_active(multi_text(&["A"]));
+        rig.draw(&mut terminal).unwrap();
+
+        // Jump h=1 → h=8 in one update.
+        rig.update_active(
+            active,
+            multi_text(&["A1", "A2", "A3", "A4", "A5", "A6", "A7", "A8"]),
+        );
+        rig.draw(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        let mut screen = String::new();
+        for y in 0..14 {
+            screen.push_str(&format!("row {y:>2}: {:?}\n", b.screen_row(y)));
+        }
+        // After the scrolls, banner at row 1, active at rows 2..=9,
+        // footer at rows 10..=13.
+        for y in 2..=9 {
+            let row = b.screen_row(y);
+            assert!(
+                !row.contains('┌')
+                    && !row.contains('┐')
+                    && !row.contains('└')
+                    && !row.contains('┘')
+                    && !row.contains('│'),
+                "row {y} has stranded border chars after multi-scroll: {row:?}\n{screen}",
+            );
+        }
+        let top = b.screen_row(10);
+        assert!(
+            top.contains('┌') && top.contains('┐') && top.contains("streaming"),
+            "footer top border at row 10 missing or corrupted: {top:?}\n{screen}",
+        );
+        let body = b.screen_row(11);
+        assert!(
+            body.starts_with('│') && body.ends_with('│'),
+            "footer body row 11 sides corrupted: {body:?}\n{screen}",
+        );
+    }
+
+    /// Same as [`growing_active_block_does_not_leak_block_borders`]
+    /// but with the spinner enabled — bump_spinner marks the active
+    /// entry damaged every spinner tick, so the active block goes
+    /// through the redraw path even when its measure hasn't changed,
+    /// and a spinner glyph is overlaid on its last row. The real
+    /// streaming scenario always has the spinner on.
+    #[test]
+    fn growing_active_block_with_spinner_does_not_leak_block_borders() {
+        use ratatui::widgets::{Block as RatBlock, Borders};
+
+        let footer = || {
+            Box::new(
+                Paragraph::new(vec![Line::raw("body row 1"), Line::raw("body row 2")]).block(
+                    RatBlock::default()
+                        .borders(Borders::ALL)
+                        .title("─ streaming "),
+                ),
+            )
+        };
+
+        let mut terminal = mk_term_terminal(40, 12);
+        let mut rig = Rig::new(footer(), 5);
+        rig.enable_spinner();
+        rig.push(multi_text(&["banner"]));
+
+        let active = rig.push_active(multi_text(&["A1"]));
+        rig.draw(&mut terminal).unwrap();
+
+        let updates = [
+            vec!["A1", "A2"],
+            vec!["A1", "A2", "A3"],
+            vec!["A1", "A2", "A3", "A4"],
+            vec!["A1", "A2", "A3", "A4", "A5"],
+        ];
+        for new_lines in &updates {
+            rig.bump_spinner();
+            rig.update_active(active, multi_text(&new_lines.to_vec()));
+            rig.draw(&mut terminal).unwrap();
+        }
+
+        let b = terminal.backend().inner();
+        for y in 3..=7 {
+            let row = b.screen_row(y);
+            assert!(
+                !row.contains('┌')
+                    && !row.contains('┐')
+                    && !row.contains('└')
+                    && !row.contains('┘')
+                    && !row.contains('│'),
+                "row {y} (active block, spinner on) has stranded border chars: {row:?}",
+            );
+        }
+    }
+
+    /// Same scenario as [`growing_active_block_does_not_leave_stranded_border_chars`]
+    /// but the footer is a ratatui-rendered `Block`-bordered
+    /// paragraph (matching the real `TextInput`'s shape) instead of
+    /// literal `─` text. The Block draws box-drawing chars through
+    /// ratatui's diff path, which has different cell-update semantics
+    /// than a literal-character paragraph.
+    #[test]
+    fn growing_active_block_does_not_leak_block_borders() {
+        use ratatui::widgets::{Block as RatBlock, Borders};
+
+        let footer = || {
+            Box::new(
+                Paragraph::new(vec![Line::raw("body row 1"), Line::raw("body row 2")]).block(
+                    RatBlock::default()
+                        .borders(Borders::ALL)
+                        .title("─ streaming "),
+                ),
+            )
+        };
+
+        let mut terminal = mk_term_terminal(40, 12);
+        let mut rig = Rig::new(footer(), 5);
+        rig.push(multi_text(&["banner"]));
+
+        let active = rig.push_active(multi_text(&["A1"]));
+        rig.draw(&mut terminal).unwrap();
+
+        // Grow several times — each growth shifts the footer down,
+        // which would force a pre-scroll in the live path.
+        let updates = [
+            vec!["A1", "A2"],
+            vec!["A1", "A2", "A3"],
+            vec!["A1", "A2", "A3", "A4"],
+            vec!["A1", "A2", "A3", "A4", "A5"],
+        ];
+        for new_lines in &updates {
+            rig.update_active(active, multi_text(&new_lines.to_vec()));
+            rig.draw(&mut terminal).unwrap();
+        }
+
+        let b = terminal.backend().inner();
+        // Inspect every row the block now occupies. With terminal_h=12,
+        // footer_h=4, banner=1, active=5 → block area rows = 7. After
+        // pre-scrolls, banner at row 2, active at rows 3..=7. Footer
+        // top border at row 8.
+        for y in 3..=7 {
+            let row = b.screen_row(y);
+            assert!(
+                !row.contains('─')
+                    && !row.contains('┌')
+                    && !row.contains('┐')
+                    && !row.contains('└')
+                    && !row.contains('┘')
+                    && !row.contains('│'),
+                "row {y} (active block) has stranded border chars: {row:?}",
+            );
+        }
+        // Positively: rows 3..=7 should contain the active block's A1..A5
+        // markers.
+        for (i, expected) in ["A1", "A2", "A3", "A4", "A5"].iter().enumerate() {
+            let y = 3 + i;
+            let row = b.screen_row(y);
+            assert!(
+                row.starts_with(expected),
+                "row {y} expected block content `{expected}`, got {row:?}",
+            );
+        }
+    }
+
+    /// Regression for an artifact seen on resume + streaming: an
+    /// active block grows past `terminal_h - footer_h`, forcing
+    /// pre-scrolls. The rows where the previous frame's textarea
+    /// border lived must be fully overwritten by the new block
+    /// content — no stale `─` characters should remain on rows the
+    /// block now occupies.
+    #[test]
+    fn growing_active_block_does_not_leave_stranded_border_chars() {
+        // Footer is a 4-row paragraph that mimics the textarea +
+        // status-row composite. Top + bottom rows are full of `─`
+        // chars; if any of them survive into rows the active block
+        // takes over, the test catches it.
+        let footer = || {
+            multi_text(&[
+                "┌────────────────────────────┐",
+                "│                            │",
+                "└────────────────────────────┘",
+                "tokens: 0                     ",
+            ])
+        };
+
+        let mut terminal = mk_term_terminal(30, 10);
+        let mut rig = Rig::new(footer(), 4);
+
+        // One safe banner row above the active block.
+        rig.push(multi_text(&["banner"]));
+
+        // Active block starts at h=1, then grows to h=3 which pushes
+        // the footer past the bottom of the terminal — pre-scrolls
+        // shift everything up.
+        let active = rig.push_active(multi_text(&["A1"]));
+        rig.draw(&mut terminal).unwrap();
+        rig.update_active(active, multi_text(&["A1", "A2", "A3"]));
+        rig.draw(&mut terminal).unwrap();
+
+        // After growth: terminal_h=10, footer_h=4 → block fits in
+        // rows 0..5. With 1 banner + 3-row active = 4 rows of content
+        // above the footer, the footer sits at rows 6..=9. The
+        // banner has been scrolled up to row 2 and the active block
+        // occupies rows 3..=5.
+        let b = terminal.backend().inner();
+        let row_3 = b.screen_row(3);
+        let row_4 = b.screen_row(4);
+        let row_5 = b.screen_row(5);
+
+        assert!(
+            !row_3.contains('─'),
+            "row 3 (active block row 0) has stranded `─` chars: {row_3:?}",
+        );
+        assert!(
+            !row_4.contains('─'),
+            "row 4 (active block row 1) has stranded `─` chars: {row_4:?}",
+        );
+        assert!(
+            !row_5.contains('─'),
+            "row 5 (active block row 2) has stranded `─` chars: {row_5:?}",
+        );
+
+        // The footer's top border should still be intact at row 6.
+        assert!(
+            b.screen_row(6).contains('─'),
+            "footer top border missing at row 6: {:?}",
+            b.screen_row(6),
+        );
+    }
+
     /// Cell-level damage tracking on the footer: when neither the
     /// content nor the anchor changed between two draws, the diff
     /// against the previous frame's buffer is empty, so an external
