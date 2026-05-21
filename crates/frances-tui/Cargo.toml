@@ -12,9 +12,11 @@ path = "src/lib.rs"
 [dependencies]
 crossterm = { workspace = true }
 ratatui = { workspace = true }
+ratatui-textarea = { workspace = true }
 slotmap = { workspace = true }
 taffy = { workspace = true }
 tracing = { workspace = true }
+unicode-width = { workspace = true }
 
 [dev-dependencies]
 alacritty_terminal = "0.26"

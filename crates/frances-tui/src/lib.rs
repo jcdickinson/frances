@@ -28,6 +28,6 @@ pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
 pub use widget::{
     Border, EventContext, EventOutcome, Flex, FlexChild, FlexDirection, Focus, FocusId,
-    FocusManager, Grid, HStack, Input, ParaWidget, RenderContext, Theme, VStack, Widget,
-    WidgetState,
+    FocusManager, Grid, HStack, Input, ParaWidget, RenderContext, TEXT_INPUT_HEIGHT, TextInput,
+    TextLine, Theme, VStack, Widget, WidgetState,
 };

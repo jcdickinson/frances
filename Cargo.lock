@@ -1567,9 +1567,11 @@ dependencies = [
  "alacritty_terminal",
  "crossterm",
  "ratatui",
+ "ratatui-textarea",
  "slotmap",
  "taffy",
  "tracing",
+ "unicode-width 0.2.2",
  "vte",
 ]
 

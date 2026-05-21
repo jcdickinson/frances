@@ -36,6 +36,8 @@ pub mod hstack;
 pub mod input;
 pub mod para;
 pub mod taffy_util;
+pub mod text_input;
+pub mod text_line;
 pub mod theme;
 pub mod vstack;
 
@@ -47,6 +49,8 @@ pub use grid::Grid;
 pub use hstack::HStack;
 pub use input::{EventOutcome, Input};
 pub use para::ParaWidget;
+pub use text_input::{TEXT_INPUT_HEIGHT, TextInput};
+pub use text_line::TextLine;
 pub use theme::Theme;
 pub use vstack::VStack;
 
