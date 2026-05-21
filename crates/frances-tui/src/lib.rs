@@ -20,8 +20,13 @@ pub mod block;
 pub mod measured_widget;
 pub mod scrollback_backend;
 pub mod scrollback_container;
+pub mod widget;
 
 pub use block::{Block, TruncatedBlock};
 pub use measured_widget::MeasuredWidget;
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
+pub use widget::{
+    EventContext, EventOutcome, Focus, FocusId, FocusManager, Input, RenderContext, Theme, Widget,
+    WidgetState,
+};
