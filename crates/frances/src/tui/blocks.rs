@@ -1,26 +1,42 @@
 use std::sync::Arc;
 
-use frances_session::events::{BlockKind, ShellState};
-use frances_tui::Block;
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
+use frances_session::events::{BlockKind as WireBlockKind, ShellState};
+use frances_tui::widget::{EventContext, EventOutcome, Input};
+use frances_tui::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
 use ratatui::style::{Color, Modifier, Style};
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
 /// Maximum body lines (post trailing-newline strip) shown for a shell
-/// output block. Earlier lines are collapsed into a single `… [N earlier
-/// lines]` marker so the visible tail tracks the action.
+/// output block in its compact (unfocused) state. Earlier lines are
+/// collapsed into a single `… [N earlier lines]` marker so the visible
+/// tail tracks the action.
 const SHELL_TAIL_LINES: usize = 10;
+
+/// Expanded tail height when the shell block is the alt-view inspector's
+/// selection. Doubles the visible body so the user has room to see more
+/// of the source while paging with `j`/`k`/`u`/`d`.
+const SHELL_TAIL_LINES_FOCUSED: usize = 20;
+
+fn shell_tail_for(selected: bool) -> usize {
+    if selected {
+        SHELL_TAIL_LINES_FOCUSED
+    } else {
+        SHELL_TAIL_LINES
+    }
+}
 
 /// Build the right [`Block`] impl for a wire `BlockKind` + accumulated
 /// text. Most kinds map onto a generic [`LabelledBlock`]; `ShellOutput`
 /// has its own structural shape (header + body tail) and gets a
 /// dedicated [`ShellOutputBlock`].
-pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
+pub fn block_for_kind(kind: WireBlockKind, text: String) -> Box<dyn Block> {
     match kind {
-        BlockKind::ShellOutput { state, cmd } => Box::new(ShellOutputBlock::new(state, cmd, text)),
-        BlockKind::Diff { lines } => Box::new(DiffBlock::new(lines)),
-        BlockKind::ToolUse {
+        WireBlockKind::ShellOutput { state, cmd } => {
+            Box::new(ShellOutputBlock::new(state, cmd, text))
+        }
+        WireBlockKind::Diff { lines } => Box::new(DiffBlock::new(lines)),
+        WireBlockKind::ToolUse {
             name,
             detail: Some(detail),
         } => Box::new(ToolUseBlock::new(name, detail)),
@@ -28,6 +44,7 @@ pub fn block_for_kind(kind: BlockKind, text: String) -> Box<dyn Block> {
     }
 }
 
+#[derive(Serialize, Deserialize)]
 pub struct DiffBlock {
     lines: Vec<frances_session::events::DiffLine>,
 }
@@ -38,9 +55,23 @@ impl DiffBlock {
     }
 }
 
+impl Input for DiffBlock {
+    fn handle_event(
+        &mut self,
+        _ctx: &mut EventContext<'_>,
+        _event: &crossterm::event::Event,
+    ) -> EventOutcome {
+        EventOutcome::Pass
+    }
+}
+
 impl Block for DiffBlock {
-    fn measure(&self, width: u16) -> u16 {
-        let max = width.max(1) as usize;
+    fn kind(&self) -> BlockKind {
+        BlockKind::Diff
+    }
+
+    fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
+        let max = ctx.width.max(1) as usize;
         let mut count = 0;
         for line in &self.lines {
             let content = match line {
@@ -57,9 +88,9 @@ impl Block for DiffBlock {
         count
     }
 
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let mut row = 0u16;
-        let max = area.width.max(1) as usize;
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+        let max = ctx.area.width.max(1) as usize;
+        let mut row_writer = RowWriter::new(ctx);
         for line in &self.lines {
             let (content, style) = match line {
                 frances_session::events::DiffLine::Context { text: c, line: l } => {
@@ -80,59 +111,79 @@ impl Block for DiffBlock {
             wrap_into("", &content, max, &mut out);
 
             for wrapped_line in out {
-                if row >= area.height {
+                let written = row_writer.write_styled(&wrapped_line, style);
+                if !written && row_writer.finished() {
+                    paint_truncation_marker_if_set(row_writer.ctx);
                     return;
                 }
-                buf.set_string(area.x, area.y + row, &wrapped_line, style);
-                let w = display_width(&wrapped_line) as u16;
-                if w < area.width {
-                    buf.set_string(
-                        area.x + w,
-                        area.y + row,
-                        " ".repeat((area.width - w) as usize),
-                        style,
-                    );
-                }
-                row += 1;
             }
         }
+        paint_truncation_marker_if_set(row_writer.ctx);
     }
 }
 
 /// History row for a labelled (kind + text) block. Wraps to the
 /// available width with the kind prefix on the first row and a
 /// matching-width indent on continuation rows.
+#[derive(Serialize, Deserialize)]
 pub struct LabelledBlock {
-    pub kind: BlockKind,
+    pub kind: WireBlockKind,
     pub text: String,
 }
 
 impl LabelledBlock {
-    pub fn new(kind: BlockKind, text: String) -> Self {
+    pub fn new(kind: WireBlockKind, text: String) -> Self {
         Self { kind, text }
     }
 }
 
+impl Input for LabelledBlock {
+    fn handle_event(
+        &mut self,
+        _ctx: &mut EventContext<'_>,
+        _event: &crossterm::event::Event,
+    ) -> EventOutcome {
+        EventOutcome::Pass
+    }
+}
+
 impl Block for LabelledBlock {
-    fn measure(&self, width: u16) -> u16 {
-        wrapped_block_lines(&self.kind, &self.text, width).len() as u16
+    fn kind(&self) -> BlockKind {
+        match self.kind {
+            WireBlockKind::Text { .. } => BlockKind::Text,
+            WireBlockKind::ToolUse { .. } => BlockKind::ToolUse,
+            WireBlockKind::ShellOutput { .. } => BlockKind::ShellOutput,
+            WireBlockKind::Diff { .. } => BlockKind::Diff,
+        }
     }
 
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = wrapped_block_lines(&self.kind, &self.text, area.width);
+    fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
+        wrapped_block_lines(&self.kind, &self.text, ctx.width).len() as u16
+    }
+
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+        let lines = wrapped_block_lines(&self.kind, &self.text, ctx.area.width);
         let prefix = prefix_for(&self.kind);
         let prefix_bytes = prefix.len();
         let prefix_cols = display_width(&prefix) as u16;
         let prefix_style = prefix_style(&self.kind);
+        let src_y = ctx.src_y;
+        let area = ctx.area;
         for (i, line) in lines.iter().enumerate() {
-            if i as u16 >= area.height {
+            let i = i as u16;
+            if i < src_y {
+                continue;
+            }
+            let dst_row = i - src_y;
+            if dst_row >= area.height {
                 break;
             }
-            let y = area.y + i as u16;
+            let y = area.y + dst_row;
             if i == 0 && line.starts_with(&prefix) {
-                buf.set_string(area.x, y, &line[..prefix_bytes], prefix_style);
+                ctx.buf
+                    .set_string(area.x, y, &line[..prefix_bytes], prefix_style);
                 if line.len() > prefix_bytes {
-                    buf.set_string(
+                    ctx.buf.set_string(
                         area.x + prefix_cols,
                         y,
                         &line[prefix_bytes..],
@@ -140,9 +191,10 @@ impl Block for LabelledBlock {
                     );
                 }
             } else {
-                buf.set_string(area.x, y, line, Style::default());
+                ctx.buf.set_string(area.x, y, line, Style::default());
             }
         }
+        paint_truncation_marker_if_set(ctx);
     }
 }
 
@@ -154,15 +206,33 @@ impl Block for LabelledBlock {
 /// `state` drives the prefix label and its colour; `cmd` rides on every
 /// `BlockDelta` so the header stays pinned even while the body keeps
 /// streaming.
+#[derive(Serialize, Deserialize)]
 pub struct ShellOutputBlock {
     pub state: ShellState,
     pub cmd: Arc<str>,
     pub text: String,
+    /// Alt-view-only scroll offset, measured in *source lines* from
+    /// the tail. `0` = the window sits at the tail (the canonical
+    /// live-view position). Live-view renders always force this to
+    /// `0` before computing the visible window, so the persisted
+    /// representation never carries scroll state — hence the
+    /// `serde(default, skip)` annotation.
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub scroll_y: u16,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
 }
 
 impl ShellOutputBlock {
     pub fn new(state: ShellState, cmd: Arc<str>, text: String) -> Self {
-        Self { state, cmd, text }
+        Self {
+            state,
+            cmd,
+            text,
+            scroll_y: 0,
+        }
     }
 
     fn header_prefix(&self) -> String {
@@ -176,30 +246,52 @@ impl ShellOutputBlock {
         out
     }
 
-    /// Body rows: ellipsis marker (if any) plus the last
-    /// `SHELL_TAIL_LINES` source lines, each wrapped to width. Returns
-    /// an empty Vec when there is no body content beyond the cmd.
-    fn body_lines(&self, width: u16) -> Vec<String> {
+    /// Non-empty source lines, with trailing blanks from a closing
+    /// `\n` stripped. Shared between `measure` (via [`body_lines`])
+    /// and the windowing logic in [`body_lines_at`].
+    fn source_lines(&self) -> Vec<&str> {
         let mut source: Vec<&str> = self.text.split('\n').collect();
-        // Drop trailing empty entries from a trailing `\n` so we don't
-        // burn budget rendering a blank tail row.
         while matches!(source.last(), Some(&"")) {
             source.pop();
         }
+        source
+    }
+
+    /// Maximum legal `scroll_y` for a given tail height — beyond this
+    /// the window would expose negative rows. Returns `0` when the
+    /// source is shorter than the tail.
+    fn max_scroll_for(&self, tail: usize) -> u16 {
+        let source_len = self.source_lines().len();
+        source_len.saturating_sub(tail) as u16
+    }
+
+    /// Body rows for a window of height `tail` whose right edge sits
+    /// `window_start` source-lines *before* the natural tail. The row
+    /// count is invariant in `window_start` (clamped via
+    /// [`max_scroll_for`]) so `measure` and `render` agree on height.
+    ///
+    /// - When `source.len() > tail`: 1 marker row + `tail` body rows.
+    ///   The marker reports how many source lines remain hidden above
+    ///   the window (`0` when scrolled to the top).
+    /// - When `source.len() <= tail`: marker suppressed, output is the
+    ///   source verbatim.
+    fn body_lines_at(&self, width: u16, window_start: u16, tail: usize) -> Vec<String> {
+        let source = self.source_lines();
         if source.is_empty() {
             return Vec::new();
         }
-
         let max = width.max(1) as usize;
         let mut out = Vec::new();
-        if source.len() > SHELL_TAIL_LINES {
-            let omitted = source.len() - SHELL_TAIL_LINES;
+        if source.len() > tail {
+            let start_offset = window_start.min(self.max_scroll_for(tail)) as usize;
+            let end = source.len() - start_offset;
+            let start = end - tail;
             let marker = format!(
-                "… [{omitted} earlier line{}]",
-                if omitted == 1 { "" } else { "s" }
+                "… [{start} earlier line{}]",
+                if start == 1 { "" } else { "s" }
             );
             wrap_into("", &marker, max, &mut out);
-            for line in &source[source.len() - SHELL_TAIL_LINES..] {
+            for line in &source[start..end] {
                 wrap_into("", line, max, &mut out);
             }
         } else {
@@ -211,47 +303,110 @@ impl ShellOutputBlock {
     }
 }
 
+impl Input for ShellOutputBlock {
+    fn handle_event(
+        &mut self,
+        _ctx: &mut EventContext<'_>,
+        event: &crossterm::event::Event,
+    ) -> EventOutcome {
+        let crossterm::event::Event::Key(key) = event else {
+            return EventOutcome::Pass;
+        };
+        if key.kind != crossterm::event::KeyEventKind::Press {
+            return EventOutcome::Pass;
+        }
+        // Input events only reach this block when it's the alt-view
+        // selection, so the focused tail is the right clamp.
+        let max = self.max_scroll_for(SHELL_TAIL_LINES_FOCUSED);
+        let half: u16 = (SHELL_TAIL_LINES_FOCUSED as u16) / 2;
+        match key.code {
+            crossterm::event::KeyCode::Char('j') => {
+                self.scroll_y = self.scroll_y.saturating_sub(1);
+                EventOutcome::Consumed
+            }
+            crossterm::event::KeyCode::Char('k') => {
+                self.scroll_y = self.scroll_y.saturating_add(1).min(max);
+                EventOutcome::Consumed
+            }
+            crossterm::event::KeyCode::Char('d') => {
+                self.scroll_y = self.scroll_y.saturating_sub(half);
+                EventOutcome::Consumed
+            }
+            crossterm::event::KeyCode::Char('u') => {
+                self.scroll_y = self.scroll_y.saturating_add(half).min(max);
+                EventOutcome::Consumed
+            }
+            _ => EventOutcome::Pass,
+        }
+    }
+}
+
 impl Block for ShellOutputBlock {
-    fn measure(&self, width: u16) -> u16 {
-        (self.header_lines(width).len() + self.body_lines(width).len()) as u16
+    fn kind(&self) -> BlockKind {
+        BlockKind::ShellOutput
     }
 
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let header = self.header_lines(area.width);
-        let body = self.body_lines(area.width);
+    fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
+        let tail = shell_tail_for(ctx.selected);
+        let body_rows = self.body_lines_at(ctx.width, 0, tail).len();
+        (self.header_lines(ctx.width).len() + body_rows) as u16
+    }
+
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+        // Live view always shows the tail (window_start = 0).
+        // Alt view honours the block's internal scroll position so the
+        // user can page through earlier source lines. The tail grows
+        // when this block is the alt-view selection.
+        let window_start = if ctx.alt_view { self.scroll_y } else { 0 };
+        let tail = shell_tail_for(ctx.selected);
+        let header = self.header_lines(ctx.area.width);
+        let body = self.body_lines_at(ctx.area.width, window_start, tail);
         let prefix = self.header_prefix();
         let prefix_bytes = prefix.len();
         let prefix_cols = display_width(&prefix) as u16;
         let prefix_style = shell_state_prefix_style(&self.state);
 
-        let mut row = 0u16;
+        let src_y = ctx.src_y;
+        let area = ctx.area;
+        let mut src_idx: u16 = 0;
         for (i, line) in header.iter().enumerate() {
-            if row >= area.height {
-                return;
-            }
-            let y = area.y + row;
-            if i == 0 && line.starts_with(&prefix) {
-                buf.set_string(area.x, y, &line[..prefix_bytes], prefix_style);
-                if line.len() > prefix_bytes {
-                    buf.set_string(
-                        area.x + prefix_cols,
-                        y,
-                        &line[prefix_bytes..],
-                        Style::default(),
-                    );
+            if src_idx >= src_y {
+                let dst_row = src_idx - src_y;
+                if dst_row >= area.height {
+                    paint_truncation_marker_if_set(ctx);
+                    return;
                 }
-            } else {
-                buf.set_string(area.x, y, line, Style::default());
+                let y = area.y + dst_row;
+                if i == 0 && line.starts_with(&prefix) {
+                    ctx.buf
+                        .set_string(area.x, y, &line[..prefix_bytes], prefix_style);
+                    if line.len() > prefix_bytes {
+                        ctx.buf.set_string(
+                            area.x + prefix_cols,
+                            y,
+                            &line[prefix_bytes..],
+                            Style::default(),
+                        );
+                    }
+                } else {
+                    ctx.buf.set_string(area.x, y, line, Style::default());
+                }
             }
-            row += 1;
+            src_idx = src_idx.saturating_add(1);
         }
         for line in body.iter() {
-            if row >= area.height {
-                return;
+            if src_idx >= src_y {
+                let dst_row = src_idx - src_y;
+                if dst_row >= area.height {
+                    paint_truncation_marker_if_set(ctx);
+                    return;
+                }
+                ctx.buf
+                    .set_string(area.x, area.y + dst_row, line, Style::default());
             }
-            buf.set_string(area.x, area.y + row, line, Style::default());
-            row += 1;
+            src_idx = src_idx.saturating_add(1);
         }
+        paint_truncation_marker_if_set(ctx);
     }
 }
 
@@ -262,6 +417,7 @@ impl Block for ShellOutputBlock {
 ///
 /// The plain `BlockKind::ToolUse` variant (no detail) still routes
 /// through [`LabelledBlock`]; only the `Some(detail)` shape comes here.
+#[derive(Serialize, Deserialize)]
 pub struct ToolUseBlock {
     name: Arc<str>,
     detail: Arc<str>,
@@ -296,13 +452,34 @@ impl ToolUseBlock {
     }
 }
 
+impl Input for ToolUseBlock {
+    fn handle_event(
+        &mut self,
+        _ctx: &mut EventContext<'_>,
+        _event: &crossterm::event::Event,
+    ) -> EventOutcome {
+        EventOutcome::Pass
+    }
+}
+
 impl Block for ToolUseBlock {
-    fn measure(&self, width: u16) -> u16 {
-        self.wrapped_lines(width).len() as u16
+    /// One-shot block — emitted as `BlockDelta` + `BlockStop`
+    /// back-to-back by the runtime. The container promotes it straight
+    /// to `safe` so it never carries the in-flight spinner overlay.
+    fn safe_on_push(&self) -> bool {
+        true
     }
 
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let lines = self.wrapped_lines(area.width);
+    fn kind(&self) -> BlockKind {
+        BlockKind::ToolUse
+    }
+
+    fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
+        self.wrapped_lines(ctx.width).len() as u16
+    }
+
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+        let lines = self.wrapped_lines(ctx.area.width);
         let prefix = self.name_prefix();
         // Split the prefix into the colored arrow+name segment (yellow)
         // and the trailing two spaces that bridge into the dim detail.
@@ -312,20 +489,30 @@ impl Block for ToolUseBlock {
         let prefix_cols = display_width(&prefix) as u16;
         let arrow_style = Style::default().fg(Color::Yellow);
         let dim_style = Style::default().add_modifier(Modifier::DIM);
+        let src_y = ctx.src_y;
+        let area = ctx.area;
         for (i, line) in lines.iter().enumerate() {
-            if i as u16 >= area.height {
+            let i = i as u16;
+            if i < src_y {
+                continue;
+            }
+            let dst_row = i - src_y;
+            if dst_row >= area.height {
                 break;
             }
-            let y = area.y + i as u16;
+            let y = area.y + dst_row;
             if i == 0 && line.starts_with(&prefix) {
-                buf.set_string(area.x, y, &line[..arrow_bytes], arrow_style);
+                ctx.buf
+                    .set_string(area.x, y, &line[..arrow_bytes], arrow_style);
                 if line.len() > prefix.len() {
-                    buf.set_string(area.x + prefix_cols, y, &line[prefix.len()..], dim_style);
+                    ctx.buf
+                        .set_string(area.x + prefix_cols, y, &line[prefix.len()..], dim_style);
                 }
             } else {
-                buf.set_string(area.x, y, line, dim_style);
+                ctx.buf.set_string(area.x, y, line, dim_style);
             }
         }
+        paint_truncation_marker_if_set(ctx);
     }
 }
 
@@ -348,10 +535,15 @@ fn shell_state_prefix_style(state: &ShellState) -> Style {
 /// History row that holds raw, pre-formatted lines and renders them
 /// verbatim (no kind prefix, no re-wrap). Used for banner rows, usage
 /// summaries, error / approval messages — anything not driven by the
-/// runtime's [`BlockKind`] vocabulary that still wants to live in the
-/// container's scrollback. `style` paints the whole block uniformly;
+/// runtime's [`WireBlockKind`] vocabulary that still wants to live in
+/// the container's scrollback. `style` paints the whole block uniformly;
 /// ANSI variants only by convention (RGB stays available for future
 /// syntax-highlighted block types).
+///
+/// `RawBlock` does not derive serde — ratatui's `Style` doesn't ship
+/// `Serialize` in our build, and `RawBlock` content is UI-side state
+/// (banners, error overlays) that never round-trips through scrollback
+/// persistence anyway.
 pub struct RawBlock {
     pub lines: Vec<String>,
     pub style: Style,
@@ -366,47 +558,144 @@ impl RawBlock {
     }
 }
 
-impl Block for RawBlock {
-    fn measure(&self, _width: u16) -> u16 {
-        self.lines.len() as u16
-    }
-
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        for (i, line) in self.lines.iter().enumerate() {
-            if i as u16 >= area.height {
-                break;
-            }
-            buf.set_string(area.x, area.y + i as u16, line, self.style);
-        }
+impl Input for RawBlock {
+    fn handle_event(
+        &mut self,
+        _ctx: &mut EventContext<'_>,
+        _event: &crossterm::event::Event,
+    ) -> EventOutcome {
+        EventOutcome::Pass
     }
 }
 
-pub fn prefix_for(kind: &BlockKind) -> String {
+impl Block for RawBlock {
+    /// One-shot block — banners and error overlays arrive fully
+    /// formed; the container can promote them straight to `safe`.
+    fn safe_on_push(&self) -> bool {
+        true
+    }
+
+    fn kind(&self) -> BlockKind {
+        BlockKind::Raw
+    }
+
+    fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
+        self.lines.len() as u16
+    }
+
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+        let src_y = ctx.src_y;
+        let area = ctx.area;
+        for (i, line) in self.lines.iter().enumerate() {
+            let i = i as u16;
+            if i < src_y {
+                continue;
+            }
+            let dst_row = i - src_y;
+            if dst_row >= area.height {
+                break;
+            }
+            ctx.buf
+                .set_string(area.x, area.y + dst_row, line, self.style);
+        }
+        paint_truncation_marker_if_set(ctx);
+    }
+}
+
+/// Overlay the dim "⋯ truncated ⋯" indicator on the bottom row of
+/// `ctx.area` when the container flagged this entry as truncated.
+/// Replaces the trailing-row Convention that `TruncatedBlock` used to
+/// own; per-block `render` decides whether to call this.
+fn paint_truncation_marker_if_set(ctx: &mut BlockRenderContext<'_>) {
+    if !ctx.truncated || ctx.area.height == 0 || ctx.area.width == 0 {
+        return;
+    }
+    let y = ctx.area.y + ctx.area.height - 1;
+    let marker = "  ⋯ truncated ⋯";
+    ctx.buf
+        .set_string(ctx.area.x, y, marker, Style::default().fg(Color::DarkGray));
+}
+
+/// Linear row writer used by the diff block — its iteration emits
+/// already-wrapped lines without keeping an explicit row index. Walks
+/// `ctx.src_y` for the skip phase, then `ctx.area.height` for the
+/// emit phase, transparently for the caller.
+struct RowWriter<'a, 'b> {
+    ctx: &'a mut BlockRenderContext<'b>,
+    src_idx: u16,
+    finished: bool,
+}
+
+impl<'a, 'b> RowWriter<'a, 'b> {
+    fn new(ctx: &'a mut BlockRenderContext<'b>) -> Self {
+        Self {
+            ctx,
+            src_idx: 0,
+            finished: false,
+        }
+    }
+
+    /// Write `line` with `style`. Returns `true` if the line was
+    /// emitted, `false` if it was skipped (above src_y) or dropped
+    /// (below area.height).
+    fn write_styled(&mut self, line: &str, style: Style) -> bool {
+        let i = self.src_idx;
+        self.src_idx = self.src_idx.saturating_add(1);
+        if i < self.ctx.src_y {
+            return false;
+        }
+        let dst_row = i - self.ctx.src_y;
+        if dst_row >= self.ctx.area.height {
+            self.finished = true;
+            return false;
+        }
+        let area = self.ctx.area;
+        self.ctx
+            .buf
+            .set_string(area.x, area.y + dst_row, line, style);
+        let w = display_width(line) as u16;
+        if w < area.width {
+            self.ctx.buf.set_string(
+                area.x + w,
+                area.y + dst_row,
+                " ".repeat((area.width - w) as usize),
+                style,
+            );
+        }
+        true
+    }
+
+    fn finished(&self) -> bool {
+        self.finished
+    }
+}
+
+pub fn prefix_for(kind: &WireBlockKind) -> String {
     match kind {
-        BlockKind::Text { sender: Some(s) } => format!("{s}: "),
-        BlockKind::Text { sender: None } => String::new(),
+        WireBlockKind::Text { sender: Some(s) } => format!("{s}: "),
+        WireBlockKind::Text { sender: None } => String::new(),
         // The `detail`-bearing variant routes through `ToolUseBlock`; the
         // `LabelledBlock` path only sees plain tool-use markers.
-        BlockKind::ToolUse { name, .. } => format!("→ {name}"),
-        BlockKind::ShellOutput { .. } => {
+        WireBlockKind::ToolUse { name, .. } => format!("→ {name}"),
+        WireBlockKind::ShellOutput { .. } => {
             // ShellOutput renders through ShellOutputBlock, which owns
             // its own prefix; LabelledBlock should never see this kind.
             String::new()
         }
-        BlockKind::Diff { .. } => String::new(),
+        WireBlockKind::Diff { .. } => String::new(),
     }
 }
 
-fn prefix_style(kind: &BlockKind) -> Style {
+fn prefix_style(kind: &WireBlockKind) -> Style {
     match kind {
-        BlockKind::Text { .. } => Style::default(),
-        BlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
-        BlockKind::ShellOutput { .. } => Style::default(),
-        BlockKind::Diff { .. } => Style::default(),
+        WireBlockKind::Text { .. } => Style::default(),
+        WireBlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
+        WireBlockKind::ShellOutput { .. } => Style::default(),
+        WireBlockKind::Diff { .. } => Style::default(),
     }
 }
 
-pub fn wrapped_block_lines(kind: &BlockKind, text: &str, width: u16) -> Vec<String> {
+pub fn wrapped_block_lines(kind: &WireBlockKind, text: &str, width: u16) -> Vec<String> {
     let prefix = prefix_for(kind);
     let indent = " ".repeat(display_width(&prefix));
     let max = width.max(1) as usize;
@@ -458,9 +747,10 @@ fn display_width(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frances_session::events::DiffLine;
 
-    fn frances() -> BlockKind {
-        BlockKind::Text {
+    fn frances() -> WireBlockKind {
+        WireBlockKind::Text {
             sender: Some("frances".into()),
         }
     }
@@ -522,8 +812,215 @@ mod tests {
 
     #[test]
     fn senderless_text_block_with_trailing_newline_does_not_emit_blank_row() {
-        let kind = BlockKind::Text { sender: None };
+        let kind = WireBlockKind::Text { sender: None };
         let lines = wrapped_block_lines(&kind, "Hello\n", 80);
         assert_eq!(lines, vec!["Hello"]);
+    }
+
+    /// One round-trip-serde test per serializable block variant.
+    /// `RawBlock` is intentionally excluded — see its doc-comment.
+    mod serde_roundtrip {
+        use super::*;
+
+        fn round_trip<T: serde::Serialize + for<'de> serde::Deserialize<'de>>(value: &T) -> T {
+            let s = serde_json::to_string(value).expect("serialize");
+            serde_json::from_str(&s).expect("deserialize")
+        }
+
+        #[test]
+        fn diff_block() {
+            let b = DiffBlock::new(vec![
+                DiffLine::Context {
+                    text: "ctx".into(),
+                    line: 7,
+                },
+                DiffLine::Added("added".into()),
+                DiffLine::Removed("removed".into()),
+            ]);
+            let r = round_trip(&b);
+            assert_eq!(r.lines.len(), 3);
+        }
+
+        #[test]
+        fn labelled_block_text() {
+            let b = LabelledBlock::new(
+                WireBlockKind::Text {
+                    sender: Some("frances".into()),
+                },
+                "hello".into(),
+            );
+            let r = round_trip(&b);
+            assert_eq!(r.text, "hello");
+            match r.kind {
+                WireBlockKind::Text { sender: Some(s) } => assert_eq!(&*s, "frances"),
+                _ => panic!("kind not preserved"),
+            }
+        }
+
+        #[test]
+        fn shell_output_block() {
+            let b = ShellOutputBlock::new(ShellState::Success, "ls".into(), "out".into());
+            let r = round_trip(&b);
+            assert_eq!(&*r.cmd, "ls");
+            assert_eq!(r.text, "out");
+            assert!(matches!(r.state, ShellState::Success));
+        }
+
+        #[test]
+        fn tool_use_block() {
+            let b = ToolUseBlock::new("shell".into(), "ls -la".into());
+            let r = round_trip(&b);
+            assert_eq!(&*r.name, "shell");
+            assert_eq!(&*r.detail, "ls -la");
+        }
+    }
+
+    /// Phase D — `ShellOutputBlock` scroll state + alt-view rendering.
+    mod shell_scroll {
+        use super::*;
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+        use frances_tui::widget::{EventContext, EventOutcome, Focus, Theme};
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        fn block_with_lines(n: usize) -> ShellOutputBlock {
+            let body: String = (0..n).map(|i| format!("line{}\n", i + 1)).collect();
+            ShellOutputBlock::new(ShellState::Success, "cmd".into(), body)
+        }
+
+        fn press(c: char) -> Event {
+            Event::Key(KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers: KeyModifiers::NONE,
+                kind: KeyEventKind::Press,
+                state: crossterm::event::KeyEventState::NONE,
+            })
+        }
+
+        fn dispatch(block: &mut ShellOutputBlock, event: &Event) -> EventOutcome {
+            let mut focus = Focus::new();
+            let mut redraw = false;
+            let mut ctx = EventContext {
+                focus: &mut focus,
+                redraw: &mut redraw,
+            };
+            block.handle_event(&mut ctx, event)
+        }
+
+        #[test]
+        fn j_decrements_scroll_y() {
+            let mut b = block_with_lines(30);
+            b.scroll_y = 5;
+            assert!(matches!(
+                dispatch(&mut b, &press('j')),
+                EventOutcome::Consumed
+            ));
+            assert_eq!(b.scroll_y, 4);
+        }
+
+        #[test]
+        fn j_at_zero_is_noop() {
+            let mut b = block_with_lines(30);
+            assert_eq!(b.scroll_y, 0);
+            dispatch(&mut b, &press('j'));
+            assert_eq!(b.scroll_y, 0);
+        }
+
+        #[test]
+        fn k_clamps_at_source_minus_focused_tail() {
+            // 25 lines, focused tail = 20 → max_scroll = 5.
+            let mut b = block_with_lines(25);
+            for _ in 0..20 {
+                dispatch(&mut b, &press('k'));
+            }
+            assert_eq!(b.scroll_y, 5);
+        }
+
+        #[test]
+        fn d_u_step_by_half_focused_tail() {
+            // 40 lines, focused tail = 20 → max_scroll = 20, half = 10.
+            let mut b = block_with_lines(40);
+            dispatch(&mut b, &press('u'));
+            assert_eq!(b.scroll_y, 10);
+            dispatch(&mut b, &press('u'));
+            assert_eq!(b.scroll_y, 20);
+            dispatch(&mut b, &press('u'));
+            assert_eq!(b.scroll_y, 20, "u saturates at max_scroll");
+            dispatch(&mut b, &press('d'));
+            assert_eq!(b.scroll_y, 10);
+            dispatch(&mut b, &press('d'));
+            assert_eq!(b.scroll_y, 0);
+            dispatch(&mut b, &press('d'));
+            assert_eq!(b.scroll_y, 0, "d saturates at zero");
+        }
+
+        #[test]
+        fn body_lines_shift_with_scroll_y() {
+            let b0 = block_with_lines(30);
+            let mut b5 = block_with_lines(30);
+            b5.scroll_y = 5;
+            let lines0 = b0.body_lines_at(80, 0, SHELL_TAIL_LINES);
+            let lines5 = b5.body_lines_at(80, 5, SHELL_TAIL_LINES);
+            // Both runs have 1 marker + SHELL_TAIL_LINES body rows.
+            assert_eq!(lines0.len(), 1 + SHELL_TAIL_LINES);
+            assert_eq!(lines5.len(), 1 + SHELL_TAIL_LINES);
+            assert_eq!(lines0[0], "… [20 earlier lines]");
+            assert_eq!(lines5[0], "… [15 earlier lines]");
+            // Window shifts back by 5 source lines.
+            assert_eq!(lines0[1], "line21");
+            assert_eq!(lines5[1], "line16");
+        }
+
+        #[test]
+        fn live_view_always_shows_tail_regardless_of_scroll_y() {
+            let mut b = block_with_lines(30);
+            b.scroll_y = 7;
+            let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+            let theme = Theme::default();
+            let mut ctx = BlockRenderContext {
+                area: Rect::new(0, 0, 40, 12),
+                buf: &mut buf,
+                src_y: 0,
+                truncated: false,
+                alt_view: false,
+                selected: false,
+                theme: &theme,
+            };
+            b.render(&mut ctx);
+            // First body row = first row after the header (1 row).
+            // Live view forces window_start = 0 → marker "20 earlier lines".
+            let marker_row: String = (0..40)
+                .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            assert!(
+                marker_row.starts_with("… [20 earlier lines]"),
+                "live view ignored scroll_y; got marker row: {marker_row:?}",
+            );
+        }
+
+        #[test]
+        fn alt_view_honours_scroll_y() {
+            let mut b = block_with_lines(30);
+            b.scroll_y = 7;
+            let mut buf = Buffer::empty(Rect::new(0, 0, 40, 12));
+            let theme = Theme::default();
+            let mut ctx = BlockRenderContext {
+                area: Rect::new(0, 0, 40, 12),
+                buf: &mut buf,
+                src_y: 0,
+                truncated: false,
+                alt_view: true,
+                selected: false,
+                theme: &theme,
+            };
+            b.render(&mut ctx);
+            let marker_row: String = (0..40)
+                .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+                .collect();
+            assert!(
+                marker_row.starts_with("… [13 earlier lines]"),
+                "alt view ignored scroll_y; got marker row: {marker_row:?}",
+            );
+        }
     }
 }

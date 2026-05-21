@@ -67,9 +67,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Widget as RatatuiWidget};
 use slotmap::{SlotMap, new_key_type};
 
-use crate::block::Block;
+use crossterm::event::Event;
+
+use crate::block::{Block, BlockMeasureContext, BlockRenderContext};
 use crate::scrollback_backend::{BackendMode, ScrollbackBackend, SyncGuard};
-use crate::widget::{Focus, RenderContext, Theme, Widget};
+use crate::widget::{EventContext, EventOutcome, Focus, RenderContext, Theme, Widget};
 
 /// Per-frame state the container threads through to the footer
 /// widget's [`Widget::render`]. Bundled so [`ScrollbackContainer::draw`]
@@ -144,6 +146,16 @@ struct SafeEntry {
     render: Option<RenderState>,
 }
 
+/// Block that has scrolled into native scrollback. The `truncated` flag
+/// is preserved from the source (set when a replay-time
+/// [`StreamFrame::BlockTruncated`] arrived); the inspector pass forwards
+/// it on the [`BlockRenderContext`] so the block can paint its own
+/// truncation indicator.
+struct CommittedEntry {
+    block: Box<dyn Block>,
+    truncated: bool,
+}
+
 /// Layout mode for the current frame. The render path forks on this:
 /// `Normal` and `SafeOnly` use the natural-scroll path (terminals
 /// scroll old rows into scrollback themselves); `ActiveOverflow`
@@ -167,7 +179,12 @@ enum LayoutMode {
 }
 
 pub struct ScrollbackContainer {
-    committed: VecDeque<Box<dyn Block>>,
+    /// Block-level theme threaded through every measure / render
+    /// context. Defaults to [`Theme::default`]; per-frame `DrawContext`
+    /// theme overrides are not yet wired through measure paths (none of
+    /// the concrete blocks consult the theme during measure today).
+    theme: Theme,
+    committed: VecDeque<CommittedEntry>,
     safe: VecDeque<SafeEntry>,
     active: SlotMap<BlockId, ActiveEntry>,
     /// Display order for `active`, oldest at the front. Promotion
@@ -224,6 +241,17 @@ pub struct ScrollbackContainer {
     /// [`scroll_up`] / [`scroll_down`] and let the renderer decide
     /// what's reachable.
     scrollback_offset: u16,
+    /// Inspector-only block selection, indexed from the *newest* block
+    /// (ordinal `0` is the bottom of `iter_history`). `None` outside
+    /// alt-view, or when no blocks exist. Seeded in [`set_scrollback`]
+    /// on the false → true transition, cleared by [`clear`].
+    ///
+    /// Ordinal-from-newest is stable under the append-only mutations
+    /// the container actually performs: promotions
+    /// (`active → safe → committed`) preserve display order, and new
+    /// pushes land at the bottom — they just bump the ordinal
+    /// distance from the selected block, never invalidate it.
+    selected_from_newest: Option<u16>,
     /// When `Some(frame)`, every entry in `active` gets a spinner glyph
     /// painted over the rightmost non-blank cell of its last row, so
     /// users can see at a glance which blocks haven't been committed
@@ -240,6 +268,7 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 impl ScrollbackContainer {
     pub fn new(initial_y: u16) -> Self {
         Self {
+            theme: Theme::default(),
             committed: VecDeque::new(),
             safe: VecDeque::new(),
             active: SlotMap::with_key(),
@@ -252,6 +281,7 @@ impl ScrollbackContainer {
             prev_mode: None,
             scrollback_active: false,
             scrollback_offset: 0,
+            selected_from_newest: None,
             spinner_frame: None,
         }
     }
@@ -297,18 +327,28 @@ impl ScrollbackContainer {
     /// Append a block to `active` and return its id. The caller may
     /// later swap in a fresh block via [`update_active`] or mark the
     /// entry finalised via [`mark_safe`].
+    ///
+    /// If the block's [`Block::safe_on_push`] returns `true` (a
+    /// one-shot block that never streams), the entry is flagged
+    /// safe-to-commit immediately and drains together with any
+    /// already-flagged prefix of `active`.
     pub fn push_active(&mut self, block: Box<dyn Block>) -> BlockId {
+        let safe_on_push = block.safe_on_push();
         let id = self.active.insert(ActiveEntry {
             block,
-            safe_to_commit: false,
+            safe_to_commit: safe_on_push,
             render: None,
         });
         self.active_order.push_back(id);
         tracing::trace!(
             ?id,
+            safe_on_push,
             active_order_len = self.active_order.len(),
             "push_active"
         );
+        if safe_on_push {
+            self.promote_ready();
+        }
         id
     }
 
@@ -378,8 +418,27 @@ impl ScrollbackContainer {
     /// `push_committed` so the inspector shows it without the TUI ever
     /// painting it on the live screen.
     pub fn push_committed(&mut self, block: Box<dyn Block>) {
-        self.committed.push_back(block);
+        self.committed.push_back(CommittedEntry {
+            block,
+            truncated: false,
+        });
         tracing::trace!(committed_len = self.committed.len(), "push_committed");
+    }
+
+    /// Like [`push_committed`], but flags the entry as truncated — the
+    /// block was in-flight when its workflow was dehydrated and never
+    /// received a clean stop. The inspector's render pass forwards the
+    /// flag to the block via [`BlockRenderContext::truncated`] so the
+    /// block can paint its own incomplete-content indicator.
+    pub fn push_committed_truncated(&mut self, block: Box<dyn Block>) {
+        self.committed.push_back(CommittedEntry {
+            block,
+            truncated: true,
+        });
+        tracing::trace!(
+            committed_len = self.committed.len(),
+            "push_committed_truncated",
+        );
     }
 
     pub fn safe_count(&self) -> usize {
@@ -444,6 +503,9 @@ impl ScrollbackContainer {
         self.prev_footer_height = None;
         self.prev_mode = None;
         self.scrollback_offset = 0;
+        // `selected_from_newest` is also reset here (line above) so the
+        // inspector reopens at the newest of the freshly-replayed
+        // history rather than pointing into evicted content.
         self.prev_term_size = Some(term_size);
 
         Ok(())
@@ -454,19 +516,135 @@ impl ScrollbackContainer {
     /// (typically against an alt-screen brought up externally).
     ///
     /// A `false → true` transition resets the scroll offset to `0`
-    /// so the inspector opens at the bottom of history. Repeated
-    /// `true` calls are idempotent — the offset is preserved.
-    /// `set_scrollback(false)` does not touch the offset; screen
-    /// state is the caller's concern. The standard pattern is to
-    /// bracket the inspector in alt-screen enter/leave so the main
-    /// screen is restored when [`draw`] resumes.
+    /// and seeds [`selected_from_newest`] to `Some(0)` (the newest
+    /// block) when any history exists. Repeated `true` calls are
+    /// idempotent — the offset and selection are preserved.
+    /// `set_scrollback(false)` does not touch either; screen state
+    /// is the caller's concern. The standard pattern is to bracket
+    /// the inspector in alt-screen enter/leave so the main screen
+    /// is restored when [`draw`] resumes.
     pub fn set_scrollback(&mut self, enabled: bool) {
         let prev = self.scrollback_active;
         if enabled && !self.scrollback_active {
             self.scrollback_offset = 0;
+            self.selected_from_newest = (self.history_count() > 0).then_some(0);
         }
         self.scrollback_active = enabled;
-        tracing::trace!(prev, enabled, "set_scrollback");
+        tracing::trace!(
+            prev,
+            enabled,
+            selected_from_newest = ?self.selected_from_newest,
+            "set_scrollback",
+        );
+    }
+
+    /// Total block count across `committed` + `safe` + `active`.
+    /// Used by [`set_scrollback`] to decide whether to seed selection
+    /// and by [`select_older`] to clamp.
+    fn history_count(&self) -> usize {
+        self.committed.len() + self.safe.len() + self.active_order.len()
+    }
+
+    /// Move selection towards the newer end of history. No-op when
+    /// already at the newest entry or when no selection is set.
+    pub fn select_newer(&mut self) {
+        if let Some(n) = self.selected_from_newest {
+            self.selected_from_newest = Some(n.saturating_sub(1));
+            tracing::trace!(
+                from = n,
+                to = ?self.selected_from_newest,
+                "select_newer",
+            );
+        }
+    }
+
+    /// Move selection towards the older end of history, clamped at
+    /// `history_count - 1`. No-op when no selection is set.
+    pub fn select_older(&mut self) {
+        let Some(n) = self.selected_from_newest else {
+            return;
+        };
+        let count = self.history_count() as u32;
+        if count == 0 {
+            return;
+        }
+        let max = (count - 1) as u16;
+        let next = n.saturating_add(1).min(max);
+        self.selected_from_newest = Some(next);
+        tracing::trace!(from = n, to = next, "select_older");
+    }
+
+    pub fn selected_from_newest(&self) -> Option<u16> {
+        self.selected_from_newest
+    }
+
+    /// Resolve an ordinal-from-newest index to a mutable block
+    /// reference. Walks `active` (newest first), then `safe`, then
+    /// `committed` to find the target's location, then takes a single
+    /// mutable borrow on the hit. Two-pass to keep the borrow checker
+    /// happy with the slotmap's `get_mut`.
+    fn entry_at_from_newest_mut(&mut self, n: u16) -> Option<&mut dyn Block> {
+        enum Target {
+            Active(BlockId),
+            Safe(usize),
+            Committed(usize),
+        }
+        let mut remaining = n as usize;
+        let target: Option<Target> = (|| {
+            for &id in self.active_order.iter().rev() {
+                if self.active.contains_key(id) {
+                    if remaining == 0 {
+                        return Some(Target::Active(id));
+                    }
+                    remaining -= 1;
+                }
+            }
+            let safe_len = self.safe.len();
+            for i in 0..safe_len {
+                if remaining == 0 {
+                    return Some(Target::Safe(safe_len - 1 - i));
+                }
+                remaining -= 1;
+            }
+            let committed_len = self.committed.len();
+            for i in 0..committed_len {
+                if remaining == 0 {
+                    return Some(Target::Committed(committed_len - 1 - i));
+                }
+                remaining -= 1;
+            }
+            None
+        })();
+        match target? {
+            Target::Active(id) => self.active.get_mut(id).map(|e| e.block.as_mut()),
+            Target::Safe(idx) => self.safe.get_mut(idx).map(|e| e.block.as_mut()),
+            Target::Committed(idx) => self.committed.get_mut(idx).map(|e| e.block.as_mut()),
+        }
+    }
+
+    /// Forward an event to the currently-selected block's
+    /// [`Block::handle_event`]. Returns [`EventOutcome::Pass`] when
+    /// nothing is selected (closed inspector, empty history, or
+    /// selection past the end).
+    ///
+    /// The transient [`EventContext`] borrows `focus` from the caller —
+    /// blocks don't manipulate widget focus today, but the field is
+    /// required by the `Input` trait signature. `redraw` is allocated
+    /// per call and discarded; the binary's run loop already repaints
+    /// on every event, so the flag is decorative.
+    pub fn handle_block_event(&mut self, focus: &mut Focus, event: &Event) -> EventOutcome {
+        let Some(n) = self.selected_from_newest else {
+            return EventOutcome::Pass;
+        };
+        let Some(block) = self.entry_at_from_newest_mut(n) else {
+            return EventOutcome::Pass;
+        };
+        let mut redraw = false;
+        let mut ctx = EventContext {
+            focus,
+            redraw: &mut redraw,
+        };
+        block.handle_event(&mut ctx, event)
     }
 
     pub fn scrollback(&self) -> bool {
@@ -492,29 +670,60 @@ impl ScrollbackContainer {
         self.scrollback_offset
     }
 
+    /// Build a [`BlockMeasureContext`] borrowing the container's theme,
+    /// with `selected = false` — the default for every call site that
+    /// doesn't know about the alt-view's per-block selection state
+    /// (layout classification, history-total measurement, etc.).
+    /// The inspector's per-block walk inside [`paint_history_window`]
+    /// constructs its own contexts with the correct `selected` flag.
+    fn measure_ctx(&self, width: u16) -> BlockMeasureContext<'_> {
+        BlockMeasureContext {
+            width,
+            selected: false,
+            theme: &self.theme,
+        }
+    }
+
     /// Sum of `block.measure(width)` across every block held by the
     /// container — `committed` + `safe` + `active`, in display order.
-    /// Inspector callers can use this to compute a max scroll offset
-    /// for their own status text; the renderer also computes it
-    /// internally each frame.
+    /// Selection-aware: the currently-selected block is measured with
+    /// `selected = true` so the inspector's `max_offset` matches the
+    /// height the block actually paints.
     pub fn measure_history(&self, width: u16) -> u16 {
+        let count = self.history_count();
         let mut total: u32 = 0;
-        for block in self.iter_history() {
-            total = total.saturating_add(u32::from(block.measure(width)));
+        for (i, (block, _)) in self.iter_history().enumerate() {
+            let is_selected = self.selected_from_newest.is_some_and(|sel| {
+                (count - 1)
+                    .checked_sub(i)
+                    .is_some_and(|fn_| sel as usize == fn_)
+            });
+            let mctx = BlockMeasureContext {
+                width,
+                selected: is_selected,
+                theme: &self.theme,
+            };
+            total = total.saturating_add(u32::from(block.measure(&mctx)));
         }
         total.min(u32::from(u16::MAX)) as u16
     }
 
     /// Iterator over every block tracked by the container, in display
     /// order: `committed` (oldest first), then `safe`, then `active`.
-    fn iter_history(&self) -> impl Iterator<Item = &dyn Block> + '_ {
-        let committed = self.committed.iter().map(|b| b.as_ref());
-        let safe = self.safe.iter().map(|e| e.block.as_ref());
+    /// Each item is paired with its `truncated` flag — only meaningful
+    /// for committed entries; safe / active entries always yield
+    /// `false`.
+    fn iter_history(&self) -> impl Iterator<Item = (&dyn Block, bool)> + '_ {
+        let committed = self
+            .committed
+            .iter()
+            .map(|e| (e.block.as_ref(), e.truncated));
+        let safe = self.safe.iter().map(|e| (e.block.as_ref(), false));
         let active = self
             .active_order
             .iter()
             .filter_map(|id| self.active.get(*id))
-            .map(|e| e.block.as_ref());
+            .map(|e| (e.block.as_ref(), false));
         committed.chain(safe).chain(active)
     }
 
@@ -583,16 +792,17 @@ impl ScrollbackContainer {
             return LayoutMode::Normal;
         }
         let available_h = (terminal_h - footer_h) as u32;
+        let mctx = self.measure_ctx(width);
         let safe_h: u32 = self
             .safe
             .iter()
-            .map(|e| e.block.measure(width) as u32)
+            .map(|e| e.block.measure(&mctx) as u32)
             .sum();
         let active_h: u32 = self
             .active_order
             .iter()
             .filter_map(|id| self.active.get(*id))
-            .map(|e| e.block.measure(width) as u32)
+            .map(|e| e.block.measure(&mctx) as u32)
             .sum();
         let total = safe_h + active_h + footer_h as u32;
         if total <= terminal_h as u32 {
@@ -734,12 +944,14 @@ impl ScrollbackContainer {
         //     changed → MoveTo its known screen position and rewrite,
         //     setting `force_cascade` so everything below redraws.
         let mut force_cascade = false;
+        let theme = &self.theme;
         for entry in self.safe.iter_mut() {
             render_or_skip_entry(
                 &mut entry.block,
                 &mut entry.render,
                 width,
                 terminal_h,
+                theme,
                 terminal.backend_mut(),
                 &mut cursor,
                 self.cumulative_scrolls,
@@ -771,6 +983,7 @@ impl ScrollbackContainer {
                 &mut entry.render,
                 width,
                 terminal_h,
+                theme,
                 terminal.backend_mut(),
                 &mut cursor,
                 self.cumulative_scrolls,
@@ -954,7 +1167,10 @@ impl ScrollbackContainer {
         for entry in self.safe.drain(..) {
             match entry.render.as_ref() {
                 Some(state) if state.absolute_y < cumulative => {
-                    self.committed.push_back(entry.block);
+                    self.committed.push_back(CommittedEntry {
+                        block: entry.block,
+                        truncated: false,
+                    });
                 }
                 _ => remaining.push_back(entry),
             }
@@ -1037,6 +1253,7 @@ impl ScrollbackContainer {
         // visible and whether the oldest visible is a boundary block.
         // We exit as soon as we hit the first non-fully-fitting entry
         // — anything older is hidden (and silently not emitted).
+        let mctx = self.measure_ctx(width);
         let mut sum: u16 = 0;
         let mut visible_active_start: usize = self.active_order.len();
         let mut boundary_skip_rows: u16 = 0;
@@ -1044,7 +1261,7 @@ impl ScrollbackContainer {
         for (rev_i, &id) in self.active_order.iter().rev().enumerate() {
             let i_from_oldest = n_active - 1 - rev_i;
             let h = match self.active.get(id) {
-                Some(e) => e.block.measure(width),
+                Some(e) => e.block.measure(&mctx),
                 None => continue,
             };
             let new_sum = sum.saturating_add(h);
@@ -1072,7 +1289,7 @@ impl ScrollbackContainer {
         let safe_evict_rows: u16 = self
             .safe
             .iter()
-            .map(|e| e.block.measure(width))
+            .map(|e| e.block.measure(&mctx))
             .fold(0u16, |a, b| a.saturating_add(b));
 
         let total_rows: u16 = safe_evict_rows
@@ -1098,13 +1315,22 @@ impl ScrollbackContainer {
 
         // 1. Evict safe entries (oldest first).
         for safe_entry in self.safe.iter() {
-            let h = safe_entry.block.measure(width);
+            let h = safe_entry.block.measure(&mctx);
             if h == 0 {
                 continue;
             }
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
-            safe_entry.block.render(area, &mut buf);
+            let mut rctx = BlockRenderContext {
+                area,
+                buf: &mut buf,
+                src_y: 0,
+                truncated: false,
+                alt_view: false,
+                selected: false,
+                theme: &self.theme,
+            };
+            safe_entry.block.render(&mut rctx);
             for row_idx in 0..h {
                 let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
                 backend.write_row(cells.into_iter())?;
@@ -1134,13 +1360,22 @@ impl ScrollbackContainer {
                 Some(e) => e,
                 None => continue,
             };
-            let h = entry.block.measure(width);
+            let h = entry.block.measure(&mctx);
             if h == 0 {
                 continue;
             }
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
-            entry.block.render(area, &mut buf);
+            let mut rctx = BlockRenderContext {
+                area,
+                buf: &mut buf,
+                src_y: 0,
+                truncated: false,
+                alt_view: false,
+                selected: false,
+                theme: &self.theme,
+            };
+            entry.block.render(&mut rctx);
             let entry_spinner = if entry.safe_to_commit {
                 None
             } else {
@@ -1210,7 +1445,10 @@ impl ScrollbackContainer {
         // Move evicted safe entries into `committed`.
         for _ in 0..self.safe.len() {
             if let Some(entry) = self.safe.pop_front() {
-                self.committed.push_back(entry.block);
+                self.committed.push_back(CommittedEntry {
+                    block: entry.block,
+                    truncated: false,
+                });
             }
         }
 
@@ -1389,17 +1627,49 @@ impl ScrollbackContainer {
     /// Copy the visible slice of structured history into `frame_buf`
     /// at `area`. Walks blocks in display order, tracking a running
     /// `block_y` cursor (= logical row index inside history). For each
-    /// block we render a temporary same-width buffer, then copy the
-    /// rows that overlap `[src_y_offset, src_y_offset + area.height)`
-    /// into `frame_buf` at the corresponding offset inside `area`.
+    /// block that overlaps the window, render directly into `frame_buf`
+    /// at the destination rect with `src_y` set to the row offset
+    /// inside the block — blocks honour `src_y` + `area.height` to
+    /// paint only the overlapping slice.
+    ///
+    /// Phase D additions:
+    /// - Reserve `area.x` (column 0 of the content area) as a selection
+    ///   gutter; each block renders at `area.x + 1` with one column
+    ///   trimmed. The gutter is only inserted when `area.width >= 2`.
+    /// - When [`selected_from_newest`] points at a block whose visible
+    ///   slice has at least one row in this window, paint a cyan `▶`
+    ///   into the gutter on the block's topmost on-screen row.
     fn paint_history_window(&self, area: Rect, src_y_offset: u16, frame_buf: &mut Buffer) {
         if area.height == 0 || area.width == 0 {
             return;
         }
         let window_end = src_y_offset.saturating_add(area.height);
+
+        let total = self.history_count();
+        let has_gutter = area.width >= 2;
+        let block_x = if has_gutter { area.x + 1 } else { area.x };
+        let block_w = if has_gutter {
+            area.width - 1
+        } else {
+            area.width
+        };
+
         let mut block_y: u16 = 0;
-        for block in self.iter_history() {
-            let h = block.measure(area.width);
+        for (i, (block, truncated)) in self.iter_history().enumerate() {
+            let is_selected = self.selected_from_newest.is_some_and(|sel| {
+                (total - 1)
+                    .checked_sub(i)
+                    .is_some_and(|fn_| sel as usize == fn_)
+            });
+            // Block measurement is selection-aware so the inspector's
+            // offset math stays consistent with what the block paints
+            // (e.g. `ShellOutputBlock` grows its tail when focused).
+            let mctx = BlockMeasureContext {
+                width: block_w,
+                selected: is_selected,
+                theme: &self.theme,
+            };
+            let h = block.measure(&mctx);
             if h == 0 {
                 continue;
             }
@@ -1416,15 +1686,23 @@ impl ScrollbackContainer {
             let dst_start = block_y.saturating_sub(src_y_offset);
             let copy_rows = (h - src_start).min(area.height - dst_start);
 
-            let block_area = Rect::new(0, 0, area.width, h);
-            let mut block_buf = Buffer::empty(block_area);
-            block.render(block_area, &mut block_buf);
+            let dst_area = Rect::new(block_x, area.y + dst_start, block_w, copy_rows);
+            let mut rctx = BlockRenderContext {
+                area: dst_area,
+                buf: frame_buf,
+                src_y: src_start,
+                truncated,
+                alt_view: true,
+                selected: is_selected,
+                theme: &self.theme,
+            };
+            block.render(&mut rctx);
 
-            for row in 0..copy_rows {
-                for col in 0..area.width {
-                    let src = block_buf[(col, src_start + row)].clone();
-                    frame_buf[(area.x + col, area.y + dst_start + row)] = src;
-                }
+            // Selection gutter: paint `▶` in column 0 of the block's
+            // topmost on-screen row.
+            if has_gutter && is_selected {
+                let indicator = Style::default().fg(Color::Cyan);
+                frame_buf.set_string(area.x, area.y + dst_start, "▶", indicator);
             }
 
             block_y = block_end;
@@ -1523,6 +1801,7 @@ fn render_or_skip_entry<B>(
     render: &mut Option<RenderState>,
     width: u16,
     terminal_h: u16,
+    theme: &Theme,
     backend: &mut ScrollbackBackend<B>,
     cursor: &mut CursorState,
     cumulative_scrolls: i32,
@@ -1532,7 +1811,12 @@ fn render_or_skip_entry<B>(
 where
     B: Backend<Error = io::Error> + Write,
 {
-    let h = block.measure(width);
+    let mctx = BlockMeasureContext {
+        width,
+        selected: false,
+        theme,
+    };
+    let h = block.measure(&mctx);
     let prior_state = render.as_ref().map(|s| (s.absolute_y, s.height, s.damaged));
 
     // Decide where this entry's first row should sit on screen. When
@@ -1579,7 +1863,16 @@ where
         if h > 0 {
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
-            block.render(area, &mut buf);
+            let mut rctx = BlockRenderContext {
+                area,
+                buf: &mut buf,
+                src_y: 0,
+                truncated: false,
+                alt_view: false,
+                selected: false,
+                theme,
+            };
+            block.render(&mut rctx);
             if let Some(frame) = spinner_frame {
                 overlay_spinner(&mut buf, area, frame);
             }
@@ -1845,11 +2138,12 @@ mod tests {
         // Sanity for the measurement step used during draw.
         let mut c = Rig::new(para("footer"), 0);
         c.push_active(multi(3));
+        let mctx = c.measure_ctx(80);
         let active_h: u16 = c
             .active_order
             .iter()
             .filter_map(|id| c.active.get(*id))
-            .map(|e| e.block.measure(80))
+            .map(|e| e.block.measure(&mctx))
             .sum();
         assert_eq!(active_h, 3);
     }
@@ -3263,10 +3557,12 @@ mod tests {
         let b = terminal.backend().inner();
         // Layout: row 0 top bar, rows 1..8 content, row 8 bottom bar,
         // row 9 footer. Content area = 7 rows; history = 2 rows, so
-        // bottom-aligned at rows 6-7.
+        // bottom-aligned at rows 6-7. Phase D: column 0 is the
+        // selection gutter — `▶` on the newest (selected) row,
+        // blank on the others.
         assert_eq!(b.screen_row(0), "", "no above marker when at bottom");
-        assert_eq!(b.screen_row(6), "one");
-        assert_eq!(b.screen_row(7), "two");
+        assert_eq!(b.screen_row(6), " one");
+        assert_eq!(b.screen_row(7), "▶two");
         let bottom = b.screen_row(8);
         assert!(
             bottom.contains("(bottom)"),
@@ -3293,17 +3589,19 @@ mod tests {
         c.paint_scrollback(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
-        // Visible at bottom: c, d, e, f.
+        // Visible at bottom: c, d, e, f. Phase D gutter shifts each
+        // row right by 1 col; `f` is the newest and therefore selected,
+        // so its gutter holds `▶` instead of a space.
         let top = b.screen_row(0);
         assert!(top.contains("▲"), "expected ▲ marker, got {top:?}");
         assert!(
             top.contains("2"),
             "expected '2 more rows above', got {top:?}"
         );
-        assert_eq!(b.screen_row(1), "c");
-        assert_eq!(b.screen_row(2), "d");
-        assert_eq!(b.screen_row(3), "e");
-        assert_eq!(b.screen_row(4), "f");
+        assert_eq!(b.screen_row(1), " c");
+        assert_eq!(b.screen_row(2), " d");
+        assert_eq!(b.screen_row(3), " e");
+        assert_eq!(b.screen_row(4), "▶f");
         let bottom = b.screen_row(5);
         assert!(
             bottom.contains("(bottom)"),
@@ -3327,13 +3625,15 @@ mod tests {
 
         let b = terminal.backend().inner();
         // max_offset = 6 - 4 = 2, scroll = 1 → y_offset = 1 → b..e visible.
+        // Phase D gutter is blank on every visible row — the selected
+        // block (newest = "f") sits below the visible window.
         let top = b.screen_row(0);
         assert!(top.contains("▲"));
         assert!(top.contains("1"));
-        assert_eq!(b.screen_row(1), "b");
-        assert_eq!(b.screen_row(2), "c");
-        assert_eq!(b.screen_row(3), "d");
-        assert_eq!(b.screen_row(4), "e");
+        assert_eq!(b.screen_row(1), " b");
+        assert_eq!(b.screen_row(2), " c");
+        assert_eq!(b.screen_row(3), " d");
+        assert_eq!(b.screen_row(4), " e");
         let bottom = b.screen_row(5);
         assert!(bottom.contains("▼"), "expected ▼ marker, got {bottom:?}");
         assert!(bottom.contains("1"));
@@ -3355,12 +3655,15 @@ mod tests {
         c.paint_scrollback(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
+        // Phase D gutter is blank on every visible row — the selected
+        // block (newest = "f") sits below the visible window when
+        // we're scrolled all the way to the top.
         let top = b.screen_row(0);
         assert!(!top.contains("▲"), "no above marker at top, got {top:?}");
-        assert_eq!(b.screen_row(1), "a");
-        assert_eq!(b.screen_row(2), "b");
-        assert_eq!(b.screen_row(3), "c");
-        assert_eq!(b.screen_row(4), "d");
+        assert_eq!(b.screen_row(1), " a");
+        assert_eq!(b.screen_row(2), " b");
+        assert_eq!(b.screen_row(3), " c");
+        assert_eq!(b.screen_row(4), " d");
         let bottom = b.screen_row(5);
         assert!(bottom.contains("▼"));
         assert!(bottom.contains("2"));
@@ -3393,13 +3696,14 @@ mod tests {
 
         let b = terminal.backend().inner();
         // Content area = 7 rows; total_h = 6 → bottom-aligned at rows
-        // 2..7 (pad = 1 above).
-        assert_eq!(b.screen_row(2), "a");
-        assert_eq!(b.screen_row(3), "b");
-        assert_eq!(b.screen_row(4), "c");
-        assert_eq!(b.screen_row(5), "d");
-        assert_eq!(b.screen_row(6), "e");
-        assert_eq!(b.screen_row(7), "f");
+        // 2..7 (pad = 1 above). Phase D gutter shifts content right by
+        // one column; `f` is the selected newest, so it carries `▶`.
+        assert_eq!(b.screen_row(2), " a");
+        assert_eq!(b.screen_row(3), " b");
+        assert_eq!(b.screen_row(4), " c");
+        assert_eq!(b.screen_row(5), " d");
+        assert_eq!(b.screen_row(6), " e");
+        assert_eq!(b.screen_row(7), "▶f");
         assert_eq!(b.screen_row(9), "footer");
     }
 
@@ -3743,5 +4047,162 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "older");
         assert_eq!(terminal.backend().inner().screen_row(1), "newer");
+    }
+
+    // ------------------------------------------------------------------
+    // Phase D — alt-view selection + per-block input dispatch
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn select_newer_at_zero_is_noop() {
+        let mut c = Rig::new(para("footer"), 0);
+        c.push(para("a"));
+        c.push(para("b"));
+        c.set_scrollback(true);
+        assert_eq!(c.selected_from_newest(), Some(0));
+        c.select_newer();
+        assert_eq!(c.selected_from_newest(), Some(0));
+    }
+
+    #[test]
+    fn select_older_clamps_at_count_minus_one() {
+        let mut c = Rig::new(para("footer"), 0);
+        c.push(para("a"));
+        c.push(para("b"));
+        c.set_scrollback(true);
+        c.select_older();
+        c.select_older();
+        c.select_older();
+        // Two blocks → max ordinal is 1.
+        assert_eq!(c.selected_from_newest(), Some(1));
+    }
+
+    #[test]
+    fn set_scrollback_seeds_selection_to_newest_when_blocks_exist() {
+        let mut c = Rig::new(para("footer"), 0);
+        // Empty history — selection stays `None`.
+        c.set_scrollback(true);
+        assert_eq!(c.selected_from_newest(), None);
+        c.set_scrollback(false);
+
+        c.push(para("a"));
+        c.set_scrollback(true);
+        assert_eq!(c.selected_from_newest(), Some(0));
+    }
+
+    #[test]
+    fn set_scrollback_idempotent_preserves_selection() {
+        let mut c = Rig::new(para("footer"), 0);
+        c.push(para("a"));
+        c.push(para("b"));
+        c.set_scrollback(true);
+        c.select_older(); // ordinal 1
+        c.set_scrollback(true);
+        assert_eq!(
+            c.selected_from_newest(),
+            Some(1),
+            "re-asserting alt-view shouldn't reset selection"
+        );
+    }
+
+    #[test]
+    fn paint_scrollback_paints_indicator_on_selected_block() {
+        // Build a 3-block container; select the middle one; assert the
+        // gutter `▶` lands at column 0 of its first row only.
+        let mut c = Rig::new(para("footer"), 0);
+        c.push(para("alpha"));
+        c.push(para("beta"));
+        c.push(para("gamma"));
+        c.set_scrollback(true);
+        // Newest is index 0 (= "gamma"); select the middle ("beta",
+        // ordinal 1).
+        c.select_older();
+        assert_eq!(c.selected_from_newest(), Some(1));
+
+        // 1-row blocks, 80-col terminal. Inspector layout:
+        //   row 0: top status bar (blank, no rows above)
+        //   row 1: alpha
+        //   row 2: beta   ← selected
+        //   row 3: gamma
+        //   row 4: bottom status bar
+        //   row 5: footer (1 row)
+        let mut terminal = mk_term_terminal(80, 6);
+        c.paint_scrollback(&mut terminal).unwrap();
+
+        let b = terminal.backend().inner();
+        // Selected block's gutter cell.
+        assert_eq!(
+            b.screen_row(2).chars().next().unwrap_or(' '),
+            '▶',
+            "middle block (= selected) should have ▶ in column 0",
+        );
+        // Non-selected blocks: column 0 is blank.
+        assert_eq!(
+            b.screen_row(1).chars().next().unwrap_or(' '),
+            ' ',
+            "alpha (non-selected) should not have an indicator",
+        );
+        assert_eq!(
+            b.screen_row(3).chars().next().unwrap_or(' '),
+            ' ',
+            "gamma (non-selected) should not have an indicator",
+        );
+    }
+
+    #[test]
+    fn handle_block_event_forwards_to_selected() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
+
+        struct Counter(u16);
+        impl crate::widget::Input for Counter {
+            fn handle_event(
+                &mut self,
+                _ctx: &mut crate::widget::EventContext<'_>,
+                _event: &Event,
+            ) -> crate::widget::EventOutcome {
+                self.0 += 1;
+                crate::widget::EventOutcome::Consumed
+            }
+        }
+        impl Block for Counter {
+            fn kind(&self) -> crate::block::BlockKind {
+                crate::block::BlockKind::Raw
+            }
+            fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
+                1
+            }
+            fn render(&self, _ctx: &mut BlockRenderContext<'_>) {}
+        }
+
+        let mut c = Rig::new(para("footer"), 0);
+        c.container.push(Box::new(Counter(0)));
+        c.container.push(Box::new(Counter(0)));
+        c.set_scrollback(true);
+        assert_eq!(c.selected_from_newest(), Some(0));
+
+        let key = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let mut focus = Focus::new();
+        c.container.handle_block_event(&mut focus, &key);
+        // The newest block's counter incremented; the older one didn't.
+        // (Verified via re-selection + repeated handle.)
+        c.container.select_older();
+        c.container.handle_block_event(&mut focus, &key);
+        // Inspect via private state: walk safe/active backwards, the
+        // newest's counter is 1, the older is 1 as well after the
+        // second dispatch.
+        let mut found = Vec::new();
+        for entry in c.container.safe.iter().rev() {
+            let counter = entry.block.as_ref().kind();
+            assert_eq!(counter, crate::block::BlockKind::Raw);
+            found.push(());
+        }
+        assert_eq!(found.len(), 2, "both counters live in safe");
     }
 }

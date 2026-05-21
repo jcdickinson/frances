@@ -28,7 +28,7 @@ use frances_session::session::Session;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::{
     BlockId as ContainerBlockId, EventContext, Focus, FocusManager, Input, ScrollbackBackend,
-    ScrollbackContainer, Theme, TruncatedBlock, Widget,
+    ScrollbackContainer, Theme, Widget,
 };
 
 use crate::tui::{Footer, RawBlock, block_for_kind};
@@ -57,7 +57,9 @@ enum ScrollbackAction {
     Exit,
     ScrollUp(u16),
     ScrollDown(u16),
-    Ignore,
+    SelectNewer,
+    SelectOlder,
+    BlockKey(KeyEvent),
 }
 
 struct ActiveBlock {
@@ -113,20 +115,15 @@ impl LiveBlocks {
                 Some(cid) => container
                     .update_active(cid, block_for_kind(entry.kind.clone(), entry.text.clone())),
                 None => {
+                    // `push_active` consults the block's `safe_on_push`
+                    // method; one-shot blocks (e.g. `ToolUseBlock`,
+                    // `RawBlock`) self-promote to safe immediately,
+                    // suppressing the in-flight spinner overlay and
+                    // letting them drain together with the next safe
+                    // prefix of `active_order`.
                     let cid = container
                         .push_active(block_for_kind(entry.kind.clone(), entry.text.clone()));
                     entry.container_id = Some(cid);
-                    // One-shot kinds (no streaming body — `ToolUse` is
-                    // emitted as `BlockDelta` + `BlockStop` back-to-back
-                    // by the runtime) should never carry the in-flight
-                    // spinner. Flag them safe-to-commit immediately so
-                    // they drain together with the next active prefix
-                    // and the renderer suppresses the overlay even
-                    // while they're stuck behind an older streaming
-                    // block (e.g. a running `ShellOutputFrame`).
-                    if matches!(entry.kind, BlockKind::ToolUse { .. }) {
-                        container.mark_safe(cid);
-                    }
                 }
             }
         } else if let Some(cid) = entry.container_id {
@@ -224,6 +221,11 @@ impl App<'_> {
         let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        // Wall-clock-paced frame index for the streaming indicator.
+        // Bumped on every `spinner_tick`, irrespective of whether
+        // `streaming` is true — keeps the cadence stable when streams
+        // toggle on and off mid-session.
+        let mut streaming_frame: u8 = 0;
 
         loop {
             frame_counter = frame_counter.wrapping_add(1);
@@ -235,6 +237,7 @@ impl App<'_> {
                 &mut focus,
                 frame_counter,
                 streaming,
+                streaming_frame,
                 latest_usage.as_ref(),
             )?;
 
@@ -259,7 +262,12 @@ impl App<'_> {
                                 }
                                 ScrollbackAction::ScrollUp(n) => container.scroll_up(n),
                                 ScrollbackAction::ScrollDown(n) => container.scroll_down(n),
-                                ScrollbackAction::Ignore => {}
+                                ScrollbackAction::SelectNewer => container.select_newer(),
+                                ScrollbackAction::SelectOlder => container.select_older(),
+                                ScrollbackAction::BlockKey(key) => {
+                                    let _ = container
+                                        .handle_block_event(&mut focus, &Event::Key(key));
+                                }
                             }
                         }
                         Event::Key(key) => {
@@ -336,6 +344,7 @@ impl App<'_> {
                     }
                 }
                 _ = spinner_tick.tick() => {
+                    streaming_frame = streaming_frame.wrapping_add(1);
                     if container.active_count() > 0 {
                         container.bump_spinner();
                     }
@@ -380,6 +389,16 @@ impl App<'_> {
     }
 }
 
+/// Braille-dot frames cycled through the streaming indicator. Same
+/// glyph set the container uses for its active-block spinner; sharing
+/// the vocabulary keeps the two animations feeling like one family.
+const STREAMING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn streaming_status(frame: u8) -> String {
+    let glyph = STREAMING_FRAMES[(frame as usize) % STREAMING_FRAMES.len()];
+    format!("{glyph} streaming…")
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "redraw threads frame-state by-ref; bundling into a struct just renames the pain."
@@ -392,11 +411,12 @@ fn redraw(
     focus: &mut Focus,
     frame: u64,
     streaming: bool,
+    streaming_frame: u8,
     latest_usage: Option<&Usage>,
 ) -> std::io::Result<()> {
     footer
         .input
-        .set_status(streaming.then_some("streaming…").map(str::to_string));
+        .set_status(streaming.then(|| streaming_status(streaming_frame)));
     let token_text = latest_usage
         .map(format_token_status)
         .unwrap_or_else(|| "tokens: —".to_string());
@@ -598,8 +618,7 @@ fn handle_replay_frame(
                 }
             });
             if let Some(open) = finished {
-                let inner = block_for_kind(open.kind, open.text);
-                container.push_committed(Box::new(TruncatedBlock::new(inner)));
+                container.push_committed_truncated(block_for_kind(open.kind, open.text));
             }
         }
         StreamFrame::Error(message) => {
@@ -667,7 +686,15 @@ fn classify_scrollback_key(key: &KeyEvent, page: u16) -> ScrollbackAction {
         KeyCode::PageDown => ScrollbackAction::ScrollDown(page),
         KeyCode::Home => ScrollbackAction::ScrollUp(u16::MAX),
         KeyCode::End => ScrollbackAction::ScrollDown(u16::MAX),
-        _ => ScrollbackAction::Ignore,
+        // Tab / Shift-Tab move block selection inside the inspector.
+        // Crossterm reports Shift-Tab as `BackTab` regardless of the
+        // modifier bits, so a bare `KeyCode::BackTab` is enough.
+        KeyCode::Tab => ScrollbackAction::SelectNewer,
+        KeyCode::BackTab => ScrollbackAction::SelectOlder,
+        // Everything else is forwarded to the selected block's
+        // `Input::handle_event`. Blocks that don't care return
+        // `Pass`, which we discard.
+        _ => ScrollbackAction::BlockKey(*key),
     }
 }
 

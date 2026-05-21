@@ -21,7 +21,7 @@ pub mod scrollback_backend;
 pub mod scrollback_container;
 pub mod widget;
 
-pub use block::{Block, TruncatedBlock};
+pub use block::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
 pub use widget::{

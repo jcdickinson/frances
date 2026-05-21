@@ -13,6 +13,7 @@ path = "src/lib.rs"
 crossterm = { workspace = true }
 ratatui = { workspace = true }
 ratatui-textarea = { workspace = true }
+serde = { workspace = true }
 slotmap = { workspace = true }
 taffy = { workspace = true }
 tracing = { workspace = true }
@@ -20,4 +21,5 @@ unicode-width = { workspace = true }
 
 [dev-dependencies]
 alacritty_terminal = "0.26"
+serde_json = { workspace = true }
 vte = { version = "0.15", features = ["ansi"] }
