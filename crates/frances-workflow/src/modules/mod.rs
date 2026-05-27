@@ -74,7 +74,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
-use crate::runtime::{HostFrame, UserInput, caught};
+use crate::runtime::{HostFrame, InboxItem, caught};
 
 pub mod chat;
 pub mod file;
@@ -99,7 +99,7 @@ const STASH_KEY: &str = "__frances_v1_stash__";
 /// stays readable.
 pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub frames_tx: UnboundedSender<HostFrame>,
-    pub input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
+    pub input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     pub closed: Arc<AtomicBool>,
     pub closed_notify: Arc<Notify>,
     pub parked: Arc<Notify>,

@@ -165,6 +165,19 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
             )?,
         )?;
 
+        // Commit accumulated edits (clears anchor tombstones). The
+        // workflow calls this at its own reconciliation boundary — the
+        // host no longer fires it automatically.
+        proto.set(
+            "commit",
+            Function::new(ctx.clone(), |this: This<Class<'js, EditorJs<D>>>| {
+                let deps = this.0.borrow().deps.clone();
+                Ok::<_, rquickjs::Error>(Promised::from(async move {
+                    EditorUnitResult(commit_inner(&deps).await)
+                }))
+            })?,
+        )?;
+
         Ok(Some(proto))
     }
 
@@ -401,6 +414,26 @@ fn mtime_ns_from(meta: &fs::Metadata) -> io::Result<i64> {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_err(|e| io::Error::other(format!("mtime before epoch: {e}")))?;
     i64::try_from(dur.as_nanos()).map_err(|e| io::Error::other(format!("mtime overflow: {e}")))
+}
+
+/// Run the session-scoped edit commit (clears anchor tombstones).
+async fn commit_inner<D: WorkflowDeps>(deps: &D) -> Result<(), String> {
+    let session = deps.editor_factory().session();
+    let mut sess = session.lock().await;
+    sess.commit_edits().await.map_err(|e| e.to_string())
+}
+
+/// Promise payload that resolves to `undefined` or rejects with an
+/// error message. Used by `editor.commit()`.
+struct EditorUnitResult(Result<(), String>);
+
+impl<'js> IntoJs<'js> for EditorUnitResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self.0 {
+            Ok(()) => Ok(Value::new_undefined(ctx.clone())),
+            Err(msg) => Err(throw(ctx, &msg)),
+        }
+    }
 }
 
 /// Promise payload that resolves to a string or rejects with an error

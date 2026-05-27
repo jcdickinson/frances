@@ -209,6 +209,35 @@ impl HistoryStoreTrait for TursoHistoryStore {
         self.append_primitive_inner(session, "tool_result", &primitive)
             .await
     }
+
+    async fn checkpoint(&self, session: ChatSessionId) -> Result<RowId, HistoryError> {
+        let conn = self.db().connect().await;
+        let mut rows = conn
+            .query(
+                "SELECT COALESCE(MAX(id), 0) FROM chat_messages WHERE chat_session_id = ?1",
+                (session.0,),
+            )
+            .await
+            .map_err(turso_err)?;
+        let row = rows
+            .next()
+            .await
+            .map_err(turso_err)?
+            .expect("COALESCE(MAX(id), 0) always returns one row");
+        let max_id: i64 = row.get(0).map_err(turso_err)?;
+        Ok(RowId(max_id))
+    }
+
+    async fn rollback(&self, session: ChatSessionId, to: RowId) -> Result<(), HistoryError> {
+        let conn = self.db().connect().await;
+        conn.execute(
+            "DELETE FROM chat_messages WHERE chat_session_id = ?1 AND id > ?2",
+            (session.0, to.0),
+        )
+        .await
+        .map_err(turso_err)?;
+        Ok(())
+    }
 }
 
 impl TursoHistoryStore {

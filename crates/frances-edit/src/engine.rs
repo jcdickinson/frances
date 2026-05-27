@@ -122,8 +122,9 @@ impl<S: AnchorStore> EditEngine<S> {
         Ok(())
     }
 
-    /// Clear the tombstones table at the end of a turn.
-    pub async fn end_turn(&self) -> StoreResult<()> {
+    /// Commit accumulated edits: clear the tombstones table. Called at a
+    /// reconciliation boundary chosen by the workflow.
+    pub async fn commit_edits(&self) -> StoreResult<()> {
         self.store.clear_tombstones().await
     }
 
@@ -225,7 +226,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn commit_persists_and_clears_with_end_turn() {
+    async fn commit_persists_and_clears_with_commit_edits() {
         let engine = EditEngine::new(FakeStore::new());
         let p = PathBuf::from("/x");
         let working = engine
@@ -246,7 +247,7 @@ mod tests {
         let used_before = engine.store().used_anchors(&p).await.unwrap();
         assert!(used_before.contains(&anchor_a));
 
-        engine.end_turn().await.unwrap();
+        engine.commit_edits().await.unwrap();
         let used_after = engine.store().used_anchors(&p).await.unwrap();
         assert!(!used_after.contains(&anchor_a));
     }

@@ -4,8 +4,10 @@
 // `Editor` is a Rust-backed handle on the runtime's session-scoped
 // `EditSession`. Each `new Editor()` returns a clone of the same
 // underlying session so the anchor cache is shared across a workflow.
-// The tool classes are thin JS wrappers around Editor's three methods
-// (`readFile`, `readRaw`, `edit`).
+// The tool classes are thin JS wrappers around Editor's read/edit
+// methods (`readFile`, `readRaw`, `edit`). `editor.commit()` reconciles
+// accumulated edits (clears anchor tombstones) — the workflow calls it
+// at its own turn boundary; the host no longer fires it automatically.
 //
 // Variables integration: every tool class takes a `Variables` instance
 // alongside the editor. `Read` accepts optional `into: "<varname>"`

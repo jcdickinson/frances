@@ -18,8 +18,15 @@ pub(super) async fn run_prompt(runtime: Arc<SessionRuntime>, text: String) {
 
 async fn stream_prompt(runtime: &Arc<SessionRuntime>, text: String) -> Result<()> {
     let result = workflows::cycle(runtime, &text).await;
-    if let Err(error) = runtime.editor_factory.session.lock().await.end_turn().await {
-        warn!(%error, "edit_session::end_turn failed");
+    if let Err(error) = runtime
+        .editor_factory
+        .session
+        .lock()
+        .await
+        .commit_edits()
+        .await
+    {
+        warn!(%error, "edit_session::commit_edits failed");
     }
     result
 }

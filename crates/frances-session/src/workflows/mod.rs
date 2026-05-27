@@ -50,7 +50,7 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FramePush, HostFrame, Invocation, UserInput, WorkflowHandle,
+    FrameId, FrameKind, FramePush, HostFrame, InboxItem, Invocation, UserInput, WorkflowHandle,
     parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
@@ -477,9 +477,9 @@ async fn dispatch_topmost(runtime: &Arc<SessionRuntime>, text: &str) -> Result<(
     // Sending to a dropped receiver would mean the body has already
     // exited and we just didn't observe it yet; treat that as
     // "exited" and let the drive loop confirm.
-    let _ = top.handle.input_tx.send(UserInput {
+    let _ = top.handle.input_tx.send(InboxItem::Input(UserInput {
         content: text.to_owned(),
-    });
+    }));
     let exited = drive(runtime, &mut top).await?;
     if exited {
         let instance_id = top.handle.instance;

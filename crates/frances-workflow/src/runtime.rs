@@ -167,6 +167,37 @@ impl<'js> IntoJs<'js> for UserInput {
     }
 }
 
+/// An item delivered to the workflow's `inbox` stream. Either a normal
+/// user message or an out-of-band interrupt request (Esc in the TUI).
+/// The body distinguishes them in JS: `Input` arrives as
+/// `{ content }`, `Interrupt` arrives as the registered symbol
+/// `Symbol.for("frances.interrupt")` (re-exported as `INTERRUPT` from
+/// `frances:v1/inbox`).
+#[derive(Debug, Clone)]
+pub enum InboxItem {
+    Input(UserInput),
+    Interrupt,
+}
+
+impl<'js> IntoJs<'js> for InboxItem {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self {
+            InboxItem::Input(input) => input.into_js(ctx),
+            InboxItem::Interrupt => interrupt_symbol(ctx),
+        }
+    }
+}
+
+/// Fetch the process-wide `Symbol.for("frances.interrupt")` from the JS
+/// global registry. Both the inbox iterator (yielding interrupts) and
+/// the `frances:v1/inbox` module (exporting `INTERRUPT`) resolve the
+/// same symbol this way, so `value === INTERRUPT` holds in workflows.
+pub(crate) fn interrupt_symbol<'js>(ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+    let symbol: Object<'js> = ctx.globals().get("Symbol")?;
+    let for_fn: rquickjs::Function<'js> = symbol.get("for")?;
+    for_fn.call(("frances.interrupt",))
+}
+
 /// Inputs the runtime supplies for one workflow invocation.
 #[derive(Default)]
 pub struct Invocation {
@@ -192,8 +223,9 @@ pub struct Invocation {
 /// and learns about lifecycle transitions through [`Self::parked`] and
 /// [`Self::done`].
 pub struct WorkflowHandle {
-    /// Send user input to the workflow's `inbox` stream.
-    pub input_tx: UnboundedSender<UserInput>,
+    /// Send user input (or an interrupt) to the workflow's `inbox`
+    /// stream.
+    pub input_tx: UnboundedSender<InboxItem>,
     /// Frames the workflow emits.
     pub frames: UnboundedReceiver<HostFrame>,
     /// Notified each time the body suspends on `inbox.next()` with an
@@ -270,7 +302,7 @@ impl<D: WorkflowDeps> Runtime<D> {
             .workflow_db(inv.entity, std::borrow::Cow::Borrowed(&inv.migrations))
             .await?;
 
-        let (input_tx, input_rx) = mpsc::unbounded_channel::<UserInput>();
+        let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
         let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
         let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
         let parked = Arc::new(Notify::new());
@@ -341,7 +373,7 @@ async fn run_workflow<D: WorkflowDeps>(
     args: Vec<String>,
     instance_id: uuid::Uuid,
     frames: UnboundedSender<HostFrame>,
-    input_rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
+    input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
@@ -431,8 +463,8 @@ pub mod test_deps {
     use dashmap::DashMap;
     use frances_edit::{EditEngine, EditSession, FakeStore};
     use frances_models_llm::chat::{
-        ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
-        HistoryError, OwnedHistoryInput,
+        ChatCheckpoint, ChatError, ChatSession, ChatSessionBuilder, ChatSessionId,
+        ChatSessionManager, HistoryError, OwnedHistoryInput,
     };
     use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
     use frances_shell::{Shell, ShellError, ShellOptions};
@@ -861,6 +893,21 @@ pub mod test_deps {
                 )),
             }
         }
+
+        async fn checkpoint(&self) -> Result<ChatCheckpoint, ChatError> {
+            Ok(ChatCheckpoint {
+                persisted: None,
+                pending_len: self.pending.lock().len(),
+            })
+        }
+
+        async fn rollback(&self, checkpoint: ChatCheckpoint) -> Result<(), ChatError> {
+            let mut pending = self.pending.lock();
+            if checkpoint.pending_len < pending.len() {
+                pending.truncate(checkpoint.pending_len);
+            }
+            Ok(())
+        }
     }
 }
 
@@ -985,9 +1032,9 @@ mod tests {
 
         handle
             .input_tx
-            .send(UserInput {
+            .send(InboxItem::Input(UserInput {
                 content: "a".into(),
-            })
+            }))
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert_eq!(text_of(&frames[0]), "got:a");
@@ -995,9 +1042,9 @@ mod tests {
 
         handle
             .input_tx
-            .send(UserInput {
+            .send(InboxItem::Input(UserInput {
                 content: "b".into(),
-            })
+            }))
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert_eq!(text_of(&frames[0]), "got:b");
@@ -1005,9 +1052,9 @@ mod tests {
 
         handle
             .input_tx
-            .send(UserInput {
+            .send(InboxItem::Input(UserInput {
                 content: "stop".into(),
-            })
+            }))
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert_eq!(text_of(&frames[0]), "got:stop");
@@ -1307,15 +1354,15 @@ mod tests {
 
         handle
             .input_tx
-            .send(UserInput {
+            .send(InboxItem::Input(UserInput {
                 content: "first".into(),
-            })
+            }))
             .unwrap();
         handle
             .input_tx
-            .send(UserInput {
+            .send(InboxItem::Input(UserInput {
                 content: "second".into(),
-            })
+            }))
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
@@ -1966,9 +2013,13 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        // Only `push` and the JS-installed `stream` should be on the
-        // prototype; the inner raw stream function must not appear.
-        assert_eq!(text_of(&frames[0]), "proto=push,stream stash=true");
+        // Only the public prototype methods (`push`, `checkpoint`,
+        // `rollback`) plus the JS-installed `stream` should appear; the
+        // inner raw stream function must not.
+        assert_eq!(
+            text_of(&frames[0]),
+            "proto=checkpoint,push,rollback,stream stash=true"
+        );
     }
 
     #[tokio::test]

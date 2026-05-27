@@ -18,11 +18,11 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
-use crate::runtime::UserInput;
+use crate::runtime::InboxItem;
 
 pub(crate) fn build_inbox<'js>(
     ctx: &Ctx<'js>,
-    rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
@@ -39,7 +39,7 @@ pub(crate) fn build_inbox<'js>(
 }
 
 pub struct Inbox {
-    rx: Arc<AsyncMutex<UnboundedReceiver<UserInput>>>,
+    rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
     parked: Arc<Notify>,
@@ -120,12 +120,12 @@ impl<'js> JsClass<'js> for Inbox {
 
 /// `{ value, done }` for the JS iterator protocol.
 struct IterResult {
-    value: Option<UserInput>,
+    value: Option<InboxItem>,
     done: bool,
 }
 
 impl IterResult {
-    fn value(v: UserInput) -> Self {
+    fn value(v: InboxItem) -> Self {
         Self {
             value: Some(v),
             done: false,

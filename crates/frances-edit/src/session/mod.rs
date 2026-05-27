@@ -120,10 +120,10 @@ impl<S: AnchorStore> EditSession<S> {
         }
     }
 
-    /// End-of-turn cleanup. Caller invokes when assistant message's tool
-    /// calls are fully processed.
-    pub async fn end_turn(&mut self) -> EditResult<()> {
-        self.engine.end_turn().await?;
+    /// Commit accumulated edits (clears anchor tombstones). The workflow
+    /// invokes this once a round's tool calls are fully processed.
+    pub async fn commit_edits(&mut self) -> EditResult<()> {
+        self.engine.commit_edits().await?;
         Ok(())
     }
 }

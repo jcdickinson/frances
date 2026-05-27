@@ -30,8 +30,8 @@ pub use permission::{
     PermissionId, PermissionRequest, PermissionResponse, PermissionResponseWire, Permissions,
 };
 pub use runtime::{
-    FrameId, FrameKind, FramePush, HostFrame, Invocation, Runtime, ShellState, UserInput,
-    WorkflowHandle,
+    FrameId, FrameKind, FramePush, HostFrame, InboxItem, Invocation, Runtime, ShellState,
+    UserInput, WorkflowHandle,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

@@ -598,7 +598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn end_turn_clears_tombstones() {
+    async fn commit_edits_clears_tombstones() {
         let mut session = fresh_session();
         let path = PathBuf::from("/x");
         session
@@ -623,7 +623,7 @@ mod tests {
         let used_before = session.engine.store().used_anchors(&path).await.unwrap();
         assert_eq!(used_before.len(), 3); // a (tombstoned) + A2 + b
 
-        session.end_turn().await.unwrap();
+        session.commit_edits().await.unwrap();
         let used_after = session.engine.store().used_anchors(&path).await.unwrap();
         assert_eq!(used_after.len(), 2); // tombstones gone; A2 + b remain
     }

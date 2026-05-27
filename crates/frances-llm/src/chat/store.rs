@@ -63,6 +63,22 @@ pub trait HistoryStore: Send + Sync + 'static {
         is_error: bool,
     ) -> Result<RowId, HistoryError>;
 
+    /// Highest persisted row id for `session` (`RowId(0)` when empty).
+    /// Used as a rollback marker: rows appended after this id can be
+    /// discarded by [`rollback`](Self::rollback). Default returns
+    /// `RowId(0)` for stores that don't support truncation (test mocks).
+    async fn checkpoint(&self, _session: ChatSessionId) -> Result<RowId, HistoryError> {
+        Ok(RowId(0))
+    }
+
+    /// Delete every persisted message for `session` whose row id is
+    /// greater than `to` (the marker from [`checkpoint`](Self::checkpoint)).
+    /// Removes both primitive rows and forged-history rows in one pass.
+    /// Default is a no-op for stores that don't support truncation.
+    async fn rollback(&self, _session: ChatSessionId, _to: RowId) -> Result<(), HistoryError> {
+        Ok(())
+    }
+
     async fn append_primitive(
         &self,
         session: ChatSessionId,

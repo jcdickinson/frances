@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use frances_models_llm::chat::{
-    ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryError, ModelIntents,
-    OwnedHistoryInput,
+    ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryError,
+    ModelIntents, OwnedHistoryInput,
 };
 use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
 use parking_lot::Mutex;
@@ -238,6 +238,46 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         }
 
         Ok(completion)
+    }
+
+    async fn checkpoint(&self) -> Result<ChatCheckpoint, ChatError> {
+        let pending_len = self.inner.pending.lock().len();
+        // Mint the row eagerly for non-ephemeral sessions so the marker
+        // is valid even if the first `run` (which would otherwise mint
+        // it) lands between this checkpoint and a rollback.
+        let persisted = match self.ensure_row().await? {
+            Some(id) => Some(
+                self.inner
+                    .manager
+                    .deps()
+                    .history_store()
+                    .checkpoint(id)
+                    .await?,
+            ),
+            None => None,
+        };
+        Ok(ChatCheckpoint {
+            persisted,
+            pending_len,
+        })
+    }
+
+    async fn rollback(&self, checkpoint: ChatCheckpoint) -> Result<(), ChatError> {
+        {
+            let mut pending = self.inner.pending.lock();
+            if checkpoint.pending_len < pending.len() {
+                pending.truncate(checkpoint.pending_len);
+            }
+        }
+        if let (Some(id), Some(to)) = (self.id(), checkpoint.persisted) {
+            self.inner
+                .manager
+                .deps()
+                .history_store()
+                .rollback(id, to)
+                .await?;
+        }
+        Ok(())
     }
 }
 
