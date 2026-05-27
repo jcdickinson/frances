@@ -18,7 +18,8 @@
 //
 // Type `quit` to exit.
 
-import { inbox } from "frances:v1/inbox";
+import { inbox, INTERRUPT } from "frances:v1/inbox";
+import { AbortController } from "whatwg:abortcontroller";
 import {
   transcript,
   MarkdownFrame,
@@ -713,18 +714,60 @@ async function handlePendingCompletion(): Promise<boolean> {
   return true;
 }
 
-async function runAgentUntilIdle(): Promise<void> {
+// Single outstanding `inbox.next()`. NEVER create a second one: a
+// leaked promise keeps its Rust future alive and would consume-and-drop
+// a real input. `turn()` races *this same promise*; `ourLoop()` is the
+// only place that consumes it and re-arms.
+let pending = inbox.next();
+
+// Why the turn ended. `idle` = the model stopped calling tools (done
+// for now); `interjected` = a new inbox item arrived mid-turn and is
+// sitting in `pending` for `ourLoop` to handle next.
+type TurnEnd = "idle" | "interjected";
+
+// Drive the agentic loop for one user turn, racing each model round
+// against the live inbox so the user can interrupt or interject
+// mid-stream. On a mid-round inbox event we abort the in-flight stream
+// and roll chat history back to a clean boundary (dropping the partial
+// assistant turn + any orphaned tool_calls — keeping the OpenAI
+// contract that tool_calls are immediately answered).
+async function turn(): Promise<TurnEnd> {
   let resetCount = 0;
   while (true) {
-    const r = await chat.stream({ maxToolCalls: 8 });
+    const cp = await chat.checkpoint();
+    const ac = new AbortController();
+    const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
     // Push the `frances:` frame eagerly with no content — the TUI tracks
-    // the id but defers measure / render, and the daemon skips persistence,
-    // until the first text delta materialises the block. A tool_call-only
-    // round therefore leaves no empty `frances:` row in the transcript.
+    // the id but defers measure / render, and the daemon skips
+    // persistence, until the first text delta materialises the block.
     const out = new MarkdownFrame({ sender: "frances" });
     transcript.push(out);
-    await pipeAssistantTextToFrame(r.text, out);
-    const { tool_calls } = await r.completed;
+
+    const round = (async () => {
+      await pipeAssistantTextToFrame(r.text, out);
+      return await r.completed;
+    })();
+
+    const winner = await Promise.race([
+      round.then((completed) => ({ kind: "round" as const, completed })),
+      pending.then(() => ({ kind: "inbox" as const })),
+    ]);
+
+    if (winner.kind === "inbox") {
+      // Interrupt or interjection arrived mid-round. Abort the stream,
+      // wait for it to settle, then roll history back to the clean
+      // checkpoint. `pending` is left for `ourLoop` to consume.
+      ac.abort(new Error("interrupted"));
+      try {
+        await round;
+      } catch (_) {
+        // Expected: the aborted stream rejects with the abort reason.
+      }
+      await chat.rollback(cp);
+      return "interjected";
+    }
+
+    const { tool_calls } = winner.completed;
     if (pendingCompletion) {
       const reset = await handlePendingCompletion();
       if (reset) {
@@ -743,6 +786,11 @@ async function runAgentUntilIdle(): Promise<void> {
     }
     if (!tool_calls || tool_calls.length === 0) break;
   }
+  // Turn boundary: reconcile accumulated file edits (clears anchor
+  // tombstones). The workflow owns this now — the host no longer fires
+  // it per prompt.
+  await editor.commit();
+  return "idle";
 }
 
 transcript.push(
@@ -752,9 +800,24 @@ transcript.push(
   }),
 );
 
-try {
-  for await (const input of inbox) {
-    const msg = input.content.trim();
+// Top-level loop. `pending` is always exactly one outstanding inbox
+// read; we await it, immediately re-arm, then act. `turn()` may also
+// observe `pending` resolving (mid-turn) — that's fine, multiple awaits
+// on one promise are safe; only this loop ever re-issues `inbox.next()`.
+async function ourLoop(): Promise<void> {
+  while (true) {
+    const { value, done } = await pending;
+    pending = inbox.next();
+    if (done) break;
+
+    if (value === INTERRUPT) {
+      // At the top level there's nothing running to interrupt — the
+      // current turn (if any) already aborted itself before handing
+      // control back. Just wait for the next input.
+      continue;
+    }
+
+    const msg = value.content.trim();
     transcript.push(
       new MarkdownFrame({ content: msg, sender: "you", closed: true }),
     );
@@ -769,11 +832,15 @@ try {
 
     chat.push({ role: "user", content: msg });
     try {
-      await runAgentUntilIdle();
+      await turn();
     } catch (e) {
       transcript.push(new ErrorFrame({ content: `chat failed: \`${e}\`` }));
     }
   }
+}
+
+try {
+  await ourLoop();
 } finally {
   await sh.close();
 }
