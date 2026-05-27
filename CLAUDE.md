@@ -33,6 +33,14 @@ Read these before changing the relevant area:
 - [`docs/arch/edit-engine.md`](docs/arch/edit-engine.md) — how `frances-edit` and `frances-anchors` are wired into the binary.
 - [`docs/arch/anchors.md`](docs/arch/anchors.md) — full anchor system design (line anchors, reconciliation, word pool, edit tool flow).
 
+## Planning docs
+
+In-progress plans live in `docs/plan/` — **untracked scratch** (it's in
+`.gitignore`) that gets emptied as each item lands on `main`. When iterating on
+a plan that already exists there, **edit the existing file in place** rather
+than spawning new ones; only add or replace a file when the plan genuinely
+changes shape. (Same scratch convention `docs/newui/` used.)
+
 ## Common commands
 
 ```bash

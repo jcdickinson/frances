@@ -73,17 +73,39 @@ pub enum StreamFrame {
     /// Runtime is asking the user for permission; client responds via
     /// [`crate::runtime::SessionRuntime::respond_permission`].
     Permission(PermissionRequest),
-    /// Replay opener for the currently-active workflow's scrollback.
-    /// The TUI clears its in-memory scrollback container, enters replay
-    /// mode, and routes the subsequent block / error frames straight
-    /// into the alt-screen inspector's committed deque. Live drawing
-    /// to the live viewport is skipped until
-    /// [`StreamFrame::ScrollbackReplayEnd`].
-    ScrollbackReset {
-        instance_id: Uuid,
+    /// A frame of the scrollback-replay sub-protocol. A burst is
+    /// bracketed by [`ScrollbackFrame::Reset`] / [`ScrollbackFrame::End`]
+    /// and carries its own block frames — a closed, bounded set distinct
+    /// from the live variants above, so the TUI's replay handler never
+    /// has to reason about live-only frames.
+    Scrollback(ScrollbackFrame),
+}
+
+/// The scrollback-replay sub-protocol: exactly the frames a replay burst
+/// emits, in their own type so consumers match a small, real set with no
+/// defensive arms. Produced by [`crate::scrollback::replay_to_channel`] /
+/// [`crate::scrollback::replay_frames`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ScrollbackFrame {
+    /// Burst opener: the TUI clears its in-memory scrollback container
+    /// and replays `instance_id`'s persisted history into the alt-screen
+    /// inspector's committed deque.
+    Reset { instance_id: Uuid },
+    /// A persisted block's content (same shape as a live `BlockDelta`).
+    Block {
+        id: BlockId,
+        kind: BlockKind,
+        text: Option<String>,
     },
-    /// Replay closer. The TUI returns to normal live-mode handling.
-    ScrollbackReplayEnd,
+    /// Clean end of a persisted block.
+    BlockStop { id: BlockId },
+    /// Truncated end — the block was in-flight when its workflow was
+    /// dehydrated and never received a clean stop.
+    BlockTruncated { id: BlockId },
+    /// A persisted error row.
+    Error(String),
+    /// Burst closer: the TUI returns to live-mode handling.
+    End,
 }
 
 /// Distinguishing tag for a block. Fields are [`Arc<str>`] so that

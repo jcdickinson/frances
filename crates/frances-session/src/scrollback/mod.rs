@@ -20,22 +20,23 @@
 //! ## Reads
 //!
 //! [`replay_to_channel`] queries every row for the given workflow
-//! instance in `id` order and emits a synthetic frame burst on the
-//! supplied unix stream:
+//! instance in `id` order and emits a [`ScrollbackFrame`] burst (each
+//! wrapped in [`StreamFrame::Scrollback`]) on the supplied channel:
 //!
-//! 1. [`StreamFrame::ScrollbackReset`] — TUI clears its in-memory
-//!    scrollback and enters replay mode.
-//! 2. For each row: a single self-describing `BlockDelta { id, kind,
-//!    text }` (the first delta with an unseen id implicitly opens the
-//!    block) followed by `BlockStop` or `BlockTruncated`. Error rows
-//!    emit a single `Error` frame.
-//! 3. [`StreamFrame::ScrollbackReplayEnd`] — TUI returns to live mode.
+//! 1. [`ScrollbackFrame::Reset`] — TUI clears its in-memory scrollback
+//!    and begins the burst.
+//! 2. For each row: a single self-describing [`ScrollbackFrame::Block`]
+//!    `{ id, kind, text }` (the first frame with an unseen id implicitly
+//!    opens the block) followed by [`ScrollbackFrame::BlockStop`] or
+//!    [`ScrollbackFrame::BlockTruncated`]. Error rows emit a single
+//!    [`ScrollbackFrame::Error`].
+//! 3. [`ScrollbackFrame::End`] — TUI returns to live mode.
 //!
 //! The replay uses its own block-id allocator (independent of
 //! `EmitState`'s) — collisions across the boundary are harmless because
 //! each replayed block opens and closes within the replay before the
 //! next one starts, so the TUI's `BlockState` is `Idle` at
-//! `ScrollbackReplayEnd`. And committed blocks have no ids at all
+//! [`ScrollbackFrame::End`]. And committed blocks have no ids at all
 //! (`crates/frances-tui/src/scrollback_container.rs`'s `committed`
 //! field stores bare trait objects), so live frames after the replay
 //! collide with nothing in scrollback either.
@@ -52,7 +53,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, StreamFrame};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
@@ -235,8 +236,7 @@ pub async fn load_for_instance(
 }
 
 /// Replay every stored row for `instance` into `events`, bracketed by
-/// [`StreamFrame::ScrollbackReset`] and
-/// [`StreamFrame::ScrollbackReplayEnd`].
+/// [`ScrollbackFrame::Reset`] and [`ScrollbackFrame::End`].
 pub async fn replay_to_channel(
     events: &EventsChannel,
     db: &Database,
@@ -246,14 +246,14 @@ pub async fn replay_to_channel(
         .await
         .map_err(crate::Error::Scrollback)?;
 
-    events.send(StreamFrame::ScrollbackReset {
+    events.send(StreamFrame::Scrollback(ScrollbackFrame::Reset {
         instance_id: instance,
-    });
+    }));
 
     // Local id allocator. Replayed block ids are independent of
     // `EmitState::next_block` — each replayed block opens and closes
     // inside the replay window before the next one starts, so the
-    // TUI's `BlockState` is `Idle` at `ScrollbackReplayEnd` and live
+    // TUI's `BlockState` is `Idle` at `ScrollbackFrame::End` and live
     // frames after replay collide with nothing.
     let mut next_id: u64 = 1;
     for row in rows {
@@ -265,30 +265,29 @@ pub async fn replay_to_channel(
             } => {
                 let id = BlockId(next_id);
                 next_id += 1;
-                // The first (and only) delta carries the kind — the
-                // TUI opens the block on the first delta for an unseen
-                // id. Stored rows always have a body (unmaterialised
-                // blocks are never persisted), so we always send
-                // `text: Some(_)` and the block materialises on the
-                // client.
-                events.send(StreamFrame::BlockDelta {
+                // Stored rows always have a body (unmaterialised blocks
+                // are never persisted), so we always send `text: Some(_)`
+                // and the block materialises on the client.
+                events.send(StreamFrame::Scrollback(ScrollbackFrame::Block {
                     id,
                     kind,
                     text: Some(text),
-                });
+                }));
                 if truncated {
-                    events.send(StreamFrame::BlockTruncated { id });
+                    events.send(StreamFrame::Scrollback(ScrollbackFrame::BlockTruncated {
+                        id,
+                    }));
                 } else {
-                    events.send(StreamFrame::BlockStop { id });
+                    events.send(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { id }));
                 }
             }
             StoredRow::Error { text } => {
-                events.send(StreamFrame::Error(text));
+                events.send(StreamFrame::Scrollback(ScrollbackFrame::Error(text)));
             }
         }
     }
 
-    events.send(StreamFrame::ScrollbackReplayEnd);
+    events.send(StreamFrame::Scrollback(ScrollbackFrame::End));
     Ok(())
 }
 
@@ -301,9 +300,9 @@ pub async fn replay_frames(
 ) -> std::result::Result<Vec<StreamFrame>, ScrollbackError> {
     let rows = load_for_instance(db, instance).await?;
     let mut out = Vec::with_capacity(rows.len() * 2 + 2);
-    out.push(StreamFrame::ScrollbackReset {
+    out.push(StreamFrame::Scrollback(ScrollbackFrame::Reset {
         instance_id: instance,
-    });
+    }));
     let mut next_id: u64 = 1;
     for row in rows {
         match row {
@@ -314,23 +313,25 @@ pub async fn replay_frames(
             } => {
                 let id = BlockId(next_id);
                 next_id += 1;
-                out.push(StreamFrame::BlockDelta {
+                out.push(StreamFrame::Scrollback(ScrollbackFrame::Block {
                     id,
                     kind,
                     text: Some(text),
-                });
+                }));
                 if truncated {
-                    out.push(StreamFrame::BlockTruncated { id });
+                    out.push(StreamFrame::Scrollback(ScrollbackFrame::BlockTruncated {
+                        id,
+                    }));
                 } else {
-                    out.push(StreamFrame::BlockStop { id });
+                    out.push(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { id }));
                 }
             }
             StoredRow::Error { text } => {
-                out.push(StreamFrame::Error(text));
+                out.push(StreamFrame::Scrollback(ScrollbackFrame::Error(text)));
             }
         }
     }
-    out.push(StreamFrame::ScrollbackReplayEnd);
+    out.push(StreamFrame::Scrollback(ScrollbackFrame::End));
     Ok(out)
 }
 
@@ -649,43 +650,52 @@ mod tests {
         .unwrap();
 
         let frames = replay_frames(&db, instance).await.unwrap();
-        // Reset + (Delta+Stop) + Error + (Delta+Truncated) + End
+        // Reset + (Block+Stop) + Error + (Block+Truncated) + End
         assert_eq!(frames.len(), 1 + 2 + 1 + 2 + 1);
         assert!(matches!(
             frames.first(),
-            Some(StreamFrame::ScrollbackReset { .. })
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Reset { .. }))
         ));
         assert!(matches!(
             frames.last(),
-            Some(StreamFrame::ScrollbackReplayEnd)
+            Some(StreamFrame::Scrollback(ScrollbackFrame::End))
         ));
-        // Each block row produces exactly one self-describing delta
-        // (kind + full text in one frame) followed by stop / truncated.
+        // Each block row produces exactly one self-describing block
+        // frame (kind + full text in one frame) followed by stop /
+        // truncated.
         assert!(matches!(
             frames.get(1),
-            Some(StreamFrame::BlockDelta {
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Block {
                 kind: BlockKind::Text { sender: Some(_) },
                 ..
-            }),
+            })),
         ));
-        assert!(matches!(frames.get(2), Some(StreamFrame::BlockStop { .. })));
-        assert!(matches!(frames.get(3), Some(StreamFrame::Error(_))));
+        assert!(matches!(
+            frames.get(2),
+            Some(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { .. }))
+        ));
+        assert!(matches!(
+            frames.get(3),
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Error(_)))
+        ));
         assert!(matches!(
             frames.get(4),
-            Some(StreamFrame::BlockDelta {
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Block {
                 kind: BlockKind::ToolUse { .. },
                 ..
-            }),
+            })),
         ));
         assert!(matches!(
             frames.get(5),
-            Some(StreamFrame::BlockTruncated { .. }),
+            Some(StreamFrame::Scrollback(
+                ScrollbackFrame::BlockTruncated { .. }
+            )),
         ));
     }
 
     /// A single stored block produces exactly:
-    /// `[ScrollbackReset, BlockDelta { kind, text }, BlockStop, ScrollbackReplayEnd]`.
-    /// No extra frames slip in (no `BlockStart`).
+    /// `[Reset, Block { kind, text }, BlockStop, End]` (all wrapped in
+    /// `StreamFrame::Scrollback`). No extra frames slip in.
     #[tokio::test]
     async fn replay_frames_for_single_block_is_minimal() {
         let db = fresh_db().await;
@@ -706,27 +716,27 @@ mod tests {
         let frames = replay_frames(&db, instance).await.unwrap();
         assert_eq!(frames.len(), 4);
         match &frames[0] {
-            StreamFrame::ScrollbackReset { .. } => {}
-            other => panic!("expected ScrollbackReset at [0], got {other:?}"),
+            StreamFrame::Scrollback(ScrollbackFrame::Reset { .. }) => {}
+            other => panic!("expected Reset at [0], got {other:?}"),
         }
         match &frames[1] {
-            StreamFrame::BlockDelta {
+            StreamFrame::Scrollback(ScrollbackFrame::Block {
                 kind: BlockKind::ToolUse { name, .. },
                 text,
                 ..
-            } => {
+            }) => {
                 assert_eq!(&**name, "shell");
                 assert_eq!(text.as_deref(), Some("ls /"));
             }
-            other => panic!("expected BlockDelta with ToolUse kind at [1], got {other:?}"),
+            other => panic!("expected Block with ToolUse kind at [1], got {other:?}"),
         }
         match &frames[2] {
-            StreamFrame::BlockStop { .. } => {}
+            StreamFrame::Scrollback(ScrollbackFrame::BlockStop { .. }) => {}
             other => panic!("expected BlockStop at [2], got {other:?}"),
         }
         match &frames[3] {
-            StreamFrame::ScrollbackReplayEnd => {}
-            other => panic!("expected ScrollbackReplayEnd at [3], got {other:?}"),
+            StreamFrame::Scrollback(ScrollbackFrame::End) => {}
+            other => panic!("expected End at [3], got {other:?}"),
         }
     }
 }

@@ -21,7 +21,9 @@ use tokio::sync::mpsc;
 use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
-use frances_session::events::{BlockKind, PermissionRequest, PermissionResponseWire, StreamFrame};
+use frances_session::events::{
+    BlockKind, PermissionRequest, PermissionResponseWire, ScrollbackFrame, StreamFrame,
+};
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
@@ -221,7 +223,10 @@ impl App<'_> {
         // `Some(text)` → footer shows `{spinner} {text}`; `None` →
         // hidden. The host no longer infers this from token flow.
         let mut status: Option<String> = None;
-        let mut replay_mode = false;
+        // Accumulator for the in-flight replayed block during a
+        // scrollback burst (between `ScrollbackFrame::Reset` and `End`).
+        // `None` outside a burst.
+        let mut replay_open: Option<ReplayBlock> = None;
         let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -354,18 +359,16 @@ impl App<'_> {
                 }
                 Some(frame) = frame_rx.recv() => {
                     // The busy indicator is workflow-driven: a `Status`
-                    // frame sets or clears it. Replay bursts don't carry
-                    // live status, so they're ignored here.
-                    if !replay_mode
-                        && let StreamFrame::Status(s) = &frame
-                    {
+                    // frame sets or clears it. (Scrollback frames carry
+                    // no status — they're their own variant now.)
+                    if let StreamFrame::Status(s) = &frame {
                         status = s.clone();
                     }
                     if let Some(req) = handle_frame(
                         &mut terminal,
                         &mut container,
                         &mut state,
-                        &mut replay_mode,
+                        &mut replay_open,
                         frame,
                         &mut latest_usage,
                     )? {
@@ -451,7 +454,7 @@ fn redraw(
 /// Per-replay scratchpad: the same {id, kind, accumulated text}
 /// triple the runtime uses, mirrored on the TUI side. Carried in
 /// `App` state for the lifetime of one replay burst (between
-/// `ScrollbackReset` and `ScrollbackReplayEnd`).
+/// `ScrollbackFrame::Reset` and `ScrollbackFrame::End`).
 struct ReplayBlock {
     id: frances_session::events::BlockId,
     kind: BlockKind,
@@ -462,28 +465,13 @@ fn handle_frame(
     terminal: &mut AppTerminal,
     container: &mut ScrollbackContainer,
     state: &mut LiveBlocks,
-    replay_mode: &mut bool,
+    replay_open: &mut Option<ReplayBlock>,
     frame: StreamFrame,
     latest_usage: &mut Option<Usage>,
 ) -> Result<Option<PermissionRequest>> {
-    if *replay_mode {
-        return handle_replay_frame(terminal, container, replay_mode, frame);
-    }
     match frame {
-        StreamFrame::ScrollbackReset { .. } => {
-            // Drop any in-flight live block tracking, then clear the
-            // container — `clear()` force-spills current screen
-            // content into native scrollback so the user keeps their
-            // view in their terminal's history, and resets the
-            // in-memory deques so the alt-screen inspector only shows
-            // the new workflow's history.
-            state.discard();
-            container.clear(terminal)?;
-            *replay_mode = true;
-        }
-        StreamFrame::ScrollbackReplayEnd => {
-            // Defensive: replay end outside replay mode means a
-            // malformed bracket. Ignore.
+        StreamFrame::Scrollback(sf) => {
+            handle_replay_frame(terminal, container, state, replay_open, sf)?;
         }
         StreamFrame::BlockDelta { id, kind, text } => {
             state.delta(container, id, kind, text);
@@ -494,9 +482,8 @@ fn handle_frame(
             }
         }
         StreamFrame::BlockTruncated { id } => {
-            // Live wire shouldn't emit truncated stops — they only
-            // appear during replay. Recover the same way as a stop
-            // for an unknown id (warn + mark orphan safe).
+            // The live wire shouldn't emit truncated stops — recover the
+            // same way as a stop for an unknown id (warn + mark safe).
             if let Some(container_id) = state.stop_or_recover(id, "BlockTruncated") {
                 container.mark_safe(container_id);
             }
@@ -532,110 +519,69 @@ fn handle_frame(
     Ok(None)
 }
 
-/// Frame handling while inside a replay bracket. Replayed blocks are
-/// built up in a thread-local `ReplayBlock` accumulator and handed to
-/// the container's `push_committed` on stop — they never touch the
-/// live `active` deque.
+/// Apply one frame of a scrollback-replay burst. Replayed blocks are
+/// accumulated in `open` (one in flight at a time) and handed to the
+/// container's `push_committed[_truncated]` on stop — they never touch
+/// the live `active` deque. Matches the bounded [`ScrollbackFrame`] set
+/// exhaustively; no live-only frames reach here.
 fn handle_replay_frame(
     terminal: &mut AppTerminal,
     container: &mut ScrollbackContainer,
-    replay_mode: &mut bool,
-    frame: StreamFrame,
-) -> Result<Option<PermissionRequest>> {
-    // Thread-local accumulator: the replay burst is single-threaded
-    // per frame channel, so a `static mut` would do — but a refcell
-    // in the function scope is uglier than tracking the in-flight
-    // replay block via parameter wouldn't fit existing call sites.
-    // Use a small bespoke shape via `static`:
-    thread_local! {
-        static REPLAY_OPEN: std::cell::RefCell<Option<ReplayBlock>> =
-            const { std::cell::RefCell::new(None) };
-    }
+    state: &mut LiveBlocks,
+    open: &mut Option<ReplayBlock>,
+    frame: ScrollbackFrame,
+) -> Result<()> {
     match frame {
-        StreamFrame::ScrollbackReset { .. } => {
-            // Nested reset: rare, but treat as a fresh burst — clear
-            // any half-built replay block and reset the container.
-            REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
+        ScrollbackFrame::Reset { .. } => {
+            // Drop live block tracking, clear the container, and start a
+            // fresh burst. `clear()` force-spills current screen content
+            // into native scrollback so the user keeps their terminal
+            // history; the in-memory deques reset so the inspector shows
+            // only the replayed workflow.
+            state.discard();
             container.clear(terminal)?;
+            *open = None;
         }
-        StreamFrame::ScrollbackReplayEnd => {
-            // Any half-built block at end is just dropped; the runtime
-            // is expected to close every block it opens.
-            REPLAY_OPEN.with(|cell| cell.borrow_mut().take());
-            *replay_mode = false;
-        }
-        StreamFrame::BlockDelta { id, kind, text } => {
-            REPLAY_OPEN.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                match guard.as_mut() {
-                    Some(open) if open.id == id => {
-                        // Replay sends `text: Some(_)` for every stored
-                        // row; `None` here would mean an in-place
-                        // metadata transition replayed against an
-                        // existing open block (unused today, but cheap
-                        // to handle and keeps the kind in sync).
-                        open.kind = kind;
-                        if let Some(t) = text {
-                            open.text.push_str(&t);
-                        }
-                    }
-                    _ => {
-                        // Either nothing open, or a new id: drop any
-                        // orphan (the runtime is expected to close
-                        // every block it opens) and start fresh.
-                        *guard = Some(ReplayBlock {
-                            id,
-                            kind,
-                            text: text.unwrap_or_default(),
-                        });
-                    }
+        ScrollbackFrame::Block { id, kind, text } => match open.as_mut() {
+            Some(b) if b.id == id => {
+                b.kind = kind;
+                if let Some(t) = text {
+                    b.text.push_str(&t);
                 }
-            });
-        }
-        StreamFrame::BlockStop { id } => {
-            let finished = REPLAY_OPEN.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                match guard.take() {
-                    Some(open) if open.id == id => Some(open),
-                    other => {
-                        *guard = other;
-                        None
-                    }
-                }
-            });
-            if let Some(open) = finished {
-                container.push_committed(block_for_kind(open.kind, open.text));
+            }
+            // Nothing open, or a new id: drop any orphan (the producer
+            // closes every block it opens) and start fresh.
+            _ => {
+                *open = Some(ReplayBlock {
+                    id,
+                    kind,
+                    text: text.unwrap_or_default(),
+                });
+            }
+        },
+        ScrollbackFrame::BlockStop { id } => {
+            if let Some(b) = open.take_if(|b| b.id == id) {
+                container.push_committed(block_for_kind(b.kind, b.text));
             }
         }
-        StreamFrame::BlockTruncated { id } => {
-            let finished = REPLAY_OPEN.with(|cell| {
-                let mut guard = cell.borrow_mut();
-                match guard.take() {
-                    Some(open) if open.id == id => Some(open),
-                    other => {
-                        *guard = other;
-                        None
-                    }
-                }
-            });
-            if let Some(open) = finished {
-                container.push_committed_truncated(block_for_kind(open.kind, open.text));
+        ScrollbackFrame::BlockTruncated { id } => {
+            if let Some(b) = open.take_if(|b| b.id == id) {
+                container.push_committed_truncated(block_for_kind(b.kind, b.text));
             }
         }
-        StreamFrame::Error(message) => {
+        ScrollbackFrame::Error(message) => {
             container.push_committed(Box::new(RawBlock::single_styled(
                 format!("frances: error: {message}"),
                 Style::default().fg(Color::Red),
             )));
         }
-        // Usage / Status / Done / Permission are not part of the replay
-        // burst. Drop them if they sneak in.
-        StreamFrame::Usage(_)
-        | StreamFrame::Status(_)
-        | StreamFrame::Done
-        | StreamFrame::Permission(_) => {}
+        ScrollbackFrame::End => {
+            // Any half-built block at end is dropped; the producer
+            // closes every block it opens.
+            *open = None;
+        }
     }
-    Ok(None)
+    Ok(())
 }
 
 const PERMISSION_PLACEHOLDER: &str =

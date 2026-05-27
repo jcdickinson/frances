@@ -3,3 +3,4 @@ target/
 .claude/settings.local.json
 key.txt
 or.txt
+docs/plan/

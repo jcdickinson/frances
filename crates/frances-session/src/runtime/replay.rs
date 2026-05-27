@@ -5,7 +5,7 @@
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::StreamFrame;
+use crate::events::{ScrollbackFrame, StreamFrame};
 use crate::store::Database;
 
 use super::EventsChannel;
@@ -24,10 +24,10 @@ pub(super) async fn write_initial_replay(
     match active_instance {
         Some(instance) => crate::scrollback::replay_to_channel(events, db, instance).await,
         None => {
-            events.send(StreamFrame::ScrollbackReset {
+            events.send(StreamFrame::Scrollback(ScrollbackFrame::Reset {
                 instance_id: Uuid::nil(),
-            });
-            events.send(StreamFrame::ScrollbackReplayEnd);
+            }));
+            events.send(StreamFrame::Scrollback(ScrollbackFrame::End));
             Ok(())
         }
     }

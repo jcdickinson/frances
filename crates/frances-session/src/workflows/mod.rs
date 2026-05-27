@@ -46,7 +46,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, StreamFrame};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
@@ -1005,10 +1005,14 @@ async fn drop_active_and_promote(
         )
         .await?;
     } else {
-        runtime.events.send(StreamFrame::ScrollbackReset {
-            instance_id: Uuid::nil(),
-        });
-        runtime.events.send(StreamFrame::ScrollbackReplayEnd);
+        runtime
+            .events
+            .send(StreamFrame::Scrollback(ScrollbackFrame::Reset {
+                instance_id: Uuid::nil(),
+            }));
+        runtime
+            .events
+            .send(StreamFrame::Scrollback(ScrollbackFrame::End));
     }
     Ok(promoted)
 }
