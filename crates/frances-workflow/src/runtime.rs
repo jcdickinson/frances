@@ -45,11 +45,13 @@ use crate::transpile::{SourceKind, ts_to_js};
 /// `frances:v1/*` namespace so the two don't visually clash.
 const USER_MODULE_NAME: &str = "frances:user-script";
 
-/// Frames a workflow can emit during a turn. The host receiver maps
-/// these onto the wire `StreamFrame` protocol; this enum is the
-/// host-API contract, not the protocol itself.
+/// The transcript stream — ordered block-lifecycle deltas from the
+/// workflow body. One consumer (the driver's emit path); cross-variant
+/// order matters (a `Close` must follow its `Push`), so it's a union enum
+/// on its own channel. The host maps these onto the wire `StreamFrame`
+/// protocol; this enum is the host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
-pub enum HostFrame {
+pub enum TranscriptDelta {
     /// A new frame was pushed onto the transcript. Does NOT implicitly
     /// seal anything — each frame type chooses when it's done (markdown
     /// emits `Close` for its predecessor before its own `Push`; shell
@@ -68,26 +70,71 @@ pub enum HostFrame {
     /// and persists the row. Idempotent on unknown ids (the JS side
     /// suppresses double-close).
     Close { id: FrameId },
-    /// Ask the user for permission. The corresponding answer arrives
-    /// back through the `Permissions` gateway's response oneshot.
-    ///
-    /// `allow_auto` flags the gate as eligible for the host's
-    /// auto-approver. It rides on the host frame (not on the wire
-    /// `PermissionRequest`) so the runtime's emit loop can read it
-    /// without a side lookup, and so it never leaks to the TUI.
+}
+
+/// A permission ask emitted to the host. The answer arrives back through
+/// the `Permissions` gateway's response oneshot.
+///
+/// `allow_auto` flags the gate as eligible for the host's auto-approver.
+/// It rides here (not on the wire `PermissionRequest`) so the driver can
+/// read it without a side lookup, and so it never leaks to the TUI.
+#[derive(Debug, Clone)]
+pub struct PermissionAsk {
+    pub request: PermissionRequest,
+    pub allow_auto: bool,
+}
+
+/// The workflow's typed outputs: a bag of single-consumer channels. The
+/// driver selects over the ones it must drive; the rest flow to their own
+/// consumers. Asymmetric with the inbox (a union) on purpose — outputs are
+/// independent concerns with no cross-channel ordering constraint.
+pub struct WorkflowOutputs {
+    /// Block-lifecycle stream (persisted to scrollback by the driver).
+    pub transcript: UnboundedReceiver<TranscriptDelta>,
+    /// Chrome the workflow declares. `Some(text)` shows busy-indicator
+    /// text with a spinner in the TUI footer; `None` hides it. Set via
+    /// `setStatus` from `frances:v1/workflow`. Never persisted.
+    pub surfaces: UnboundedReceiver<Option<String>>,
+    /// Permission asks awaiting a user (or auto-approver) answer.
+    pub permissions: UnboundedReceiver<PermissionAsk>,
+    /// LLM token-usage telemetry. Side-channel; opens/closes no block and
+    /// is never persisted (the TUI drops it during replay).
+    pub usage: UnboundedReceiver<frances_models_llm::wire::Usage>,
+}
+
+/// Paired senders for [`WorkflowOutputs`], bundled so `V1HostState` stays
+/// readable. Cloned per emitter at install time.
+#[derive(Clone)]
+pub(crate) struct OutputSenders {
+    pub transcript: UnboundedSender<TranscriptDelta>,
+    pub surfaces: UnboundedSender<Option<String>>,
+    pub permissions: UnboundedSender<PermissionAsk>,
+    pub usage: UnboundedSender<frances_models_llm::wire::Usage>,
+}
+
+/// Merged view of [`WorkflowOutputs`] used only by the test harness, which
+/// wants a single ordered frame vec to assert against. Production consumes
+/// the typed channels directly.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug, Clone)]
+pub enum HostFrame {
+    Push(FramePush),
+    Append {
+        id: FrameId,
+        delta: String,
+    },
+    UpdateKind {
+        id: FrameId,
+        kind: FrameKind,
+    },
+    Close {
+        id: FrameId,
+    },
     Permission {
         request: PermissionRequest,
         allow_auto: bool,
     },
-    /// Token usage for the just-finished LLM turn. The runtime
-    /// translates this to `StreamFrame::Usage`; it opens / closes
-    /// no block and is not persisted (the TUI drops `Usage` during
-    /// replay, so persisting it would only re-render stale numbers).
     Usage(frances_models_llm::wire::Usage),
-    /// Workflow-set busy-indicator text. `Some(text)` shows the text
-    /// with a spinner in the TUI footer; `None` hides it. Set via
-    /// `setStatus` from `frances:v1/workflow`. Side-channel like
-    /// `Usage`: opens / closes no block and is never persisted.
     Status(Option<String>),
 }
 
@@ -230,14 +277,14 @@ pub struct Invocation {
 }
 
 /// Handle to a running workflow. The session runtime owns this; it delivers user
-/// input via [`Self::input_tx`], drains frames from [`Self::frames`],
+/// input via [`Self::input_tx`], drains the typed [`Self::outputs`] bag,
 /// and learns about termination through [`Self::done`].
 pub struct WorkflowHandle {
     /// Send user input (or an interrupt) to the workflow's `inbox`
     /// stream.
     pub input_tx: UnboundedSender<InboxItem>,
-    /// Frames the workflow emits.
-    pub frames: UnboundedReceiver<HostFrame>,
+    /// Typed output channels the workflow emits on.
+    pub outputs: WorkflowOutputs,
     /// Notified each time the body suspends on `inbox.next()` with an
     /// empty queue — i.e. it's parked waiting for input. The continuous
     /// driver doesn't consult this (it completes when the event loop
@@ -394,14 +441,22 @@ async fn start_impl<D: WorkflowDeps>(
         .await?;
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
-    let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
+    let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptDelta>();
+    let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<Option<String>>();
+    let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionAsk>();
+    let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::wire::Usage>();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
     let shutdown_notify = Arc::new(Notify::new());
     #[cfg(any(test, feature = "test-utils"))]
     let on_idle = Arc::new(Notify::new());
 
     let host = modules::V1HostState {
-        frames_tx,
+        senders: OutputSenders {
+            transcript: transcript_tx,
+            surfaces: surfaces_tx,
+            permissions: permissions_tx,
+            usage: usage_tx,
+        },
         input_rx: Arc::new(AsyncMutex::new(input_rx)),
         closed: Arc::new(AtomicBool::new(false)),
         closed_notify: Arc::new(Notify::new()),
@@ -425,7 +480,12 @@ async fn start_impl<D: WorkflowDeps>(
 
     Ok(WorkflowHandle {
         input_tx,
-        frames: frames_rx,
+        outputs: WorkflowOutputs {
+            transcript: transcript_rx,
+            surfaces: surfaces_rx,
+            permissions: permissions_rx,
+            usage: usage_rx,
+        },
         #[cfg(any(test, feature = "test-utils"))]
         on_idle,
         done: done_rx,
@@ -625,7 +685,42 @@ pub mod test_drive {
     //! Shared workflow-driving helper for this crate's unit tests and the
     //! `tests/` integration suites. Drives a body until it parks on
     //! `inbox.next()` or terminates, collecting the frames it emits.
-    use super::{HostFrame, WorkflowError, WorkflowHandle};
+    use super::{HostFrame, PermissionAsk, TranscriptDelta, WorkflowError, WorkflowHandle};
+
+    /// Map a single transcript delta onto the merged test-view enum.
+    fn transcript_to_host(delta: TranscriptDelta) -> HostFrame {
+        match delta {
+            TranscriptDelta::Push(p) => HostFrame::Push(p),
+            TranscriptDelta::Append { id, delta } => HostFrame::Append { id, delta },
+            TranscriptDelta::UpdateKind { id, kind } => HostFrame::UpdateKind { id, kind },
+            TranscriptDelta::Close { id } => HostFrame::Close { id },
+        }
+    }
+
+    fn permission_to_host(ask: PermissionAsk) -> HostFrame {
+        HostFrame::Permission {
+            request: ask.request,
+            allow_auto: ask.allow_auto,
+        }
+    }
+
+    /// Drain every output channel into `out`, transcript first so its
+    /// internal ordering is preserved. Cross-channel order is best-effort
+    /// (separate channels), which the assertions don't depend on.
+    fn drain_outputs(handle: &mut WorkflowHandle, out: &mut Vec<HostFrame>) {
+        while let Ok(delta) = handle.outputs.transcript.try_recv() {
+            out.push(transcript_to_host(delta));
+        }
+        while let Ok(ask) = handle.outputs.permissions.try_recv() {
+            out.push(permission_to_host(ask));
+        }
+        while let Ok(status) = handle.outputs.surfaces.try_recv() {
+            out.push(HostFrame::Status(status));
+        }
+        while let Ok(usage) = handle.outputs.usage.try_recv() {
+            out.push(HostFrame::Usage(usage));
+        }
+    }
 
     /// Hard ceiling on how long an individual cycle is allowed to run.
     /// Real workflow turns are interactive (a body can wait for input
@@ -669,23 +764,20 @@ pub mod test_drive {
     ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
         let mut out = Vec::new();
         loop {
-            while let Ok(frame) = handle.frames.try_recv() {
-                out.push(frame);
-            }
+            drain_outputs(handle, &mut out);
             tokio::select! {
                 biased;
-                Some(frame) = handle.frames.recv() => out.push(frame),
+                Some(delta) = handle.outputs.transcript.recv() => out.push(transcript_to_host(delta)),
+                Some(ask) = handle.outputs.permissions.recv() => out.push(permission_to_host(ask)),
+                Some(status) = handle.outputs.surfaces.recv() => out.push(HostFrame::Status(status)),
+                Some(usage) = handle.outputs.usage.recv() => out.push(HostFrame::Usage(usage)),
                 done = &mut handle.done => {
                     let result = done.unwrap_or(Ok(()));
-                    while let Ok(frame) = handle.frames.try_recv() {
-                        out.push(frame);
-                    }
+                    drain_outputs(handle, &mut out);
                     return (out, Some(result));
                 }
                 () = handle.on_idle.notified() => {
-                    while let Ok(frame) = handle.frames.try_recv() {
-                        out.push(frame);
-                    }
+                    drain_outputs(handle, &mut out);
                     return (out, None);
                 }
             }
@@ -5406,12 +5498,8 @@ mod tests {
 
         let (req, allow_auto) = tokio::time::timeout(CYCLE_TIMEOUT, async {
             loop {
-                if let Some(HostFrame::Permission {
-                    request,
-                    allow_auto,
-                }) = handle.frames.recv().await
-                {
-                    return (request, allow_auto);
+                if let Some(ask) = handle.outputs.permissions.recv().await {
+                    return (ask.request, ask.allow_auto);
                 }
             }
         })
@@ -5436,15 +5524,15 @@ mod tests {
             .expect("done channel closed without value");
         assert!(matches!(result, Ok(())), "got {result:?}");
 
-        let mut frames = Vec::new();
-        while let Ok(f) = handle.frames.try_recv() {
-            frames.push(f);
+        let mut deltas = Vec::new();
+        while let Ok(d) = handle.outputs.transcript.try_recv() {
+            deltas.push(d);
         }
-        let last = frames
+        let last = deltas
             .iter()
             .rev()
-            .find_map(|f| match f {
-                HostFrame::Push(p) => Some(p),
+            .find_map(|d| match d {
+                TranscriptDelta::Push(p) => Some(p),
                 _ => None,
             })
             .expect("expected a markdown push after approval");

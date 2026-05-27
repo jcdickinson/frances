@@ -403,22 +403,17 @@ async fn shell_capture_unset_var_errors() {
     );
 }
 
-/// Drain frames until an approval request lands, return its request and
-/// any frames seen along the way. Panics on timeout.
-async fn await_approval(handle: &mut WorkflowHandle) -> (PermissionRequest, Vec<HostFrame>) {
-    let mut buffered = Vec::new();
-    let approval = tokio::time::timeout(CYCLE_TIMEOUT, async {
-        loop {
-            match handle.frames.recv().await {
-                Some(HostFrame::Permission { request, .. }) => return request,
-                Some(other) => buffered.push(other),
-                None => panic!("frames channel closed before permission request landed"),
-            }
+/// Wait until an approval request lands on the permissions channel.
+/// Panics on timeout.
+async fn await_approval(handle: &mut WorkflowHandle) -> PermissionRequest {
+    tokio::time::timeout(CYCLE_TIMEOUT, async {
+        match handle.outputs.permissions.recv().await {
+            Some(ask) => ask.request,
+            None => panic!("permissions channel closed before a request landed"),
         }
     })
     .await
-    .expect("permission request did not arrive within timeout");
-    (approval, buffered)
+    .expect("permission request did not arrive within timeout")
 }
 
 #[tokio::test]
@@ -453,7 +448,7 @@ async fn shell_run_approve_yes_executes_command() {
         .await
         .unwrap();
 
-    let (req, _seen) = await_approval(&mut handle).await;
+    let req = await_approval(&mut handle).await;
     assert!(
         req.prompt.contains("echo approved-and-ran"),
         "prompt should contain the command: {}",
@@ -519,7 +514,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
         .await
         .unwrap();
 
-    let (req, _seen) = await_approval(&mut handle).await;
+    let req = await_approval(&mut handle).await;
     assert!(req.prompt.contains("rm -rf /"));
 
     assert!(deps.answer_approval(

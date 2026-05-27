@@ -20,8 +20,6 @@ use rquickjs::{Ctx, Function, Result as JsResult};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::HostFrame;
-
 pub(crate) fn build_exit<'js>(
     ctx: &Ctx<'js>,
     shutdown_notify: Arc<Notify>,
@@ -38,11 +36,11 @@ pub(crate) fn build_exit<'js>(
 /// session is winding down.
 pub(crate) fn build_set_status<'js>(
     ctx: &Ctx<'js>,
-    frames_tx: UnboundedSender<HostFrame>,
+    surfaces_tx: UnboundedSender<Option<String>>,
 ) -> JsResult<Function<'js>> {
     Function::new(ctx.clone(), move |text: Opt<Option<String>>| {
         let status = text.0.flatten();
-        let _ = frames_tx.send(HostFrame::Status(status));
+        let _ = surfaces_tx.send(status);
         Ok::<_, rquickjs::Error>(())
     })
 }

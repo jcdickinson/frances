@@ -31,11 +31,11 @@ pub use permission::{
     PermissionId, PermissionRequest, PermissionResponse, PermissionResponseWire, Permissions,
 };
 pub use runtime::{
-    FrameId, FrameKind, FramePush, HostFrame, InboxItem, Invocation, Runtime, ShellState,
-    UserInput, WorkflowHandle,
+    FrameId, FrameKind, FramePush, InboxItem, Invocation, PermissionAsk, Runtime, ShellState,
+    TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use runtime::{test_deps, test_drive};
+pub use runtime::{HostFrame, test_deps, test_drive};

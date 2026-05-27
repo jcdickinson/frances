@@ -79,9 +79,9 @@ pub trait Permissions: Clone + Send + Sync + 'static {
     /// caller emits the returned `PermissionRequest` to the host and
     /// awaits the receiver.
     ///
-    /// `allow_auto` is not handled here — it rides on the
-    /// `HostFrame::Permission` variant the caller emits, since only
-    /// the host frame's consumer (the runtime's emit loop) reads it.
+    /// `allow_auto` is not handled here — it rides on the `PermissionAsk`
+    /// the caller emits, since only the driver (which reads the
+    /// permissions channel) consults it.
     fn allocate(
         &self,
         prompt: String,

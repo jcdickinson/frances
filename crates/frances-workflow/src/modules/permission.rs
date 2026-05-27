@@ -16,8 +16,8 @@
 //!
 //! Rust does the work behind a single primitive `_approve(options)` on
 //! the install stash: parse the options object, allocate a
-//! `PermissionId` via the gateway, emit a `HostFrame::Permission(req)`
-//! so the runtime can forward it to the TUI, then await the gateway's
+//! `PermissionId` via the gateway, send a `PermissionAsk` on the
+//! permissions channel so the runtime can forward it to the TUI, then await the gateway's
 //! response oneshot. If the workflow shuts down first, the await
 //! resolves to a synthetic `No { details: None }` so the JS body can
 //! unwind cleanly without throwing.
@@ -34,16 +34,16 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::deps::WorkflowDeps;
 use crate::permission::{PermissionResponse, Permissions};
-use crate::runtime::HostFrame;
+use crate::runtime::PermissionAsk;
 
 /// Build the `_approve` primitive that `frances:v1/approval` re-wraps.
-/// Captures the gateway from deps, the frames channel, and the workflow
-/// `closed` signal so a graceful shutdown surfaces as a benign result
-/// instead of a hung promise.
+/// Captures the gateway from deps, the permissions channel, and the
+/// workflow `closed` signal so a graceful shutdown surfaces as a benign
+/// result instead of a hung promise.
 pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
-    frames_tx: UnboundedSender<HostFrame>,
+    permissions_tx: UnboundedSender<PermissionAsk>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
 ) -> JsResult<Function<'js>> {
@@ -64,11 +64,11 @@ pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
             // loop), so a closed channel here means the host is gone
             // and there's nothing to do but resolve the promise.
             //
-            // `allow_auto` rides on the host frame, not on the wire
-            // `PermissionRequest` — the runtime's emit loop reads it
-            // and either consults the auto-judge or forwards to the
-            // TUI; the TUI never sees the flag.
-            let _ = frames_tx.send(HostFrame::Permission {
+            // `allow_auto` rides on the `PermissionAsk`, not on the wire
+            // `PermissionRequest` — the driver reads it and either
+            // consults the auto-judge or forwards to the TUI; the TUI
+            // never sees the flag.
+            let _ = permissions_tx.send(PermissionAsk {
                 request,
                 allow_auto,
             });

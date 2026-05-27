@@ -41,8 +41,8 @@
 //! - `frances:v1/approval`       — single async
 //!   `approve({ prompt, toolCall?, allowAuto? })` that asks the user
 //!   for permission. Backed by a private `_approve` primitive on the
-//!   install stash; the host bridges via `HostFrame::Permission` +
-//!   the `Permissions` trait.
+//!   install stash; the host bridges via the permissions channel
+//!   (`PermissionAsk`) + the `Permissions` trait.
 //! - `frances:v1/storage`        — `db` singleton with
 //!   `exec`/`query`/`queryStream`/`transaction`. Backed by a workflow's
 //!   per-entity migrations declared in `[workflows.<id>].migrations`.
@@ -69,12 +69,12 @@ use std::sync::atomic::AtomicBool;
 
 use rquickjs::module::Module;
 use rquickjs::{CatchResultExt, Ctx, Object, Value};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
-use crate::runtime::{HostFrame, InboxItem, caught};
+use crate::runtime::{InboxItem, OutputSenders, caught};
 
 pub mod chat;
 pub mod file;
@@ -98,7 +98,7 @@ const STASH_KEY: &str = "__frances_v1_stash__";
 /// capture. Bundled into a single struct so the install call site
 /// stays readable.
 pub(crate) struct V1HostState<D: WorkflowDeps> {
-    pub frames_tx: UnboundedSender<HostFrame>,
+    pub senders: OutputSenders,
     pub input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     pub closed: Arc<AtomicBool>,
     pub closed_notify: Arc<Notify>,
@@ -129,7 +129,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     // doesn't allow `#[cfg]` on a destructure-pattern field) via `..`,
     // then pull `on_idle` out by field access under the same cfg.
     let V1HostState {
-        frames_tx,
+        senders,
         input_rx,
         closed,
         closed_notify,
@@ -142,17 +142,17 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let on_idle = host.on_idle;
 
     // Clones for the approval primitive — it owns the gateway and a
-    // sender into the frames channel so JS `approve()` can emit a
+    // sender into the permissions channel so JS `approve()` can emit a
     // request without going through `transcript`.
     let approval_deps = deps.clone();
-    let approval_frames_tx = frames_tx.clone();
+    let approval_permissions_tx = senders.permissions.clone();
 
     let stash = Object::new(ctx.clone())?;
 
     let exit_fn = workflow::build_exit(ctx, shutdown_notify.clone())?;
     stash.set("exit", exit_fn)?;
 
-    let set_status_fn = workflow::build_set_status(ctx, frames_tx.clone())?;
+    let set_status_fn = workflow::build_set_status(ctx, senders.surfaces.clone())?;
     stash.set("setStatus", set_status_fn)?;
 
     // The lifecycle hook is invoked by the runtime on shutdown (it reads
@@ -181,7 +181,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         shell_output_ctor,
         tool_use_ctor,
         diff_ctor,
-    ) = frames::build_frames(ctx, frames_tx.clone())?;
+    ) = frames::build_frames(ctx, senders.transcript.clone())?;
     stash.set("transcript", transcript_proxy)?;
     stash.set("MarkdownFrame", md_ctor)?;
     stash.set("ErrorFrame", err_ctor)?;
@@ -191,7 +191,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("DiffFrame", diff_ctor)?;
 
     let (chat_ctor, chat_inner_stream) =
-        chat::build_chat_session_ctor(ctx, deps.clone(), frames_tx.clone())?;
+        chat::build_chat_session_ctor(ctx, deps.clone(), senders.usage.clone())?;
     stash.set("ChatSession", chat_ctor)?;
     stash.set("__chat_inner_stream", chat_inner_stream)?;
 
@@ -233,7 +233,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let approve_fn = permission::build_approve_primitive(
         ctx,
         approval_deps,
-        approval_frames_tx,
+        approval_permissions_tx,
         closed,
         closed_notify,
     )?;

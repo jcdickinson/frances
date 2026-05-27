@@ -10,7 +10,7 @@
 //! Each writeable frame exposes:
 //!   - `frame.write(text)` — append, throws if `closed`.
 //!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
-//!   - `frame.close()` — emit [`HostFrame::Close`], flip `closed`,
+//!   - `frame.close()` — emit [`TranscriptDelta::Close`], flip `closed`,
 //!     return `this` so `new MarkdownFrame(...).close()` chains.
 //!   - `frame.autoclose` (default `true`) — when truthy, the writable's
 //!     `close`/`abort` hook calls `frame.close()` so a finished pipe
@@ -25,10 +25,10 @@
 //! `transcript` import). The `Transcript` class is exported as a type
 //! for future rotation work; users can't construct one in v1.
 //!
-//! Wire contract: the host receives a [`HostFrame::Push`] for each new
-//! frame, [`HostFrame::Append`] for each text delta, [`HostFrame::UpdateKind`]
+//! Wire contract: the host receives a [`TranscriptDelta::Push`] for each new
+//! frame, [`TranscriptDelta::Append`] for each text delta, [`TranscriptDelta::UpdateKind`]
 //! for in-place metadata transitions (e.g. shell state going terminal),
-//! and [`HostFrame::Close`] when a frame is sealed.
+//! and [`TranscriptDelta::Close`] when a frame is sealed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,18 +41,18 @@ use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as Js
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{FrameId, FrameKind, FramePush, HostFrame};
+use crate::runtime::{FrameId, FrameKind, FramePush, TranscriptDelta};
 
 /// Shared state for the v1 frames surface. One per workflow invocation.
 pub(crate) struct FramesState {
     /// Monotonically-increasing frame id. Bumped by `transcript.push`.
     next_id: AtomicU64,
     /// Where push/append events go.
-    tx: UnboundedSender<HostFrame>,
+    tx: UnboundedSender<TranscriptDelta>,
 }
 
 impl FramesState {
-    fn new(tx: UnboundedSender<HostFrame>) -> Arc<Self> {
+    fn new(tx: UnboundedSender<TranscriptDelta>) -> Arc<Self> {
         Arc::new(Self {
             next_id: AtomicU64::new(0),
             tx,
@@ -77,7 +77,7 @@ pub(crate) type BuiltFrames<'js> = (
 
 pub(crate) fn build_frames<'js>(
     ctx: &Ctx<'js>,
-    tx: UnboundedSender<HostFrame>,
+    tx: UnboundedSender<TranscriptDelta>,
 ) -> JsResult<BuiltFrames<'js>> {
     let state = FramesState::new(tx);
 
@@ -162,7 +162,7 @@ fn push_frame<'js>(
             content: borrow.content.clone(),
             sender: borrow.sender.clone(),
         };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
@@ -172,7 +172,7 @@ fn push_frame<'js>(
         // Close in the same batch and never paints the spinner over
         // it.
         if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(HostFrame::Close {
+            let _ = state.tx.send(TranscriptDelta::Close {
                 id: FrameId(new_id),
             });
         }
@@ -184,7 +184,7 @@ fn push_frame<'js>(
         let kind = FrameKind::Error {
             content: err.borrow().content.clone(),
         };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
@@ -201,12 +201,12 @@ fn push_frame<'js>(
             name: borrow.name.clone(),
             detail: borrow.detail.clone(),
         };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
         // One-shot: the runtime closes + persists this frame on its end
-        // (see emit() for FrameKind::ToolUse). No HostFrame::Close from
+        // (see emit() for FrameKind::ToolUse). No TranscriptDelta::Close from
         // the workflow side — keeps the JS API simple.
         return Ok(());
     }
@@ -216,7 +216,7 @@ fn push_frame<'js>(
         borrow.id.store(new_id, Ordering::Release);
         let ops = std::mem::take(&mut borrow.ops);
         let kind = FrameKind::Diff { lines: ops };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
@@ -231,7 +231,7 @@ fn push_frame<'js>(
             tag: borrow.tag.clone(),
             value: borrow.value.clone(),
         };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
@@ -246,12 +246,12 @@ fn push_frame<'js>(
             cmd: borrow.cmd.clone(),
             content: borrow.content.clone(),
         };
-        let _ = state.tx.send(HostFrame::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
             id: FrameId(new_id),
             kind,
         }));
         if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(HostFrame::Close {
+            let _ = state.tx.send(TranscriptDelta::Close {
                 id: FrameId(new_id),
             });
         }
@@ -390,7 +390,7 @@ fn append_text<'js>(
     if closed.load(Ordering::Acquire) {
         return throw_type(ctx, "frame.write: frame is closed");
     }
-    let _ = state.tx.send(HostFrame::Append {
+    let _ = state.tx.send(TranscriptDelta::Append {
         id: FrameId(frame_id),
         delta,
     });
@@ -398,7 +398,7 @@ fn append_text<'js>(
 }
 
 /// Mark the frame closed and (if it has been pushed) emit
-/// [`HostFrame::Close`] exactly once. Idempotent: a second call is a
+/// [`TranscriptDelta::Close`] exactly once. Idempotent: a second call is a
 /// silent no-op. When called before `transcript.push`, just records
 /// the intent — `transcript.push` notices the pre-set flag and emits
 /// the close right after the push so `new MarkdownFrame(...).close()`
@@ -416,7 +416,7 @@ fn close_frame<'js>(
         return Ok(());
     }
     if !closed.swap(true, Ordering::AcqRel) {
-        let _ = state.tx.send(HostFrame::Close {
+        let _ = state.tx.send(TranscriptDelta::Close {
             id: FrameId(frame_id),
         });
     }
@@ -794,7 +794,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             )?,
         )?;
         // `frame.success()` and `frame.exit(code)` set the new state
-        // on the wire via `HostFrame::UpdateKind`. They do NOT close
+        // on the wire via `TranscriptDelta::UpdateKind`. They do NOT close
         // the frame — JS-side auto-close (writable's close hook) or
         // an explicit `frame.close()` is still required to seal the
         // block. Keeping these orthogonal lets the workflow stream a
@@ -841,7 +841,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
     }
 }
 
-/// Update the frame's state and emit [`HostFrame::UpdateKind`].
+/// Update the frame's state and emit [`TranscriptDelta::UpdateKind`].
 /// Throws if the frame hasn't been pushed yet.
 fn set_shell_state<'js>(
     ctx: &Ctx<'js>,
@@ -868,7 +868,7 @@ fn set_shell_state<'js>(
         cmd: cmd.to_owned(),
         content: String::new(),
     };
-    let _ = state.tx.send(HostFrame::UpdateKind {
+    let _ = state.tx.send(TranscriptDelta::UpdateKind {
         id: FrameId(frame_id),
         kind,
     });

@@ -52,8 +52,8 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FramePush, HostFrame, InboxItem, Invocation, UserInput, WorkflowHandle,
-    parse_slash_command,
+    FrameId, FrameKind, FramePush, InboxItem, Invocation, PermissionAsk, TranscriptDelta,
+    UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
@@ -553,7 +553,10 @@ pub(crate) async fn run_driver(
     initial: Option<WorkflowInstance>,
 ) {
     enum Step {
-        Frame(HostFrame),
+        Transcript(TranscriptDelta),
+        Surface(Option<String>),
+        Permission(PermissionAsk),
+        Usage(frances_models_llm::wire::Usage),
         Done(Option<WorkflowError>),
         Push { name: String, args: Vec<String> },
         Shutdown,
@@ -580,17 +583,32 @@ pub(crate) async fn run_driver(
             continue;
         };
 
-        // Drain queued frames first so a burst doesn't starve the select.
-        while let Ok(frame) = instance.handle.frames.try_recv() {
-            if let Err(error) = emit(&runtime, &mut instance.emit, frame).await {
-                warn!(%error, "emit failed");
+        // Drain queued transcript deltas first so a burst doesn't starve
+        // the select. The other outputs are independent — the select
+        // picks them up. Only the transcript persists, so it's the one
+        // that must not back up.
+        while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
+            if let Err(error) = emit_transcript(&runtime, &mut instance.emit, delta).await {
+                warn!(%error, "transcript emit failed");
             }
         }
 
         let step = tokio::select! {
             biased;
-            frame = instance.handle.frames.recv() => match frame {
-                Some(f) => Step::Frame(f),
+            delta = instance.handle.outputs.transcript.recv() => match delta {
+                Some(d) => Step::Transcript(d),
+                None => Step::Shutdown,
+            },
+            surface = instance.handle.outputs.surfaces.recv() => match surface {
+                Some(s) => Step::Surface(s),
+                None => Step::Shutdown,
+            },
+            ask = instance.handle.outputs.permissions.recv() => match ask {
+                Some(a) => Step::Permission(a),
+                None => Step::Shutdown,
+            },
+            usage = instance.handle.outputs.usage.recv() => match usage {
+                Some(u) => Step::Usage(u),
                 None => Step::Shutdown,
             },
             done = &mut instance.handle.done => match done {
@@ -608,12 +626,15 @@ pub(crate) async fn run_driver(
         };
 
         match step {
-            Step::Frame(frame) => {
+            Step::Transcript(delta) => {
                 let instance = current.as_mut().expect("active while pumping");
-                if let Err(error) = emit(&runtime, &mut instance.emit, frame).await {
-                    warn!(%error, "emit failed");
+                if let Err(error) = emit_transcript(&runtime, &mut instance.emit, delta).await {
+                    warn!(%error, "transcript emit failed");
                 }
             }
+            Step::Surface(status) => emit_surface(&runtime, status),
+            Step::Permission(ask) => emit_permission(&runtime, ask).await,
+            Step::Usage(usage) => emit_usage(&runtime, usage),
             Step::Done(reported) => {
                 let mut instance = current.take().expect("active on done");
                 runtime.workflow_stack.clear_active();
@@ -657,8 +678,8 @@ async fn finish_done(
     instance: &mut WorkflowInstance,
     reported: Option<WorkflowError>,
 ) -> Result<()> {
-    while let Ok(frame) = instance.handle.frames.try_recv() {
-        emit(runtime, &mut instance.emit, frame).await?;
+    while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
+        emit_transcript(runtime, &mut instance.emit, delta).await?;
     }
     instance.emit.close_all_stop(&runtime.events).await?;
     if let Some(error) = reported {
@@ -714,20 +735,23 @@ async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance
     let deadline = tokio::time::sleep(DEHYDRATE_TIMEOUT);
     tokio::pin!(deadline);
     loop {
-        // Flush anything sitting in the queue first.
-        while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(runtime, &mut instance.emit, host_frame).await?;
+        // Flush any queued transcript first — it's the only output that
+        // persists, so it must reach scrollback before we suspend.
+        // Surfaces/usage are ephemeral and a pending permission is
+        // resolved by the body's own shutdown path (`closed_notify`).
+        while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
+            emit_transcript(runtime, &mut instance.emit, delta).await?;
         }
         tokio::select! {
             biased;
-            Some(host_frame) = instance.handle.frames.recv() => {
-                emit(runtime, &mut instance.emit, host_frame).await?;
+            Some(delta) = instance.handle.outputs.transcript.recv() => {
+                emit_transcript(runtime, &mut instance.emit, delta).await?;
             }
             done = &mut instance.handle.done => {
-                // Drain any tail frames the lifecycle hook pushed
+                // Drain any tail transcript the lifecycle hook pushed
                 // immediately before settling.
-                while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(runtime, &mut instance.emit, host_frame).await?;
+                while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
+                    emit_transcript(runtime, &mut instance.emit, delta).await?;
                 }
                 // Body exited cleanly: every remaining open block gets
                 // a clean BlockStop on the wire and a non-truncated row.
@@ -754,13 +778,15 @@ async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance
     }
 }
 
-async fn emit(
+/// Project a transcript delta onto the wire `StreamFrame` protocol and
+/// persist closed blocks to scrollback.
+async fn emit_transcript(
     runtime: &Arc<SessionRuntime>,
     state: &mut EmitState,
-    frame: HostFrame,
+    delta: TranscriptDelta,
 ) -> Result<()> {
-    match frame {
-        HostFrame::Push(FramePush { id: frame_id, kind }) => match kind {
+    match delta {
+        TranscriptDelta::Push(FramePush { id: frame_id, kind }) => match kind {
             FrameKind::Markdown { content, sender } => {
                 let block_kind = BlockKind::Text {
                     sender: sender.map(Arc::from),
@@ -862,7 +888,7 @@ async fn emit(
                     .await?;
             }
         },
-        HostFrame::Append {
+        TranscriptDelta::Append {
             id: frame_id,
             delta,
         } => {
@@ -880,7 +906,7 @@ async fn emit(
                 });
             }
         }
-        HostFrame::UpdateKind { id: frame_id, kind } => {
+        TranscriptDelta::UpdateKind { id: frame_id, kind } => {
             // Translate the workflow's FrameKind delta into a wire
             // BlockKind delta. Frame kinds without a streaming
             // representation on the wire (Error, Json) are no-ops.
@@ -918,45 +944,55 @@ async fn emit(
                 });
             }
         }
-        HostFrame::Close { id: frame_id } => {
+        TranscriptDelta::Close { id: frame_id } => {
             state.close_one(&runtime.events, frame_id).await?;
-        }
-        HostFrame::Usage(usage) => {
-            runtime.events.send(StreamFrame::Usage(usage));
-        }
-        HostFrame::Status(status) => {
-            runtime.events.send(StreamFrame::Status(status));
-        }
-        HostFrame::Permission {
-            request,
-            allow_auto,
-        } => {
-            if allow_auto {
-                let id = request.id;
-                let outcome = crate::runtime::auto_judge::judge(runtime, &request).await;
-                match outcome {
-                    crate::runtime::auto_judge::JudgeOutcome::Approve { reason } => {
-                        if let Err(error) = runtime.permissions.respond(
-                            id,
-                            frances_workflow::PermissionResponse::Yes {
-                                details: Some(reason),
-                            },
-                        ) {
-                            warn!(%error, %id, "auto-judge approve: respond failed");
-                        }
-                    }
-                    crate::runtime::auto_judge::JudgeOutcome::Reject { reason }
-                    | crate::runtime::auto_judge::JudgeOutcome::Indeterminate { reason } => {
-                        tracing::debug!(%id, %reason, "auto-judge fell through to user");
-                        runtime.events.send(StreamFrame::Permission(request));
-                    }
-                }
-            } else {
-                runtime.events.send(StreamFrame::Permission(request));
-            }
         }
     }
     Ok(())
+}
+
+/// Workflow-declared chrome (the busy indicator). `Some(text)` shows it;
+/// `None` hides it. Ephemeral — never persisted.
+fn emit_surface(runtime: &Arc<SessionRuntime>, status: Option<String>) {
+    runtime.events.send(StreamFrame::Status(status));
+}
+
+/// LLM token-usage telemetry. Pass-through to the TUI footer; not persisted.
+fn emit_usage(runtime: &Arc<SessionRuntime>, usage: frances_models_llm::wire::Usage) {
+    runtime.events.send(StreamFrame::Usage(usage));
+}
+
+/// A permission ask. When `allow_auto`, consult the auto-judge first and
+/// answer directly on approve; otherwise (or on reject/indeterminate)
+/// forward to the TUI for a human decision.
+async fn emit_permission(runtime: &Arc<SessionRuntime>, ask: PermissionAsk) {
+    let PermissionAsk {
+        request,
+        allow_auto,
+    } = ask;
+    if allow_auto {
+        let id = request.id;
+        let outcome = crate::runtime::auto_judge::judge(runtime, &request).await;
+        match outcome {
+            crate::runtime::auto_judge::JudgeOutcome::Approve { reason } => {
+                if let Err(error) = runtime.permissions.respond(
+                    id,
+                    frances_workflow::PermissionResponse::Yes {
+                        details: Some(reason),
+                    },
+                ) {
+                    warn!(%error, %id, "auto-judge approve: respond failed");
+                }
+            }
+            crate::runtime::auto_judge::JudgeOutcome::Reject { reason }
+            | crate::runtime::auto_judge::JudgeOutcome::Indeterminate { reason } => {
+                tracing::debug!(%id, %reason, "auto-judge fell through to user");
+                runtime.events.send(StreamFrame::Permission(request));
+            }
+        }
+    } else {
+        runtime.events.send(StreamFrame::Permission(request));
+    }
 }
 
 fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::events::DiffLine {
