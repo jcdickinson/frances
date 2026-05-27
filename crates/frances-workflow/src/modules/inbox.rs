@@ -1,8 +1,9 @@
 //! `frances:v1/inbox` — async-iterable user-input stream.
 //!
-//! `next()` pulls from the input mpsc; when the buffer is empty it
-//! pulses `parked` before suspending. `return()` and `workflow.exit()`
-//! flip `closed`, breaking any in-flight `next()` with `{done: true}`.
+//! `next()` pulls from the input mpsc; when the buffer is empty it pulses
+//! the test-harness `on_idle` signal (compiled only under test) before
+//! suspending. `return()` and `workflow.exit()` flip `closed`, breaking
+//! any in-flight `next()` with `{done: true}`.
 //!
 //! Same wiring as the previous `workflow.user.input` class, with the
 //! message field renamed `message` → `content`.
@@ -20,20 +21,28 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::runtime::InboxItem;
 
-pub(crate) fn build_inbox<'js>(
-    ctx: &Ctx<'js>,
-    rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
-) -> JsResult<Class<'js, Inbox>> {
+/// Args for [`build_inbox`], bundled so the call site isn't a long
+/// positional list — and so the test-only `on_idle` signal can be
+/// cfg-gated as a field rather than a (non-cfg-able) positional param.
+pub(crate) struct InboxArgs {
+    pub rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
+    pub closed: Arc<AtomicBool>,
+    pub closed_notify: Arc<Notify>,
+    /// Test-harness "parked on input" pulse; see
+    /// [`crate::runtime::WorkflowHandle`]. Compiled only under test.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub on_idle: Arc<Notify>,
+}
+
+pub(crate) fn build_inbox<'js>(ctx: &Ctx<'js>, args: InboxArgs) -> JsResult<Class<'js, Inbox>> {
     Class::instance(
         ctx.clone(),
         Inbox {
-            rx,
-            closed,
-            closed_notify,
-            parked,
+            rx: args.rx,
+            closed: args.closed,
+            closed_notify: args.closed_notify,
+            #[cfg(any(test, feature = "test-utils"))]
+            on_idle: args.on_idle,
         },
     )
 }
@@ -42,7 +51,8 @@ pub struct Inbox {
     rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
+    #[cfg(any(test, feature = "test-utils"))]
+    on_idle: Arc<Notify>,
 }
 
 impl<'js> Trace<'js> for Inbox {
@@ -74,7 +84,8 @@ impl<'js> JsClass<'js> for Inbox {
                 let rx = borrow.rx.clone();
                 let closed = borrow.closed.clone();
                 let closed_notify = borrow.closed_notify.clone();
-                let parked = borrow.parked.clone();
+                #[cfg(any(test, feature = "test-utils"))]
+                let on_idle = borrow.on_idle.clone();
                 drop(borrow);
                 Ok::<_, rquickjs::Error>(Promised::from(async move {
                     if closed.load(Ordering::Acquire) {
@@ -87,7 +98,8 @@ impl<'js> JsClass<'js> for Inbox {
                     if let Ok(value) = guard.try_recv() {
                         return IterResult::value(value);
                     }
-                    parked.notify_one();
+                    #[cfg(any(test, feature = "test-utils"))]
+                    on_idle.notify_one();
                     tokio::select! {
                         msg = guard.recv() => match msg {
                             Some(input) => IterResult::value(input),

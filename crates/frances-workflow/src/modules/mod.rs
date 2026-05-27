@@ -102,11 +102,16 @@ pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     pub closed: Arc<AtomicBool>,
     pub closed_notify: Arc<Notify>,
-    pub parked: Arc<Notify>,
+    /// Pulsed by `inbox.next()` when it suspends on an empty queue (the
+    /// body is idle, waiting for input). Test-harness signal; production
+    /// completion is driven by the event loop draining, not this — so it's
+    /// compiled only under test.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub on_idle: Arc<Notify>,
     /// Pulsed when the host (or `exit()`) requests graceful shutdown.
-    /// The `frances:v1/lifecycle` module's IIFE awaits this; on fire
-    /// it runs the workflow's registered handler (if any) then closes
-    /// the inbox.
+    /// The runtime races this against the event loop; on fire it runs the
+    /// workflow's registered shutdown handler (if any) then closes the
+    /// inbox.
     pub shutdown_notify: Arc<Notify>,
     pub deps: D,
     pub workflow_db: Arc<crate::storage::WorkflowDb>,
@@ -120,16 +125,21 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     host: V1HostState<D>,
 ) -> Result<(), WorkflowError> {
+    // Bind everything except `on_idle` (which is cfg-gated, and Rust
+    // doesn't allow `#[cfg]` on a destructure-pattern field) via `..`,
+    // then pull `on_idle` out by field access under the same cfg.
     let V1HostState {
         frames_tx,
         input_rx,
         closed,
         closed_notify,
-        parked,
         shutdown_notify,
         deps,
         workflow_db,
+        ..
     } = host;
+    #[cfg(any(test, feature = "test-utils"))]
+    let on_idle = host.on_idle;
 
     // Clones for the approval primitive — it owns the gateway and a
     // sender into the frames channel so JS `approve()` can emit a
@@ -145,18 +155,22 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let set_status_fn = workflow::build_set_status(ctx, frames_tx.clone())?;
     stash.set("setStatus", set_status_fn)?;
 
-    let (lifecycle_obj, wait_for_shutdown, close_inbox) = lifecycle::build_lifecycle_primitives(
-        ctx,
-        shutdown_notify,
-        closed.clone(),
-        closed_notify.clone(),
-    )?;
+    // The lifecycle hook is invoked by the runtime on shutdown (it reads
+    // the runner the module registers on a hidden global) and the runtime
+    // closes the inbox itself, so the module needs nothing but the object.
+    let lifecycle_obj = lifecycle::build_lifecycle_object(ctx)?;
     stash.set("lifecycle", lifecycle_obj)?;
-    stash.set("_waitForShutdown", wait_for_shutdown)?;
-    stash.set("_closeInbox", close_inbox)?;
 
-    let inbox_instance =
-        inbox::build_inbox(ctx, input_rx, closed.clone(), closed_notify.clone(), parked)?;
+    let inbox_instance = inbox::build_inbox(
+        ctx,
+        inbox::InboxArgs {
+            rx: input_rx,
+            closed: closed.clone(),
+            closed_notify: closed_notify.clone(),
+            #[cfg(any(test, feature = "test-utils"))]
+            on_idle,
+        },
+    )?;
     stash.set("inbox", inbox_instance)?;
 
     let (

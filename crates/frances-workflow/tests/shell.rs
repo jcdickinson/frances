@@ -8,7 +8,8 @@ use std::io::Write;
 
 use frances_workflow::{
     FrameKind, HostFrame, Invocation, PermissionRequest, PermissionResponse, Runtime,
-    WorkflowHandle, test_deps::StubDepsRealShell,
+    WorkflowHandle,
+    test_deps::StubDepsRealShell,
     test_drive::{CYCLE_TIMEOUT, drive_one_cycle},
 };
 

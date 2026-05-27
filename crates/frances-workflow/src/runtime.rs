@@ -24,7 +24,7 @@ use rquickjs::async_with;
 use rquickjs::context::AsyncContext;
 use rquickjs::module::Module;
 use rquickjs::runtime::AsyncRuntime;
-use rquickjs::{CatchResultExt, Ctx, IntoJs, Object, Result as JsResult, Value};
+use rquickjs::{CatchResultExt, Ctx, Function, IntoJs, Object, Promise, Result as JsResult, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::JoinHandle;
@@ -38,6 +38,18 @@ use crate::transpile::{SourceKind, ts_to_js};
 /// Internal name we declare the user script under. Distinct from the
 /// `frances:v1/*` namespace so the two don't visually clash.
 const USER_MODULE_NAME: &str = "frances:user-script";
+
+/// Hidden global the runtime roots the body promise on between evaluating
+/// the script and reading its outcome after the event loop drains.
+/// `Persistent` can't cross the `async_with!` boundary (it isn't `Send`),
+/// so we stash through JS; see `docs/plan/single-threaded-js.md` for the
+/// follow-up that removes this.
+const BODY_PROMISE_KEY: &str = "__frances_body_promise";
+
+/// Hidden global the `frances:v1/lifecycle` module registers its
+/// shutdown runner on (set non-enumerable from JS). The runtime calls it
+/// when shutdown is requested.
+const SHUTDOWN_RUNNER_KEY: &str = "__frances_shutdown_runner";
 
 /// Frames a workflow can emit during a turn. The host receiver maps
 /// these onto the wire `StreamFrame` protocol; this enum is the
@@ -225,8 +237,7 @@ pub struct Invocation {
 
 /// Handle to a running workflow. The session runtime owns this; it delivers user
 /// input via [`Self::input_tx`], drains frames from [`Self::frames`],
-/// and learns about lifecycle transitions through [`Self::parked`] and
-/// [`Self::done`].
+/// and learns about termination through [`Self::done`].
 pub struct WorkflowHandle {
     /// Send user input (or an interrupt) to the workflow's `inbox`
     /// stream.
@@ -234,9 +245,12 @@ pub struct WorkflowHandle {
     /// Frames the workflow emits.
     pub frames: UnboundedReceiver<HostFrame>,
     /// Notified each time the body suspends on `inbox.next()` with an
-    /// empty queue — i.e. the body is parked waiting for input. One
-    /// pulse per park; the runtime uses this to detect end-of-cycle.
-    pub parked: Arc<Notify>,
+    /// empty queue — i.e. it's parked waiting for input. The continuous
+    /// driver doesn't consult this (it completes when the event loop
+    /// drains); it's the signal the test harness uses to step a workflow
+    /// turn-by-turn, so it's compiled only under test.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub on_idle: Arc<Notify>,
     /// Resolves when the workflow terminates (body settled or `exit()`
     /// called). The inner result mirrors the body's outcome.
     pub done: oneshot::Receiver<Result<(), WorkflowError>>,
@@ -245,8 +259,8 @@ pub struct WorkflowHandle {
     /// [`Invocation::instance_id`].
     pub instance: uuid::Uuid,
     /// Pulsed by [`Self::request_shutdown`] (and by JS `exit()`). The
-    /// `frances:v1/lifecycle` module's IIFE awaits this to run the
-    /// workflow's registered shutdown hook before closing the inbox.
+    /// runtime's completion loop races this against the event loop; on
+    /// fire it runs the workflow's shutdown hook then closes the inbox.
     shutdown_notify: Arc<Notify>,
     /// Owns the spawned task; dropping the handle aborts the workflow.
     _join: JoinHandle<()>,
@@ -310,43 +324,38 @@ impl<D: WorkflowDeps> Runtime<D> {
         let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
         let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
         let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
-        let parked = Arc::new(Notify::new());
         let shutdown_notify = Arc::new(Notify::new());
+        #[cfg(any(test, feature = "test-utils"))]
+        let on_idle = Arc::new(Notify::new());
 
-        let task_input_rx = Arc::new(AsyncMutex::new(input_rx));
-        let task_closed = Arc::new(AtomicBool::new(false));
-        let task_closed_notify = Arc::new(Notify::new());
-        let task_parked = parked.clone();
-        let task_shutdown = shutdown_notify.clone();
-        let task_frames = frames_tx;
-        let task_args = inv.args;
-        let task_instance = inv.instance_id;
-        let task_js = self.js.clone();
-        let task_deps = self.deps.clone();
+        let host = modules::V1HostState {
+            frames_tx,
+            input_rx: Arc::new(AsyncMutex::new(input_rx)),
+            closed: Arc::new(AtomicBool::new(false)),
+            closed_notify: Arc::new(Notify::new()),
+            #[cfg(any(test, feature = "test-utils"))]
+            on_idle: on_idle.clone(),
+            shutdown_notify: shutdown_notify.clone(),
+            deps: self.deps.clone(),
+            workflow_db,
+        };
+        let task = WorkflowTask {
+            js: self.js.clone(),
+            js_source,
+            args: inv.args,
+            instance_id: inv.instance_id,
+            host,
+        };
 
         let join = tokio::spawn(async move {
-            let result = run_workflow(
-                task_js,
-                js_source,
-                task_args,
-                task_instance,
-                task_frames,
-                task_input_rx,
-                task_closed,
-                task_closed_notify,
-                task_parked,
-                task_shutdown,
-                task_deps,
-                workflow_db,
-            )
-            .await;
-            let _ = done_tx.send(result);
+            let _ = done_tx.send(run_workflow(task).await);
         });
 
         Ok(WorkflowHandle {
             input_tx,
             frames: frames_rx,
-            parked,
+            #[cfg(any(test, feature = "test-utils"))]
+            on_idle,
             done: done_rx,
             instance: inv.instance_id,
             shutdown_notify,
@@ -368,48 +377,48 @@ impl<D: WorkflowDeps> Runtime<D> {
     }
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "shared task-local state, packing buys nothing"
-)]
-async fn run_workflow<D: WorkflowDeps>(
+/// Everything [`run_workflow`] needs to drive one workflow body, bundled
+/// so the spawn site isn't a long positional list. The host-state fields
+/// live in [`modules::V1HostState`].
+struct WorkflowTask<D: WorkflowDeps> {
     js: AsyncRuntime,
     js_source: String,
     args: Vec<String>,
     instance_id: uuid::Uuid,
-    frames: UnboundedSender<HostFrame>,
-    input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
-    parked: Arc<Notify>,
-    shutdown_notify: Arc<Notify>,
-    deps: D,
-    workflow_db: Arc<crate::storage::WorkflowDb>,
-) -> Result<(), WorkflowError> {
-    let context = AsyncContext::full(&js).await?;
+    host: modules::V1HostState<D>,
+}
 
+async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), WorkflowError> {
+    let WorkflowTask {
+        js,
+        js_source,
+        args,
+        instance_id,
+        host,
+    } = task;
+    let context = AsyncContext::full(&js).await?;
+    // Kept for the completion `select!` / inbox close below; `host` itself
+    // is moved into phase 1.
+    let shutdown = host.shutdown_notify.clone();
+    let closed_for_shutdown = host.closed.clone();
+    let closed_notify_for_shutdown = host.closed_notify.clone();
+
+    // Phase 1 — install modules, evaluate the body, and root the body
+    // promise on a hidden global so its outcome stays readable after the
+    // event loop drains (a `Promise<'js>` can't cross the `async_with!`
+    // boundary). We do NOT await it here: completion is decided by the
+    // loop emptying, not by the top-level body settling, so a body that
+    // leaves a bare never-resolving promise still terminates.
+    //
+    // The install-time stash must be live before either family of modules
+    // evaluates. `whatwg:abortcontroller` captures `_setSleep` from it (for
+    // `AbortSignal.timeout`), and every `frances:v1/*` module captures its
+    // own slots. The whatwg polyfills are declared before v1 because the v1
+    // modules import from them (frames uses WritableStream, chat uses
+    // Readable/TransformStream).
     async_with!(context => |ctx| {
         let result: Result<(), WorkflowError> = async {
-            // The install-time stash must be live before either family
-            // of modules evaluates. `whatwg:abortcontroller` captures
-            // `_setSleep` from it (for `AbortSignal.timeout`), and
-            // every `frances:v1/*` module captures its own slots. The
-            // whatwg polyfills are declared before v1 because the v1
-            // modules import from them (frames uses WritableStream,
-            // chat uses Readable/TransformStream).
-            modules::install_stash(
-                &ctx,
-                modules::V1HostState {
-                    frames_tx: frames,
-                    input_rx,
-                    closed: closed.clone(),
-                    closed_notify: closed_notify.clone(),
-                    parked,
-                    shutdown_notify,
-                    deps,
-                    workflow_db,
-                },
-            )?;
+            modules::install_stash(&ctx, host)?;
             modules::install_whatwg(&ctx)?;
             modules::install_v1_modules(&ctx)?;
             modules::remove_stash(&ctx)?;
@@ -432,15 +441,86 @@ async fn run_workflow<D: WorkflowDeps>(
                 .eval()
                 .catch(&ctx)
                 .map_err(caught("eval user-script"))?;
-            promise
-                .into_future::<()>()
-                .await
+            ctx.globals()
+                .set(BODY_PROMISE_KEY, promise)
                 .catch(&ctx)
-                .map_err(caught("await user-script promise"))?;
+                .map_err(caught("stash body promise"))?;
             Ok(())
         }
         .await;
 
+        result
+    })
+    .await?;
+
+    // Phase 2 — drive jobs and spawned host futures (timers, inbox waits,
+    // LLM calls, …) until the loop is empty. A bare `new Promise(() => {})`
+    // registers no future, so it doesn't keep the loop alive. Shutdown (a
+    // host dehydrate or `exit()`) is just a one-time interjection: run the
+    // user's shutdown hook and close the inbox so a parked `inbox.next()`
+    // unwinds — then the same `idle()` drains the rest. Normal completion
+    // is simply the case where that interjection never fires.
+    let shutdown = shutdown.notified();
+    tokio::pin!(shutdown);
+    shutdown.as_mut().enable();
+    let mut shutdown_pending = true;
+    loop {
+        tokio::select! {
+            () = js.idle() => break,
+            () = &mut shutdown, if shutdown_pending => {
+                shutdown_pending = false;
+                run_shutdown_hook(&context).await?;
+                if !closed_for_shutdown.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                    closed_notify_for_shutdown.notify_waiters();
+                }
+            }
+        }
+    }
+
+    // Phase 3 — report the body's outcome. `result::<()>()` is `None` only
+    // if the body promise never settled (a dangling promise the loop
+    // emptied around): not an error, just nothing left to do.
+    async_with!(context => |ctx| {
+        let promise: Promise = ctx
+            .globals()
+            .get(BODY_PROMISE_KEY)
+            .catch(&ctx)
+            .map_err(caught("read body promise"))?;
+        match promise.result::<()>() {
+            Some(outcome) => outcome.catch(&ctx).map_err(caught("await user-script promise")),
+            None => {
+                tracing::warn!(
+                    "workflow event loop emptied while the body promise was still pending"
+                );
+                Ok(())
+            }
+        }
+    })
+    .await
+}
+
+/// Run the workflow's registered `lifecycle.shutdown` hook to completion
+/// (a no-op if it set none). The lifecycle module stashes a runner that
+/// wraps the user hook, so this is always a single awaitable.
+async fn run_shutdown_hook(context: &AsyncContext) -> Result<(), WorkflowError> {
+    async_with!(context => |ctx| {
+        let result: Result<(), WorkflowError> = async {
+            let runner: Function = ctx
+                .globals()
+                .get(SHUTDOWN_RUNNER_KEY)
+                .catch(&ctx)
+                .map_err(caught("get shutdown runner"))?;
+            let hook: Promise = runner
+                .call(())
+                .catch(&ctx)
+                .map_err(caught("call shutdown runner"))?;
+            hook.into_future::<()>()
+                .await
+                .catch(&ctx)
+                .map_err(caught("await shutdown hook"))?;
+            Ok(())
+        }
+        .await;
         result
     })
     .await
@@ -498,7 +578,7 @@ pub mod test_drive {
                     }
                     return (out, Some(result));
                 }
-                () = handle.parked.notified() => {
+                () = handle.on_idle.notified() => {
                     while let Ok(frame) = handle.frames.try_recv() {
                         out.push(frame);
                     }
@@ -1131,6 +1211,43 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         assert_eq!(text_of(&frames[0]), "hi");
+    }
+
+    #[tokio::test]
+    async fn dangling_promise_does_not_keep_workflow_alive() {
+        // A bare `new Promise(() => {})` has no backing host IO, so the
+        // event loop empties around it and the workflow reaps cleanly
+        // rather than hanging. (Under the old "await the body promise"
+        // model this hung until CYCLE_TIMEOUT.)
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            transcript.push(new MarkdownFrame({ content: "before" }));
+            await new Promise(() => {});
+            transcript.push(new MarkdownFrame({ content: "unreachable" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert!(
+            frames.iter().any(|f| text_of(f) == "before"),
+            "missing 'before': {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|f| text_of(f) == "unreachable"),
+            "should not run past the dangling await: {frames:?}"
+        );
     }
 
     #[tokio::test]
