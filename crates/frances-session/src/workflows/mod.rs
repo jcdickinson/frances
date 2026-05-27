@@ -52,7 +52,7 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FramePush, InboxItem, Invocation, PermissionAsk, TranscriptDelta,
+    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, TranscriptDelta,
     UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
@@ -786,106 +786,51 @@ async fn emit_transcript(
     delta: TranscriptDelta,
 ) -> Result<()> {
     match delta {
-        TranscriptDelta::Push(FramePush { id: frame_id, kind }) => match kind {
-            FrameKind::Markdown { content, sender } => {
+        TranscriptDelta::Set {
+            id: frame_id,
+            frame: FrameSpec { kind, seed },
+        } => match kind {
+            FrameKind::Markdown { sender } => {
                 let block_kind = BlockKind::Text {
                     sender: sender.map(Arc::from),
                 };
-                let block = state.alloc();
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: block_kind.clone(),
-                    text: content.clone(),
-                });
-                state.open.insert(
-                    frame_id,
-                    OpenBlock {
-                        id: block,
-                        kind: block_kind,
-                        text: content,
-                    },
-                );
+                set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
             FrameKind::ShellOutput {
                 state: shell_state,
                 cmd,
-                content,
             } => {
                 let block_kind = BlockKind::ShellOutput {
                     state: shell_state_to_protocol(&shell_state),
                     cmd: Arc::from(cmd),
                 };
-                let block = state.alloc();
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: block_kind.clone(),
-                    text: Some(content.clone()),
-                });
-                state.open.insert(
-                    frame_id,
-                    OpenBlock {
-                        id: block,
-                        kind: block_kind,
-                        text: Some(content),
-                    },
-                );
+                set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
-            FrameKind::Error { content } => {
+            FrameKind::Error => {
+                let content = seed.unwrap_or_default();
                 state.persist_error(&content).await?;
                 runtime.events.send(StreamFrame::Error(content));
             }
             FrameKind::ToolUse { name, detail } => {
-                let block = state.alloc();
-                let name_arc: Arc<str> = Arc::from(name);
-                let detail_arc: Option<Arc<str>> = detail.map(Arc::from);
                 let kind = BlockKind::ToolUse {
-                    name: name_arc.clone(),
-                    detail: detail_arc,
+                    name: Arc::from(name),
+                    detail: detail.map(Arc::from),
                 };
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: kind.clone(),
-                    text: Some(String::new()),
-                });
-                // One-shot: stop + persist immediately, no entry in
-                // `state.open`. Text is empty — the name lives in the
+                // One-shot: open + stop + persist immediately, no entry
+                // in `state.open`. Text is empty — the name lives in the
                 // prefix on the TUI side.
-                runtime.events.send(StreamFrame::BlockStop { id: block });
-                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
-                    .await?;
+                emit_one_shot(runtime, state, kind, "").await?;
             }
             FrameKind::Json { tag, value } => {
                 let body =
                     serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
-                let block = state.alloc();
-                let kind = BlockKind::Text { sender: None };
                 let text = format!("[{tag}] {body}");
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: kind.clone(),
-                    text: Some(text.clone()),
-                });
-                // Open + persist + close in one go: a JsonFrame is a
-                // one-shot block. It never enters `state.open`.
-                runtime.events.send(StreamFrame::BlockStop { id: block });
-                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, &text, false)
-                    .await?;
+                emit_one_shot(runtime, state, BlockKind::Text { sender: None }, &text).await?;
             }
             FrameKind::Diff { lines } => {
                 let wire_lines: Vec<crate::events::DiffLine> =
                     lines.into_iter().map(diff_op_to_protocol).collect();
-                let block = state.alloc();
-                let kind = BlockKind::Diff { lines: wire_lines };
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: kind.clone(),
-                    text: Some(String::new()),
-                });
-                // One-shot like ToolUse / Json — Push + Stop in the
-                // same batch, never enters `state.open`.
-                runtime.events.send(StreamFrame::BlockStop { id: block });
-                crate::scrollback::persist_block(&state.db, state.instance_id, &kind, "", false)
-                    .await?;
+                emit_one_shot(runtime, state, BlockKind::Diff { lines: wire_lines }, "").await?;
             }
         },
         TranscriptDelta::Append {
@@ -906,48 +851,65 @@ async fn emit_transcript(
                 });
             }
         }
-        TranscriptDelta::UpdateKind { id: frame_id, kind } => {
-            // Translate the workflow's FrameKind delta into a wire
-            // BlockKind delta. Frame kinds without a streaming
-            // representation on the wire (Error, Json) are no-ops.
-            let new_block_kind = match kind {
-                FrameKind::Markdown { sender, .. } => Some(BlockKind::Text {
-                    sender: sender.map(Arc::from),
-                }),
-                FrameKind::ShellOutput {
-                    state: shell_state,
-                    cmd,
-                    ..
-                } => Some(BlockKind::ShellOutput {
-                    state: shell_state_to_protocol(&shell_state),
-                    cmd: Arc::from(cmd),
-                }),
-                FrameKind::Error { .. }
-                | FrameKind::Json { .. }
-                | FrameKind::ToolUse { .. }
-                | FrameKind::Diff { .. } => None,
-            };
-            let Some(new_block_kind) = new_block_kind else {
-                return Ok(());
-            };
-            if let Some(open) = state.open.get_mut(&frame_id) {
-                open.kind = new_block_kind.clone();
-                let block = open.id;
-                // No text on a kind-only delta. The client either
-                // updates the kind on a materialised block (re-render)
-                // or, if the block was never materialised, just stores
-                // the new kind for whenever the first body delta lands.
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
-                    kind: new_block_kind,
-                    text: None,
-                });
-            }
-        }
         TranscriptDelta::Close { id: frame_id } => {
             state.close_one(&runtime.events, frame_id).await?;
         }
     }
+    Ok(())
+}
+
+/// Apply a `Set` for a streaming kind (Markdown / ShellOutput). The first
+/// `Set` for an id creates the block, seeding its body from `seed`; a
+/// later `Set` is a metadata-only re-render — it replaces the kind and
+/// emits a no-text delta, leaving the accumulated body untouched.
+fn set_streaming_block(
+    runtime: &Arc<SessionRuntime>,
+    state: &mut EmitState,
+    frame_id: FrameId,
+    block_kind: BlockKind,
+    seed: Option<String>,
+) {
+    if let Some(open) = state.open.get_mut(&frame_id) {
+        open.kind = block_kind.clone();
+        runtime.events.send(StreamFrame::BlockDelta {
+            id: open.id,
+            kind: block_kind,
+            text: None,
+        });
+    } else {
+        let block = state.alloc();
+        runtime.events.send(StreamFrame::BlockDelta {
+            id: block,
+            kind: block_kind.clone(),
+            text: seed.clone(),
+        });
+        state.open.insert(
+            frame_id,
+            OpenBlock {
+                id: block,
+                kind: block_kind,
+                text: seed,
+            },
+        );
+    }
+}
+
+/// Open, stop, and persist a one-shot block (ToolUse / Json / Diff) in a
+/// single batch. Never enters `state.open` — there's no body to grow.
+async fn emit_one_shot(
+    runtime: &Arc<SessionRuntime>,
+    state: &mut EmitState,
+    kind: BlockKind,
+    text: &str,
+) -> Result<()> {
+    let block = state.alloc();
+    runtime.events.send(StreamFrame::BlockDelta {
+        id: block,
+        kind: kind.clone(),
+        text: Some(text.to_owned()),
+    });
+    runtime.events.send(StreamFrame::BlockStop { id: block });
+    crate::scrollback::persist_block(&state.db, state.instance_id, &kind, text, false).await?;
     Ok(())
 }
 

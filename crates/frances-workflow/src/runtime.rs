@@ -52,20 +52,20 @@ const USER_MODULE_NAME: &str = "frances:user-script";
 /// protocol; this enum is the host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
 pub enum TranscriptDelta {
-    /// A new frame was pushed onto the transcript. Does NOT implicitly
-    /// seal anything — each frame type chooses when it's done (markdown
-    /// emits `Close` for its predecessor before its own `Push`; shell
-    /// output emits `Close` when its state goes terminal).
-    Push(FramePush),
+    /// Declarative upsert of the frame with the given id. The first
+    /// `Set` for an id creates the block (with `frame.seed` as its
+    /// initial body, if any); a later `Set` replaces its kind + bounded
+    /// metadata — e.g. ShellOutput's state going `Running → Success` —
+    /// carrying no body (`seed: None`). Does NOT seal anything: each
+    /// frame type chooses when it's done (markdown emits `Close` for its
+    /// predecessor before its own `Set`; shell output `Close`s when its
+    /// state goes terminal).
+    Set { id: FrameId, frame: FrameSpec },
     /// Append text to the frame with the given id. Valid for as long
     /// as the frame remains open; the JS side enforces per-frame-type
-    /// rules (active-markdown slot, ShellOutput's open flag).
+    /// rules (active-markdown slot, ShellOutput's open flag). The body
+    /// grows by delta — a full-value `Set` per chunk would be O(n²).
     Append { id: FrameId, delta: String },
-    /// Replace the kind of the frame with the given id. Used for
-    /// in-place metadata transitions (e.g. ShellOutput's state going
-    /// from Running to Success/Exit). The host emits a no-text
-    /// `BlockDelta` carrying the new kind so the TUI re-renders.
-    UpdateKind { id: FrameId, kind: FrameKind },
     /// Close the frame with the given id. The host emits a `BlockStop`
     /// and persists the row. Idempotent on unknown ids (the JS side
     /// suppresses double-close).
@@ -112,61 +112,35 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::wire::Usage>,
 }
 
-/// Merged view of [`WorkflowOutputs`] used only by the test harness, which
-/// wants a single ordered frame vec to assert against. Production consumes
-/// the typed channels directly.
-#[cfg(any(test, feature = "test-utils"))]
-#[derive(Debug, Clone)]
-pub enum HostFrame {
-    Push(FramePush),
-    Append {
-        id: FrameId,
-        delta: String,
-    },
-    UpdateKind {
-        id: FrameId,
-        kind: FrameKind,
-    },
-    Close {
-        id: FrameId,
-    },
-    Permission {
-        request: PermissionRequest,
-        allow_auto: bool,
-    },
-    Usage(frances_models_llm::wire::Usage),
-    Status(Option<String>),
-}
-
 /// Frame identity, scoped to one invocation. Monotonically assigned by
 /// `transcript.push`. Useful for the host to map back to its own block
 /// ids.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct FrameId(pub u64);
 
+/// What a [`TranscriptDelta::Set`] carries: the frame's kind + bounded
+/// metadata, plus an optional `seed` — the initial body chunk for
+/// text-bodied kinds (Markdown / ShellOutput / Error). One-shot data
+/// kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave it
+/// `None`. The streaming body never lives here; it grows via
+/// [`TranscriptDelta::Append`].
 #[derive(Debug, Clone)]
-pub struct FramePush {
-    pub id: FrameId,
+pub struct FrameSpec {
     pub kind: FrameKind,
+    pub seed: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub enum FrameKind {
-    /// `MarkdownFrame` — text content that may be extended with `append`.
-    /// `sender` labels the speaker (e.g. `"you"`, `"frances"`); the host
-    /// renders it as a block prefix. `None` ⇒ no prefix.
-    ///
-    /// `content` is `None` when the workflow constructed the frame
-    /// without an initial body — the runtime sends a `BlockDelta` with
-    /// `text: None`, the client tracks the id but doesn't measure or
-    /// render it. The first `append` materialises the block.
-    Markdown {
-        content: Option<String>,
-        sender: Option<String>,
-    },
-    /// `ErrorFrame` — text content (typically rendered as an error) that
-    /// may be extended with `append`.
-    Error { content: String },
+    /// `MarkdownFrame` — text body extended with `append`. `sender`
+    /// labels the speaker (e.g. `"you"`, `"frances"`); the host renders
+    /// it as a block prefix. `None` ⇒ no prefix. The initial body, if
+    /// any, rides as `FrameSpec::seed`; `None` seed ⇒ the client tracks
+    /// the id but doesn't measure/render until the first `append`.
+    Markdown { sender: Option<String> },
+    /// `ErrorFrame` — one-shot text (rendered as an error). The message
+    /// rides as `FrameSpec::seed`.
+    Error,
     /// `ToolUseFrame` — one-shot marker that names a tool the workflow
     /// is about to invoke. The host renders this as a small "→ name"
     /// row so the user can see the tool being called even when the
@@ -184,16 +158,12 @@ pub enum FrameKind {
     },
     /// `ShellOutputFrame` — streaming output from one shell command.
     /// `cmd` is the bash source that produced the output; it rides on
-    /// every frame so the host can keep it pinned even after the body
-    /// has been truncated for display. `content` is the initial body
-    /// (any output captured before the first push, or empty). `state`
-    /// transitions from `Running` to `Success`/`Exit(N)` via
-    /// [`HostFrame::UpdateKind`] as the command completes.
-    ShellOutput {
-        state: ShellState,
-        cmd: String,
-        content: String,
-    },
+    /// every `Set` so the host can keep it pinned even after the body
+    /// has been truncated for display. The initial body (output captured
+    /// before the first `Set`, if any) rides as `FrameSpec::seed`.
+    /// `state` transitions `Running → Success`/`Exit(N)` via a metadata
+    /// re-`Set` as the command completes.
+    ShellOutput { state: ShellState, cmd: String },
     /// `DiffFrame` — one-shot structured diff produced by a file-edit
     /// tool. `lines` is the unified-diff content with line numbers for
     /// context rows only; the session runtime translates each op to
@@ -684,43 +654,13 @@ pub(crate) fn caught<'js>(
 pub mod test_drive {
     //! Shared workflow-driving helper for this crate's unit tests and the
     //! `tests/` integration suites. Drives a body until it parks on
-    //! `inbox.next()` or terminates, collecting the frames it emits.
-    use super::{HostFrame, PermissionAsk, TranscriptDelta, WorkflowError, WorkflowHandle};
-
-    /// Map a single transcript delta onto the merged test-view enum.
-    fn transcript_to_host(delta: TranscriptDelta) -> HostFrame {
-        match delta {
-            TranscriptDelta::Push(p) => HostFrame::Push(p),
-            TranscriptDelta::Append { id, delta } => HostFrame::Append { id, delta },
-            TranscriptDelta::UpdateKind { id, kind } => HostFrame::UpdateKind { id, kind },
-            TranscriptDelta::Close { id } => HostFrame::Close { id },
-        }
-    }
-
-    fn permission_to_host(ask: PermissionAsk) -> HostFrame {
-        HostFrame::Permission {
-            request: ask.request,
-            allow_auto: ask.allow_auto,
-        }
-    }
-
-    /// Drain every output channel into `out`, transcript first so its
-    /// internal ordering is preserved. Cross-channel order is best-effort
-    /// (separate channels), which the assertions don't depend on.
-    fn drain_outputs(handle: &mut WorkflowHandle, out: &mut Vec<HostFrame>) {
-        while let Ok(delta) = handle.outputs.transcript.try_recv() {
-            out.push(transcript_to_host(delta));
-        }
-        while let Ok(ask) = handle.outputs.permissions.try_recv() {
-            out.push(permission_to_host(ask));
-        }
-        while let Ok(status) = handle.outputs.surfaces.try_recv() {
-            out.push(HostFrame::Status(status));
-        }
-        while let Ok(usage) = handle.outputs.usage.try_recv() {
-            out.push(HostFrame::Usage(usage));
-        }
-    }
+    //! `inbox.next()` or terminates, collecting the transcript it emits.
+    //!
+    //! Only the transcript is collected — it's the ordered stream tests
+    //! assert against. The other outputs (surfaces / permissions / usage)
+    //! buffer on their own channels; the few tests that care read them
+    //! directly off [`WorkflowHandle::outputs`].
+    use super::{TranscriptDelta, WorkflowError, WorkflowHandle};
 
     /// Hard ceiling on how long an individual cycle is allowed to run.
     /// Real workflow turns are interactive (a body can wait for input
@@ -732,23 +672,23 @@ pub mod test_drive {
     /// Panics if `CYCLE_TIMEOUT` is exceeded so tests fail fast.
     pub async fn drive_one_cycle(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
+    ) -> (Vec<TranscriptDelta>, Option<Result<(), WorkflowError>>) {
         match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
             Ok(result) => result,
             Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
         }
     }
 
-    /// Drive a workflow to termination, accumulating every frame. Loops
-    /// past transient parks — a body parked on `inbox.next()` that a
-    /// pending `exit()`/shutdown is about to unblock would otherwise be
-    /// reported as `None` by [`drive_one_cycle`] (the park and the
+    /// Drive a workflow to termination, accumulating every transcript
+    /// delta. Loops past transient parks — a body parked on `inbox.next()`
+    /// that a pending `exit()`/shutdown is about to unblock would otherwise
+    /// be reported as `None` by [`drive_one_cycle`] (the park and the
     /// completion race across the JS-thread boundary). Use this for
     /// workflows that terminate on their own; for interactive multi-turn
     /// tests use `drive_one_cycle` and feed input between calls.
     pub async fn drive_to_done(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<HostFrame>, Result<(), WorkflowError>) {
+    ) -> (Vec<TranscriptDelta>, Result<(), WorkflowError>) {
         let mut frames = Vec::new();
         loop {
             let (mut batch, outcome) = drive_one_cycle(handle).await;
@@ -761,23 +701,26 @@ pub mod test_drive {
 
     async fn drive_one_cycle_inner(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
+    ) -> (Vec<TranscriptDelta>, Option<Result<(), WorkflowError>>) {
         let mut out = Vec::new();
         loop {
-            drain_outputs(handle, &mut out);
+            while let Ok(delta) = handle.outputs.transcript.try_recv() {
+                out.push(delta);
+            }
             tokio::select! {
                 biased;
-                Some(delta) = handle.outputs.transcript.recv() => out.push(transcript_to_host(delta)),
-                Some(ask) = handle.outputs.permissions.recv() => out.push(permission_to_host(ask)),
-                Some(status) = handle.outputs.surfaces.recv() => out.push(HostFrame::Status(status)),
-                Some(usage) = handle.outputs.usage.recv() => out.push(HostFrame::Usage(usage)),
+                Some(delta) = handle.outputs.transcript.recv() => out.push(delta),
                 done = &mut handle.done => {
                     let result = done.unwrap_or(Ok(()));
-                    drain_outputs(handle, &mut out);
+                    while let Ok(delta) = handle.outputs.transcript.try_recv() {
+                        out.push(delta);
+                    }
                     return (out, Some(result));
                 }
                 () = handle.on_idle.notified() => {
-                    drain_outputs(handle, &mut out);
+                    while let Ok(delta) = handle.outputs.transcript.try_recv() {
+                        out.push(delta);
+                    }
                     return (out, None);
                 }
             }
@@ -1264,33 +1207,27 @@ mod tests {
 
     use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle, drive_to_done};
 
-    fn text_of(frame: &HostFrame) -> String {
-        match frame {
-            HostFrame::Push(p) => match &p.kind {
-                FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
-                FrameKind::Error { content } => content.clone(),
+    fn text_of(delta: &TranscriptDelta) -> String {
+        match delta {
+            TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
+                FrameKind::Markdown { .. } | FrameKind::Error => {
+                    spec.seed.clone().unwrap_or_default()
+                }
                 FrameKind::ToolUse { name, detail } => match detail {
                     Some(d) => format!("→ {name}  {d}"),
                     None => format!("→ {name}"),
                 },
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-                FrameKind::ShellOutput {
-                    state,
-                    cmd,
-                    content,
-                } => {
-                    format!("[shell:{state:?}] $ {cmd}\n{content}")
+                FrameKind::ShellOutput { state, cmd } => {
+                    format!(
+                        "[shell:{state:?}] $ {cmd}\n{}",
+                        spec.seed.clone().unwrap_or_default()
+                    )
                 }
                 FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             },
-            HostFrame::Append { delta, .. } => delta.clone(),
-            HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
-            HostFrame::Close { id } => format!("[close:{}]", id.0),
-            HostFrame::Permission { request, .. } => {
-                format!("[approval:{}] {}", request.id, request.prompt)
-            }
-            HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
-            HostFrame::Status(s) => format!("[status:{s:?}]"),
+            TranscriptDelta::Append { delta, .. } => delta.clone(),
+            TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
         }
     }
 
@@ -1313,16 +1250,17 @@ mod tests {
             })
             .await
             .unwrap();
-        let (frames, done) = drive_one_cycle(&mut handle).await;
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        let rendered: Vec<String> = frames.iter().map(text_of).collect();
-        assert!(
-            rendered.contains(&"[status:Some(\"working…\")]".to_string()),
-            "expected a set-status frame, got {rendered:?}",
-        );
-        assert!(
-            rendered.contains(&"[status:None]".to_string()),
-            "expected a clear-status frame, got {rendered:?}",
+        // setStatus lands on the surfaces channel, not the transcript.
+        let mut surfaces = Vec::new();
+        while let Ok(s) = handle.outputs.surfaces.try_recv() {
+            surfaces.push(s);
+        }
+        assert_eq!(
+            surfaces,
+            vec![Some("working…".to_string()), None],
+            "expected set then clear on the surfaces channel",
         );
     }
 
@@ -1805,9 +1743,9 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))));
         for (i, expect_sender) in [Some("frances"), None, None].iter().enumerate() {
             match &frames[i] {
-                HostFrame::Push(p) => match &p.kind {
-                    FrameKind::Markdown { content, sender } => {
-                        assert!(content.is_none(), "frame {i} should have content=None");
+                TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
+                    FrameKind::Markdown { sender } => {
+                        assert!(spec.seed.is_none(), "frame {i} should have no seed");
                         assert_eq!(sender.as_deref(), *expect_sender, "frame {i} sender");
                     }
                     other => panic!("frame {i} unexpected kind {other:?}"),
@@ -1845,11 +1783,14 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))));
         assert!(matches!(
             &frames[0],
-            HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content: None, .. })
+            TranscriptDelta::Set { frame: spec, .. }
+                if matches!(&spec.kind, FrameKind::Markdown { .. }) && spec.seed.is_none()
         ));
-        assert!(matches!(&frames[1], HostFrame::Close { .. }));
+        assert!(matches!(&frames[1], TranscriptDelta::Close { .. }));
         assert!(
-            !frames.iter().any(|f| matches!(f, HostFrame::Append { .. })),
+            !frames
+                .iter()
+                .any(|f| matches!(f, TranscriptDelta::Append { .. })),
             "no Append should be emitted for a never-written frame"
         );
     }
@@ -1879,9 +1820,9 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert!(
-            matches!(&frames[0], HostFrame::Push(p) if matches!(&p.kind, FrameKind::Markdown { content: Some(content), .. } if content == "hello"))
+            matches!(&frames[0], TranscriptDelta::Set { frame: spec, .. } if matches!(&spec.kind, FrameKind::Markdown { .. }) && spec.seed.as_deref() == Some("hello"))
         );
-        assert!(matches!(&frames[1], HostFrame::Append { delta, .. } if delta == " world"));
+        assert!(matches!(&frames[1], TranscriptDelta::Append { delta, .. } if delta == " world"));
     }
 
     #[tokio::test]
@@ -1907,15 +1848,15 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))));
         assert!(matches!(
             &frames[0],
-            HostFrame::Push(p)
-                if matches!(&p.kind, FrameKind::Markdown { content: Some(content), sender: Some(s) }
-                    if content == "hi" && s == "you")
+            TranscriptDelta::Set { frame: spec, .. }
+                if matches!(&spec.kind, FrameKind::Markdown { sender: Some(s) } if s == "you")
+                    && spec.seed.as_deref() == Some("hi")
         ));
         assert!(matches!(
             &frames[1],
-            HostFrame::Push(p)
-                if matches!(&p.kind, FrameKind::Markdown { content: Some(content), sender: None }
-                    if content == "ok")
+            TranscriptDelta::Set { frame: spec, .. }
+                if matches!(&spec.kind, FrameKind::Markdown { sender: None })
+                    && spec.seed.as_deref() == Some("ok")
         ));
     }
 
@@ -1979,7 +1920,7 @@ mod tests {
         let appends: Vec<_> = frames
             .iter()
             .filter_map(|f| match f {
-                HostFrame::Append { id, delta } => Some((*id, delta.clone())),
+                TranscriptDelta::Append { id, delta } => Some((*id, delta.clone())),
                 _ => None,
             })
             .collect();
@@ -2016,29 +1957,29 @@ mod tests {
         let (frames, result) = drive_one_cycle(&mut handle).await;
         assert!(matches!(result, Some(Ok(()))), "got {result:?}");
 
-        // Expect: one Push (Running, "$ ls\n"), two Appends ("a\n",
-        // "b\n"), one UpdateKind (Exit(0)), one Close.
-        let push = match frames.first() {
-            Some(HostFrame::Push(p)) => p,
-            other => panic!("expected first frame to be Push, got {other:?}"),
-        };
-        let frame_id = push.id;
-        match &push.kind {
-            FrameKind::ShellOutput {
-                state: ShellState::Running,
-                cmd,
-                content,
-            } => {
-                assert_eq!(cmd, "ls");
-                assert_eq!(content, "");
+        // Expect: one Set (Running, seed ""), two Appends ("a\n",
+        // "b\n"), one metadata Set (Exit(0)), one Close.
+        let frame_id = match frames.first() {
+            Some(TranscriptDelta::Set { id, frame: spec }) => {
+                match &spec.kind {
+                    FrameKind::ShellOutput {
+                        state: ShellState::Running,
+                        cmd,
+                    } => {
+                        assert_eq!(cmd, "ls");
+                        assert_eq!(spec.seed.as_deref(), Some(""));
+                    }
+                    other => panic!("expected ShellOutput Running, got {other:?}"),
+                }
+                *id
             }
-            other => panic!("expected ShellOutput Running, got {other:?}"),
-        }
+            other => panic!("expected first frame to be Set, got {other:?}"),
+        };
 
         let appends: Vec<&String> = frames
             .iter()
             .filter_map(|f| match f {
-                HostFrame::Append { id, delta } if *id == frame_id => Some(delta),
+                TranscriptDelta::Append { id, delta } if *id == frame_id => Some(delta),
                 _ => None,
             })
             .collect();
@@ -2050,14 +1991,14 @@ mod tests {
         let saw_exit = frames.iter().any(|f| {
             matches!(
                 f,
-                HostFrame::UpdateKind { id, kind: FrameKind::ShellOutput { state: ShellState::Exit(0), .. } } if *id == frame_id,
+                TranscriptDelta::Set { id, frame: spec } if *id == frame_id && matches!(&spec.kind, FrameKind::ShellOutput { state: ShellState::Exit(0), .. }),
             )
         });
-        assert!(saw_exit, "expected UpdateKind(Exit(0)) for the frame");
+        assert!(saw_exit, "expected a metadata Set(Exit(0)) for the frame");
 
         let saw_close = frames
             .iter()
-            .any(|f| matches!(f, HostFrame::Close { id } if *id == frame_id));
+            .any(|f| matches!(f, TranscriptDelta::Close { id } if *id == frame_id));
         assert!(saw_close, "expected Close for the frame");
     }
 
@@ -2087,7 +2028,7 @@ mod tests {
         let (frames, _result) = drive_one_cycle(&mut handle).await;
         let close_count = frames
             .iter()
-            .filter(|f| matches!(f, HostFrame::Close { .. }))
+            .filter(|f| matches!(f, TranscriptDelta::Close { .. }))
             .count();
         assert_eq!(close_count, 0, "autoclose=false should suppress Close");
     }
@@ -2500,19 +2441,19 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(HostFrame::Push(p)) => p.id,
+            Some(TranscriptDelta::Set { id, .. }) => *id,
             other => panic!("expected first frame push, got {other:?}"),
         };
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, HostFrame::Append { id, delta } if *id == push_id && delta == "hello")),
+                .any(|f| matches!(f, TranscriptDelta::Append { id, delta } if *id == push_id && delta == "hello")),
             "expected text append for markdown frame: {frames:?}"
         );
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, HostFrame::Close { id } if *id == push_id)),
+                .any(|f| matches!(f, TranscriptDelta::Close { id } if *id == push_id)),
             "expected markdown frame to close after text pipe: {frames:?}"
         );
     }
@@ -2543,11 +2484,11 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(HostFrame::Push(p)) => p.id,
+            Some(TranscriptDelta::Set { id, .. }) => *id,
             other => panic!("expected push first, got {other:?}"),
         };
         assert!(
-            matches!(frames.get(1), Some(HostFrame::Close { id }) if *id == push_id),
+            matches!(frames.get(1), Some(TranscriptDelta::Close { id }) if *id == push_id),
             "second frame must be the matching Close: {frames:?}"
         );
     }
@@ -2577,11 +2518,11 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(HostFrame::Push(p)) => p.id,
+            Some(TranscriptDelta::Set { id, .. }) => *id,
             other => panic!("expected push first, got {other:?}"),
         };
         assert!(
-            matches!(frames.get(1), Some(HostFrame::Close { id }) if *id == push_id),
+            matches!(frames.get(1), Some(TranscriptDelta::Close { id }) if *id == push_id),
             "expected Push then Close: {frames:?}"
         );
     }
@@ -5532,14 +5473,14 @@ mod tests {
             .iter()
             .rev()
             .find_map(|d| match d {
-                TranscriptDelta::Push(p) => Some(p),
+                TranscriptDelta::Set { frame, .. } => Some(frame),
                 _ => None,
             })
-            .expect("expected a markdown push after approval");
+            .expect("expected a markdown set after approval");
         assert!(
-            matches!(&last.kind, FrameKind::Markdown { content: Some(content), .. } if content == "yes:scoped to /tmp"),
-            "got {:?}",
-            last.kind,
+            matches!(&last.kind, FrameKind::Markdown { .. })
+                && last.seed.as_deref() == Some("yes:scoped to /tmp"),
+            "got {last:?}",
         );
     }
 

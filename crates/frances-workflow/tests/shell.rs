@@ -7,7 +7,7 @@
 use std::io::Write;
 
 use frances_workflow::{
-    FrameKind, HostFrame, Invocation, PermissionRequest, PermissionResponse, Runtime,
+    FrameKind, Invocation, PermissionRequest, PermissionResponse, Runtime, TranscriptDelta,
     WorkflowHandle,
     test_deps::StubDepsRealShell,
     test_drive::{CYCLE_TIMEOUT, drive_one_cycle},
@@ -22,31 +22,24 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn text_of(frame: &HostFrame) -> String {
+fn text_of(frame: &TranscriptDelta) -> String {
     match frame {
-        HostFrame::Push(p) => match &p.kind {
-            FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
-            FrameKind::Error { content } => content.clone(),
+        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
+            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
             FrameKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput {
-                state,
-                cmd,
-                content,
-            } => format!("[shell:{state:?}] $ {cmd}\n{content}"),
+            FrameKind::ShellOutput { state, cmd } => format!(
+                "[shell:{state:?}] $ {cmd}
+{}",
+                spec.seed.clone().unwrap_or_default()
+            ),
             FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        HostFrame::Append { delta, .. } => delta.clone(),
-        HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
-        HostFrame::Close { id } => format!("[close:{}]", id.0),
-        HostFrame::Permission { request, .. } => {
-            format!("[permission:{}] {}", request.id, request.prompt)
-        }
-        HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
-        HostFrame::Status(s) => format!("[status:{s:?}]"),
+        TranscriptDelta::Append { delta, .. } => delta.clone(),
+        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
     }
 }
 
@@ -59,12 +52,12 @@ fn text_of(frame: &HostFrame) -> String {
 /// focused on the markdown frames they care about. Empty-content
 /// pushes (the `None` case) collapse to "" since the tests work in
 /// terms of body text.
-fn markdown_pushes(frames: &[HostFrame]) -> Vec<String> {
+fn markdown_pushes(frames: &[TranscriptDelta]) -> Vec<String> {
     frames
         .iter()
         .filter_map(|f| match f {
-            HostFrame::Push(p) => match &p.kind {
-                FrameKind::Markdown { content, .. } => Some(content.clone().unwrap_or_default()),
+            TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
+                FrameKind::Markdown { .. } => Some(spec.seed.clone().unwrap_or_default()),
                 _ => None,
             },
             _ => None,
@@ -530,7 +523,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let out = frames
         .iter()
         .find_map(|f| match f {
-            HostFrame::Push(p) => Some(text_of(&HostFrame::Push(p.clone()))),
+            set @ TranscriptDelta::Set { .. } => Some(text_of(set)),
             _ => None,
         })
         .expect("expected a tool result transcript push");
@@ -572,12 +565,10 @@ async fn shell_run_approve_false_skips_gate() {
 
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    for f in &frames {
-        assert!(
-            !matches!(f, HostFrame::Permission { .. }),
-            "approve:false should not emit an approval frame: {f:?}",
-        );
-    }
+    assert!(
+        handle.outputs.permissions.try_recv().is_err(),
+        "approve:false should not emit a permission ask",
+    );
     let pushes = markdown_pushes(&frames);
     let out = &pushes[0];
     assert!(out.starts_with("Exit 0"), "got `{out}`");

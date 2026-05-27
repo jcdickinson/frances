@@ -8,7 +8,8 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use frances_workflow::{
-    FrameKind, HostFrame, Invocation, Runtime, test_deps::StubDeps, test_drive::drive_one_cycle,
+    FrameKind, Invocation, Runtime, TranscriptDelta, test_deps::StubDeps,
+    test_drive::drive_one_cycle,
 };
 
 fn write_source(body: &str) -> tempfile::NamedTempFile {
@@ -20,31 +21,24 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn text_of(frame: &HostFrame) -> String {
+fn text_of(frame: &TranscriptDelta) -> String {
     match frame {
-        HostFrame::Push(p) => match &p.kind {
-            FrameKind::Markdown { content, .. } => content.clone().unwrap_or_default(),
-            FrameKind::Error { content } => content.clone(),
+        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
+            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
             FrameKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
             FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput {
-                state,
-                cmd,
-                content,
-            } => format!("[shell:{state:?}] $ {cmd}\n{content}"),
+            FrameKind::ShellOutput { state, cmd } => format!(
+                "[shell:{state:?}] $ {cmd}
+{}",
+                spec.seed.clone().unwrap_or_default()
+            ),
             FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        HostFrame::Append { delta, .. } => delta.clone(),
-        HostFrame::UpdateKind { id, kind } => format!("[update:{}] {kind:?}", id.0),
-        HostFrame::Close { id } => format!("[close:{}]", id.0),
-        HostFrame::Permission { request, .. } => {
-            format!("[approval:{}] {}", request.id, request.prompt)
-        }
-        HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
-        HostFrame::Status(s) => format!("[status:{s:?}]"),
+        TranscriptDelta::Append { delta, .. } => delta.clone(),
+        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
     }
 }
 

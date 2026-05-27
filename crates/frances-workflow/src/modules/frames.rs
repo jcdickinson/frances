@@ -25,10 +25,10 @@
 //! `transcript` import). The `Transcript` class is exported as a type
 //! for future rotation work; users can't construct one in v1.
 //!
-//! Wire contract: the host receives a [`TranscriptDelta::Push`] for each new
-//! frame, [`TranscriptDelta::Append`] for each text delta, [`TranscriptDelta::UpdateKind`]
-//! for in-place metadata transitions (e.g. shell state going terminal),
-//! and [`TranscriptDelta::Close`] when a frame is sealed.
+//! Wire contract: the host receives a [`TranscriptDelta::Set`] for each
+//! frame (the first creates it; a later one re-upserts kind + metadata,
+//! e.g. shell state going terminal), [`TranscriptDelta::Append`] for each
+//! text delta, and [`TranscriptDelta::Close`] when a frame is sealed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,7 +41,7 @@ use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as Js
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{FrameId, FrameKind, FramePush, TranscriptDelta};
+use crate::runtime::{FrameId, FrameKind, FrameSpec, TranscriptDelta};
 
 /// Shared state for the v1 frames surface. One per workflow invocation.
 pub(crate) struct FramesState {
@@ -158,14 +158,16 @@ fn push_frame<'js>(
         let new_id = state.assign_id();
         let borrow = md.borrow();
         borrow.id.store(new_id, Ordering::Release);
-        let kind = FrameKind::Markdown {
-            content: borrow.content.clone(),
-            sender: borrow.sender.clone(),
+        let frame = FrameSpec {
+            kind: FrameKind::Markdown {
+                sender: borrow.sender.clone(),
+            },
+            seed: borrow.content.clone(),
         };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         // Pre-closed frame (either `{ ..., closed: true }` at
         // construction or `frame.close()` called before push) — seal
         // it on the wire now that it has an id. The TUI sees Push +
@@ -181,13 +183,14 @@ fn push_frame<'js>(
     if let Some(err) = as_frame::<ErrorFrame>(&frame) {
         let new_id = state.assign_id();
         err.borrow().id.store(new_id, Ordering::Release);
-        let kind = FrameKind::Error {
-            content: err.borrow().content.clone(),
+        let frame = FrameSpec {
+            kind: FrameKind::Error,
+            seed: Some(err.borrow().content.clone()),
         };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         return Ok(());
     }
     if let Some(tu) = as_frame::<ToolUseFrame>(&frame) {
@@ -197,14 +200,17 @@ fn push_frame<'js>(
         }
         let new_id = state.assign_id();
         borrow.id.store(new_id, Ordering::Release);
-        let kind = FrameKind::ToolUse {
-            name: borrow.name.clone(),
-            detail: borrow.detail.clone(),
+        let frame = FrameSpec {
+            kind: FrameKind::ToolUse {
+                name: borrow.name.clone(),
+                detail: borrow.detail.clone(),
+            },
+            seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         // One-shot: the runtime closes + persists this frame on its end
         // (see emit() for FrameKind::ToolUse). No TranscriptDelta::Close from
         // the workflow side — keeps the JS API simple.
@@ -215,11 +221,14 @@ fn push_frame<'js>(
         let new_id = state.assign_id();
         borrow.id.store(new_id, Ordering::Release);
         let ops = std::mem::take(&mut borrow.ops);
-        let kind = FrameKind::Diff { lines: ops };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let frame = FrameSpec {
+            kind: FrameKind::Diff { lines: ops },
+            seed: None,
+        };
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         // One-shot — runtime seals on its side. Same shape as ToolUseFrame.
         return Ok(());
     }
@@ -227,29 +236,34 @@ fn push_frame<'js>(
         let new_id = state.assign_id();
         json.borrow().id.store(new_id, Ordering::Release);
         let borrow = json.borrow();
-        let kind = FrameKind::Json {
-            tag: borrow.tag.clone(),
-            value: borrow.value.clone(),
+        let frame = FrameSpec {
+            kind: FrameKind::Json {
+                tag: borrow.tag.clone(),
+                value: borrow.value.clone(),
+            },
+            seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         return Ok(());
     }
     if let Some(sh) = as_frame::<ShellOutputFrame>(&frame) {
         let new_id = state.assign_id();
         let borrow = sh.borrow();
         borrow.id.store(new_id, Ordering::Release);
-        let kind = FrameKind::ShellOutput {
-            state: load_shell_state(&borrow.state_atom),
-            cmd: borrow.cmd.clone(),
-            content: borrow.content.clone(),
+        let frame = FrameSpec {
+            kind: FrameKind::ShellOutput {
+                state: load_shell_state(&borrow.state_atom),
+                cmd: borrow.cmd.clone(),
+            },
+            seed: Some(borrow.content.clone()),
         };
-        let _ = state.tx.send(TranscriptDelta::Push(FramePush {
+        let _ = state.tx.send(TranscriptDelta::Set {
             id: FrameId(new_id),
-            kind,
-        }));
+            frame,
+        });
         if borrow.closed.load(Ordering::Acquire) {
             let _ = state.tx.send(TranscriptDelta::Close {
                 id: FrameId(new_id),
@@ -794,7 +808,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             )?,
         )?;
         // `frame.success()` and `frame.exit(code)` set the new state
-        // on the wire via `TranscriptDelta::UpdateKind`. They do NOT close
+        // on the wire via a metadata-only `TranscriptDelta::Set`. They do NOT close
         // the frame — JS-side auto-close (writable's close hook) or
         // an explicit `frame.close()` is still required to seal the
         // block. Keeping these orthogonal lets the workflow stream a
@@ -841,7 +855,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
     }
 }
 
-/// Update the frame's state and emit [`TranscriptDelta::UpdateKind`].
+/// Update the frame's state and emit a metadata-only [`TranscriptDelta::Set`].
 /// Throws if the frame hasn't been pushed yet.
 fn set_shell_state<'js>(
     ctx: &Ctx<'js>,
@@ -859,18 +873,20 @@ fn set_shell_state<'js>(
         );
     }
     state_atom.store(encode_shell_state(&new_state), Ordering::Release);
-    // Content is empty here — the runtime's UpdateKind handler emits a
-    // no-text BlockDelta carrying just the new kind. `cmd` rides along
-    // because the wire `BlockKind::ShellOutput` carries it on every
-    // delta.
-    let kind = FrameKind::ShellOutput {
-        state: new_state,
-        cmd: cmd.to_owned(),
-        content: String::new(),
+    // Metadata-only re-`Set`: no body (`seed: None`), so the runtime
+    // emits a no-text BlockDelta carrying just the new kind. `cmd` rides
+    // along because the wire `BlockKind::ShellOutput` carries it on
+    // every delta.
+    let frame = FrameSpec {
+        kind: FrameKind::ShellOutput {
+            state: new_state,
+            cmd: cmd.to_owned(),
+        },
+        seed: None,
     };
-    let _ = state.tx.send(TranscriptDelta::UpdateKind {
+    let _ = state.tx.send(TranscriptDelta::Set {
         id: FrameId(frame_id),
-        kind,
+        frame,
     });
     Ok(())
 }
