@@ -31,10 +31,9 @@ pub enum StreamFrame {
     /// Self-describing block content. The first delta with a
     /// previously-unseen `id` implicitly opens a new block of `kind`;
     /// subsequent deltas with the same id append to that block's
-    /// text. There is no separate "block start" frame — that way a
-    /// client that connects mid-block (or reconnects after the events
-    /// socket died) can construct the block from the very next delta
-    /// without needing to have seen the start.
+    /// text. There is no separate "block start" frame — every delta is
+    /// self-describing, so the consumer can construct the block from any
+    /// delta without having seen the start.
     ///
     /// `text` is `None` when the frame carries no body delta this
     /// round — either an opener for a block that was pushed without

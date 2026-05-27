@@ -267,7 +267,7 @@ impl<const N: usize> From<[Value; N]> for Path {
 
 /// Convenience constructor for the common case of building a path from
 /// string literals or owned strings: `Path::from(["models", name])`. Each
-/// segment is parsed via [`parse_segment`] so numeric-looking strings
+/// segment is parsed via `parse_segment` so numeric-looking strings
 /// become [`Value::Int`], matching [`Path::parse`].
 impl<S: AsRef<str>, const N: usize> From<[S; N]> for Path {
     fn from(arr: [S; N]) -> Self {

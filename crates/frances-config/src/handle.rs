@@ -64,7 +64,7 @@ impl BindingRegistry {
 ///
 /// Holds the current [`Configuration`] snapshot in an [`ArcSwap`], owns the
 /// providers (so they can keep publishing runtime events), and runs a
-/// background task that consumes batched [`ConfigEvent`]s, rebuilds the
+/// background task that consumes batched [`ConfigEvent`](crate::ConfigEvent)s, rebuilds the
 /// snapshot, and refreshes registered bindings.
 #[derive(Clone)]
 pub struct ConfigHandle {

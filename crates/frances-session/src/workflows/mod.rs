@@ -3,7 +3,7 @@
 //! ## Single-slot in-memory, multi-level in DB
 //!
 //! At any time only one workflow runs — the **top** of the stack, owned
-//! by the long-lived driver task ([`run_driver`]). Levels below the top
+//! by the long-lived driver task (`run_driver`). Levels below the top
 //! live as rows in the `workflow_stack` table (`active = 0`,
 //! `completed_at IS NULL`). When
 //! a slash command pushes B on top of A, A is **dehydrated**:
@@ -25,7 +25,7 @@
 //!
 //! ## Boot
 //!
-//! [`restore_or_seed`] reads the table. If `COUNT(*) = 0`, it pushes
+//! `restore_or_seed` reads the table. If `COUNT(*) = 0`, it pushes
 //! the configured `default_workflow` (which inserts the first row and
 //! hydrates). Otherwise it hydrates the row with `active = 1`. If no
 //! row is active (the user popped everything down to zero live rows
@@ -95,7 +95,7 @@ pub enum WorkflowStackError {
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// The session-scoped workflow stack. The currently-hydrated workflow is
-/// owned by the long-lived driver task (see [`run_driver`]), not held
+/// owned by the long-lived driver task (see `run_driver`), not held
 /// here — this struct keeps the per-session [`Database`] plus the
 /// "live wires" the rest of the runtime uses to reach the active
 /// workflow without going through the driver: a clone of its inbox
@@ -107,7 +107,7 @@ pub struct WorkflowStack {
     /// `interrupt` push straight onto this — input is just IO, delivered
     /// any time, decoupled from any cycle.
     active_input: PlMutex<Option<UnboundedSender<InboxItem>>>,
-    /// `instance_id` of the active workflow, for callers (attach,
+    /// `instance_id` of the active workflow, for callers (e.g.
     /// scrollback replay) that need to know which workflow is live.
     active_instance_id: PlMutex<Option<Uuid>>,
 }
@@ -132,15 +132,15 @@ impl WorkflowStack {
     }
 
     /// `instance_id` of the currently-hydrated workflow, if any.
-    /// Read-only helper for callers (e.g. attach) that need to know
-    /// which workflow to replay scrollback for.
+    /// Read-only helper for the startup scrollback replay path, which
+    /// needs to know which workflow to replay for.
     pub async fn active_instance(&self) -> Option<Uuid> {
         *self.active_instance_id.lock()
     }
 
     /// Publish the active wires for the driver's initial instance,
     /// synchronously during `SessionRuntime::start` (before the driver
-    /// task is scheduled) so attach / scrollback replay see it right
+    /// task is scheduled) so the startup scrollback replay sees it right
     /// away. No-op when the stack boots empty.
     pub(crate) fn seat_initial(&self, instance: Option<&WorkflowInstance>) {
         match instance {
@@ -313,7 +313,7 @@ impl EmitState {
     /// Dehydrate close-all: the workflow is going away while blocks are
     /// in flight. Persist each row marked truncated and drop the
     /// entries. No wire frames are emitted — the TUI is about to be
-    /// told to clear and replay via `ScrollbackReset`, and the replay
+    /// told to clear and replay via `ScrollbackFrame::Reset`, and the replay
     /// will surface these rows as `BlockTruncated`. Unmaterialised
     /// blocks (never wrote anything) are dropped silently.
     async fn close_all_truncate(&mut self) -> Result<()> {
@@ -746,7 +746,7 @@ async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance
                 );
                 // Body never settled. Mark every in-flight block
                 // truncated. No wire BlockStop — the TUI is about to
-                // be told to ScrollbackReset by the caller's push path.
+                // be told to clear via `ScrollbackFrame::Reset` by the caller's push path.
                 instance.emit.close_all_truncate().await?;
                 return Ok(());
             }

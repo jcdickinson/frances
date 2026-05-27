@@ -16,9 +16,9 @@
 //!   "Overwrite", path, ... }`. Returns the diff block (or full
 //!   anchored file for `New`).
 //!
-//! Paths are resolved against the runtime's most-recently-attached
-//! client cwd (`WorkflowDeps::current_cwd`) on every call, so re-attach
-//! with a new cwd takes effect immediately.
+//! Paths are resolved against the latest invocation's cwd
+//! (`WorkflowDeps::current_cwd`) on every call, so a new invocation cwd
+//! takes effect immediately.
 //!
 //! Writes (`New`, `Overwrite`, anchor edits) `create_dir_all` for the
 //! parent — idempotent; in practice it only matters for `New` since the

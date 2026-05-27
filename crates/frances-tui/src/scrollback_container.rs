@@ -32,11 +32,11 @@
 //!   via [`ScrollbackContainer::update_active`]. Each entry carries a
 //!   `safe_to_commit` flag.
 //!
-//! Insertion always lands in `active`. [`mark_safe`] flips the flag
+//! Insertion always lands in `active`. `mark_safe` flips the flag
 //! on one entry and then drains the contiguous safe-flagged prefix of
 //! `active_order` into the back of `safe`, preserving display order —
 //! a block flagged before its older siblings waits behind them until
-//! they're flagged too. [`push`] is a convenience that wraps
+//! they're flagged too. `push` is a convenience that wraps
 //! `push_active` + `mark_safe`, so a caller who already has the final
 //! content can just `push` and let the drain run: the block ends up
 //! in `safe` immediately if nothing in `active` is blocking it, or
@@ -215,7 +215,7 @@ pub struct ScrollbackContainer {
     prev_footer_anchor_y: Option<u16>,
     prev_footer_height: Option<u16>,
     /// Terminal size as of the previous frame's draw. Used to detect
-    /// resizes: footer pinning (see the slack-pin logic in [`draw`])
+    /// resizes: footer pinning (see the slack-pin logic in `draw`)
     /// is only valid when the layout coords from the previous frame
     /// still mean the same thing on screen, so a resize forces a
     /// fall-back to the natural anchor for the next frame.
@@ -227,23 +227,23 @@ pub struct ScrollbackContainer {
     /// `RenderState` invalidated.
     prev_mode: Option<LayoutMode>,
     /// Scrollback inspector mode flag. When set, the caller drives
-    /// [`paint_scrollback`] instead of [`draw`] (typically against an
+    /// `paint_scrollback` instead of `draw` (typically against an
     /// alt-screen) to render a historical view of all the container's
     /// blocks. The container does not itself toggle the alt-screen —
     /// the flag is purely a piece of shared state so the caller can
-    /// branch its render loop and so subsequent live [`draw`] calls
+    /// branch its render loop and so subsequent live `draw` calls
     /// know to reset their bookkeeping.
     scrollback_active: bool,
     /// Inspector scroll position, in wrapped rows measured from the
     /// bottom of history. `0` = most-recent content sits flush against
     /// the footer. Clamped against the current maximum inside
-    /// [`paint_scrollback`], so callers may move freely via
+    /// `paint_scrollback`, so callers may move freely via
     /// [`scroll_up`] / [`scroll_down`] and let the renderer decide
     /// what's reachable.
     scrollback_offset: u16,
     /// Inspector-only block selection, indexed from the *newest* block
     /// (ordinal `0` is the bottom of `iter_history`). `None` outside
-    /// alt-view, or when no blocks exist. Seeded in [`set_scrollback`]
+    /// alt-view, or when no blocks exist. Seeded in `set_scrollback`
     /// on the false → true transition, cleared by [`clear`].
     ///
     /// Ordinal-from-newest is stable under the append-only mutations
@@ -255,13 +255,13 @@ pub struct ScrollbackContainer {
     /// When `Some(frame)`, every entry in `active` gets a spinner glyph
     /// painted over the rightmost non-blank cell of its last row, so
     /// users can see at a glance which blocks haven't been committed
-    /// yet. The app drives the animation via [`bump_spinner`]; left
+    /// yet. The app drives the animation via `bump_spinner`; left
     /// `None` (the default) the container behaves as if spinners
     /// didn't exist, which is what the tests rely on.
     spinner_frame: Option<u8>,
 }
 
-/// Braille-dot frames cycled through by [`bump_spinner`]. Single-cell
+/// Braille-dot frames cycled through by `bump_spinner`. Single-cell
 /// glyphs, width 1 — they overlay cleanly on top of any character.
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -289,7 +289,7 @@ impl ScrollbackContainer {
     /// Turn on the active-block spinner overlay. After this every
     /// entry in `active` gets a single-cell braille glyph painted over
     /// the rightmost non-blank cell of its last visible row. Call
-    /// [`bump_spinner`] periodically to advance the glyph.
+    /// `bump_spinner` periodically to advance the glyph.
     pub fn enable_spinner(&mut self) {
         if self.spinner_frame.is_none() {
             self.spinner_frame = Some(0);
@@ -297,7 +297,7 @@ impl ScrollbackContainer {
     }
 
     /// Advance the spinner one frame and mark every currently-tracked
-    /// active entry damaged so the next [`draw`] repaints them with
+    /// active entry damaged so the next `draw` repaints them with
     /// the new glyph. No-op when the spinner hasn't been enabled, or
     /// when there are no active entries.
     pub fn bump_spinner(&mut self) {
@@ -313,7 +313,7 @@ impl ScrollbackContainer {
     }
 
     /// Append a block whose content is already final. Routes through
-    /// [`push_active`] + [`mark_safe`] so the new entry respects any
+    /// `push_active` + `mark_safe` so the new entry respects any
     /// older in-flight blocks ahead of it: with no active block in
     /// the way it drains straight into `safe`, otherwise it queues at
     /// the back of `active` (already flagged `safe_to_commit`) and
@@ -325,8 +325,8 @@ impl ScrollbackContainer {
     }
 
     /// Append a block to `active` and return its id. The caller may
-    /// later swap in a fresh block via [`update_active`] or mark the
-    /// entry finalised via [`mark_safe`].
+    /// later swap in a fresh block via `update_active` or mark the
+    /// entry finalised via `mark_safe`.
     ///
     /// If the block's [`Block::safe_on_push`] returns `true` (a
     /// one-shot block that never streams), the entry is flagged
@@ -355,7 +355,7 @@ impl ScrollbackContainer {
     /// Replace the block at `id` with a freshly constructed one
     /// representing the new full state. No-op if `id` is unknown
     /// (already promoted / never existed). Flags the entry as
-    /// damaged so the next [`draw`] re-emits its rows.
+    /// damaged so the next `draw` re-emits its rows.
     pub fn update_active(&mut self, id: BlockId, block: Box<dyn Block>) {
         if let Some(entry) = self.active.get_mut(id) {
             entry.block = block;
@@ -394,7 +394,7 @@ impl ScrollbackContainer {
     }
 
     /// Absolute screen row where the footer's first row was painted
-    /// on the most recent [`draw`]. Callers driving an inline cursor
+    /// on the most recent `draw`. Callers driving an inline cursor
     /// (e.g. a textarea inside the footer) use this to place the
     /// cursor over the right row.
     pub fn footer_top_row(&self) -> u16 {
@@ -425,7 +425,7 @@ impl ScrollbackContainer {
         tracing::trace!(committed_len = self.committed.len(), "push_committed");
     }
 
-    /// Like [`push_committed`], but flags the entry as truncated — the
+    /// Like `push_committed`, but flags the entry as truncated — the
     /// block was in-flight when its workflow was dehydrated and never
     /// received a clean stop. The inspector's render pass forwards the
     /// flag to the block via [`BlockRenderContext::truncated`] so the
@@ -451,13 +451,13 @@ impl ScrollbackContainer {
 
     /// Drop the in-memory block deques (committed / safe / active)
     /// without disturbing the terminal screen. Whatever cells are
-    /// currently on screen stay there; the next [`draw`] resumes at
+    /// currently on screen stay there; the next `draw` resumes at
     /// the previous footer anchor and new content overwrites old
     /// footer cells row-by-row. Anything above that anchor remains
     /// visible until natural growth pushes it off the top into
     /// native scrollback — same way a shell prompt scrolls history.
     ///
-    /// Used by the TUI on `StreamFrame::ScrollbackReset` so each
+    /// Used by the TUI on a scrollback `Reset` frame so each
     /// workflow starts with a fresh in-memory deque while the
     /// terminal's visible state continues evolving inline.
     ///
@@ -512,17 +512,17 @@ impl ScrollbackContainer {
     }
 
     /// Toggle scrollback inspector mode. While set, the caller is
-    /// expected to drive [`paint_scrollback`] instead of [`draw`]
+    /// expected to drive `paint_scrollback` instead of `draw`
     /// (typically against an alt-screen brought up externally).
     ///
     /// A `false → true` transition resets the scroll offset to `0`
-    /// and seeds [`selected_from_newest`] to `Some(0)` (the newest
+    /// and seeds `selected_from_newest` to `Some(0)` (the newest
     /// block) when any history exists. Repeated `true` calls are
     /// idempotent — the offset and selection are preserved.
     /// `set_scrollback(false)` does not touch either; screen state
     /// is the caller's concern. The standard pattern is to bracket
     /// the inspector in alt-screen enter/leave so the main screen
-    /// is restored when [`draw`] resumes.
+    /// is restored when `draw` resumes.
     pub fn set_scrollback(&mut self, enabled: bool) {
         let prev = self.scrollback_active;
         if enabled && !self.scrollback_active {
@@ -539,7 +539,7 @@ impl ScrollbackContainer {
     }
 
     /// Total block count across `committed` + `safe` + `active`.
-    /// Used by [`set_scrollback`] to decide whether to seed selection
+    /// Used by `set_scrollback` to decide whether to seed selection
     /// and by [`select_older`] to clamp.
     fn history_count(&self) -> usize {
         self.committed.len() + self.safe.len() + self.active_order.len()
@@ -623,7 +623,7 @@ impl ScrollbackContainer {
     }
 
     /// Forward an event to the currently-selected block's
-    /// [`Block::handle_event`]. Returns [`EventOutcome::Pass`] when
+    /// `Block::handle_event`. Returns [`EventOutcome::Pass`] when
     /// nothing is selected (closed inspector, empty history, or
     /// selection past the end).
     ///
@@ -653,7 +653,7 @@ impl ScrollbackContainer {
 
     /// Move the inspector window towards older content by `n` rows.
     /// Stored unclamped — the renderer pins it against the current
-    /// maximum on the next [`paint_scrollback`], so the typical
+    /// maximum on the next `paint_scrollback`, so the typical
     /// "page up past the top" key still lands cleanly at the top.
     pub fn scroll_up(&mut self, n: u16) {
         self.scrollback_offset = self.scrollback_offset.saturating_add(n);
@@ -818,7 +818,7 @@ impl ScrollbackContainer {
     /// [`ScrollbackBackend`].
     ///
     /// Three render paths share this entry point, dispatched by
-    /// [`classify_layout`]:
+    /// `classify_layout`:
     ///
     /// **Normal / SafeOnly** — content fits, or only safe entries
     /// overflow. The natural-scroll path runs:
@@ -843,7 +843,7 @@ impl ScrollbackContainer {
     /// 5. Save `next_y` for the next frame = the row where the
     ///    footer's first row ended up on screen this time.
     ///
-    /// **ActiveOverflow** — see [`draw_active_overflow`]. Paints from
+    /// **ActiveOverflow** — see `draw_active_overflow`. Paints from
     /// row 0 down with a `•••` indicator on the top row; safe entries
     /// that need to commit emit at the top so they scroll into
     /// native scrollback; active rows that don't fit are silently
@@ -1183,7 +1183,7 @@ impl ScrollbackContainer {
 
     /// Active-overflow render path.
     ///
-    /// Triggered by [`classify_layout`] when total content exceeds the
+    /// Triggered by `classify_layout` when total content exceeds the
     /// terminal *and* the cumulative active height is at least
     /// `available_h`. In that situation we must not let the terminal's
     /// natural scroll push active cells into native scrollback (we'd
@@ -1500,7 +1500,7 @@ impl ScrollbackContainer {
     /// positioning + cell writes — never a `\n` — so cells cannot leak
     /// into native scrollback. Caller is responsible for switching to /
     /// from an alt-screen around the inspector loop; the container only
-    /// holds the mode flag (via [`set_scrollback`]) so callers can
+    /// holds the mode flag (via `set_scrollback`) so callers can
     /// branch their render loop.
     pub fn paint_scrollback<B>(
         &mut self,
@@ -1636,7 +1636,7 @@ impl ScrollbackContainer {
     /// - Reserve `area.x` (column 0 of the content area) as a selection
     ///   gutter; each block renders at `area.x + 1` with one column
     ///   trimmed. The gutter is only inserted when `area.width >= 2`.
-    /// - When [`selected_from_newest`] points at a block whose visible
+    /// - When `selected_from_newest` points at a block whose visible
     ///   slice has at least one row in this window, paint a cyan `▶`
     ///   into the gutter on the block's topmost on-screen row.
     fn paint_history_window(&self, area: Rect, src_y_offset: u16, frame_buf: &mut Buffer) {

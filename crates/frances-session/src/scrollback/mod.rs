@@ -6,7 +6,7 @@
 //! ## Writes
 //!
 //! - **Clean close** (`BlockStop` on the wire): [`persist_block`] with
-//!   `truncated = false`. Called from the [`EmitState`]'s normal close
+//!   `truncated = false`. Called from the `EmitState`'s normal close
 //!   path inside `workflows::emit`.
 //! - **Dehydrate-interrupted close**: same call with `truncated = true`.
 //!   Triggered when a workflow is pushed off the top with an open

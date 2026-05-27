@@ -1,6 +1,7 @@
 //! Slash-command workflows.
 //!
-//! A workflow is a script-defined hook that takes over a turn. Workflows
+//! A workflow is a script-defined hook that drives a chat session and
+//! its tool calls. Workflows
 //! are declared per-id in the layered config tree as
 //! `workflows.<id>.file = "/path/to/foo.ts"` and invoked from the TUI by
 //! typing `/<id> [args...]`.

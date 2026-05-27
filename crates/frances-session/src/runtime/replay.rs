@@ -10,9 +10,9 @@ use crate::store::Database;
 
 use super::EventsChannel;
 
-/// Push the attach-time replay burst into `events`. With an active
-/// workflow this is the same `ScrollbackReset` / replay /
-/// `ScrollbackReplayEnd` bracket emitted by
+/// Push the startup replay burst into `events`. With an active
+/// workflow this is the same [`ScrollbackFrame::Reset`] / replay /
+/// [`ScrollbackFrame::End`] bracket emitted by
 /// [`crate::scrollback::replay_to_channel`]; with no active workflow
 /// we still emit an empty bracket so the TUI clears any stale
 /// in-memory scrollback before going live.

@@ -42,7 +42,7 @@ impl ProviderId {
 }
 
 /// The sender handed to providers' `load()`. Wraps the handle's internal
-/// channel and stamps each batch with the provider's [`ProviderId`] so the
+/// channel and stamps each batch with the provider's `ProviderId` so the
 /// processor can route events into the right layer.
 #[derive(Clone)]
 pub struct EventSender {

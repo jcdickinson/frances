@@ -26,7 +26,7 @@
 //! concrete blocks — `Box<dyn Block>` itself isn't `Serialize` because
 //! that would block dyn dispatch (Serialize is not object-safe). The
 //! binary's `block_for_kind` reconstructs concrete blocks from a wire
-//! [`frances_session::events::BlockKind`] + text payload; the same path
+//! `frances_session::events::BlockKind` + text payload; the same path
 //! is intended to drive scrollback restore. If we later need open-set
 //! extensibility, swap to `typetag`.
 

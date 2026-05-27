@@ -14,8 +14,8 @@
 //! instead of `paths: ["a"]`) parse the same as the strict shape — at
 //! zero cost on the happy path.
 //!
-//! Paths are resolved against the runtime's most-recently-attached
-//! client cwd (`WorkflowDeps::current_cwd`), matching the file editor.
+//! Paths are resolved against the latest invocation's cwd
+//! (`WorkflowDeps::current_cwd`), matching the file editor.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

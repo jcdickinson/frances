@@ -10,7 +10,7 @@ use crate::value::{Path, Value};
 
 /// An immutable snapshot of layered configuration.
 ///
-/// Each node carries one slot per provider (indexed by [`ProviderId`]) plus
+/// Each node carries one slot per provider (indexed by `ProviderId`) plus
 /// a cache of the highest-priority non-null slot, so reads are O(1) and
 /// retraction by a higher-priority provider naturally falls through to the
 /// next provider that has a value at the same path.
@@ -72,7 +72,7 @@ impl Configuration {
         ConfigBinding::from_snapshot(Path::new(), Some(self), Weak::new())
     }
 
-    /// Ergonomic single-event update against [`ProviderId`] 0. Used by tests
+    /// Ergonomic single-event update against `ProviderId` 0. Used by tests
     /// and ad-hoc snapshot construction. The processor uses the batch form.
     pub fn applied(&self, event: ConfigEvent) -> Self {
         self.applied_batch(ProviderId(0), std::slice::from_ref(&event))

@@ -160,7 +160,7 @@ impl LiveBlocks {
     }
 
     /// Drop all live tracking without touching the container. Used on
-    /// `ScrollbackReset`: the container is about to be cleared, so
+    /// a scrollback `Reset` frame: the container is about to be cleared, so
     /// every in-memory active entry will go away with it; we just
     /// need to reset the protocol-id → container-id map.
     fn discard(&mut self) {

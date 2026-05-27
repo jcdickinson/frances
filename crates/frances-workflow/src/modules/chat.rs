@@ -120,7 +120,8 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
 pub struct ChatSessionJs<D: WorkflowDeps> {
     handle: Session<D>,
     /// Captured at construction so each `stream()` call can resolve env
-    /// vars (auth, etc.) against the latest client attach snapshot.
+    /// vars (auth, etc.) against the latest invocation's environment
+    /// snapshot.
     deps: D,
     /// Side-channel for emitting `HostFrame::Usage` when the LLM
     /// stream reports token usage. Independent of the JS-visible

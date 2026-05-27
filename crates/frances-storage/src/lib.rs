@@ -73,7 +73,7 @@ impl Database {
         })
     }
 
-    /// Shortcut for [`Database::open(":memory:")`]. Useful in tests.
+    /// Shortcut for [`Database::open`] with `":memory:"`. Useful in tests.
     pub async fn open_in_memory() -> std::result::Result<Self, turso::Error> {
         Self::open(":memory:").await
     }
@@ -285,7 +285,7 @@ async fn load_applied(conn: &Connection, entity: &[u8]) -> Result<Vec<AppliedRow
     Ok(out)
 }
 
-/// Apply [`schema`] to `conn`. Caller must have already invoked
+/// Apply `schema` to `conn`. Caller must have already invoked
 /// [`ensure_table`].
 ///
 /// Rejects the load (returns an error without applying anything) if

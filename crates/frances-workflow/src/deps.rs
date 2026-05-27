@@ -44,17 +44,17 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     /// session-runtime impl bridges to the TUI; tests stub it.
     fn permissions(&self) -> &Self::Permissions;
 
-    /// Snapshot of the most recently attached client's environment.
-    /// Used by `ChatSession.stream()` so the provider can resolve auth
-    /// env vars (e.g. `OPENROUTER_API_KEY`) against the client process,
-    /// not the session-runtime process. Returns an empty map if no client has
-    /// attached yet.
+    /// Snapshot of the latest invocation's environment. Used by
+    /// `ChatSession.stream()` so the provider can resolve auth env vars
+    /// (e.g. `OPENROUTER_API_KEY`) against the invoking process, not the
+    /// session-runtime process. Returns an empty map before the
+    /// invocation context is set.
     fn current_env(&self) -> HashMap<OsString, OsString>;
 
-    /// Snapshot of the most recently attached client's working
-    /// directory. `Editor` resolves relative paths against this on every
-    /// call so re-attach with a different client cwd takes effect
-    /// immediately. `None` when no client has attached yet.
+    /// Snapshot of the latest invocation's working directory. `Editor`
+    /// resolves relative paths against this on every call, so a new
+    /// invocation context with a different cwd takes effect immediately.
+    /// `None` before the invocation context is set.
     fn current_cwd(&self) -> Option<PathBuf>;
 
     /// Resolve a workflow's per-session SQL handle. On first touch the

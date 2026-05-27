@@ -34,11 +34,11 @@ pub enum QuietReason {
     MaxElapsed,
 }
 
-/// Discrete events delivered through an [`OutputReader`]'s sink. A
+/// Discrete events delivered through an `OutputReader`'s sink. A
 /// command run produces zero or more `Output` events as bytes arrive
 /// (the sentinel itself is never shipped), terminated by exactly one
 /// of `Quiet { reason }`, `Done { exit_code }`, or `Dead`. The
-/// terminal event always corresponds to the [`ReadOutcome`] the same
+/// terminal event always corresponds to the `ReadOutcome` the same
 /// `read_until_sentinel` call is about to return, so consumers can
 /// drive frame-close logic off the event alone without a separate
 /// barrier.

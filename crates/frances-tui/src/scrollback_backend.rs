@@ -1,15 +1,15 @@
 //! [`ScrollbackBackend`] — a `ratatui::backend::Backend` wrapper that
-//! serves two roles on the same struct, distinguished by [`mode`]:
+//! serves two roles on the same struct, distinguished by `mode`:
 //!
 //! * **`Scrollback` mode (default).** Transparent passthrough; the
 //!   `ScrollbackContainer` drives the terminal directly via row-level
-//!   helpers — [`ScrollbackBackend::move_cursor_abs`],
-//!   [`ScrollbackBackend::write_row`], [`ScrollbackBackend::newline`] —
+//!   helpers — `ScrollbackBackend::move_cursor_abs`,
+//!   `ScrollbackBackend::write_row`, `ScrollbackBackend::newline` —
 //!   and `\n`s push old content into native scrollback.
 //! * **`Footer` mode.** ratatui's `Terminal::draw` is in charge of the
 //!   footer rect. [`Backend::size`] reports the footer's dimensions
 //!   (not the whole band), and [`Backend::draw`] translates cell
-//!   coordinates by [`footer_anchor_y`] before emitting, so a buffer
+//!   coordinates by `footer_anchor_y` before emitting, so a buffer
 //!   ratatui owns at logical `(0, 0)` lands at the right screen row.
 //!
 //! [`SyncGuard`] brackets a frame with DEC mode 2026 synchronised

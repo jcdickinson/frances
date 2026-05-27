@@ -140,7 +140,7 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     /// JSON-shaped args from the LLM. Serialized through
-    /// [`json_value_as_string`] so non-self-describing formats (bincode)
+    /// `json_value_as_string` so non-self-describing formats (bincode)
     /// can carry it — `serde_json::Value` itself uses
     /// `deserialize_any`, which bincode rejects.
     #[serde(with = "json_value_as_string")]

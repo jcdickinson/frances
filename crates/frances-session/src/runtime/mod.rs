@@ -1,7 +1,6 @@
 //! In-process session runtime.
 //!
-//! Owns everything that used to live behind the daemon's
-//! socket boundary: per-session DB handles, the workflow runtime, the
+//! Owns the per-session state: per-session DB handles, the workflow runtime, the
 //! chat manager, scrollback / history stores, permission registry, and
 //! the events channel into the TUI.
 
@@ -222,9 +221,9 @@ impl EditorFactory for SessionEditorFactory {
     }
 }
 
-/// The session runtime. Holds the per-session state previously owned
-/// by the daemon process; produces frames into [`EventsChannel`] and
-/// accepts prompt / permission input from the TUI.
+/// The session runtime. Holds the per-session state; produces frames
+/// into [`EventsChannel`] and accepts prompt / permission input from
+/// the TUI.
 pub struct SessionRuntime {
     pub session: Session,
     pub invocation: Arc<StdMutex<InvocationContext>>,
@@ -353,7 +352,7 @@ impl SessionRuntime {
             }
         };
         // Publish the active wires synchronously (before the driver task
-        // is scheduled) so `replay_initial_scrollback` / attach see the
+        // is scheduled) so `replay_initial_scrollback` sees the
         // active instance immediately.
         runtime.workflow_stack.seat_initial(initial.as_ref());
 
@@ -373,8 +372,8 @@ impl SessionRuntime {
     }
 
     /// Run the initial scrollback replay for the currently-active
-    /// workflow instance. Sends a `ScrollbackReset` / replay /
-    /// `ScrollbackReplayEnd` burst into the events channel.
+    /// workflow instance. Sends a `ScrollbackFrame::Reset` / replay /
+    /// `ScrollbackFrame::End` burst into the events channel.
     pub async fn replay_initial_scrollback(self: &Arc<Self>) {
         let active_instance = self.workflow_stack.active_instance().await;
         if let Err(error) =

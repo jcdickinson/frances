@@ -247,8 +247,8 @@ impl ShellOutputBlock {
     }
 
     /// Non-empty source lines, with trailing blanks from a closing
-    /// `\n` stripped. Shared between `measure` (via [`body_lines`])
-    /// and the windowing logic in [`body_lines_at`].
+    /// `\n` stripped. Shared between [`Self::max_scroll_for`] and the
+    /// windowing logic in [`Self::body_lines_at`].
     fn source_lines(&self) -> Vec<&str> {
         let mut source: Vec<&str> = self.text.split('\n').collect();
         while matches!(source.last(), Some(&"")) {
@@ -268,7 +268,7 @@ impl ShellOutputBlock {
     /// Body rows for a window of height `tail` whose right edge sits
     /// `window_start` source-lines *before* the natural tail. The row
     /// count is invariant in `window_start` (clamped via
-    /// [`max_scroll_for`]) so `measure` and `render` agree on height.
+    /// [`Self::max_scroll_for`]) so `measure` and `render` agree on height.
     ///
     /// - When `source.len() > tail`: 1 marker row + `tail` body rows.
     ///   The marker reports how many source lines remain hidden above

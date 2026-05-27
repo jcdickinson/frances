@@ -332,7 +332,7 @@ impl<D: WorkflowDeps> Runtime<D> {
 
     /// Start a workflow on the JS thread and return the handle the host
     /// uses to drive it. The JS thread does the source read + transpile,
-    /// resolves the per-workflow [`WorkflowDb`] (applying migrations on
+    /// resolves the per-workflow [`WorkflowDb`](crate::WorkflowDb) (applying migrations on
     /// first touch), and `spawn_local`s the body.
     pub async fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
         let (reply, reply_rx) = oneshot::channel();

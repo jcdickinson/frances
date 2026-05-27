@@ -9,7 +9,7 @@
 //! `ProviderConfig.base_url` is honoured by injecting a
 //! `ServiceTargetResolver` into the genai `Client` that overrides the
 //! adapter's default endpoint. The bearer resolves per call against the
-//! per-attach env via an `AuthResolver`.
+//! latest invocation's env via an `AuthResolver`.
 //!
 //! Reasoning round-trips natively: genai's `ContentPart::ReasoningContent`
 //! is hoisted back into each adapter's wire format on subsequent
