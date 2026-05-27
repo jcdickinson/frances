@@ -41,8 +41,8 @@
 //! - `frances:v1/approval`       — single async
 //!   `approve({ prompt, toolCall?, allowAuto? })` that asks the user
 //!   for permission. Backed by a private `_approve` primitive on the
-//!   install stash; the host bridges via the permissions channel
-//!   (`PermissionAsk`) + the `Permissions` trait.
+//!   install stash; the host bridges via the permissions channel, whose
+//!   `PermissionRequest` carries its own reply slot.
 //! - `frances:v1/storage`        — `db` singleton with
 //!   `exec`/`query`/`queryStream`/`transaction`. Backed by a workflow's
 //!   per-entity migrations declared in `[workflows.<id>].migrations`.
@@ -141,10 +141,9 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     #[cfg(any(test, feature = "test-utils"))]
     let on_idle = host.on_idle;
 
-    // Clones for the approval primitive — it owns the gateway and a
-    // sender into the permissions channel so JS `approve()` can emit a
-    // request without going through `transcript`.
-    let approval_deps = deps.clone();
+    // Clone for the approval primitive — it owns a sender into the
+    // permissions channel so JS `approve()` can emit a request without
+    // going through `transcript`.
     let approval_permissions_tx = senders.permissions.clone();
 
     let stash = Object::new(ctx.clone())?;
@@ -230,13 +229,8 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("_setSleep", set_sleep)?;
     stash.set("_clearSleep", clear_sleep)?;
 
-    let approve_fn = permission::build_approve_primitive(
-        ctx,
-        approval_deps,
-        approval_permissions_tx,
-        closed,
-        closed_notify,
-    )?;
+    let approve_fn =
+        permission::build_approve_primitive(ctx, approval_permissions_tx, closed, closed_notify)?;
     stash.set("_approve", approve_fn)?;
 
     let db_instance = storage::build_storage(ctx, workflow_db)?;

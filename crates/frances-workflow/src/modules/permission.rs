@@ -31,19 +31,17 @@ use rquickjs::promise::Promised;
 use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Result as JsResult, Value};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::oneshot;
 
-use crate::deps::WorkflowDeps;
-use crate::permission::{PermissionResponse, Permissions};
-use crate::runtime::PermissionAsk;
+use crate::permission::{PermissionRequest, PermissionResponse};
 
 /// Build the `_approve` primitive that `frances:v1/approval` re-wraps.
-/// Captures the gateway from deps, the permissions channel, and the
-/// workflow `closed` signal so a graceful shutdown surfaces as a benign
-/// result instead of a hung promise.
-pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
+/// Owns a sender into the permissions channel and the workflow `closed`
+/// signal so a graceful shutdown surfaces as a benign result instead of
+/// a hung promise.
+pub(crate) fn build_approve_primitive<'js>(
     ctx: &Ctx<'js>,
-    deps: D,
-    permissions_tx: UnboundedSender<PermissionAsk>,
+    permissions_tx: UnboundedSender<PermissionRequest>,
     closed: Arc<AtomicBool>,
     closed_notify: Arc<Notify>,
 ) -> JsResult<Function<'js>> {
@@ -56,21 +54,19 @@ pub(crate) fn build_approve_primitive<'js, D: WorkflowDeps>(
                 allow_auto,
             } = parse_options(&ctx, &options)?;
 
-            let gateway = deps.permissions().clone();
-            let (request, rx) = gateway.allocate(prompt, tool_call);
+            // The request carries its own reply slot — no gateway, no id
+            // table. Whoever answers (auto-judge or TUI) resolves it.
+            let (reply, rx) = oneshot::channel();
 
             // Best-effort emit; the receiver side is a tokio mpsc that
             // outlives the workflow body (owned by the runtime's drive
             // loop), so a closed channel here means the host is gone
             // and there's nothing to do but resolve the promise.
-            //
-            // `allow_auto` rides on the `PermissionAsk`, not on the wire
-            // `PermissionRequest` — the driver reads it and either
-            // consults the auto-judge or forwards to the TUI; the TUI
-            // never sees the flag.
-            let _ = permissions_tx.send(PermissionAsk {
-                request,
+            let _ = permissions_tx.send(PermissionRequest {
+                prompt,
+                tool_call,
                 allow_auto,
+                reply,
             });
 
             let closed = closed.clone();

@@ -27,12 +27,10 @@ mod transpile;
 pub use config::WorkflowConfig;
 pub use deps::{EditorFactory, ShellFactory, WorkflowDeps};
 pub use error::WorkflowError;
-pub use permission::{
-    PermissionId, PermissionRequest, PermissionResponse, PermissionResponseWire, Permissions,
-};
+pub use permission::{PermissionRequest, PermissionResponse, PermissionResponseWire};
 pub use runtime::{
-    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, Runtime, ShellState,
-    SurfaceCmd, TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
+    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, Runtime, ShellState, SurfaceCmd,
+    TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

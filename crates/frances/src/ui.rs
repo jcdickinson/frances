@@ -17,12 +17,13 @@ use ratatui::Viewport;
 use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::Size;
 use ratatui::style::{Color, Style};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
 use frances_session::events::{
-    BlockKind, PermissionRequest, PermissionResponseWire, ScrollbackFrame, StreamFrame, SurfaceCmd,
+    BlockKind, PermissionRequest, PermissionResponse, PermissionResponseWire, ScrollbackFrame,
+    StreamFrame, SurfaceCmd,
 };
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
@@ -303,7 +304,7 @@ impl App<'_> {
                                         footer.input.set_placeholder("type a message…");
                                         respond_permission(
                                             &self.runtime,
-                                            req.id,
+                                            req.reply,
                                             PermissionResponseWire::RedirectToChat { content: text },
                                         );
                                     } else {
@@ -325,7 +326,7 @@ impl App<'_> {
                                         }
                                         _ => PermissionResponseWire::No { details },
                                     };
-                                    respond_permission(&self.runtime, req.id, response);
+                                    respond_permission(&self.runtime, req.reply, response);
                                 }
                                 KeyAction::Edit => {
                                     let mut redraw = false;
@@ -587,10 +588,10 @@ const PERMISSION_PLACEHOLDER: &str =
 
 fn respond_permission(
     runtime: &Arc<SessionRuntime>,
-    id: frances_session::events::PermissionId,
+    reply: oneshot::Sender<PermissionResponse>,
     response: PermissionResponseWire,
 ) {
-    if let Err(error) = runtime.respond_permission(id, response) {
+    if let Err(error) = runtime.respond_permission(reply, response) {
         runtime
             .events
             .send(StreamFrame::Error(format!("permission: {error}")));

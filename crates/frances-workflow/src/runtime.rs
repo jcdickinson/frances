@@ -85,18 +85,6 @@ pub enum SurfaceCmd {
     ClearFooter,
 }
 
-/// A permission ask emitted to the host. The answer arrives back through
-/// the `Permissions` gateway's response oneshot.
-///
-/// `allow_auto` flags the gate as eligible for the host's auto-approver.
-/// It rides here (not on the wire `PermissionRequest`) so the driver can
-/// read it without a side lookup, and so it never leaks to the TUI.
-#[derive(Debug, Clone)]
-pub struct PermissionAsk {
-    pub request: PermissionRequest,
-    pub allow_auto: bool,
-}
-
 /// The workflow's typed outputs: a bag of single-consumer channels. The
 /// driver selects over the ones it must drive; the rest flow to their own
 /// consumers. Asymmetric with the inbox (a union) on purpose — outputs are
@@ -108,7 +96,7 @@ pub struct WorkflowOutputs {
     /// via `setStatus` from `frances:v1/workflow`. Never persisted.
     pub surfaces: UnboundedReceiver<SurfaceCmd>,
     /// Permission asks awaiting a user (or auto-approver) answer.
-    pub permissions: UnboundedReceiver<PermissionAsk>,
+    pub permissions: UnboundedReceiver<PermissionRequest>,
     /// LLM token-usage telemetry. Side-channel; opens/closes no block and
     /// is never persisted (the TUI drops it during replay).
     pub usage: UnboundedReceiver<frances_models_llm::wire::Usage>,
@@ -120,7 +108,7 @@ pub struct WorkflowOutputs {
 pub(crate) struct OutputSenders {
     pub transcript: UnboundedSender<TranscriptDelta>,
     pub surfaces: UnboundedSender<SurfaceCmd>,
-    pub permissions: UnboundedSender<PermissionAsk>,
+    pub permissions: UnboundedSender<PermissionRequest>,
     pub usage: UnboundedSender<frances_models_llm::wire::Usage>,
 }
 
@@ -425,7 +413,7 @@ async fn start_impl<D: WorkflowDeps>(
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
     let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptDelta>();
     let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<SurfaceCmd>();
-    let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionAsk>();
+    let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionRequest>();
     let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::wire::Usage>();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
     let shutdown_notify = Arc::new(Notify::new());
@@ -768,30 +756,16 @@ pub mod test_deps {
     use uuid::Uuid;
 
     use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
-    use crate::permission::{PermissionId, PermissionRequest, PermissionResponse, Permissions};
     use crate::storage::{WorkflowDb, WorkflowDbError};
-    use frances_models_llm::wire::ToolCall;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use tokio::sync::OnceCell;
-    use tokio::sync::oneshot;
 
     #[derive(Clone, Default)]
     pub struct StubDeps {
         manager: StubManager,
         shell_factory: StubShellFactory,
         editor_factory: StubEditorFactory,
-        approvals: StubPermissions,
         cwd: Arc<Mutex<Option<PathBuf>>>,
         storage: StubStorage,
-    }
-
-    impl StubDeps {
-        /// Resolve the most-recently-allocated permission slot with the
-        /// given response. Returns `false` if there's no pending slot or
-        /// it already settled.
-        pub fn answer_approval(&self, id: PermissionId, response: PermissionResponse) -> bool {
-            self.approvals.answer(id, response)
-        }
     }
 
     impl StubDeps {
@@ -818,7 +792,6 @@ pub mod test_deps {
         type ChatSessionManager = StubManager;
         type ShellFactory = StubShellFactory;
         type EditorFactory = StubEditorFactory;
-        type Permissions = StubPermissions;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -830,10 +803,6 @@ pub mod test_deps {
 
         fn editor_factory(&self) -> &Self::EditorFactory {
             &self.editor_factory
-        }
-
-        fn permissions(&self) -> &Self::Permissions {
-            &self.approvals
         }
 
         fn current_env(&self) -> HashMap<OsString, OsString> {
@@ -909,48 +878,6 @@ pub mod test_deps {
         }
     }
 
-    /// In-memory `Permissions` for tests. Records each allocation
-    /// and lets the test settle the oneshot via `answer`.
-    #[derive(Clone, Default)]
-    pub struct StubPermissions {
-        inner: Arc<StubPermissionsInner>,
-    }
-
-    #[derive(Default)]
-    struct StubPermissionsInner {
-        next_id: AtomicU64,
-        pending: Mutex<HashMap<PermissionId, oneshot::Sender<PermissionResponse>>>,
-    }
-
-    impl Permissions for StubPermissions {
-        fn allocate(
-            &self,
-            prompt: String,
-            tool_call: Option<ToolCall>,
-        ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
-            let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-            let (tx, rx) = oneshot::channel();
-            self.inner.pending.lock().insert(id, tx);
-            (
-                PermissionRequest {
-                    id,
-                    prompt,
-                    tool_call,
-                },
-                rx,
-            )
-        }
-    }
-
-    impl StubPermissions {
-        fn answer(&self, id: PermissionId, response: PermissionResponse) -> bool {
-            match self.inner.pending.lock().remove(&id) {
-                Some(tx) => tx.send(response).is_ok(),
-                None => false,
-            }
-        }
-    }
-
     /// Real-bash shell factory for shell-specific tests. Spawns an
     /// actual bash subprocess. Tests that don't need bash use
     /// `StubShellFactory` (the default).
@@ -984,7 +911,6 @@ pub mod test_deps {
         manager: StubManager,
         shell_factory: RealShellFactory,
         editor_factory: StubEditorFactory,
-        approvals: StubPermissions,
         storage: StubStorage,
     }
 
@@ -992,7 +918,6 @@ pub mod test_deps {
         type ChatSessionManager = StubManager;
         type ShellFactory = RealShellFactory;
         type EditorFactory = StubEditorFactory;
-        type Permissions = StubPermissions;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
@@ -1004,10 +929,6 @@ pub mod test_deps {
 
         fn editor_factory(&self) -> &Self::EditorFactory {
             &self.editor_factory
-        }
-
-        fn permissions(&self) -> &Self::Permissions {
-            &self.approvals
         }
 
         fn current_env(&self) -> HashMap<OsString, OsString> {
@@ -1063,13 +984,6 @@ pub mod test_deps {
 
         pub fn sessions(&self) -> Vec<StubSession> {
             self.manager.sessions.lock().clone()
-        }
-
-        /// Resolve the pending permission slot `id` with `response`. Mirrors
-        /// `StubDeps::answer_approval` for the real-shell deps variant
-        /// used by `frances:v1/tools/shell` tests.
-        pub fn answer_approval(&self, id: PermissionId, response: PermissionResponse) -> bool {
-            self.approvals.answer(id, response)
         }
     }
 
@@ -5454,26 +5368,25 @@ mod tests {
             .await
             .unwrap();
 
-        let (req, allow_auto) = tokio::time::timeout(CYCLE_TIMEOUT, async {
+        let req = tokio::time::timeout(CYCLE_TIMEOUT, async {
             loop {
-                if let Some(ask) = handle.outputs.permissions.recv().await {
-                    return (ask.request, ask.allow_auto);
+                if let Some(req) = handle.outputs.permissions.recv().await {
+                    return req;
                 }
             }
         })
         .await
         .expect("approval frame did not arrive in time");
         assert_eq!(req.prompt, "delete /tmp/foo?");
-        assert!(!allow_auto, "default allowAuto should be false");
+        assert!(!req.allow_auto, "default allowAuto should be false");
 
         assert!(
-            deps.answer_approval(
-                req.id,
-                PermissionResponse::Yes {
+            req.reply
+                .send(PermissionResponse::Yes {
                     details: Some("scoped to /tmp".into()),
-                },
-            ),
-            "answer should land on the pending slot",
+                })
+                .is_ok(),
+            "answer should land on the embedded reply slot",
         );
 
         let result = tokio::time::timeout(CYCLE_TIMEOUT, &mut handle.done)

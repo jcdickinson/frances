@@ -14,7 +14,9 @@ pub use frances_workflow::SurfaceCmd;
 
 use crate::llm::Usage;
 
-pub use frances_workflow::permission::{PermissionId, PermissionRequest, PermissionResponseWire};
+pub use frances_workflow::permission::{
+    PermissionRequest, PermissionResponse, PermissionResponseWire,
+};
 
 /// Identifies a content block (user text, assistant text, etc.) within a
 /// prompt-response cycle.
@@ -28,7 +30,7 @@ impl std::fmt::Display for BlockId {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum StreamFrame {
     /// Self-describing block content. The first delta with a
     /// previously-unseen `id` implicitly opens a new block of `kind`;

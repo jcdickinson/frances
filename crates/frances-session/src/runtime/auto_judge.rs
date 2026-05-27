@@ -107,7 +107,7 @@ pub(crate) async fn judge(
 ) -> JudgeOutcome {
     let env = runtime.invocation.lock().process.env.clone();
 
-    let session_id = format!("auto-judge:{}", request.id);
+    let session_id = format!("auto-judge:{}", uuid::Uuid::new_v4());
     let tools = [APPROVE_TOOL.clone(), REJECT_TOOL.clone()];
 
     let inputs: Vec<HistoryInput<'_>> = vec![
@@ -122,7 +122,7 @@ pub(crate) async fn judge(
     let first = match run_round(runtime, &session_id, &env, &inputs, &tools).await {
         RoundOutcome::Parsed(parse) => parse,
         RoundOutcome::Errored(reason) => {
-            warn!(%reason, id = %request.id, "auto-judge: chat.complete failed");
+            warn!(%reason, "auto-judge: chat.complete failed");
             return JudgeOutcome::Indeterminate { reason };
         }
     };
@@ -131,8 +131,7 @@ pub(crate) async fn judge(
         ParseResult::Approve { reason } => return JudgeOutcome::Approve { reason },
         ParseResult::Reject { reason } => return JudgeOutcome::Reject { reason },
         ParseResult::Malformed { detail } => {
-            warn!(id = %request.id, %detail,
-                "auto-judge: malformed response; retrying once");
+            warn!(%detail, "auto-judge: malformed response; retrying once");
         }
     }
 
@@ -144,7 +143,7 @@ pub(crate) async fn judge(
     let second = match run_round(runtime, &session_id, &env, &retry_inputs, &tools).await {
         RoundOutcome::Parsed(parse) => parse,
         RoundOutcome::Errored(reason) => {
-            warn!(%reason, id = %request.id, "auto-judge: retry chat.complete failed");
+            warn!(%reason, "auto-judge: retry chat.complete failed");
             return JudgeOutcome::Indeterminate {
                 reason: format!("retry chat.complete failed: {reason}"),
             };

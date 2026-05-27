@@ -52,7 +52,7 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, SurfaceCmd,
+    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionRequest, SurfaceCmd,
     TranscriptDelta, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
@@ -555,7 +555,7 @@ pub(crate) async fn run_driver(
     enum Step {
         Transcript(TranscriptDelta),
         Surface(SurfaceCmd),
-        Permission(PermissionAsk),
+        Permission(PermissionRequest),
         Usage(frances_models_llm::wire::Usage),
         Done(Option<WorkflowError>),
         Push { name: String, args: Vec<String> },
@@ -924,31 +924,27 @@ fn emit_usage(runtime: &Arc<SessionRuntime>, usage: frances_models_llm::wire::Us
     runtime.events.send(StreamFrame::Usage(usage));
 }
 
-/// A permission ask. When `allow_auto`, consult the auto-judge first and
-/// answer directly on approve; otherwise (or on reject/indeterminate)
-/// forward to the TUI for a human decision.
-async fn emit_permission(runtime: &Arc<SessionRuntime>, ask: PermissionAsk) {
-    let PermissionAsk {
-        request,
-        allow_auto,
-    } = ask;
-    if allow_auto {
-        let id = request.id;
+/// A permission request. When `allow_auto`, consult the auto-judge first
+/// and answer on the embedded reply slot on approve; otherwise (or on
+/// reject/indeterminate) forward to the TUI for a human decision.
+async fn emit_permission(runtime: &Arc<SessionRuntime>, request: PermissionRequest) {
+    if request.allow_auto {
         let outcome = crate::runtime::auto_judge::judge(runtime, &request).await;
         match outcome {
             crate::runtime::auto_judge::JudgeOutcome::Approve { reason } => {
-                if let Err(error) = runtime.permissions.respond(
-                    id,
-                    frances_workflow::PermissionResponse::Yes {
+                if request
+                    .reply
+                    .send(frances_workflow::PermissionResponse::Yes {
                         details: Some(reason),
-                    },
-                ) {
-                    warn!(%error, %id, "auto-judge approve: respond failed");
+                    })
+                    .is_err()
+                {
+                    warn!("auto-judge approve: workflow stopped waiting");
                 }
             }
             crate::runtime::auto_judge::JudgeOutcome::Reject { reason }
             | crate::runtime::auto_judge::JudgeOutcome::Indeterminate { reason } => {
-                tracing::debug!(%id, %reason, "auto-judge fell through to user");
+                tracing::debug!(%reason, "auto-judge fell through to user");
                 runtime.events.send(StreamFrame::Permission(request));
             }
         }

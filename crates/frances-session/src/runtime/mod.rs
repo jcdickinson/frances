@@ -1,14 +1,13 @@
 //! In-process session runtime.
 //!
 //! Owns the per-session state: per-session DB handles, the workflow runtime, the
-//! chat manager, scrollback / history stores, permission registry, and
-//! the events channel into the TUI.
+//! chat manager, scrollback / history stores, and the events channel
+//! into the TUI.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::Mutex as StdMutex;
@@ -21,7 +20,7 @@ use uuid::Uuid;
 
 use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
-use crate::events::{PermissionId, PermissionRequest, PermissionResponseWire, StreamFrame};
+use crate::events::{PermissionResponseWire, StreamFrame};
 use crate::history::TursoHistoryStore;
 use crate::llm::{SessionConfigProvider, SessionConfigWriter};
 use crate::session::Session;
@@ -30,11 +29,10 @@ use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, T
 use frances_edit::{EditEngine, EditSession};
 use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
 use frances_models_llm::config::ModelConfig;
-use frances_models_llm::wire::ToolCall;
 use frances_storage::{Database, Migration};
 use frances_workflow::{
-    EditorFactory, PermissionResponse, Permissions, Runtime as WorkflowRuntime, WorkflowDb,
-    WorkflowDbError, WorkflowDeps,
+    EditorFactory, PermissionResponse, Runtime as WorkflowRuntime, WorkflowDb, WorkflowDbError,
+    WorkflowDeps,
 };
 
 pub(crate) mod auto_judge;
@@ -63,15 +61,13 @@ impl ChatManagerDeps for ChatDepsImpl {
 }
 
 /// Concrete `WorkflowDeps` impl. Holds the chat manager and the
-/// per-session DB handle plus the same permission/editor factories the
-/// TUI sees, so `current_env` / `current_cwd` / permission round-trips
-/// share state with the host.
+/// per-session DB handle plus the same editor factory the TUI sees, so
+/// `current_env` / `current_cwd` share state with the host.
 #[derive(Clone)]
 pub struct WorkflowDepsImpl {
     pub chat: ChatSessionManager<ChatDepsImpl>,
     pub invocation: Arc<StdMutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
-    pub permissions: SessionPermissions,
     pub db: Database,
     /// Per-workflow `WorkflowDb` cache. First touch under an entity
     /// applies its migrations and inserts; subsequent touches hit the
@@ -84,7 +80,6 @@ impl WorkflowDeps for WorkflowDepsImpl {
     type ChatSessionManager = ChatSessionManager<ChatDepsImpl>;
     type ShellFactory = SessionShellFactory;
     type EditorFactory = SessionEditorFactory;
-    type Permissions = SessionPermissions;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
@@ -96,10 +91,6 @@ impl WorkflowDeps for WorkflowDepsImpl {
 
     fn editor_factory(&self) -> &Self::EditorFactory {
         &self.editor_factory
-    }
-
-    fn permissions(&self) -> &Self::Permissions {
-        &self.permissions
     }
 
     fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
@@ -129,67 +120,11 @@ impl WorkflowDeps for WorkflowDepsImpl {
     }
 }
 
-/// `Permissions` impl shared between the workflow runtime (which
-/// allocates pending slots) and the TUI (which resolves them via
-/// [`SessionRuntime::respond_permission`]). Cheap to clone — wraps an
-/// `Arc`.
-#[derive(Clone, Default)]
-pub struct SessionPermissions {
-    inner: Arc<SessionPermissionsInner>,
-}
-
-#[derive(Default)]
-struct SessionPermissionsInner {
-    next_id: AtomicU64,
-    pending: DashMap<PermissionId, oneshot::Sender<PermissionResponse>>,
-}
-
-impl Permissions for SessionPermissions {
-    fn allocate(
-        &self,
-        prompt: String,
-        tool_call: Option<ToolCall>,
-    ) -> (PermissionRequest, oneshot::Receiver<PermissionResponse>) {
-        let id = PermissionId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let (tx, rx) = oneshot::channel();
-        self.inner.pending.insert(id, tx);
-        (
-            PermissionRequest {
-                id,
-                prompt,
-                tool_call,
-            },
-            rx,
-        )
-    }
-}
-
-impl SessionPermissions {
-    /// Settle a pending permission. Returns `Err` if the id is unknown
-    /// (already responded or never allocated) or if the awaiter has
-    /// gone away.
-    pub fn respond(
-        &self,
-        id: PermissionId,
-        response: PermissionResponse,
-    ) -> Result<(), PermissionResponseError> {
-        let (_, tx) = self
-            .inner
-            .pending
-            .remove(&id)
-            .ok_or(PermissionResponseError::UnknownId)?;
-        tx.send(response)
-            .map_err(|_| PermissionResponseError::Dropped)
-    }
-}
-
+/// The workflow stopped waiting for a permission before the user (or
+/// auto-judge) answered — the embedded reply oneshot's receiver is gone.
 #[derive(Debug, thiserror::Error)]
-pub enum PermissionResponseError {
-    #[error("no pending permission with that id")]
-    UnknownId,
-    #[error("workflow stopped waiting for this permission")]
-    Dropped,
-}
+#[error("workflow stopped waiting for this permission")]
+pub struct PermissionDropped;
 
 /// Stateless factory that spawns a fresh bash subprocess for each
 /// `new Shell()` call from a workflow script. We use
@@ -246,10 +181,6 @@ pub struct SessionRuntime {
     /// pushes go here; plain input/interrupts bypass it and land on the
     /// active inbox via [`WorkflowStack`]'s live sender.
     pub(crate) workflow_cmd: mpsc::UnboundedSender<DriverCmd>,
-    /// Registry of pending user-permission round-trips. Cloned into
-    /// [`WorkflowDepsImpl`] so the workflow JS surface and
-    /// [`SessionRuntime::respond_permission`] see the same pending slots.
-    pub permissions: SessionPermissions,
     /// Same `ChatSessionManager` the workflow runtime uses (it's a
     /// cheap `Arc`-backed clone). The auto-judge calls `chat.complete`
     /// directly to score permission requests that opted into auto.
@@ -307,12 +238,10 @@ impl SessionRuntime {
         let editor_factory = SessionEditorFactory {
             session: Arc::new(AsyncMutex::new(EditSession::new(edit_engine))),
         };
-        let permissions = SessionPermissions::default();
         let workflow_runtime = Arc::new(WorkflowRuntime::new(WorkflowDepsImpl {
             chat: chat.clone(),
             invocation: invocation.clone(),
             editor_factory: editor_factory.clone(),
-            permissions: permissions.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
         })?);
@@ -333,7 +262,6 @@ impl SessionRuntime {
             workflow_runtime,
             workflow_stack: WorkflowStack::new(db),
             workflow_cmd,
-            permissions,
             chat,
             session_config_writer,
             cancel: CancellationToken::new(),
@@ -398,15 +326,15 @@ impl SessionRuntime {
         crate::workflows::dispatch_interrupt(self);
     }
 
-    /// Resolve a pending permission request previously emitted as
-    /// [`StreamFrame::Permission`]. If the user picked
-    /// `RedirectToChat`, the workflow sees a denial and a fresh prompt
-    /// is dispatched with the user's text.
+    /// Resolve a permission request previously emitted as
+    /// [`StreamFrame::Permission`] by sending on its embedded `reply`
+    /// slot. If the user picked `RedirectToChat`, the workflow sees a
+    /// denial and a fresh prompt is dispatched with the user's text.
     pub fn respond_permission(
         self: &Arc<Self>,
-        id: PermissionId,
+        reply: oneshot::Sender<PermissionResponse>,
         response: PermissionResponseWire,
-    ) -> Result<(), PermissionResponseError> {
+    ) -> Result<(), PermissionDropped> {
         let (workflow_response, redirect) = match response {
             PermissionResponseWire::Yes { details } => (PermissionResponse::Yes { details }, None),
             PermissionResponseWire::No { details } => (PermissionResponse::No { details }, None),
@@ -415,7 +343,9 @@ impl SessionRuntime {
             }
         };
 
-        self.permissions.respond(id, workflow_response)?;
+        reply
+            .send(workflow_response)
+            .map_err(|_| PermissionDropped)?;
 
         if let Some(content) = redirect {
             self.prompt(content);

@@ -401,7 +401,7 @@ async fn shell_capture_unset_var_errors() {
 async fn await_approval(handle: &mut WorkflowHandle) -> PermissionRequest {
     tokio::time::timeout(CYCLE_TIMEOUT, async {
         match handle.outputs.permissions.recv().await {
-            Some(ask) => ask.request,
+            Some(req) => req,
             None => panic!("permissions channel closed before a request landed"),
         }
     })
@@ -460,8 +460,10 @@ async fn shell_run_approve_yes_executes_command() {
     assert_eq!(call.name, "shell_run");
 
     assert!(
-        deps.answer_approval(req.id, PermissionResponse::Yes { details: None }),
-        "answer should land on the pending slot",
+        req.reply
+            .send(PermissionResponse::Yes { details: None })
+            .is_ok(),
+        "answer should land on the embedded reply slot",
     );
 
     let (frames, done) = drive_one_cycle(&mut handle).await;
@@ -510,12 +512,13 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let req = await_approval(&mut handle).await;
     assert!(req.prompt.contains("rm -rf /"));
 
-    assert!(deps.answer_approval(
-        req.id,
-        PermissionResponse::No {
-            details: Some("too scary".into()),
-        },
-    ));
+    assert!(
+        req.reply
+            .send(PermissionResponse::No {
+                details: Some("too scary".into()),
+            })
+            .is_ok()
+    );
 
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
