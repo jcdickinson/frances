@@ -32,7 +32,7 @@ pub use permission::{
 };
 pub use runtime::{
     FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, Runtime, ShellState,
-    TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
+    SurfaceCmd, TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

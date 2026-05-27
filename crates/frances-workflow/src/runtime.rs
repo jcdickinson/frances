@@ -72,6 +72,19 @@ pub enum TranscriptDelta {
     Close { id: FrameId },
 }
 
+/// Chrome a workflow declares — the `surfaces` output. Declarative
+/// Set/Clear, not a stream: a re-`SetFooter` replaces the footer view,
+/// `ClearFooter` removes it. Today the only surface is the footer busy
+/// indicator; this grows a `Region`/`ViewNode` vocabulary only when a
+/// second surface (panel, plan-editor) actually appears.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SurfaceCmd {
+    /// Show `text` (with a spinner) in the footer busy indicator.
+    SetFooter { text: String },
+    /// Hide the footer busy indicator.
+    ClearFooter,
+}
+
 /// A permission ask emitted to the host. The answer arrives back through
 /// the `Permissions` gateway's response oneshot.
 ///
@@ -91,10 +104,9 @@ pub struct PermissionAsk {
 pub struct WorkflowOutputs {
     /// Block-lifecycle stream (persisted to scrollback by the driver).
     pub transcript: UnboundedReceiver<TranscriptDelta>,
-    /// Chrome the workflow declares. `Some(text)` shows busy-indicator
-    /// text with a spinner in the TUI footer; `None` hides it. Set via
-    /// `setStatus` from `frances:v1/workflow`. Never persisted.
-    pub surfaces: UnboundedReceiver<Option<String>>,
+    /// Chrome the workflow declares (footer busy indicator today). Set
+    /// via `setStatus` from `frances:v1/workflow`. Never persisted.
+    pub surfaces: UnboundedReceiver<SurfaceCmd>,
     /// Permission asks awaiting a user (or auto-approver) answer.
     pub permissions: UnboundedReceiver<PermissionAsk>,
     /// LLM token-usage telemetry. Side-channel; opens/closes no block and
@@ -107,7 +119,7 @@ pub struct WorkflowOutputs {
 #[derive(Clone)]
 pub(crate) struct OutputSenders {
     pub transcript: UnboundedSender<TranscriptDelta>,
-    pub surfaces: UnboundedSender<Option<String>>,
+    pub surfaces: UnboundedSender<SurfaceCmd>,
     pub permissions: UnboundedSender<PermissionAsk>,
     pub usage: UnboundedSender<frances_models_llm::wire::Usage>,
 }
@@ -412,7 +424,7 @@ async fn start_impl<D: WorkflowDeps>(
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
     let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptDelta>();
-    let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<Option<String>>();
+    let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<SurfaceCmd>();
     let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionAsk>();
     let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::wire::Usage>();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
@@ -1259,7 +1271,12 @@ mod tests {
         }
         assert_eq!(
             surfaces,
-            vec![Some("working…".to_string()), None],
+            vec![
+                SurfaceCmd::SetFooter {
+                    text: "working…".to_string()
+                },
+                SurfaceCmd::ClearFooter,
+            ],
             "expected set then clear on the surfaces channel",
         );
     }

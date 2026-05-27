@@ -20,6 +20,8 @@ use rquickjs::{Ctx, Function, Result as JsResult};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::runtime::SurfaceCmd;
+
 pub(crate) fn build_exit<'js>(
     ctx: &Ctx<'js>,
     shutdown_notify: Arc<Notify>,
@@ -36,11 +38,14 @@ pub(crate) fn build_exit<'js>(
 /// session is winding down.
 pub(crate) fn build_set_status<'js>(
     ctx: &Ctx<'js>,
-    surfaces_tx: UnboundedSender<Option<String>>,
+    surfaces_tx: UnboundedSender<SurfaceCmd>,
 ) -> JsResult<Function<'js>> {
     Function::new(ctx.clone(), move |text: Opt<Option<String>>| {
-        let status = text.0.flatten();
-        let _ = surfaces_tx.send(status);
+        let cmd = match text.0.flatten() {
+            Some(text) => SurfaceCmd::SetFooter { text },
+            None => SurfaceCmd::ClearFooter,
+        };
+        let _ = surfaces_tx.send(cmd);
         Ok::<_, rquickjs::Error>(())
     })
 }

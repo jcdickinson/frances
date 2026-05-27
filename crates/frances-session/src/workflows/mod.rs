@@ -52,8 +52,8 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, TranscriptDelta,
-    UserInput, WorkflowHandle, parse_slash_command,
+    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionAsk, SurfaceCmd,
+    TranscriptDelta, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
@@ -554,7 +554,7 @@ pub(crate) async fn run_driver(
 ) {
     enum Step {
         Transcript(TranscriptDelta),
-        Surface(Option<String>),
+        Surface(SurfaceCmd),
         Permission(PermissionAsk),
         Usage(frances_models_llm::wire::Usage),
         Done(Option<WorkflowError>),
@@ -913,10 +913,10 @@ async fn emit_one_shot(
     Ok(())
 }
 
-/// Workflow-declared chrome (the busy indicator). `Some(text)` shows it;
-/// `None` hides it. Ephemeral — never persisted.
-fn emit_surface(runtime: &Arc<SessionRuntime>, status: Option<String>) {
-    runtime.events.send(StreamFrame::Status(status));
+/// Workflow-declared chrome (the footer busy indicator). Ephemeral —
+/// never persisted; forwarded to the TUI as-is.
+fn emit_surface(runtime: &Arc<SessionRuntime>, cmd: SurfaceCmd) {
+    runtime.events.send(StreamFrame::Surface(cmd));
 }
 
 /// LLM token-usage telemetry. Pass-through to the TUI footer; not persisted.

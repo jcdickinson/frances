@@ -10,6 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
+pub use frances_workflow::SurfaceCmd;
+
 use crate::llm::Usage;
 
 pub use frances_workflow::permission::{PermissionId, PermissionRequest, PermissionResponseWire};
@@ -59,10 +61,10 @@ pub enum StreamFrame {
         id: BlockId,
     },
     Usage(Usage),
-    /// Workflow-set busy-indicator text. `Some(text)` → the TUI footer
-    /// shows the text with a spinner; `None` → hidden. Driven by
-    /// `setStatus` in the workflow; not persisted, dropped during replay.
-    Status(Option<String>),
+    /// Workflow-declared chrome (the footer busy indicator today).
+    /// `SetFooter`/`ClearFooter`. Driven by `setStatus` in the workflow;
+    /// not persisted, dropped during replay.
+    Surface(SurfaceCmd),
     Error(String),
     /// Runtime is asking the user for permission; client responds via
     /// [`crate::runtime::SessionRuntime::respond_permission`].

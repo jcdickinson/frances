@@ -22,7 +22,7 @@ use tokio::time::{self, MissedTickBehavior};
 use tracing::warn;
 
 use frances_session::events::{
-    BlockKind, PermissionRequest, PermissionResponseWire, ScrollbackFrame, StreamFrame,
+    BlockKind, PermissionRequest, PermissionResponseWire, ScrollbackFrame, StreamFrame, SurfaceCmd,
 };
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
@@ -358,11 +358,14 @@ impl App<'_> {
                     }
                 }
                 Some(frame) = frame_rx.recv() => {
-                    // The busy indicator is workflow-driven: a `Status`
-                    // frame sets or clears it. (Scrollback frames carry
-                    // no status — they're their own variant now.)
-                    if let StreamFrame::Status(s) = &frame {
-                        status = s.clone();
+                    // The busy indicator is workflow-driven: a `Surface`
+                    // frame sets or clears the footer. (Scrollback frames
+                    // carry no chrome — they're their own variant now.)
+                    if let StreamFrame::Surface(cmd) = &frame {
+                        status = match cmd {
+                            SurfaceCmd::SetFooter { text } => Some(text.clone()),
+                            SurfaceCmd::ClearFooter => None,
+                        };
                     }
                     if let Some(req) = handle_frame(
                         &mut terminal,
@@ -491,7 +494,7 @@ fn handle_frame(
         StreamFrame::Usage(usage) => {
             *latest_usage = Some(usage);
         }
-        StreamFrame::Status(_) => {
+        StreamFrame::Surface(_) => {
             // The busy indicator is applied in the run loop before
             // `handle_frame`; nothing to do here.
         }
