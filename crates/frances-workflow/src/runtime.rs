@@ -15,6 +15,7 @@
 //! - `import { ChatSession } from "frances:v1/chat"` (LLM backend pending)
 //! - `import.meta.args` — per-invocation slash-command args.
 
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -22,12 +23,17 @@ use std::sync::atomic::AtomicBool;
 use parking_lot::Mutex as StdMutex;
 use rquickjs::async_with;
 use rquickjs::context::AsyncContext;
+use rquickjs::function::This;
 use rquickjs::module::Module;
+use rquickjs::promise::MaybePromise;
 use rquickjs::runtime::AsyncRuntime;
-use rquickjs::{CatchResultExt, Ctx, Function, IntoJs, Object, Promise, Result as JsResult, Value};
+use rquickjs::{
+    CatchResultExt, Ctx, Function, IntoJs, Object, Persistent, Promise, Result as JsResult, Value,
+};
+use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
-use tokio::task::JoinHandle;
+use tokio::task::LocalSet;
 
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
@@ -38,18 +44,6 @@ use crate::transpile::{SourceKind, ts_to_js};
 /// Internal name we declare the user script under. Distinct from the
 /// `frances:v1/*` namespace so the two don't visually clash.
 const USER_MODULE_NAME: &str = "frances:user-script";
-
-/// Hidden global the runtime roots the body promise on between evaluating
-/// the script and reading its outcome after the event loop drains.
-/// `Persistent` can't cross the `async_with!` boundary (it isn't `Send`),
-/// so we stash through JS; see `docs/plan/single-threaded-js.md` for the
-/// follow-up that removes this.
-const BODY_PROMISE_KEY: &str = "__frances_body_promise";
-
-/// Hidden global the `frances:v1/lifecycle` module registers its
-/// shutdown runner on (set non-enumerable from JS). The runtime calls it
-/// when shutdown is requested.
-const SHUTDOWN_RUNNER_KEY: &str = "__frances_shutdown_runner";
 
 /// Frames a workflow can emit during a turn. The host receiver maps
 /// these onto the wire `StreamFrame` protocol; this enum is the
@@ -262,8 +256,6 @@ pub struct WorkflowHandle {
     /// runtime's completion loop races this against the event loop; on
     /// fire it runs the workflow's shutdown hook then closes the inbox.
     shutdown_notify: Arc<Notify>,
-    /// Owns the spawned task; dropping the handle aborts the workflow.
-    _join: JoinHandle<()>,
 }
 
 impl WorkflowHandle {
@@ -278,11 +270,37 @@ impl WorkflowHandle {
     }
 }
 
-/// Workflow script runtime. One per runtime; cheap to share via `Arc`.
+/// Workflow script runtime. Owns a dedicated OS thread that runs all
+/// workflow JS on a single-threaded tokio runtime + [`LocalSet`]: quickjs
+/// is single-threaded per runtime anyway, and running the bodies via
+/// `spawn_local` lets them hold `!Send` rquickjs handles across `await`.
+/// `Runtime` itself holds only a `Send` dispatch channel, so it lives
+/// happily on the multi-thread session runtime; cheap to share via `Arc`.
 pub struct Runtime<D: WorkflowDeps> {
-    js: AsyncRuntime,
-    transpile_cache: Arc<StdMutex<TranspileCache>>,
-    deps: D,
+    start_tx: UnboundedSender<StartRequest>,
+    // `D` is consumed by the JS thread, not stored here — marker only.
+    _deps: PhantomData<D>,
+    // Declared after `start_tx`: on drop the sender closes first, ending
+    // the JS thread's loop, then this guard joins the thread.
+    _js_thread: JsThreadGuard,
+}
+
+/// A request to start a workflow on the JS thread; the resulting handle
+/// comes back over `reply`.
+struct StartRequest {
+    inv: Invocation,
+    reply: oneshot::Sender<Result<WorkflowHandle, WorkflowError>>,
+}
+
+/// Joins the JS thread when the [`Runtime`] is dropped.
+struct JsThreadGuard(Option<std::thread::JoinHandle<()>>);
+
+impl Drop for JsThreadGuard {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            let _ = handle.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -292,89 +310,145 @@ struct TranspileCache {
 }
 
 impl<D: WorkflowDeps> Runtime<D> {
+    /// Spawn the JS thread and block until it has stood up its
+    /// `AsyncRuntime` (so construction errors surface here).
     pub fn new(deps: D) -> Result<Self, WorkflowError> {
-        let js = AsyncRuntime::new()?;
-        Ok(Self {
-            js,
-            transpile_cache: Arc::new(StdMutex::new(TranspileCache::default())),
-            deps,
-        })
-    }
-
-    /// Start a workflow. Reads + transpiles the source, resolves the
-    /// per-workflow [`WorkflowDb`] handle (applying migrations on first
-    /// touch), then spawns the body on a Tokio task and returns a
-    /// handle the host uses to drive it.
-    ///
-    /// Async because [`WorkflowDeps::workflow_db`] is async — both the
-    /// migrator and the cache lookup go through it.
-    pub async fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
-        let source =
-            std::fs::read_to_string(&inv.source_path).map_err(WorkflowError::ReadSource)?;
-        let js_source = match SourceKind::from_path(&inv.source_path) {
-            SourceKind::JavaScript => source,
-            SourceKind::TypeScript => self.transpile(&inv.source_path, &source)?,
-        };
-
-        let workflow_db = self
-            .deps
-            .workflow_db(inv.entity, std::borrow::Cow::Borrowed(&inv.migrations))
-            .await?;
-
-        let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
-        let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
-        let shutdown_notify = Arc::new(Notify::new());
-        #[cfg(any(test, feature = "test-utils"))]
-        let on_idle = Arc::new(Notify::new());
-
-        let host = modules::V1HostState {
-            frames_tx,
-            input_rx: Arc::new(AsyncMutex::new(input_rx)),
-            closed: Arc::new(AtomicBool::new(false)),
-            closed_notify: Arc::new(Notify::new()),
-            #[cfg(any(test, feature = "test-utils"))]
-            on_idle: on_idle.clone(),
-            shutdown_notify: shutdown_notify.clone(),
-            deps: self.deps.clone(),
-            workflow_db,
-        };
-        let task = WorkflowTask {
-            js: self.js.clone(),
-            js_source,
-            args: inv.args,
-            instance_id: inv.instance_id,
-            host,
-        };
-
-        let join = tokio::spawn(async move {
-            let _ = done_tx.send(run_workflow(task).await);
-        });
-
-        Ok(WorkflowHandle {
-            input_tx,
-            frames: frames_rx,
-            #[cfg(any(test, feature = "test-utils"))]
-            on_idle,
-            done: done_rx,
-            instance: inv.instance_id,
-            shutdown_notify,
-            _join: join,
-        })
-    }
-
-    fn transpile(&self, path: &Path, source: &str) -> Result<String, WorkflowError> {
-        let hash = twox_hash::XxHash3_64::oneshot(source.as_bytes());
-        if let Some(cached) = self.transpile_cache.lock().by_hash.get(&hash).cloned() {
-            return Ok(cached.to_string());
+        let (start_tx, start_rx) = mpsc::unbounded_channel::<StartRequest>();
+        let (ack_tx, ack_rx) = std::sync::mpsc::channel::<Result<(), WorkflowError>>();
+        let handle = std::thread::Builder::new()
+            .name("frances-workflow-js".to_owned())
+            .spawn(move || js_thread_main(deps, start_rx, ack_tx))
+            .map_err(WorkflowError::JsThreadSpawn)?;
+        match ack_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                start_tx,
+                _deps: PhantomData,
+                _js_thread: JsThreadGuard(Some(handle)),
+            }),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(WorkflowError::JsThreadGone),
         }
-        let js = ts_to_js(path, source)?;
-        self.transpile_cache
-            .lock()
-            .by_hash
-            .insert(hash, Arc::<str>::from(js.as_str()));
-        Ok(js)
     }
+
+    /// Start a workflow on the JS thread and return the handle the host
+    /// uses to drive it. The JS thread does the source read + transpile,
+    /// resolves the per-workflow [`WorkflowDb`] (applying migrations on
+    /// first touch), and `spawn_local`s the body.
+    pub async fn start(&self, inv: Invocation) -> Result<WorkflowHandle, WorkflowError> {
+        let (reply, reply_rx) = oneshot::channel();
+        self.start_tx
+            .send(StartRequest { inv, reply })
+            .map_err(|_| WorkflowError::JsThreadGone)?;
+        reply_rx.await.map_err(|_| WorkflowError::JsThreadGone)?
+    }
+}
+
+/// The JS thread body: a current-thread tokio runtime driving a
+/// [`LocalSet`] that owns the `AsyncRuntime` and runs every workflow.
+fn js_thread_main<D: WorkflowDeps>(
+    deps: D,
+    mut start_rx: UnboundedReceiver<StartRequest>,
+    ack_tx: std::sync::mpsc::Sender<Result<(), WorkflowError>>,
+) {
+    let rt = match Builder::new_current_thread().enable_all().build() {
+        Ok(rt) => rt,
+        Err(error) => {
+            let _ = ack_tx.send(Err(WorkflowError::JsThreadRuntime(error)));
+            return;
+        }
+    };
+    let local = LocalSet::new();
+    local.block_on(&rt, async move {
+        let js = match AsyncRuntime::new() {
+            Ok(js) => js,
+            Err(error) => {
+                let _ = ack_tx.send(Err(WorkflowError::Script(error)));
+                return;
+            }
+        };
+        let transpile_cache = StdMutex::new(TranspileCache::default());
+        let _ = ack_tx.send(Ok(()));
+        while let Some(StartRequest { inv, reply }) = start_rx.recv().await {
+            let result = start_impl(&js, &transpile_cache, &deps, inv).await;
+            let _ = reply.send(result);
+        }
+    });
+}
+
+/// Build the channels + host state for one workflow and `spawn_local` its
+/// body. Runs on the JS thread (inside the `LocalSet`).
+async fn start_impl<D: WorkflowDeps>(
+    js: &AsyncRuntime,
+    transpile_cache: &StdMutex<TranspileCache>,
+    deps: &D,
+    inv: Invocation,
+) -> Result<WorkflowHandle, WorkflowError> {
+    let source = std::fs::read_to_string(&inv.source_path).map_err(WorkflowError::ReadSource)?;
+    let js_source = match SourceKind::from_path(&inv.source_path) {
+        SourceKind::JavaScript => source,
+        SourceKind::TypeScript => transpile(transpile_cache, &inv.source_path, &source)?,
+    };
+
+    let workflow_db = deps
+        .workflow_db(inv.entity, std::borrow::Cow::Borrowed(&inv.migrations))
+        .await?;
+
+    let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
+    let (frames_tx, frames_rx) = mpsc::unbounded_channel::<HostFrame>();
+    let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
+    let shutdown_notify = Arc::new(Notify::new());
+    #[cfg(any(test, feature = "test-utils"))]
+    let on_idle = Arc::new(Notify::new());
+
+    let host = modules::V1HostState {
+        frames_tx,
+        input_rx: Arc::new(AsyncMutex::new(input_rx)),
+        closed: Arc::new(AtomicBool::new(false)),
+        closed_notify: Arc::new(Notify::new()),
+        #[cfg(any(test, feature = "test-utils"))]
+        on_idle: on_idle.clone(),
+        shutdown_notify: shutdown_notify.clone(),
+        deps: deps.clone(),
+        workflow_db,
+    };
+    let task = WorkflowTask {
+        js: js.clone(),
+        js_source,
+        args: inv.args,
+        instance_id: inv.instance_id,
+        host,
+    };
+
+    tokio::task::spawn_local(async move {
+        let _ = done_tx.send(run_workflow(task).await);
+    });
+
+    Ok(WorkflowHandle {
+        input_tx,
+        frames: frames_rx,
+        #[cfg(any(test, feature = "test-utils"))]
+        on_idle,
+        done: done_rx,
+        instance: inv.instance_id,
+        shutdown_notify,
+    })
+}
+
+fn transpile(
+    transpile_cache: &StdMutex<TranspileCache>,
+    path: &Path,
+    source: &str,
+) -> Result<String, WorkflowError> {
+    let hash = twox_hash::XxHash3_64::oneshot(source.as_bytes());
+    if let Some(cached) = transpile_cache.lock().by_hash.get(&hash).cloned() {
+        return Ok(cached.to_string());
+    }
+    let js = ts_to_js(path, source)?;
+    transpile_cache
+        .lock()
+        .by_hash
+        .insert(hash, Arc::<str>::from(js.as_str()));
+    Ok(js)
 }
 
 /// Everything [`run_workflow`] needs to drive one workflow body, bundled
@@ -403,12 +477,13 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
     let closed_for_shutdown = host.closed.clone();
     let closed_notify_for_shutdown = host.closed_notify.clone();
 
-    // Phase 1 — install modules, evaluate the body, and root the body
-    // promise on a hidden global so its outcome stays readable after the
-    // event loop drains (a `Promise<'js>` can't cross the `async_with!`
-    // boundary). We do NOT await it here: completion is decided by the
-    // loop emptying, not by the top-level body settling, so a body that
-    // leaves a bare never-resolving promise still terminates.
+    // Phase 1 — install modules, evaluate the body, and hand the body
+    // promise + the `lifecycle` object back as `Persistent`s so they stay
+    // readable after the event loop drains (a `Promise<'js>` / `Object<'js>`
+    // can't cross the `async_with!` boundary, but a `Persistent` held by
+    // this `!Send` JS-thread task can). We do NOT await the body here:
+    // completion is decided by the loop emptying, not by the body settling,
+    // so a body that leaves a bare never-resolving promise still terminates.
     //
     // The install-time stash must be live before either family of modules
     // evaluates. `whatwg:abortcontroller` captures `_setSleep` from it (for
@@ -416,9 +491,9 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
     // own slots. The whatwg polyfills are declared before v1 because the v1
     // modules import from them (frames uses WritableStream, chat uses
     // Readable/TransformStream).
-    async_with!(context => |ctx| {
-        let result: Result<(), WorkflowError> = async {
-            modules::install_stash(&ctx, host)?;
+    let (body, lifecycle) = async_with!(context => |ctx| {
+        let result: Result<(Persistent<Promise>, Persistent<Object>), WorkflowError> = async {
+            let lifecycle = modules::install_stash(&ctx, host)?;
             modules::install_whatwg(&ctx)?;
             modules::install_v1_modules(&ctx)?;
             modules::remove_stash(&ctx)?;
@@ -441,11 +516,7 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
                 .eval()
                 .catch(&ctx)
                 .map_err(caught("eval user-script"))?;
-            ctx.globals()
-                .set(BODY_PROMISE_KEY, promise)
-                .catch(&ctx)
-                .map_err(caught("stash body promise"))?;
-            Ok(())
+            Ok((Persistent::save(&ctx, promise), Persistent::save(&ctx, lifecycle)))
         }
         .await;
 
@@ -469,7 +540,7 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
             () = js.idle() => break,
             () = &mut shutdown, if shutdown_pending => {
                 shutdown_pending = false;
-                run_shutdown_hook(&context).await?;
+                run_shutdown_hook(&context, &lifecycle).await?;
                 if !closed_for_shutdown.swap(true, std::sync::atomic::Ordering::AcqRel) {
                     closed_notify_for_shutdown.notify_waiters();
                 }
@@ -481,11 +552,10 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
     // if the body promise never settled (a dangling promise the loop
     // emptied around): not an error, just nothing left to do.
     async_with!(context => |ctx| {
-        let promise: Promise = ctx
-            .globals()
-            .get(BODY_PROMISE_KEY)
+        let promise = body
+            .restore(&ctx)
             .catch(&ctx)
-            .map_err(caught("read body promise"))?;
+            .map_err(caught("restore body promise"))?;
         match promise.result::<()>() {
             Some(outcome) => outcome.catch(&ctx).map_err(caught("await user-script promise")),
             None => {
@@ -502,22 +572,36 @@ async fn run_workflow<D: WorkflowDeps>(task: WorkflowTask<D>) -> Result<(), Work
 /// Run the workflow's registered `lifecycle.shutdown` hook to completion
 /// (a no-op if it set none). The lifecycle module stashes a runner that
 /// wraps the user hook, so this is always a single awaitable.
-async fn run_shutdown_hook(context: &AsyncContext) -> Result<(), WorkflowError> {
+async fn run_shutdown_hook(
+    context: &AsyncContext,
+    lifecycle: &Persistent<Object<'static>>,
+) -> Result<(), WorkflowError> {
     async_with!(context => |ctx| {
         let result: Result<(), WorkflowError> = async {
-            let runner: Function = ctx
-                .globals()
-                .get(SHUTDOWN_RUNNER_KEY)
+            let lifecycle = lifecycle
+                .clone()
+                .restore(&ctx)
                 .catch(&ctx)
-                .map_err(caught("get shutdown runner"))?;
-            let hook: Promise = runner
-                .call(())
+                .map_err(caught("restore lifecycle"))?;
+            // `null` ⇒ no hook registered; anything else must be callable.
+            let hook: Option<Function> = lifecycle
+                .get("shutdown")
                 .catch(&ctx)
-                .map_err(caught("call shutdown runner"))?;
-            hook.into_future::<()>()
+                .map_err(caught("read lifecycle.shutdown"))?;
+            if let Some(hook) = hook {
+                // Best-effort, like the old JS `try/catch`: run the hook
+                // (sync or async — `MaybePromise` handles both) and log on
+                // failure rather than failing the whole workflow.
+                let outcome = async {
+                    let ret: MaybePromise = hook.call((This(lifecycle.clone()),))?;
+                    ret.into_future::<()>().await
+                }
                 .await
-                .catch(&ctx)
-                .map_err(caught("await shutdown hook"))?;
+                .catch(&ctx);
+                if let Err(error) = outcome {
+                    tracing::warn!("workflow shutdown hook errored: {error}");
+                }
+            }
             Ok(())
         }
         .await;
@@ -557,6 +641,26 @@ pub mod test_drive {
         match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
             Ok(result) => result,
             Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
+        }
+    }
+
+    /// Drive a workflow to termination, accumulating every frame. Loops
+    /// past transient parks — a body parked on `inbox.next()` that a
+    /// pending `exit()`/shutdown is about to unblock would otherwise be
+    /// reported as `None` by [`drive_one_cycle`] (the park and the
+    /// completion race across the JS-thread boundary). Use this for
+    /// workflows that terminate on their own; for interactive multi-turn
+    /// tests use `drive_one_cycle` and feed input between calls.
+    pub async fn drive_to_done(
+        handle: &mut WorkflowHandle,
+    ) -> (Vec<HostFrame>, Result<(), WorkflowError>) {
+        let mut frames = Vec::new();
+        loop {
+            let (mut batch, outcome) = drive_one_cycle(handle).await;
+            frames.append(&mut batch);
+            if let Some(result) = outcome {
+                return (frames, result);
+            }
         }
     }
 
@@ -1066,7 +1170,7 @@ mod tests {
         f
     }
 
-    use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle};
+    use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle, drive_to_done};
 
     fn text_of(frame: &HostFrame) -> String {
         match frame {
@@ -1368,8 +1472,11 @@ mod tests {
             })
             .await
             .unwrap();
-        let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        // exit() is queued before the body parks, so the park and the
+        // shutdown-driven completion collapse into one logical cycle —
+        // drive to done rather than racing the transient park.
+        let (frames, result) = drive_to_done(&mut handle).await;
+        assert!(matches!(result, Ok(())), "result was {result:?}");
         assert_eq!(text_of(&frames[0]), "bye");
     }
 
@@ -1457,8 +1564,8 @@ mod tests {
             })
             .await
             .unwrap();
-        let (frames, done) = drive_one_cycle(&mut handle).await;
-        assert!(matches!(done, Some(Ok(()))));
+        let (frames, result) = drive_to_done(&mut handle).await;
+        assert!(matches!(result, Ok(())), "result was {result:?}");
         assert_eq!(text_of(&frames[0]), "after-loop");
     }
 

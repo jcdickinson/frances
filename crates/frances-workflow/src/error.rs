@@ -34,6 +34,15 @@ pub enum WorkflowError {
     #[error("script ({context}): {detail}")]
     ScriptCaught { context: String, detail: String },
 
+    #[error("build workflow JS thread runtime: {0}")]
+    JsThreadRuntime(#[source] std::io::Error),
+
+    #[error("spawn workflow JS thread: {0}")]
+    JsThreadSpawn(#[source] std::io::Error),
+
+    #[error("workflow JS thread unavailable")]
+    JsThreadGone,
+
     #[error(transparent)]
     Storage(#[from] WorkflowDbError),
 }

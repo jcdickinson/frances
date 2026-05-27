@@ -124,7 +124,7 @@ pub(crate) struct V1HostState<D: WorkflowDeps> {
 pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     host: V1HostState<D>,
-) -> Result<(), WorkflowError> {
+) -> Result<Object<'js>, WorkflowError> {
     // Bind everything except `on_idle` (which is cfg-gated, and Rust
     // doesn't allow `#[cfg]` on a destructure-pattern field) via `..`,
     // then pull `on_idle` out by field access under the same cfg.
@@ -156,10 +156,10 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("setStatus", set_status_fn)?;
 
     // The lifecycle hook is invoked by the runtime on shutdown (it reads
-    // the runner the module registers on a hidden global) and the runtime
-    // closes the inbox itself, so the module needs nothing but the object.
+    // `lifecycle.shutdown` off the returned object) and the runtime closes
+    // the inbox itself, so the module just needs the object exported.
     let lifecycle_obj = lifecycle::build_lifecycle_object(ctx)?;
-    stash.set("lifecycle", lifecycle_obj)?;
+    stash.set("lifecycle", lifecycle_obj.clone())?;
 
     let inbox_instance = inbox::build_inbox(
         ctx,
@@ -243,7 +243,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("db", db_instance)?;
 
     ctx.globals().set(STASH_KEY, stash)?;
-    Ok(())
+    Ok(lifecycle_obj)
 }
 
 /// Declares the `whatwg:*` polyfill modules. Evaluation order matters:
