@@ -57,3 +57,18 @@ pub(crate) fn ts_to_js(path: &Path, source: &str) -> Result<String, WorkflowErro
 
     Ok(transpiled.into_source().text)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The shipped default workflow is a TS asset that nothing else in
+    /// the build compiles. Transpiling it here catches syntax/type-strip
+    /// regressions (e.g. when editing `referee` to use `complete`).
+    #[test]
+    fn default_workflow_asset_transpiles() {
+        let src = include_str!("../../../assets/workflows/main.ts");
+        ts_to_js(Path::new("main.ts"), src)
+            .expect("assets/workflows/main.ts should transpile cleanly");
+    }
+}

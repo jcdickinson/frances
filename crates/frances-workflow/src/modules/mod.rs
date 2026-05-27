@@ -193,6 +193,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         chat::build_chat_session_ctor(ctx, deps.clone(), senders.usage.clone())?;
     stash.set("ChatSession", chat_ctor)?;
     stash.set("__chat_inner_stream", chat_inner_stream)?;
+    stash.set("__complete", chat::build_complete_fn(ctx, deps.clone())?)?;
 
     let shell_ctor = shell::build_shell_ctor(ctx, deps.clone())?;
     stash.set("Shell", shell_ctor)?;

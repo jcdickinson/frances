@@ -13,7 +13,10 @@ pub mod providers;
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_util;
 
-pub use chat::{ChatManagerDeps, ChatSession, ChatSessionManager, CompleteRequest, HistoryStore};
+pub use chat::{
+    ChatManagerDeps, ChatSession, ChatSessionManager, CompleteRequest, Demand, EnforceError,
+    HistoryStore,
+};
 pub use provider::{ErasedProvider, Provider, ProviderRequest};
 pub use provider_cache::{ProviderCache, ProviderCacheError};
 

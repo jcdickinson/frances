@@ -10,9 +10,10 @@ use std::ffi::OsString;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
+use crate::wire::{CompletionOutcome, HistoryInput, StreamEvent, ToolChoice, ToolDef};
 
 use super::builder::ChatSessionBuilder;
+use super::complete::{CompleteRequest, Demand, EnforceError};
 use super::error::ChatError;
 use super::types::{ChatCheckpoint, ChatSessionId, OwnedHistoryInput};
 
@@ -65,4 +66,54 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
 
     /// Load a previously-persisted session by id.
     async fn load(&self, id: ChatSessionId) -> Result<Self::Session, ChatError>;
+
+    /// One-shot, non-persisted call: resolve a model by walking
+    /// `req.intents`, then call the provider with `req.history` +
+    /// `req.new_inputs` verbatim. Nothing is read from or written to a
+    /// history store. Provider-specific, so it's abstract.
+    async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome, ChatError>;
+
+    /// Like [`complete`](Self::complete), but *demands* a tool call and
+    /// distrusts the provider: after each round it checks the outcome
+    /// against `demand`, and on a miss appends a generic structural
+    /// scold and retries (up to `retries` times). The demand drives
+    /// `tool_choice` — any `tool_choice` on `req` is ignored. Generic
+    /// over `complete`, so it's a provided default.
+    async fn complete_enforced(
+        &self,
+        req: CompleteRequest<'_>,
+        demand: Demand,
+        retries: u8,
+    ) -> Result<CompletionOutcome, EnforceError> {
+        let tool_choice = demand.to_tool_choice();
+        let scold = demand.scold();
+        // Own the inputs so we can grow them with scolds across rounds;
+        // covariance lets the borrowed clones sit alongside `&scold`.
+        let mut inputs: Vec<HistoryInput> = req.new_inputs.to_vec();
+        let mut attempts_left = retries;
+        loop {
+            let round = CompleteRequest {
+                intents: req.intents,
+                session_id: req.session_id,
+                env: req.env,
+                history: req.history,
+                new_inputs: &inputs,
+                tools: req.tools,
+                tool_choice: Some(&tool_choice),
+                cancel: req.cancel.clone(),
+                max_tool_calls: req.max_tool_calls,
+            };
+            let outcome = self.complete(round).await?;
+            if demand.satisfied_by(&outcome) {
+                return Ok(outcome);
+            }
+            if attempts_left == 0 {
+                return Err(EnforceError::Unsatisfied {
+                    detail: demand.unsatisfied_detail(),
+                });
+            }
+            inputs.push(HistoryInput::User { text: &scold });
+            attempts_left -= 1;
+        }
+    }
 }

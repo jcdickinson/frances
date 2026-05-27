@@ -4,6 +4,7 @@ pub mod session;
 pub mod store;
 
 pub use deps::ChatManagerDeps;
-pub use manager::{ChatSessionManager, CompleteRequest};
+pub use frances_models_llm::chat::{CompleteRequest, Demand, EnforceError};
+pub use manager::ChatSessionManager;
 pub use session::ChatSession;
 pub use store::HistoryStore;

@@ -295,7 +295,7 @@ mod tests {
         OwnedHistoryInput, RowId,
     };
     use frances_models_llm::config::ModelConfig;
-    use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+    use frances_models_llm::wire::{CompletionOutcome, HistoryInput, StreamEvent, ToolCall};
     use serde_json::{Value, json};
 
     use crate::chat::deps::ChatManagerDeps;
@@ -303,6 +303,7 @@ mod tests {
     use crate::chat::store::HistoryStore;
     use crate::provider_cache::ProviderCache;
     use crate::test_util::{StubProvider, StubScript};
+    use frances_models_llm::chat::{CompleteRequest, Demand, EnforceError};
 
     /// `HistoryStore` impl that counts each method invocation. Lets the
     /// ephemeral test assert "zero writes" and the persisted test
@@ -761,5 +762,79 @@ mod tests {
             stub.captured().is_empty(),
             "provider should not have been invoked once token was pre-cancelled",
         );
+    }
+
+    fn enforce_req<'a>(
+        env: &'a std::collections::HashMap<std::ffi::OsString, std::ffi::OsString>,
+        inputs: &'a [HistoryInput<'a>],
+    ) -> CompleteRequest<'a> {
+        CompleteRequest {
+            intents: &["default"],
+            session_id: "enforce-test",
+            env,
+            history: &[],
+            new_inputs: inputs,
+            tools: &[],
+            tool_choice: None,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            max_tool_calls: Some(1),
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_enforced_scolds_once_then_succeeds() {
+        let (manager, _store, stub) = build_manager().await;
+        // Round 1: a bare assistant turn (no tool call) → one scold.
+        stub.push_script(assistant_script("thinking out loud"));
+        // Round 2: the demanded `decide` call.
+        stub.push_script(tool_call_script(
+            "c1",
+            "decide",
+            json!({ "verdict": "approve" }),
+        ));
+
+        let env = std::collections::HashMap::new();
+        let inputs = [HistoryInput::User { text: "may I?" }];
+        let outcome = manager
+            .complete_enforced(
+                enforce_req(&env, &inputs),
+                Demand::Function("decide".into()),
+                1,
+            )
+            .await
+            .expect("a decide call lands on the retry");
+        assert!(outcome.tool_calls.iter().any(|c| c.name == "decide"));
+
+        // Two rounds happened, and the second carried an extra (scold) input.
+        let caps = stub.captured();
+        assert_eq!(caps.len(), 2, "expected one scold + one success");
+        assert!(
+            caps[1].new_inputs.len() > caps[0].new_inputs.len(),
+            "the scold should have been appended on the retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_enforced_unsatisfied_after_budget() {
+        let (manager, _store, stub) = build_manager().await;
+        // Never calls a tool; with retries = 1 that's two rounds total.
+        stub.push_script(assistant_script("nope"));
+        stub.push_script(assistant_script("still nope"));
+
+        let env = std::collections::HashMap::new();
+        let inputs = [HistoryInput::User { text: "may I?" }];
+        let err = manager
+            .complete_enforced(
+                enforce_req(&env, &inputs),
+                Demand::Function("decide".into()),
+                1,
+            )
+            .await
+            .expect_err("never satisfies the demand");
+        assert!(
+            matches!(err, EnforceError::Unsatisfied { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(stub.captured().len(), 2, "initial round + one retry");
     }
 }

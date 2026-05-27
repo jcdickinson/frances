@@ -26,7 +26,7 @@ import {
   ErrorFrame,
   ToolUseFrame,
 } from "frances:v1/frames";
-import { ChatSession } from "frances:v1/chat";
+import { ChatSession, complete } from "frances:v1/chat";
 import {
   Shell,
   Run,
@@ -529,85 +529,85 @@ class TaskComplete {
   };
 }
 
-const APPROVE_SCHEMA = { type: "object", properties: {} };
-const DECLINE_SCHEMA = {
+const DECIDE_SCHEMA = {
   type: "object",
   properties: {
+    verdict: {
+      type: "string",
+      enum: ["approve", "decline"],
+      description:
+        "`approve` if the outcome and proof satisfy the current step, otherwise `decline`.",
+    },
     message: {
       type: "string",
       description:
-        "Why the completion/proof is insufficient, and what the main agent should do next.",
+        "When declining: why the completion/proof is insufficient, and what the main agent should do next.",
     },
   },
-  required: ["message"],
+  required: ["verdict"],
 };
 
 async function referee(
   signal: CompletionSignal,
 ): Promise<{ type: "approve" } | { type: "decline"; message: string }> {
-  let decision:
-    | { type: "approve" }
-    | { type: "decline"; message: string }
-    | null = null;
-  const approveTool = {
-    name: "approve",
-    description:
-      "Approve the task-completion signal because the outcome and proof satisfy the current step.",
-    parameters: APPROVE_SCHEMA,
-    handler: async ({ call }: any) => {
-      decision = { type: "approve" };
-      return _okResult(call.id, "approved");
-    },
-  };
-  const declineTool = {
-    name: "decline",
-    description:
-      "Decline the task-completion signal and explain what the main agent must do before trying again.",
-    parameters: DECLINE_SCHEMA,
-    handler: async ({ call }: any) => {
-      decision = {
-        type: "decline",
-        message: String(call.arguments?.message || "proof was insufficient"),
-      };
-      return _okResult(call.id, "declined");
-    },
-  };
-  const judge = new ChatSession({
-    model_intents: ["referee", "cheap"],
-    ephemeral: true,
-  });
-  judge.tools.push(approveTool, declineTool);
-  judge.push({
-    role: "system",
-    content:
-      "You are a strict but lightweight referee for an agentic coding loop. " +
-      "Decide whether the submitted task-completion signal satisfies the " +
-      "current step. You MUST call exactly one tool: approve, or decline with " +
-      "a concise message telling the main agent what to do next. Do not ask the user.",
-  });
-  judge.push({
-    role: "user",
-    content:
-      "Current plan state:\n\n" +
-      renderPlanForPrompt() +
-      "\n\nTask-completion signal:\n\n" +
-      JSON.stringify(signal, null, 2),
-  });
+  // One forced `decide` call — `complete` (with `toolChoice`) routes to
+  // the enforced path, so the force-a-tool + scold-on-miss + bounded
+  // retry loop lives in Rust, not here.
+  let r;
+  try {
+    r = await complete({
+      intents: ["referee", "cheap"],
+      input: [
+        {
+          role: "system",
+          content:
+            "You are a strict but lightweight referee for an agentic coding loop. " +
+            "Decide whether the submitted task-completion signal satisfies the " +
+            "current step. Call the `decide` tool exactly once: verdict " +
+            '"approve", or "decline" with a concise `message` telling the main ' +
+            "agent what to do next. Do not ask the user.",
+        },
+        {
+          role: "user",
+          content:
+            "Current plan state:\n\n" +
+            renderPlanForPrompt() +
+            "\n\nTask-completion signal:\n\n" +
+            JSON.stringify(signal, null, 2),
+        },
+      ],
+      tools: [
+        {
+          name: "decide",
+          description:
+            "Approve or decline the task-completion signal for the current step.",
+          parameters: DECIDE_SCHEMA,
+        },
+      ],
+      toolChoice: "decide",
+      maxToolCalls: 1,
+    });
+  } catch (e: any) {
+    // Enforcement gave up (or the call failed): default to decline so the
+    // loop continues rather than falsely approving.
+    return {
+      type: "decline",
+      message: `referee unavailable (${String((e && e.message) || e)}); continue and provide clearer proof`,
+    };
+  }
 
-  for (let i = 0; i < 3; i++) {
-    const r = await judge.stream({ maxToolCalls: 1 });
-    const { tool_calls } = await r.completed;
-    if (decision) return decision;
-    if (!tool_calls || tool_calls.length === 0) {
-      judge.push({
-        role: "user",
-        content: "You must call approve or decline(message).",
-      });
-    }
+  const call = (r.tool_calls || []).find((c: any) => c.name === "decide");
+  const verdict = call?.arguments?.verdict;
+  if (verdict === "approve") return { type: "approve" };
+  if (verdict === "decline") {
+    return {
+      type: "decline",
+      message: String(call.arguments?.message || "proof was insufficient"),
+    };
   }
   return {
     type: "decline",
-    message: "referee did not approve; continue and provide clearer proof",
+    message: "referee did not produce a verdict; continue and provide clearer proof",
   };
 }
 

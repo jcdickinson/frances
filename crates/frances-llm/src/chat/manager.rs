@@ -1,20 +1,15 @@
 use std::collections::HashMap;
-use std::ffi::OsString;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use frances_config::{ConfigBinding, ConfigHandle, RequiredConfigBinding};
 use frances_models_llm::chat::{
     ChatError, ChatSessionBuilder, ChatSessionId, ChatSessionManager as ChatSessionManagerTrait,
-    ChatSessionRow,
+    ChatSessionRow, CompleteRequest,
 };
 use frances_models_llm::config::ModelConfig;
-use frances_models_llm::wire::{
-    CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolChoice, ToolDef,
-};
+use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent};
 use serde::Deserialize;
-use serde_json::Value;
-use tokio_util::sync::CancellationToken;
 use tracing::error;
 
 use crate::chat::deps::ChatManagerDeps;
@@ -29,28 +24,6 @@ use crate::provider_cache::ProviderCache;
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct Models(pub(crate) HashMap<String, ModelConfig>);
-
-/// Inputs to [`ChatSessionManager::complete`]. Bundled so the call site
-/// reads as `chat.complete(CompleteRequest { … })` instead of a wall of
-/// positional args.
-pub struct CompleteRequest<'a> {
-    /// Model-intent names to walk; first hit wins, default fallback.
-    pub intents: &'a [&'a str],
-    /// Token-cache scope id. For classifier-style calls during a chat
-    /// turn, pass the parent chat session's id.
-    pub session_id: &'a str,
-    pub env: &'a HashMap<OsString, OsString>,
-    pub history: &'a [Value],
-    pub new_inputs: &'a [HistoryInput<'a>],
-    pub tools: &'a [ToolDef],
-    pub tool_choice: Option<&'a ToolChoice>,
-    /// Firing cancels the in-flight provider stream. Pass
-    /// `CancellationToken::new()` (never fires) when the caller has no
-    /// upstream abort source.
-    pub cancel: CancellationToken,
-    /// Optional cap on tool calls. See `ProviderRequest::max_tool_calls`.
-    pub max_tool_calls: Option<usize>,
-}
 
 /// Concrete chat-session manager. Clone-by-value handle; complex state
 /// lives in `Arc<Inner>`.
@@ -118,16 +91,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
         self.default_model()
     }
 
-    /// One-shot, non-persisted call. Resolves a model by walking
-    /// `req.intents`, then calls the provider with `req.history` +
-    /// `req.new_inputs` verbatim. Nothing is read from or written to
-    /// the history store. Used by tools that need an LLM but aren't
-    /// part of a persistent conversation (e.g. the shell classifier).
-    pub async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome, ChatError> {
-        self.complete_with_events(req, &mut |_| {}).await
-    }
-
-    /// Same as [`complete`](Self::complete), but the caller observes
+    /// Same as the trait's `complete`, but the caller observes
     /// every `StreamEvent` the provider emits. The callback is the
     /// auto-judge's lever for cancelling after the 2nd
     /// `StreamEvent::ToolCall`; see
@@ -173,6 +137,14 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
 #[async_trait]
 impl<D: ChatManagerDeps> ChatSessionManagerTrait for ChatSessionManager<D> {
     type Session = ChatSession<D>;
+
+    /// One-shot, non-persisted call. Resolves a model by walking
+    /// `req.intents`, then calls the provider with `req.history` +
+    /// `req.new_inputs` verbatim. Nothing is read from or written to
+    /// the history store. (`complete_enforced` is the trait default.)
+    async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome, ChatError> {
+        self.complete_with_events(req, &mut |_| {}).await
+    }
 
     fn create(&self, builder: ChatSessionBuilder) -> Self::Session {
         let session_id = uuid::Uuid::new_v4().to_string();

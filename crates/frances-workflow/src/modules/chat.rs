@@ -57,9 +57,10 @@ use tokio_util::sync::CancellationToken;
 use frances_core::Truncated;
 use frances_models_llm::chat::{
     ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
-    ChatSessionManager as ChatSessionManagerTrait, ModelIntents, OwnedHistoryInput, RowId,
+    ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, ModelIntents,
+    OwnedHistoryInput, RowId,
 };
-use frances_models_llm::wire::{StreamEvent, ToolCall, ToolDef, ToolFunction};
+use frances_models_llm::wire::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
 
 use crate::deps::WorkflowDeps;
 
@@ -114,6 +115,272 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     )?;
 
     Ok((ctor, inner_stream))
+}
+
+/// Build the standalone `complete` export: a one-shot, ephemeral LLM
+/// call that bundles the constructor args (`intents`) with the request
+/// args. Routes to the manager's `complete_enforced` when a tool call is
+/// demanded (`toolChoice` names a tool, or `requireToolCall` forces any),
+/// else plain `complete`. Returns a promise resolving to
+/// `{ text, tool_calls }`. No streaming, no history, no cancellation
+/// sentinel.
+pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
+    ctx: &Ctx<'js>,
+    deps: D,
+) -> JsResult<Function<'js>> {
+    Function::new(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Value<'js>| -> JsResult<Value<'js>> {
+            let CompleteOpts {
+                intents,
+                messages,
+                tools,
+                demand,
+                retries,
+                max_tool_calls,
+            } = parse_complete_opts(&ctx, &arg)?;
+            let manager = deps.chat_session_manager().clone();
+            let env = deps.current_env();
+
+            let promised = Promised::from(async move {
+                let session_id = uuid::Uuid::new_v4().to_string();
+                let intents_ref: Vec<&str> = intents.iter().map(String::as_str).collect();
+                let new_inputs: Vec<HistoryInput<'_>> = messages
+                    .iter()
+                    .map(OwnedHistoryInput::as_borrowed)
+                    .collect();
+                let req = CompleteRequest {
+                    intents: &intents_ref,
+                    session_id: &session_id,
+                    env: &env,
+                    history: &[],
+                    new_inputs: &new_inputs,
+                    tools: &tools,
+                    // `complete_enforced` drives tool_choice from the demand;
+                    // the plain path forces nothing.
+                    tool_choice: None,
+                    cancel: CancellationToken::new(),
+                    max_tool_calls,
+                };
+                let result = match demand {
+                    Some(demand) => manager
+                        .complete_enforced(req, demand, retries)
+                        .await
+                        .map_err(|e| e.to_string()),
+                    None => manager.complete(req).await.map_err(|e| e.to_string()),
+                };
+                CompletionResult(result.map(|outcome| CompletedJs {
+                    text: outcome.text,
+                    tool_calls: validate_tool_calls(outcome.tool_calls, &tools),
+                    usage: None,
+                }))
+            });
+            promised.into_js(&ctx)
+        },
+    )
+}
+
+struct CompleteOpts {
+    intents: Vec<String>,
+    messages: Vec<OwnedHistoryInput>,
+    tools: Vec<ToolDef>,
+    /// `Some` ⇒ enforce a tool call (route to `complete_enforced`).
+    demand: Option<Demand>,
+    retries: u8,
+    max_tool_calls: Option<usize>,
+}
+
+/// Parse `complete({ intents, input, tools?, requireToolCall?, toolChoice?, retries?, maxToolCalls? })`.
+fn parse_complete_opts<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<CompleteOpts> {
+    let Some(obj) = arg.as_object() else {
+        return Err(throw(
+            ctx,
+            "complete: expected an options object { intents, input, tools?, requireToolCall?, toolChoice?, retries?, maxToolCalls? }",
+        ));
+    };
+
+    // intents: string[]
+    let intents_val: Value<'js> = obj
+        .get("intents")
+        .map_err(|_| throw(ctx, "complete: missing `intents`"))?;
+    let Some(intents_arr) = intents_val.as_array() else {
+        return Err(throw(
+            ctx,
+            "complete: `intents` must be an array of strings",
+        ));
+    };
+    let mut intents: Vec<String> = Vec::with_capacity(intents_arr.len());
+    for item in intents_arr.iter::<String>() {
+        intents.push(
+            item.map_err(|_| throw(ctx, "complete: every `intents` entry must be a string"))?,
+        );
+    }
+    if intents.is_empty() {
+        return Err(throw(ctx, "complete: `intents` must be non-empty"));
+    }
+
+    // input: { role, content }[]
+    let input_val: Value<'js> = obj
+        .get("input")
+        .map_err(|_| throw(ctx, "complete: missing `input`"))?;
+    let Some(input_arr) = input_val.as_array() else {
+        return Err(throw(
+            ctx,
+            "complete: `input` must be an array of { role, content } messages",
+        ));
+    };
+    let mut messages: Vec<OwnedHistoryInput> = Vec::with_capacity(input_arr.len());
+    for (i, item) in input_arr.iter::<Value<'js>>().enumerate() {
+        let item = item.map_err(|_| throw(ctx, &format!("complete: input[{i}] not readable")))?;
+        messages.push(parse_message_obj(ctx, &item, i)?);
+    }
+
+    // tools?: [...]
+    let tools_val: Value<'js> = obj
+        .get("tools")
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let tools = if tools_val.is_undefined() || tools_val.is_null() {
+        Vec::new()
+    } else {
+        let Some(arr) = tools_val.as_array() else {
+            return Err(throw(ctx, "complete: `tools` must be an array"));
+        };
+        parse_tool_defs(ctx, arr, "complete: tools")?
+    };
+
+    // requireToolCall? + toolChoice? → demand. A named `toolChoice` forces
+    // that tool; `requireToolCall: true` forces any tool; neither ⇒ plain.
+    let require_tool_call = get_optional_bool(ctx, obj, "requireToolCall")?.unwrap_or(false);
+    let tool_choice_name = get_optional_string(ctx, obj, "toolChoice")?;
+    let demand = match (tool_choice_name, require_tool_call) {
+        (Some(name), _) => Some(Demand::Function(name)),
+        (None, true) => Some(Demand::Required),
+        (None, false) => None,
+    };
+
+    let retries = get_optional_u32(ctx, obj, "retries")?.unwrap_or(1) as u8;
+    let max_tool_calls = get_optional_u32(ctx, obj, "maxToolCalls")?.map(|n| n as usize);
+
+    Ok(CompleteOpts {
+        intents,
+        messages,
+        tools,
+        demand,
+        retries,
+        max_tool_calls,
+    })
+}
+
+/// Parse one `{ role, content[, call_id, is_error] }` message into an
+/// `OwnedHistoryInput`. `assistant` is rejected (model-only); other
+/// unknown roles error.
+fn parse_message_obj<'js>(
+    ctx: &Ctx<'js>,
+    msg: &Value<'js>,
+    i: usize,
+) -> JsResult<OwnedHistoryInput> {
+    let Some(obj) = msg.as_object() else {
+        return Err(throw(
+            ctx,
+            &format!("complete: input[{i}] must be an object"),
+        ));
+    };
+    let role: String = obj
+        .get("role")
+        .map_err(|_| throw(ctx, &format!("complete: input[{i}] missing string `role`")))?;
+    let content = |label: &str| -> JsResult<String> {
+        obj.get("content").map_err(|_| {
+            throw(
+                ctx,
+                &format!("complete: input[{i}] ({label}) missing string `content`"),
+            )
+        })
+    };
+    match role.as_str() {
+        "user" => Ok(OwnedHistoryInput::User {
+            text: content("user")?,
+        }),
+        "system" => Ok(OwnedHistoryInput::System {
+            text: content("system")?,
+        }),
+        "tool" => {
+            let call_id: String = obj.get("call_id").map_err(|_| {
+                throw(
+                    ctx,
+                    &format!("complete: input[{i}] (tool) missing `call_id`"),
+                )
+            })?;
+            let is_error: bool = obj.get("is_error").map_err(|_| {
+                throw(
+                    ctx,
+                    &format!("complete: input[{i}] (tool) missing `is_error`"),
+                )
+            })?;
+            Ok(OwnedHistoryInput::ToolResult {
+                call_id,
+                content: content("tool")?,
+                is_error,
+            })
+        }
+        "assistant" => Err(throw(
+            ctx,
+            &format!("complete: input[{i}] role `assistant` is model-only, not an input"),
+        )),
+        other => Err(throw(
+            ctx,
+            &format!("complete: input[{i}] unknown role `{other}` (expected system/user/tool)"),
+        )),
+    }
+}
+
+fn get_optional_bool<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> JsResult<Option<bool>> {
+    let v: Value<'js> = obj
+        .get(key)
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if v.is_undefined() || v.is_null() {
+        return Ok(None);
+    }
+    v.as_bool()
+        .map(Some)
+        .ok_or_else(|| throw(ctx, &format!("complete: `{key}` must be a boolean")))
+}
+
+fn get_optional_string<'js>(
+    ctx: &Ctx<'js>,
+    obj: &Object<'js>,
+    key: &str,
+) -> JsResult<Option<String>> {
+    let v: Value<'js> = obj
+        .get(key)
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if v.is_undefined() || v.is_null() {
+        return Ok(None);
+    }
+    let Some(s) = v.as_string() else {
+        return Err(throw(ctx, &format!("complete: `{key}` must be a string")));
+    };
+    s.to_string()
+        .map(Some)
+        .map_err(|e| throw(ctx, &format!("complete: `{key}` conversion: {e}")))
+}
+
+fn get_optional_u32<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> JsResult<Option<u32>> {
+    let v: Value<'js> = obj
+        .get(key)
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    if v.is_undefined() || v.is_null() {
+        return Ok(None);
+    }
+    let n = v
+        .as_number()
+        .ok_or_else(|| throw(ctx, &format!("complete: `{key}` must be a number")))?;
+    if !n.is_finite() || n < 0.0 || n.fract() != 0.0 {
+        return Err(throw(
+            ctx,
+            &format!("complete: `{key}` must be a non-negative integer"),
+        ));
+    }
+    Ok(Some(n as u32))
 }
 
 pub struct ChatSessionJs<D: WorkflowDeps> {
@@ -382,48 +649,52 @@ fn snapshot_tools<'js, D: WorkflowDeps>(
     let Some(arr) = tools_val.as_array() else {
         return Err(throw(ctx, "chat.stream: `chat.tools` must be an array"));
     };
+    parse_tool_defs(ctx, arr, "chat.tools")
+}
 
+/// Parse a JS array of `{ name, description, parameters }` tool entries
+/// into `Vec<ToolDef>`. `label` names the source for error messages
+/// (`chat.tools` for the streaming path, `complete: tools` for the
+/// one-shot export). The `handler` field is JS-only; not inspected here.
+fn parse_tool_defs<'js>(ctx: &Ctx<'js>, arr: &Array<'js>, label: &str) -> JsResult<Vec<ToolDef>> {
     let mut defs: Vec<ToolDef> = Vec::with_capacity(arr.len());
     let mut seen: HashSet<String> = HashSet::with_capacity(arr.len());
     for (i, item) in arr.iter::<Value<'js>>().enumerate() {
-        let item = item.map_err(|_| throw(ctx, &format!("chat.tools[{i}]: not readable")))?;
+        let item = item.map_err(|_| throw(ctx, &format!("{label}[{i}]: not readable")))?;
         let Some(obj) = item.as_object() else {
-            return Err(throw(ctx, &format!("chat.tools[{i}]: expected an object")));
+            return Err(throw(ctx, &format!("{label}[{i}]: expected an object")));
         };
-        let name: String = obj.get("name").map_err(|_| {
-            throw(
-                ctx,
-                &format!("chat.tools[{i}]: missing or non-string `name`"),
-            )
-        })?;
+        let name: String = obj
+            .get("name")
+            .map_err(|_| throw(ctx, &format!("{label}[{i}]: missing or non-string `name`")))?;
         if !seen.insert(name.clone()) {
             return Err(throw(
                 ctx,
-                &format!("chat.tools: duplicate tool name `{name}`"),
+                &format!("{label}: duplicate tool name `{name}`"),
             ));
         }
         let description: String = obj.get("description").map_err(|_| {
             throw(
                 ctx,
-                &format!("chat.tools[{i}]: missing or non-string `description`"),
+                &format!("{label}[{i}]: missing or non-string `description`"),
             )
         })?;
         let parameters_val: Value<'js> = obj.get("parameters").map_err(|_| {
             throw(
                 ctx,
-                &format!("chat.tools[{i}]: missing `parameters` (JSON schema object)"),
+                &format!("{label}[{i}]: missing `parameters` (JSON schema object)"),
             )
         })?;
         if !parameters_val.is_object() {
             return Err(throw(
                 ctx,
-                &format!("chat.tools[{i}]: `parameters` must be an object"),
+                &format!("{label}[{i}]: `parameters` must be an object"),
             ));
         }
         let parameters: JsonValue = from_json_value(&parameters_val).map_err(|e| {
             throw(
                 ctx,
-                &format!("chat.tools[{i}]: `parameters` not JSON-serialisable: {e}"),
+                &format!("{label}[{i}]: `parameters` not JSON-serialisable: {e}"),
             )
         })?;
 
@@ -541,6 +812,10 @@ fn start_stream<'js, D: WorkflowDeps>(
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
+    // `run` consumes `tool_defs`; keep a copy to validate the returned
+    // tool-call args against their schemas.
+    let tool_defs_for_validation = tool_defs.clone();
+
     tokio::spawn({
         let usage_capture = usage_capture.clone();
         async move {
@@ -573,7 +848,7 @@ fn start_stream<'js, D: WorkflowDeps>(
             drop(event_tx);
             let mapped = result.map(|outcome| CompletedJs {
                 text: outcome.text,
-                tool_calls: outcome.tool_calls,
+                tool_calls: validate_tool_calls(outcome.tool_calls, &tool_defs_for_validation),
                 usage,
             });
             let _ = completed_tx.send(mapped);
@@ -745,9 +1020,35 @@ impl<'js> IntoJs<'js> for CompletionResult {
     }
 }
 
+/// A tool call paired with the result of validating its arguments against
+/// the called tool's JSON schema. `schema_error` is `None` when the args
+/// validate (or the tool/schema couldn't be matched).
+struct ValidatedToolCall {
+    call: ToolCall,
+    schema_error: Option<String>,
+}
+
+/// Validate each tool call's arguments against the matching tool's schema.
+/// Surfaced to JS as `schemaError` so the dispatch loop can hand back an
+/// error result for a malformed call instead of invoking its handler.
+fn validate_tool_calls(calls: Vec<ToolCall>, tools: &[ToolDef]) -> Vec<ValidatedToolCall> {
+    calls
+        .into_iter()
+        .map(|call| {
+            let schema = tools
+                .iter()
+                .find_map(|ToolDef::Function(f)| (f.name == call.name).then_some(&f.parameters));
+            let schema_error = schema.and_then(|schema| {
+                frances_models_llm::tool_args::validate(&call.arguments, schema).err()
+            });
+            ValidatedToolCall { call, schema_error }
+        })
+        .collect()
+}
+
 struct CompletedJs {
     text: String,
-    tool_calls: Vec<ToolCall>,
+    tool_calls: Vec<ValidatedToolCall>,
     usage: Option<frances_models_llm::wire::Usage>,
 }
 
@@ -757,11 +1058,15 @@ impl<'js> IntoJs<'js> for CompletedJs {
         obj.set("text", self.text)?;
 
         let calls = Array::new(ctx.clone())?;
-        for (i, call) in self.tool_calls.iter().enumerate() {
+        for (i, vc) in self.tool_calls.iter().enumerate() {
             let entry = Object::new(ctx.clone())?;
-            entry.set("id", call.id.clone())?;
-            entry.set("name", call.name.clone())?;
-            entry.set("arguments", json_value_into_js(ctx, &call.arguments)?)?;
+            entry.set("id", vc.call.id.clone())?;
+            entry.set("name", vc.call.name.clone())?;
+            entry.set("arguments", json_value_into_js(ctx, &vc.call.arguments)?)?;
+            match &vc.schema_error {
+                Some(err) => entry.set("schemaError", err.clone())?,
+                None => entry.set("schemaError", Value::new_null(ctx.clone()))?,
+            }
             calls.set(i, entry)?;
         }
         obj.set("tool_calls", calls)?;

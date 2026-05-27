@@ -355,7 +355,11 @@ fn tool_def_to_genai(td: &ToolDef) -> GenaiTool {
         name: ToolName::Custom(f.name.clone()),
         description: Some(f.description.clone()),
         schema: Some(f.parameters.clone()),
-        strict: None,
+        // Strict "when possible": OpenAI strict mode rejects extensible
+        // schemas, so only enable it for schemas that satisfy the subset.
+        strict: Some(frances_models_llm::tool_args::is_strict_compatible(
+            &f.parameters,
+        )),
         config: None,
     }
 }

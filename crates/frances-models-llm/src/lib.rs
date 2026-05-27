@@ -7,6 +7,7 @@
 
 pub mod chat;
 pub mod config;
+pub mod tool_args;
 pub mod wire;
 
 pub use chat::{

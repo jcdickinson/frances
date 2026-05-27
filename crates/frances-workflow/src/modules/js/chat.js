@@ -65,7 +65,7 @@
 
 import { ReadableStream, TransformStream } from "whatwg:web-streams";
 
-const { ChatSession, __chat_inner_stream: _innerStream } =
+const { ChatSession, __chat_inner_stream: _innerStream, __complete: complete } =
   globalThis.__frances_v1_stash__;
 
 ChatSession.prototype.stream = function stream(opts) {
@@ -196,6 +196,15 @@ async function _streamWithDispatch(chat, opts, getHook) {
 async function _dispatchSlot(chat, call, hook, session, idx) {
   const scope = _createScope(chat, session, idx);
   const invoke = async () => {
+    // Rust validated the call's arguments against the tool's JSON schema;
+    // a mismatch becomes an error result so the model self-corrects next
+    // round (rather than handing bad args to the handler).
+    if (call.schemaError) {
+      return _errorResult(
+        call.id,
+        `arguments did not match the tool's schema: ${call.schemaError}`,
+      );
+    }
     const tool = chat.tools.find((t) => t.name === call.name);
     if (!tool) return _errorResult(call.id, `tool not found: ${call.name}`);
     return await tool.handler({ call, scope });
@@ -248,4 +257,19 @@ function _createScope(chat, session, idx) {
   };
 }
 
-export { ChatSession };
+// `complete(opts)` — one-shot, ephemeral, no streaming. Bundles the
+// session ctor args (`intents`) with the request:
+//
+//   const { text, tool_calls } = await complete({
+//     intents: ["classify"],
+//     input: [{ role: "user", content: "…" }],
+//     tools,            // optional [{ name, description, parameters }]
+//     requireToolCall,  // optional bool ⇒ demand any tool call
+//     toolChoice,       // optional string ⇒ demand that named tool
+//     retries,          // optional, default 1 (only when enforcing)
+//     maxToolCalls,     // optional cap
+//   });
+//
+// `requireToolCall`/`toolChoice` route to the enforced path (force the
+// tool, scold + retry); otherwise it's a plain completion.
+export { ChatSession, complete };
