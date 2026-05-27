@@ -45,6 +45,7 @@ pub struct App<'a> {
 
 enum KeyAction {
     Quit,
+    Interrupt,
     Submit,
     Approve,
     Reject,
@@ -274,6 +275,7 @@ impl App<'_> {
                             if key.kind != KeyEventKind::Press { continue; }
                             match classify_key(&key, pending_approval.is_some()) {
                                 KeyAction::Quit => return Ok(()),
+                                KeyAction::Interrupt => self.runtime.interrupt(),
                                 KeyAction::EnterScrollback => {
                                     // If the alt-screen escape sequence
                                     // fails, leave the flag clear so we
@@ -384,7 +386,7 @@ impl App<'_> {
     fn banner_lines(&self) -> Vec<String> {
         vec![
             format!("frances session {}", self.session.id),
-            "  Enter to send. Alt+Enter for newline. Ctrl-O for history. Ctrl-C, Ctrl-D, or Esc to exit.".to_string(),
+            "  Enter to send. Alt+Enter for newline. Esc to interrupt. Ctrl-O for history. Ctrl-C or Ctrl-D to exit.".to_string(),
         ]
     }
 }
@@ -661,7 +663,9 @@ fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
-        KeyCode::Esc => KeyAction::Quit,
+        // Esc interrupts the running workflow (delivered to its inbox);
+        // it no longer quits. The app exits via Ctrl-C / Ctrl-D.
+        KeyCode::Esc => KeyAction::Interrupt,
         KeyCode::Char('c' | 'd') if ctrl => KeyAction::Quit,
         KeyCode::Char('o' | 'O') if ctrl && !pending_approval => KeyAction::EnterScrollback,
         KeyCode::Char('y' | 'Y') if alt && pending_approval => KeyAction::Approve,

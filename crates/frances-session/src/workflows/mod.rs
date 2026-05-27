@@ -2,9 +2,10 @@
 //!
 //! ## Single-slot in-memory, multi-level in DB
 //!
-//! At any time only one workflow runs — the **top** of the stack
-//! ([`WorkflowStack::top`]). Levels below the top live as rows in the
-//! `workflow_stack` table (`active = 0`, `completed_at IS NULL`). When
+//! At any time only one workflow runs — the **top** of the stack, owned
+//! by the long-lived driver task ([`run_driver`]). Levels below the top
+//! live as rows in the `workflow_stack` table (`active = 0`,
+//! `completed_at IS NULL`). When
 //! a slash command pushes B on top of A, A is **dehydrated**:
 //! [`WorkflowHandle::request_shutdown`] fires, the body's
 //! `frances:v1/lifecycle` hook runs, the inbox closes, and A's task
