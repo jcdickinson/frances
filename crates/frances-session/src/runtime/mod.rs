@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use dashmap::DashMap;
 use parking_lot::Mutex as StdMutex;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -25,7 +26,7 @@ use crate::events::{PermissionId, PermissionRequest, PermissionResponseWire, Str
 use crate::history::TursoHistoryStore;
 use crate::llm::{SessionConfigProvider, SessionConfigWriter};
 use crate::session::Session;
-use crate::workflows::{WorkflowConfig, WorkflowStack};
+use crate::workflows::{DriverCmd, WorkflowConfig, WorkflowStack};
 use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
 use frances_edit::{EditEngine, EditSession};
 use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
@@ -42,7 +43,6 @@ mod error;
 mod events;
 mod logging;
 mod replay;
-mod turn;
 
 pub use error::RuntimeError;
 pub use events::EventsChannel;
@@ -243,6 +243,10 @@ pub struct SessionRuntime {
     pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl>>,
     pub workflow_stack: WorkflowStack,
+    /// Control channel into the long-lived workflow driver task. Slash
+    /// pushes go here; plain input/interrupts bypass it and land on the
+    /// active inbox via [`WorkflowStack`]'s live sender.
+    pub(crate) workflow_cmd: mpsc::UnboundedSender<DriverCmd>,
     /// Registry of pending user-permission round-trips. Cloned into
     /// [`WorkflowDepsImpl`] so the workflow JS surface and
     /// [`SessionRuntime::respond_permission`] see the same pending slots.
@@ -315,6 +319,7 @@ impl SessionRuntime {
         })?);
 
         let (events, events_rx) = EventsChannel::new();
+        let (workflow_cmd, cmd_rx) = mpsc::unbounded_channel();
 
         let runtime = Arc::new(Self {
             session: session.clone(),
@@ -328,6 +333,7 @@ impl SessionRuntime {
             default_workflow,
             workflow_runtime,
             workflow_stack: WorkflowStack::new(db),
+            workflow_cmd,
             permissions,
             chat,
             session_config_writer,
@@ -335,13 +341,27 @@ impl SessionRuntime {
         });
 
         // Restore the persisted workflow stack — or, if the table is
-        // literally empty, seat the configured `default_workflow`.
-        // Anything either path emits during top-level evaluation buffers
-        // in the handle's frame channel and is flushed on the first
-        // prompt cycle.
-        if let Err(error) = crate::workflows::restore_or_seed(&runtime).await {
-            warn!(%error, "workflow stack restore failed");
-        }
+        // literally empty, seat the configured `default_workflow`. The
+        // returned instance becomes the driver's initial active workflow;
+        // anything it emits during top-level evaluation buffers in the
+        // handle's frame channel and flushes once the driver pumps.
+        let initial = match crate::workflows::restore_or_seed(&runtime).await {
+            Ok(initial) => initial,
+            Err(error) => {
+                warn!(%error, "workflow stack restore failed");
+                None
+            }
+        };
+        // Publish the active wires synchronously (before the driver task
+        // is scheduled) so `replay_initial_scrollback` / attach see the
+        // active instance immediately.
+        runtime.workflow_stack.seat_initial(initial.as_ref());
+
+        tokio::spawn(crate::workflows::run_driver(
+            runtime.clone(),
+            cmd_rx,
+            initial,
+        ));
 
         Ok((runtime, events_rx))
     }
@@ -365,13 +385,18 @@ impl SessionRuntime {
         }
     }
 
-    /// Run a prompt cycle. Fire-and-forget: spawns the cycle and
-    /// returns immediately. Frames flow through `self.events`.
+    /// Deliver user input. Slash commands push a workflow (via the
+    /// driver's control channel); anything else lands on the active
+    /// workflow's inbox as plain input. Non-blocking — input is just
+    /// IO, decoupled from any cycle. Frames flow through `self.events`.
     pub fn prompt(self: &Arc<Self>, text: String) {
-        let runtime = self.clone();
-        tokio::spawn(async move {
-            turn::run_prompt(runtime, text).await;
-        });
+        crate::workflows::dispatch_input(self, &text);
+    }
+
+    /// Deliver an interrupt to the active workflow's inbox (Esc in the
+    /// TUI). The workflow decides how to react.
+    pub fn interrupt(self: &Arc<Self>) {
+        crate::workflows::dispatch_interrupt(self);
     }
 
     /// Resolve a pending permission request previously emitted as

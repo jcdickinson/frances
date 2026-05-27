@@ -36,9 +36,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use parking_lot::Mutex as PlMutex;
 use thiserror::Error;
 
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::warn;
 use turso::Value;
 use uuid::Uuid;
@@ -92,12 +93,22 @@ pub enum WorkflowStackError {
 /// hook can't hang a push.
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The session-scoped workflow stack. Holds the currently-hydrated
-/// workflow (if any) plus the per-session [`Database`] used for stack
-/// persistence.
+/// The session-scoped workflow stack. The currently-hydrated workflow is
+/// owned by the long-lived driver task (see [`run_driver`]), not held
+/// here — this struct keeps the per-session [`Database`] plus the
+/// "live wires" the rest of the runtime uses to reach the active
+/// workflow without going through the driver: a clone of its inbox
+/// sender and its `instance_id`.
 pub struct WorkflowStack {
-    top: AsyncMutex<Option<WorkflowInstance>>,
     db: Database,
+    /// Sender into the active workflow's `inbox`. Set when the driver
+    /// seats an instance, cleared when none is active. `prompt` and
+    /// `interrupt` push straight onto this — input is just IO, delivered
+    /// any time, decoupled from any cycle.
+    active_input: PlMutex<Option<UnboundedSender<InboxItem>>>,
+    /// `instance_id` of the active workflow, for callers (attach,
+    /// scrollback replay) that need to know which workflow is live.
+    active_instance_id: PlMutex<Option<Uuid>>,
 }
 
 impl WorkflowStack {
@@ -106,8 +117,9 @@ impl WorkflowStack {
     /// `workflow_stack` table on this database.
     pub fn new(db: Database) -> Self {
         Self {
-            top: AsyncMutex::new(None),
             db,
+            active_input: PlMutex::new(None),
+            active_instance_id: PlMutex::new(None),
         }
     }
 
@@ -122,15 +134,58 @@ impl WorkflowStack {
     /// Read-only helper for callers (e.g. attach) that need to know
     /// which workflow to replay scrollback for.
     pub async fn active_instance(&self) -> Option<Uuid> {
-        self.top.lock().await.as_ref().map(|i| i.handle.instance)
+        *self.active_instance_id.lock()
     }
+
+    /// Publish the active wires for the driver's initial instance,
+    /// synchronously during `SessionRuntime::start` (before the driver
+    /// task is scheduled) so attach / scrollback replay see it right
+    /// away. No-op when the stack boots empty.
+    pub(crate) fn seat_initial(&self, instance: Option<&WorkflowInstance>) {
+        match instance {
+            Some(inst) => self.set_active(inst),
+            None => self.clear_active(),
+        }
+    }
+
+    /// Record the active workflow's live wires. Called by the driver
+    /// (and once up-front in `start`) when an instance becomes active.
+    fn set_active(&self, instance: &WorkflowInstance) {
+        *self.active_input.lock() = Some(instance.handle.input_tx.clone());
+        *self.active_instance_id.lock() = Some(instance.handle.instance);
+    }
+
+    /// Clear the active wires when no workflow is hydrated.
+    fn clear_active(&self) {
+        *self.active_input.lock() = None;
+        *self.active_instance_id.lock() = None;
+    }
+
+    /// Deliver an inbox item to the active workflow. No-op (dropped)
+    /// when nothing is hydrated — same best-effort semantics as sending
+    /// to an exited body.
+    fn deliver(&self, item: InboxItem) {
+        if let Some(tx) = self.active_input.lock().as_ref() {
+            let _ = tx.send(item);
+        }
+    }
+}
+
+/// A command for the long-lived workflow driver. Input and interrupts
+/// do *not* go through here — they're delivered straight to the active
+/// inbox via [`WorkflowStack::deliver`]. Only stack-lifecycle changes
+/// (slash-command pushes) need the driver to act.
+pub(crate) enum DriverCmd {
+    /// Push a fresh workflow on top of the stack (dehydrating the
+    /// current active one first).
+    Push { name: String, args: Vec<String> },
 }
 
 /// The currently-hydrated workflow plus the wire-state needed across
 /// multiple `drive()` invocations (block id allocator, currently-open
 /// block) and a copy of its `config_key` for diagnostics. The runtime
 /// `WorkflowHandle` already carries the `instance_id`.
-struct WorkflowInstance {
+pub(crate) struct WorkflowInstance {
     handle: WorkflowHandle,
     emit: EmitState,
     #[expect(
@@ -285,46 +340,66 @@ impl EmitState {
     }
 }
 
-/// Top-level entry from the prompt RPC. Parses the input and either
-/// pushes a fresh JS workflow (for slash commands) or hands the text
-/// to the topmost workflow. Always finishes one "cycle" — i.e. drives
-/// the topmost workflow until it parks waiting for input or
-/// terminates.
-pub(crate) async fn cycle(runtime: &Arc<SessionRuntime>, text: &str) -> Result<()> {
+/// Translate a prompt-RPC text into the right delivery. Slash commands
+/// become a [`DriverCmd::Push`] (stack lifecycle, handled by the
+/// driver); everything else is plain input delivered straight to the
+/// active workflow's inbox — input is just IO, no cycle.
+///
+/// Called from [`SessionRuntime::prompt`]. Non-blocking: the channel
+/// sends return immediately; the driver and the workflow body pick the
+/// work up on their own tasks.
+pub(crate) fn dispatch_input(runtime: &SessionRuntime, text: &str) {
     match parse_slash_command(text) {
-        Ok(Some((name, args))) => push_and_drive(runtime, name, args).await,
-        Ok(None) => dispatch_topmost(runtime, text).await,
+        Ok(Some((name, args))) => {
+            let _ = runtime.workflow_cmd.send(DriverCmd::Push {
+                name: name.to_owned(),
+                args,
+            });
+        }
+        Ok(None) => {
+            runtime.workflow_stack.deliver(InboxItem::Input(UserInput {
+                content: text.to_owned(),
+            }));
+        }
         Err(error) => {
             runtime
                 .events
                 .send(StreamFrame::Error(format!("bad workflow args: {error}")));
-            Ok(())
         }
     }
 }
 
+/// Deliver an interrupt to the active workflow's inbox.
+pub(crate) fn dispatch_interrupt(runtime: &SessionRuntime) {
+    runtime.workflow_stack.deliver(InboxItem::Interrupt);
+}
+
 /// Boot-time entry. Either restores the persisted stack (hydrating
 /// the row with `active = 1`) or, if the table is literally empty,
-/// seats the configured `default_workflow` via the normal push path
-/// — which inserts its row and hydrates it in one shot.
+/// seats the configured `default_workflow`. Returns the instance to
+/// seat as the driver's initial active workflow (or `None` when the
+/// stack is empty / nothing hydrated).
 ///
 /// Errors during hydration (missing config, migration drift, runtime
-/// error) cascade through [`drop_active_and_promote`] until a row
-/// hydrates cleanly or the live stack is exhausted. The runtime is
-/// always usable when this returns.
-pub(crate) async fn restore_or_seed(runtime: &Arc<SessionRuntime>) -> Result<()> {
+/// error) cascade until a row hydrates cleanly or the live stack is
+/// exhausted. The runtime is always usable when this returns.
+pub(crate) async fn restore_or_seed(
+    runtime: &Arc<SessionRuntime>,
+) -> Result<Option<WorkflowInstance>> {
     let db = &runtime.workflow_stack.db;
 
     if row_count(db).await? == 0 {
         let default_workflow = runtime.default_workflow.get();
         let Some(name) = default_workflow.as_deref().and_then(|opt| opt.as_deref()) else {
-            return Ok(());
+            return Ok(None);
         };
         match push_default_workflow(runtime, name).await {
-            Ok(()) => {}
-            Err(error) => warn!(%error, workflow = %name, "default_workflow start failed"),
+            Ok(instance) => return Ok(instance),
+            Err(error) => {
+                warn!(%error, workflow = %name, "default_workflow start failed");
+                return Ok(None);
+            }
         }
-        return Ok(());
     }
 
     hydrate_active_or_cascade(runtime).await
@@ -332,10 +407,14 @@ pub(crate) async fn restore_or_seed(runtime: &Arc<SessionRuntime>) -> Result<()>
 
 /// Push the configured default workflow with empty args. Used by
 /// `restore_or_seed` when the table is empty (first-ever boot or a
-/// fresh session). Frames the workflow emits during top-level
-/// evaluation buffer in `WorkflowHandle::frames` and flush on the
-/// first prompt cycle — there is no stream to write to here.
-async fn push_default_workflow(runtime: &Arc<SessionRuntime>, name: &str) -> Result<()> {
+/// fresh session). Returns the started instance for the driver to seat;
+/// `None` when config is missing or migrations fail to read. Frames the
+/// workflow emits during top-level evaluation buffer in
+/// `WorkflowHandle::frames` and flush once the driver starts pumping.
+async fn push_default_workflow(
+    runtime: &Arc<SessionRuntime>,
+    name: &str,
+) -> Result<Option<WorkflowInstance>> {
     let workflows = runtime.workflows.get_or_default();
     let Some(cfg) = workflows.get(name) else {
         warn!(
@@ -343,7 +422,7 @@ async fn push_default_workflow(runtime: &Arc<SessionRuntime>, name: &str) -> Res
             "default_workflow is set but no matching [workflows.*] entry exists; \
              leaving stack empty"
         );
-        return Ok(());
+        return Ok(None);
     };
     let migrations = match load_migrations(cfg).await {
         Ok(m) => m,
@@ -353,7 +432,7 @@ async fn push_default_workflow(runtime: &Arc<SessionRuntime>, name: &str) -> Res
                 %error,
                 "default_workflow migration read failed; leaving stack empty"
             );
-            return Ok(());
+            return Ok(None);
         }
     };
     let instance_id = Uuid::new_v4();
@@ -366,30 +445,30 @@ async fn push_default_workflow(runtime: &Arc<SessionRuntime>, name: &str) -> Res
     };
     let handle = runtime.workflow_runtime.start(invocation).await?;
     insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &[]).await?;
-    *runtime.workflow_stack.top.lock().await = Some(WorkflowInstance {
+    Ok(Some(WorkflowInstance {
         handle,
         emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
-    });
-    Ok(())
+    }))
 }
 
-/// Slash-command push path: dehydrate the current top (if any), start
-/// the new workflow, install it as the top, drive its initial cycle.
-/// If the initial cycle exits, fall through to the pop+rehydrate path
-/// so the caller never ends up "with no top" purely because the new
-/// workflow returned synchronously.
-async fn push_and_drive(
+/// Slash-command push: start the new workflow, then (only on success)
+/// dehydrate `old`, persist the row, and tell the TUI to replay the new
+/// instance's scrollback. Returns the new `current` for the driver:
+/// `Some(new)` on success, or `old` unchanged if the push aborted (so a
+/// failed start never leaves the stack empty).
+async fn push(
     runtime: &Arc<SessionRuntime>,
+    old: Option<WorkflowInstance>,
     name: &str,
     args: Vec<String>,
-) -> Result<()> {
+) -> Option<WorkflowInstance> {
     let workflows = runtime.workflows.get_or_default();
     let Some(cfg) = workflows.get(name) else {
         runtime
             .events
             .send(StreamFrame::Error(format!("unknown workflow: {name}")));
-        return Ok(());
+        return old;
     };
 
     let migrations = match load_migrations(cfg).await {
@@ -398,7 +477,7 @@ async fn push_and_drive(
             runtime
                 .events
                 .send(StreamFrame::Error(format!("workflow: {error}")));
-            return Ok(());
+            return old;
         }
     };
 
@@ -411,84 +490,180 @@ async fn push_and_drive(
         migrations,
     };
 
-    // Start the new runtime BEFORE we touch any state. If it fails,
-    // the previous top (if any) keeps running and the DB is unchanged.
+    // Start the new runtime BEFORE touching any state. If it fails, the
+    // previous workflow keeps running and the DB is unchanged.
     let handle = match runtime.workflow_runtime.start(invocation).await {
         Ok(handle) => handle,
         Err(error) => {
             runtime
                 .events
                 .send(StreamFrame::Error(format!("workflow: {error}")));
-            return Ok(());
+            return old;
         }
     };
 
-    // Take the old top out of memory (we'll dehydrate it next). The
-    // dehydration is bounded by `DEHYDRATE_TIMEOUT`; the JS body's
-    // `lifecycle.shutdown` hook (if any) runs first.
-    let old = runtime.workflow_stack.top.lock().await.take();
-    if let Some(old) = old {
-        dehydrate(runtime, old).await?;
+    // Commit to the push: dehydrate the old workflow (bounded by
+    // `DEHYDRATE_TIMEOUT`; the body's `lifecycle.shutdown` runs first).
+    if let Some(old) = old
+        && let Err(error) = dehydrate(runtime, old).await
+    {
+        warn!(%error, "dehydrate during push failed");
     }
 
-    // Persist the new row. Truncates any non-completed rows above the
-    // (now demoted) current top — defensive against crash-mid-pop.
-    insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &args).await?;
+    // Persist the new row (truncates any non-completed rows above the
+    // demoted top — defensive against crash-mid-pop).
+    if let Err(error) =
+        insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &args).await
+    {
+        warn!(%error, "insert_pushed_row failed");
+    }
 
     // Tell the TUI to drop the previous workflow's in-memory scrollback
-    // and replay the new active instance's (empty on a fresh push, but
-    // we run the burst anyway for protocol uniformity — and for the
-    // future "resume previously-popped" case which would have rows).
-    crate::scrollback::replay_to_channel(&runtime.events, &runtime.workflow_stack.db, instance_id)
-        .await?;
+    // and replay the new active instance's.
+    if let Err(error) = crate::scrollback::replay_to_channel(
+        &runtime.events,
+        &runtime.workflow_stack.db,
+        instance_id,
+    )
+    .await
+    {
+        warn!(%error, "scrollback replay on push failed");
+    }
 
-    let mut new_instance = WorkflowInstance {
+    Some(WorkflowInstance {
         handle,
         emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
         config_key: name.to_owned(),
-    };
-    let exited = drive(runtime, &mut new_instance).await?;
-    if exited {
-        // The new workflow ran to completion in its initial cycle.
-        // Treat that as an immediate pop: tombstone its row, then
-        // rehydrate whatever's underneath.
-        drop_active_and_promote(runtime, instance_id).await?;
-    } else {
-        *runtime.workflow_stack.top.lock().await = Some(new_instance);
-    }
-    Ok(())
+    })
 }
 
-/// Hand `text` to the topmost workflow's inbox and drive a cycle. On
-/// exit, tombstone the row and rehydrate the next live row (if any).
-async fn dispatch_topmost(runtime: &Arc<SessionRuntime>, text: &str) -> Result<()> {
-    let mut top = match runtime.workflow_stack.top.lock().await.take() {
-        Some(top) => top,
-        None => {
-            runtime.events.send(StreamFrame::Error(
-                "no workflow is active; use a slash command or set \
-                 `default_workflow` in your config"
-                    .to_owned(),
-            ));
-            return Ok(());
-        }
-    };
+/// The long-lived workflow driver. Owns the active instance for its
+/// in-memory life and plays the host side of a classical event loop:
+/// continuously pump the body's `HostFrame`s to the TUI, watch for
+/// genuine termination (`done` — the top-level promise settled or
+/// `exit()`), and apply stack-lifecycle commands (slash pushes).
+///
+/// Input and interrupts do NOT pass through here — they're delivered
+/// straight to the active inbox via [`WorkflowStack::deliver`], so the
+/// body receives them whenever its JS loop reads, mid-turn or not.
+pub(crate) async fn run_driver(
+    runtime: Arc<SessionRuntime>,
+    mut cmd_rx: UnboundedReceiver<DriverCmd>,
+    initial: Option<WorkflowInstance>,
+) {
+    enum Step {
+        Frame(HostFrame),
+        Done(Option<WorkflowError>),
+        Push { name: String, args: Vec<String> },
+        Shutdown,
+    }
 
-    // Sending to a dropped receiver would mean the body has already
-    // exited and we just didn't observe it yet; treat that as
-    // "exited" and let the drive loop confirm.
-    let _ = top.handle.input_tx.send(InboxItem::Input(UserInput {
-        content: text.to_owned(),
-    }));
-    let exited = drive(runtime, &mut top).await?;
-    if exited {
-        let instance_id = top.handle.instance;
-        // Drop the in-memory state explicitly so its task is gone
-        // before we begin rehydrating the next row.
-        drop(top);
-        drop_active_and_promote(runtime, instance_id).await?;
-    } else {
-        *runtime.workflow_stack.top.lock().await = Some(top);
+    let mut current = initial;
+    if let Some(instance) = current.as_ref() {
+        runtime.workflow_stack.set_active(instance);
+    }
+
+    loop {
+        let Some(instance) = current.as_mut() else {
+            // No active workflow: only a push can make progress.
+            match cmd_rx.recv().await {
+                Some(DriverCmd::Push { name, args }) => {
+                    current = push(&runtime, None, &name, args).await;
+                    match current.as_ref() {
+                        Some(inst) => runtime.workflow_stack.set_active(inst),
+                        None => runtime.workflow_stack.clear_active(),
+                    }
+                }
+                None => return,
+            }
+            continue;
+        };
+
+        // Drain queued frames first so a burst doesn't starve the select.
+        while let Ok(frame) = instance.handle.frames.try_recv() {
+            if let Err(error) = emit(&runtime, &mut instance.emit, frame).await {
+                warn!(%error, "emit failed");
+            }
+        }
+
+        let step = tokio::select! {
+            biased;
+            frame = instance.handle.frames.recv() => match frame {
+                Some(f) => Step::Frame(f),
+                None => Step::Shutdown,
+            },
+            done = &mut instance.handle.done => match done {
+                Ok(Err(e)) => Step::Done(Some(e)),
+                Ok(Ok(())) => Step::Done(None),
+                Err(error) => {
+                    warn!(%error, "workflow done channel closed without value");
+                    Step::Done(None)
+                }
+            },
+            cmd = cmd_rx.recv() => match cmd {
+                Some(DriverCmd::Push { name, args }) => Step::Push { name, args },
+                None => Step::Shutdown,
+            },
+        };
+
+        match step {
+            Step::Frame(frame) => {
+                let instance = current.as_mut().expect("active while pumping");
+                if let Err(error) = emit(&runtime, &mut instance.emit, frame).await {
+                    warn!(%error, "emit failed");
+                }
+            }
+            Step::Done(reported) => {
+                let mut instance = current.take().expect("active on done");
+                runtime.workflow_stack.clear_active();
+                if let Err(error) = finish_done(&runtime, &mut instance, reported).await {
+                    warn!(%error, "workflow done handling failed");
+                }
+                let instance_id = instance.handle.instance;
+                // Drop the in-memory state so its task is gone before we
+                // rehydrate the next row.
+                drop(instance);
+                match drop_active_and_promote(&runtime, instance_id).await {
+                    Ok(next) => current = next,
+                    Err(error) => {
+                        warn!(%error, "pop/promote failed");
+                        current = None;
+                    }
+                }
+                if let Some(inst) = current.as_ref() {
+                    runtime.workflow_stack.set_active(inst);
+                }
+            }
+            Step::Push { name, args } => {
+                let old = current.take();
+                runtime.workflow_stack.clear_active();
+                current = push(&runtime, old, &name, args).await;
+                match current.as_ref() {
+                    Some(inst) => runtime.workflow_stack.set_active(inst),
+                    None => runtime.workflow_stack.clear_active(),
+                }
+            }
+            Step::Shutdown => return,
+        }
+    }
+}
+
+/// Genuine-termination handling for the active instance: drain any tail
+/// frames, emit a clean `BlockStop` for every still-open block, and
+/// surface a workflow error if the body settled with one.
+async fn finish_done(
+    runtime: &Arc<SessionRuntime>,
+    instance: &mut WorkflowInstance,
+    reported: Option<WorkflowError>,
+) -> Result<()> {
+    while let Ok(frame) = instance.handle.frames.try_recv() {
+        emit(runtime, &mut instance.emit, frame).await?;
+    }
+    instance.emit.close_all_stop(&runtime.events).await?;
+    if let Some(error) = reported {
+        let msg = format!("workflow: {error}");
+        instance.emit.persist_error(&msg).await?;
+        runtime.events.send(StreamFrame::Error(msg));
     }
     Ok(())
 }
@@ -573,43 +748,6 @@ async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance
                 // be told to ScrollbackReset by the caller's push path.
                 instance.emit.close_all_truncate().await?;
                 return Ok(());
-            }
-        }
-    }
-}
-
-/// Drains the instance's host-frame channel until the body either
-/// parks waiting for input or terminates. Returns `true` if the body
-/// exited.
-async fn drive(runtime: &Arc<SessionRuntime>, instance: &mut WorkflowInstance) -> Result<bool> {
-    loop {
-        while let Ok(host_frame) = instance.handle.frames.try_recv() {
-            emit(runtime, &mut instance.emit, host_frame).await?;
-        }
-        tokio::select! {
-            biased;
-            Some(host_frame) = instance.handle.frames.recv() => {
-                emit(runtime, &mut instance.emit, host_frame).await?;
-            }
-            done = &mut instance.handle.done => {
-                while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(runtime, &mut instance.emit, host_frame).await?;
-                }
-                instance.emit.close_all_stop(&runtime.events).await?;
-                if let Ok(Err(error)) = done {
-                    let msg = format!("workflow: {error}");
-                    instance.emit.persist_error(&msg).await?;
-                    runtime.events.send(StreamFrame::Error(msg));
-                } else if let Err(error) = done {
-                    warn!(%error, "workflow done channel closed without value");
-                }
-                return Ok(true);
-            }
-            () = instance.handle.parked.notified() => {
-                while let Ok(host_frame) = instance.handle.frames.try_recv() {
-                    emit(runtime, &mut instance.emit, host_frame).await?;
-                }
-                return Ok(false);
             }
         }
     }
@@ -845,25 +983,21 @@ fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::event
 /// memory (if any). If hydration fails, recurse — tombstoning the
 /// failed row's branch — until either a row hydrates cleanly or the
 /// live stack is exhausted (top stays `None`).
-async fn drop_active_and_promote(runtime: &Arc<SessionRuntime>, instance_id: Uuid) -> Result<()> {
+async fn drop_active_and_promote(
+    runtime: &Arc<SessionRuntime>,
+    instance_id: Uuid,
+) -> Result<Option<WorkflowInstance>> {
     mark_completed_and_promote(&runtime.workflow_stack.db, instance_id).await?;
-    hydrate_active_or_cascade(runtime).await?;
+    let promoted = hydrate_active_or_cascade(runtime).await?;
     // Tell the TUI to clear scrollback and replay the newly-promoted
     // workflow's history (if any row was promoted). When the stack ran
     // dry there's no instance to replay — we still emit an empty reset
     // so the previous workflow's in-memory scrollback is dropped.
-    let new_top_instance = runtime
-        .workflow_stack
-        .top
-        .lock()
-        .await
-        .as_ref()
-        .map(|i| i.handle.instance);
-    if let Some(new_instance) = new_top_instance {
+    if let Some(instance) = promoted.as_ref() {
         crate::scrollback::replay_to_channel(
             &runtime.events,
             &runtime.workflow_stack.db,
-            new_instance,
+            instance.handle.instance,
         )
         .await?;
     } else {
@@ -872,26 +1006,24 @@ async fn drop_active_and_promote(runtime: &Arc<SessionRuntime>, instance_id: Uui
         });
         runtime.events.send(StreamFrame::ScrollbackReplayEnd);
     }
-    Ok(())
+    Ok(promoted)
 }
 
-/// Find the row with `active = 1` and hydrate it as the in-memory top.
-/// On any failure, tombstone the row + everything at or above its
-/// position and promote the next live row; retry. Loops until the
-/// stack hydrates or runs dry.
-async fn hydrate_active_or_cascade(runtime: &Arc<SessionRuntime>) -> Result<()> {
+/// Find the row with `active = 1` and hydrate it. On any failure,
+/// tombstone the row + everything at or above its position and promote
+/// the next live row; retry. Loops until a row hydrates (returns
+/// `Some`) or the stack runs dry (`None`).
+async fn hydrate_active_or_cascade(
+    runtime: &Arc<SessionRuntime>,
+) -> Result<Option<WorkflowInstance>> {
     let db = &runtime.workflow_stack.db;
     loop {
         let Some(row) = read_active_row(db).await? else {
-            *runtime.workflow_stack.top.lock().await = None;
-            return Ok(());
+            return Ok(None);
         };
 
         match hydrate(runtime, &row).await {
-            Ok(instance) => {
-                *runtime.workflow_stack.top.lock().await = Some(instance);
-                return Ok(());
-            }
+            Ok(instance) => return Ok(Some(instance)),
             Err(error) => {
                 warn!(
                     instance = %row.instance_id,
