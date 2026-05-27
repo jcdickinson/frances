@@ -51,7 +51,7 @@ import {
   Set as VarSet,
   Assign as VarAssign,
 } from "frances:v1/tools/variable";
-import { exit } from "frances:v1/workflow";
+import { exit, setStatus } from "frances:v1/workflow";
 
 type StepStatus = "pending" | "active" | "completed" | "abandoned";
 type StepOutcome = "succeeded" | "partial" | "failed" | "abandoned";
@@ -734,6 +734,7 @@ type TurnEnd = "idle" | "interjected";
 async function turn(): Promise<TurnEnd> {
   let resetCount = 0;
   while (true) {
+    setStatus("thinking…");
     const cp = await chat.checkpoint();
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
@@ -764,6 +765,7 @@ async function turn(): Promise<TurnEnd> {
         // Expected: the aborted stream rejects with the abort reason.
       }
       await chat.rollback(cp);
+      setStatus(null);
       return "interjected";
     }
 
@@ -790,6 +792,7 @@ async function turn(): Promise<TurnEnd> {
   // tombstones). The workflow owns this now — the host no longer fires
   // it per prompt.
   await editor.commit();
+  setStatus(null);
   return "idle";
 }
 

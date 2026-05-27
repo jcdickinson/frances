@@ -64,6 +64,10 @@ pub enum StreamFrame {
         id: BlockId,
     },
     Usage(Usage),
+    /// Workflow-set busy-indicator text. `Some(text)` → the TUI footer
+    /// shows the text with a spinner; `None` → hidden. Driven by
+    /// `setStatus` in the workflow; not persisted, dropped during replay.
+    Status(Option<String>),
     Done,
     Error(String),
     /// Runtime is asking the user for permission; client responds via

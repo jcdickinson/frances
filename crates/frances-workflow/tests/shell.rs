@@ -84,6 +84,7 @@ fn text_of(frame: &HostFrame) -> String {
             format!("[permission:{}] {}", request.id, request.prompt)
         }
         HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
+        HostFrame::Status(s) => format!("[status:{s:?}]"),
     }
 }
 

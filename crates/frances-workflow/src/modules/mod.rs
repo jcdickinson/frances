@@ -142,6 +142,9 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let exit_fn = workflow::build_exit(ctx, shutdown_notify.clone())?;
     stash.set("exit", exit_fn)?;
 
+    let set_status_fn = workflow::build_set_status(ctx, frames_tx.clone())?;
+    stash.set("setStatus", set_status_fn)?;
+
     let (lifecycle_obj, wait_for_shutdown, close_inbox) = lifecycle::build_lifecycle_primitives(
         ctx,
         shutdown_notify,

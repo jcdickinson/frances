@@ -924,6 +924,9 @@ async fn emit(
         HostFrame::Usage(usage) => {
             runtime.events.send(StreamFrame::Usage(usage));
         }
+        HostFrame::Status(status) => {
+            runtime.events.send(StreamFrame::Status(status));
+        }
         HostFrame::Permission {
             request,
             allow_auto,

@@ -78,6 +78,11 @@ pub enum HostFrame {
     /// no block and is not persisted (the TUI drops `Usage` during
     /// replay, so persisting it would only re-render stale numbers).
     Usage(frances_models_llm::wire::Usage),
+    /// Workflow-set busy-indicator text. `Some(text)` shows the text
+    /// with a spinner in the TUI footer; `None` hides it. Set via
+    /// `setStatus` from `frances:v1/workflow`. Side-channel like
+    /// `Usage`: opens / closes no block and is never persisted.
+    Status(Option<String>),
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -999,7 +1004,40 @@ mod tests {
                 format!("[approval:{}] {}", request.id, request.prompt)
             }
             HostFrame::Usage(u) => format!("[usage:total={}]", u.total_tokens),
+            HostFrame::Status(s) => format!("[status:{s:?}]"),
         }
+    }
+
+    #[tokio::test]
+    async fn set_status_emits_status_frames() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { setStatus } from "frances:v1/workflow";
+            setStatus("working…");
+            setStatus(null);
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))));
+        let rendered: Vec<String> = frames.iter().map(text_of).collect();
+        assert!(
+            rendered.contains(&"[status:Some(\"working…\")]".to_string()),
+            "expected a set-status frame, got {rendered:?}",
+        );
+        assert!(
+            rendered.contains(&"[status:None]".to_string()),
+            "expected a clear-status frame, got {rendered:?}",
+        );
     }
 
     #[tokio::test]

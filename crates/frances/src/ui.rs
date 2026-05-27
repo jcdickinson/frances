@@ -217,16 +217,18 @@ impl App<'_> {
         let mut pending_approval: Option<PermissionRequest> = None;
         let mut frame_rx = self.events;
         let mut events = EventStream::new();
-        let mut streaming = false;
+        // Busy-indicator text, set by the workflow via `setStatus`.
+        // `Some(text)` → footer shows `{spinner} {text}`; `None` →
+        // hidden. The host no longer infers this from token flow.
+        let mut status: Option<String> = None;
         let mut replay_mode = false;
         let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Wall-clock-paced frame index for the streaming indicator.
-        // Bumped on every `spinner_tick`, irrespective of whether
-        // `streaming` is true — keeps the cadence stable when streams
-        // toggle on and off mid-session.
-        let mut streaming_frame: u8 = 0;
+        // Wall-clock-paced frame index for the status spinner. Bumped on
+        // every `spinner_tick` so the cadence stays stable regardless of
+        // whether the indicator is currently shown.
+        let mut status_frame: u8 = 0;
 
         loop {
             frame_counter = frame_counter.wrapping_add(1);
@@ -237,8 +239,8 @@ impl App<'_> {
                 &theme,
                 &mut focus,
                 frame_counter,
-                streaming,
-                streaming_frame,
+                status.as_deref(),
+                status_frame,
                 latest_usage.as_ref(),
             )?;
 
@@ -301,7 +303,6 @@ impl App<'_> {
                                         );
                                     } else {
                                         self.runtime.prompt(text);
-                                        streaming = true;
                                     }
                                 }
                                 KeyAction::Approve | KeyAction::Reject => {
@@ -346,26 +347,19 @@ impl App<'_> {
                     }
                 }
                 _ = spinner_tick.tick() => {
-                    streaming_frame = streaming_frame.wrapping_add(1);
+                    status_frame = status_frame.wrapping_add(1);
                     if container.active_count() > 0 {
                         container.bump_spinner();
                     }
                 }
                 Some(frame) = frame_rx.recv() => {
-                    // The transport-level boundary (`Done`) and any
-                    // terminal frame (`Error`, `Permission`) end the
-                    // streaming indicator. A `BlockDelta` re-enters
-                    // streaming so a follow-up stream after an Error
-                    // / Permission lights it back up. Replay frames
-                    // don't change streaming state.
-                    if !replay_mode {
-                        match &frame {
-                            StreamFrame::BlockDelta { .. } => streaming = true,
-                            StreamFrame::Done
-                            | StreamFrame::Error(_)
-                            | StreamFrame::Permission(_) => streaming = false,
-                            _ => {}
-                        }
+                    // The busy indicator is workflow-driven: a `Status`
+                    // frame sets or clears it. Replay bursts don't carry
+                    // live status, so they're ignored here.
+                    if !replay_mode
+                        && let StreamFrame::Status(s) = &frame
+                    {
+                        status = s.clone();
                     }
                     if let Some(req) = handle_frame(
                         &mut terminal,
@@ -391,14 +385,15 @@ impl App<'_> {
     }
 }
 
-/// Braille-dot frames cycled through the streaming indicator. Same
-/// glyph set the container uses for its active-block spinner; sharing
-/// the vocabulary keeps the two animations feeling like one family.
-const STREAMING_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Braille-dot frames cycled through the busy indicator. Same glyph
+/// set the container uses for its active-block spinner; sharing the
+/// vocabulary keeps the two animations feeling like one family.
+const STATUS_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn streaming_status(frame: u8) -> String {
-    let glyph = STREAMING_FRAMES[(frame as usize) % STREAMING_FRAMES.len()];
-    format!("{glyph} streaming…")
+/// Render the workflow-set status text with the current spinner glyph.
+fn status_line(text: &str, frame: u8) -> String {
+    let glyph = STATUS_FRAMES[(frame as usize) % STATUS_FRAMES.len()];
+    format!("{glyph} {text}")
 }
 
 #[expect(
@@ -412,13 +407,13 @@ fn redraw(
     theme: &Theme,
     focus: &mut Focus,
     frame: u64,
-    streaming: bool,
-    streaming_frame: u8,
+    status: Option<&str>,
+    status_frame: u8,
     latest_usage: Option<&Usage>,
 ) -> std::io::Result<()> {
     footer
         .input
-        .set_status(streaming.then(|| streaming_status(streaming_frame)));
+        .set_status(status.map(|text| status_line(text, status_frame)));
     let token_text = latest_usage
         .map(format_token_status)
         .unwrap_or_else(|| "tokens: —".to_string());
@@ -508,6 +503,10 @@ fn handle_frame(
         }
         StreamFrame::Usage(usage) => {
             *latest_usage = Some(usage);
+        }
+        StreamFrame::Status(_) => {
+            // The busy indicator is applied in the run loop before
+            // `handle_frame`; nothing to do here.
         }
         StreamFrame::Done => {
             // Done is a transport boundary ("this prompt's stream
@@ -629,9 +628,12 @@ fn handle_replay_frame(
                 Style::default().fg(Color::Red),
             )));
         }
-        // Usage / Done / Permission are not part of the replay burst.
-        // Drop them if they sneak in.
-        StreamFrame::Usage(_) | StreamFrame::Done | StreamFrame::Permission(_) => {}
+        // Usage / Status / Done / Permission are not part of the replay
+        // burst. Drop them if they sneak in.
+        StreamFrame::Usage(_)
+        | StreamFrame::Status(_)
+        | StreamFrame::Done
+        | StreamFrame::Permission(_) => {}
     }
     Ok(None)
 }
