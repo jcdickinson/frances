@@ -291,50 +291,6 @@ pub async fn replay_to_channel(
     Ok(())
 }
 
-/// In-process equivalent of [`replay_to_channel`] — produces the same
-/// frame sequence as a `Vec<StreamFrame>` so it can be bundled into
-/// an `AttachResponse`. The order matches the wire path exactly.
-pub async fn replay_frames(
-    db: &Database,
-    instance: Uuid,
-) -> std::result::Result<Vec<StreamFrame>, ScrollbackError> {
-    let rows = load_for_instance(db, instance).await?;
-    let mut out = Vec::with_capacity(rows.len() * 2 + 2);
-    out.push(StreamFrame::Scrollback(ScrollbackFrame::Reset {
-        instance_id: instance,
-    }));
-    let mut next_id: u64 = 1;
-    for row in rows {
-        match row {
-            StoredRow::Block {
-                kind,
-                text,
-                truncated,
-            } => {
-                let id = BlockId(next_id);
-                next_id += 1;
-                out.push(StreamFrame::Scrollback(ScrollbackFrame::Block {
-                    id,
-                    kind,
-                    text: Some(text),
-                }));
-                if truncated {
-                    out.push(StreamFrame::Scrollback(ScrollbackFrame::BlockTruncated {
-                        id,
-                    }));
-                } else {
-                    out.push(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { id }));
-                }
-            }
-            StoredRow::Error { text } => {
-                out.push(StreamFrame::Scrollback(ScrollbackFrame::Error(text)));
-            }
-        }
-    }
-    out.push(StreamFrame::Scrollback(ScrollbackFrame::End));
-    Ok(out)
-}
-
 fn encode_block(
     kind: &BlockKind,
     text: &str,
@@ -464,6 +420,19 @@ mod tests {
             run_all(&conn, &[&SCHEMA]).await.unwrap();
         }
         db
+    }
+
+    /// Drain a full replay burst from the production `replay_to_channel`
+    /// path into a `Vec` for order/shape assertions.
+    async fn collect_replay(db: &Database, instance: Uuid) -> Vec<StreamFrame> {
+        let (events, mut rx) = EventsChannel::new();
+        replay_to_channel(&events, db, instance).await.unwrap();
+        drop(events);
+        let mut frames = Vec::new();
+        while let Some(frame) = rx.recv().await {
+            frames.push(frame);
+        }
+        frames
     }
 
     #[tokio::test]
@@ -649,7 +618,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = replay_frames(&db, instance).await.unwrap();
+        let frames = collect_replay(&db, instance).await;
         // Reset + (Block+Stop) + Error + (Block+Truncated) + End
         assert_eq!(frames.len(), 1 + 2 + 1 + 2 + 1);
         assert!(matches!(
@@ -713,7 +682,7 @@ mod tests {
         .await
         .unwrap();
 
-        let frames = replay_frames(&db, instance).await.unwrap();
+        let frames = collect_replay(&db, instance).await;
         assert_eq!(frames.len(), 4);
         match &frames[0] {
             StreamFrame::Scrollback(ScrollbackFrame::Reset { .. }) => {}

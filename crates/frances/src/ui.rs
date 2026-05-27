@@ -495,11 +495,6 @@ fn handle_frame(
             // The busy indicator is applied in the run loop before
             // `handle_frame`; nothing to do here.
         }
-        StreamFrame::Done => {
-            // Done is a transport boundary ("this prompt's stream
-            // ended"), not a semantic "close everything". Blocks live
-            // until an explicit BlockStop.
-        }
         StreamFrame::Error(message) => {
             // Error frames are a side-channel — they don't seal any
             // open block. They render below whatever's in flight.

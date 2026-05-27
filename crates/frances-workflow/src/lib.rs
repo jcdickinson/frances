@@ -37,4 +37,4 @@ pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};
 
 #[cfg(any(test, feature = "test-utils"))]
-pub use runtime::test_deps;
+pub use runtime::{test_deps, test_drive};

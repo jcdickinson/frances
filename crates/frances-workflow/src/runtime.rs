@@ -457,6 +457,59 @@ pub(crate) fn caught<'js>(
 }
 
 #[cfg(any(test, feature = "test-utils"))]
+pub mod test_drive {
+    //! Shared workflow-driving helper for this crate's unit tests and the
+    //! `tests/` integration suites. Drives a body until it parks on
+    //! `inbox.next()` or terminates, collecting the frames it emits.
+    use super::{HostFrame, WorkflowError, WorkflowHandle};
+
+    /// Hard ceiling on how long an individual cycle is allowed to run.
+    /// Real workflow turns are interactive (a body can wait for input
+    /// indefinitely); in tests, anything past a few seconds is a bug.
+    /// Panicking with a clear message beats a hung test process.
+    pub const CYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Drives a workflow until it parks on `inbox.next()` or terminates.
+    /// Panics if `CYCLE_TIMEOUT` is exceeded so tests fail fast.
+    pub async fn drive_one_cycle(
+        handle: &mut WorkflowHandle,
+    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
+        match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
+            Ok(result) => result,
+            Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
+        }
+    }
+
+    async fn drive_one_cycle_inner(
+        handle: &mut WorkflowHandle,
+    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
+        let mut out = Vec::new();
+        loop {
+            while let Ok(frame) = handle.frames.try_recv() {
+                out.push(frame);
+            }
+            tokio::select! {
+                biased;
+                Some(frame) = handle.frames.recv() => out.push(frame),
+                done = &mut handle.done => {
+                    let result = done.unwrap_or(Ok(()));
+                    while let Ok(frame) = handle.frames.try_recv() {
+                        out.push(frame);
+                    }
+                    return (out, Some(result));
+                }
+                () = handle.parked.notified() => {
+                    while let Ok(frame) = handle.frames.try_recv() {
+                        out.push(frame);
+                    }
+                    return (out, None);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
 pub mod test_deps {
     //! In-memory `WorkflowDeps` for tests. `push` records to a local
     //! Vec; `run` errors out (no provider) by default. Tests that need a
@@ -933,50 +986,7 @@ mod tests {
         f
     }
 
-    /// Hard ceiling on how long an individual cycle is allowed to run.
-    /// Real workflow turns are interactive (a body can wait for input
-    /// indefinitely); in tests, anything past a few seconds is a bug.
-    /// Panicking with a clear message beats a hung test process.
-    const CYCLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-    /// Drives a workflow until it parks on `inbox.next()` or terminates.
-    /// Panics if `CYCLE_TIMEOUT` is exceeded so tests fail fast.
-    async fn drive_one_cycle(
-        handle: &mut WorkflowHandle,
-    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
-        match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
-            Ok(result) => result,
-            Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
-        }
-    }
-
-    async fn drive_one_cycle_inner(
-        handle: &mut WorkflowHandle,
-    ) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
-        let mut out = Vec::new();
-        loop {
-            while let Ok(frame) = handle.frames.try_recv() {
-                out.push(frame);
-            }
-            tokio::select! {
-                biased;
-                Some(frame) = handle.frames.recv() => out.push(frame),
-                done = &mut handle.done => {
-                    let result = done.unwrap_or(Ok(()));
-                    while let Ok(frame) = handle.frames.try_recv() {
-                        out.push(frame);
-                    }
-                    return (out, Some(result));
-                }
-                () = handle.parked.notified() => {
-                    while let Ok(frame) = handle.frames.try_recv() {
-                        out.push(frame);
-                    }
-                    return (out, None);
-                }
-            }
-        }
-    }
+    use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle};
 
     fn text_of(frame: &HostFrame) -> String {
         match frame {

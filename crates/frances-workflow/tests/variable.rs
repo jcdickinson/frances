@@ -3,10 +3,9 @@
 //! through the workflow runtime against `StubDeps`.
 
 use std::io::Write;
-use std::time::Duration;
 
 use frances_workflow::{
-    FrameKind, HostFrame, Invocation, Runtime, WorkflowError, WorkflowHandle, test_deps::StubDeps,
+    FrameKind, HostFrame, Invocation, Runtime, test_deps::StubDeps, test_drive::drive_one_cycle,
 };
 
 fn write_source(body: &str) -> tempfile::NamedTempFile {
@@ -16,45 +15,6 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
         .expect("tempfile");
     f.write_all(body.as_bytes()).expect("write");
     f
-}
-
-const CYCLE_TIMEOUT: Duration = Duration::from_secs(5);
-
-async fn drive_one_cycle(
-    handle: &mut WorkflowHandle,
-) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
-    match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
-        Ok(result) => result,
-        Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
-    }
-}
-
-async fn drive_one_cycle_inner(
-    handle: &mut WorkflowHandle,
-) -> (Vec<HostFrame>, Option<Result<(), WorkflowError>>) {
-    let mut out = Vec::new();
-    loop {
-        while let Ok(frame) = handle.frames.try_recv() {
-            out.push(frame);
-        }
-        tokio::select! {
-            biased;
-            Some(frame) = handle.frames.recv() => out.push(frame),
-            done = &mut handle.done => {
-                let result = done.unwrap_or(Ok(()));
-                while let Ok(frame) = handle.frames.try_recv() {
-                    out.push(frame);
-                }
-                return (out, Some(result));
-            }
-            () = handle.parked.notified() => {
-                while let Ok(frame) = handle.frames.try_recv() {
-                    out.push(frame);
-                }
-                return (out, None);
-            }
-        }
-    }
 }
 
 fn text_of(frame: &HostFrame) -> String {

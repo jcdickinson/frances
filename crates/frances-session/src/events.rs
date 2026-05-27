@@ -3,9 +3,6 @@
 //!
 //! There is no inter-process boundary — these types travel through an
 //! in-process `tokio::sync::mpsc` from the session runtime to the TUI.
-//! `Serialize` / `Deserialize` remain implemented because scrollback
-//! persists block payloads to the turso DB as bincode rows, not because
-//! the events themselves cross the wire.
 
 use std::sync::Arc;
 
@@ -29,7 +26,7 @@ impl std::fmt::Display for BlockId {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum StreamFrame {
     /// Self-describing block content. The first delta with a
     /// previously-unseen `id` implicitly opens a new block of `kind`;
@@ -56,8 +53,7 @@ pub enum StreamFrame {
     /// Replay-only sibling of `BlockStop`: the block was in flight when
     /// its workflow was dehydrated, so it never received a clean stop.
     /// The session runtime emits this in place of `BlockStop` from
-    /// [`crate::scrollback::replay_to_channel`] (or
-    /// [`crate::scrollback::replay_frames`]) for rows whose `truncated`
+    /// [`crate::scrollback::replay_to_channel`] for rows whose `truncated`
     /// column is set. The TUI renders the block with a visible
     /// "(truncated)" indicator.
     BlockTruncated {
@@ -68,7 +64,6 @@ pub enum StreamFrame {
     /// shows the text with a spinner; `None` → hidden. Driven by
     /// `setStatus` in the workflow; not persisted, dropped during replay.
     Status(Option<String>),
-    Done,
     Error(String),
     /// Runtime is asking the user for permission; client responds via
     /// [`crate::runtime::SessionRuntime::respond_permission`].
@@ -83,9 +78,8 @@ pub enum StreamFrame {
 
 /// The scrollback-replay sub-protocol: exactly the frames a replay burst
 /// emits, in their own type so consumers match a small, real set with no
-/// defensive arms. Produced by [`crate::scrollback::replay_to_channel`] /
-/// [`crate::scrollback::replay_frames`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// defensive arms. Produced by [`crate::scrollback::replay_to_channel`].
+#[derive(Debug, Clone)]
 pub enum ScrollbackFrame {
     /// Burst opener: the TUI clears its in-memory scrollback container
     /// and replays `instance_id`'s persisted history into the alt-screen
