@@ -30,6 +30,11 @@ const GET_SCHEMA = {
   type: "object",
   properties: {
     name: { type: "string" },
+    filter: {
+      type: "string",
+      description:
+        "Optional jq filter. The stored value is bound as `.`; the filter's single output is returned instead of the whole value. No `$name` bindings — use variable_assign to combine variables.",
+    },
   },
   required: ["name"],
 };
@@ -128,11 +133,22 @@ class Get {
   }
 
   handler = async ({ call }) => {
-    const { name } = call.arguments;
+    const { name, filter } = call.arguments;
     if (!this.vars.has(name)) {
       return _errResult(call.id, `unknown variable: ${name}`);
     }
-    return _okResult(call.id, JSON.stringify(this.vars.get(name), null, 2));
+    const value = this.vars.get(name);
+    if (filter === undefined || filter === null) {
+      return _okResult(call.id, JSON.stringify(value, null, 2));
+    }
+    let resultJson;
+    try {
+      resultJson = _jaqEval(filter, JSON.stringify(value), "{}");
+    } catch (err) {
+      return _errResult(call.id, err);
+    }
+    const filtered = JSON.parse(resultJson);
+    return _okResult(call.id, JSON.stringify(filtered, null, 2));
   };
 }
 

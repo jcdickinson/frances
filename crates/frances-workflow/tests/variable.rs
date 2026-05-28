@@ -270,6 +270,94 @@ async fn variable_assign_introspection_and_errors() {
 }
 
 #[tokio::test]
+async fn variable_get_with_filter_lenses_into_stored_value() {
+    let rt = Runtime::new(StubDeps::default()).unwrap();
+    let file = write_source(
+        r#"
+        import { Variables, Get, Set } from "frances:v1/tools/variable";
+        import { transcript, MarkdownFrame } from "frances:v1/frames";
+
+        const vars = new Variables();
+        const get = new Get(vars);
+        const set = new Set(vars);
+
+        await set.handler({
+            call: { id: "s1", name: "variable_set",
+                    arguments: { name: "plan", value: { steps: ["a","b","c"], done: false } } },
+            scope: null,
+        });
+        await set.handler({
+            call: { id: "s2", name: "variable_set",
+                    arguments: { name: "text", value: "L1\nL2\nL3\nL4\nL5" } },
+            scope: null,
+        });
+
+        // Object-key lens.
+        const objLens = await get.handler({
+            call: { id: "g1", name: "variable_get",
+                    arguments: { name: "plan", filter: ".steps" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(objLens) }));
+
+        // String-slice lens — split + range + join.
+        const textLens = await get.handler({
+            call: { id: "g2", name: "variable_get",
+                    arguments: { name: "text",
+                                 filter: "split(\"\n\") | .[1:4] | join(\"\n\")" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(textLens) }));
+
+        // Bad jq surfaces as is_error.
+        const broken = await get.handler({
+            call: { id: "g3", name: "variable_get",
+                    arguments: { name: "plan", filter: "this is not jq" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(broken) }));
+
+        // Filter on missing variable still reports unknown-variable, not a jq error.
+        const missing = await get.handler({
+            call: { id: "g4", name: "variable_get",
+                    arguments: { name: "nope", filter: "." } },
+            scope: null,
+        });
+        transcript.push(new MarkdownFrame({ content: JSON.stringify(missing) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let obj_lens = text_of(&frames[0]);
+    assert!(obj_lens.contains(r#""is_error":false"#), "obj: {obj_lens}");
+    assert!(obj_lens.contains(r#"\"a\""#), "obj: {obj_lens}");
+    assert!(obj_lens.contains(r#"\"c\""#), "obj: {obj_lens}");
+
+    let text_lens = text_of(&frames[1]);
+    assert!(
+        text_lens.contains(r#""is_error":false"#),
+        "text: {text_lens}"
+    );
+    assert!(text_lens.contains(r#"L2\\nL3\\nL4"#), "text: {text_lens}");
+
+    let broken = text_of(&frames[2]);
+    assert!(broken.contains(r#""is_error":true"#), "broken: {broken}");
+
+    let missing = text_of(&frames[3]);
+    assert!(missing.contains(r#""is_error":true"#), "missing: {missing}",);
+    assert!(missing.contains("unknown variable"), "missing: {missing}",);
+}
+
+#[tokio::test]
 async fn variable_get_and_set_tool_handlers_work() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
