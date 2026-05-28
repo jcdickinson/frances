@@ -41,7 +41,7 @@ use twox_hash::XxHash3_64;
 use frances_edit::{DiffOp, DiffRender, LlmEdit, LoopKey};
 
 use crate::deps::{EditorFactory, WorkflowDeps};
-use crate::io::{WorkflowFs, WorkflowIo};
+use crate::io::WorkflowFs;
 
 pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
@@ -196,7 +196,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
 /// unchanged file trips the same guard as `file_read`.
 async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
-    let fs = deps.io().fs();
+    let fs = deps.fs();
     let (mtime_ns, size) = stat_file(fs, &resolved)
         .await
         .map_err(|e| format!("{}: {e}", resolved.display()))?;
@@ -230,7 +230,7 @@ struct ReadFileArgs {
 
 async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&args.path));
-    let fs = deps.io().fs();
+    let fs = deps.fs();
     let (mtime_ns, size) = stat_file(fs, &resolved)
         .await
         .map_err(|e| format!("{}: {e}", resolved.display()))?;

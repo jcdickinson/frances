@@ -54,7 +54,7 @@ use frances_shell::{QuietReason, ReadEvent, RunOutcome, Shell, ShellOptions, Wai
 use crate::deps::WorkflowDeps;
 use crate::io::{WorkflowIo, WorkflowShell};
 
-type ShellOf<D> = <<D as WorkflowDeps>::Io as WorkflowIo>::Shell;
+type ShellOf<D> = <D as WorkflowIo>::Shell;
 
 pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
@@ -69,7 +69,7 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
             Class::instance(
                 ctx.clone(),
                 ShellJs {
-                    factory: deps.io().shell().clone(),
+                    factory: deps.shell().clone(),
                     state: Arc::new(AsyncMutex::new(ShellState {
                         shell: None,
                         running: false,

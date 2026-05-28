@@ -20,20 +20,18 @@ use uuid::Uuid;
 use crate::io::WorkflowIo;
 use crate::storage::{WorkflowDb, WorkflowDbError};
 
-pub trait WorkflowDeps: Clone + Send + Sync + 'static {
+/// The dep bundle the host hands to the workflow runtime.
+///
+/// `WorkflowDeps` is itself a [`WorkflowIo`] — implementations supply
+/// the timer/shell/fs surface directly, no separate `io()` accessor.
+/// The supertrait keeps the trait surface flat: callers say
+/// `deps.timer()`, `deps.shell()`, `deps.fs()` without going through
+/// an indirection.
+pub trait WorkflowDeps: WorkflowIo + Clone {
     type ChatSessionManager: ChatSessionManager;
-    /// Timer + shell + fs bundle. See [`crate::io`] for the sub-trait
-    /// layout — each sub-piece is independently swappable, the umbrella
-    /// is just for convenient routing.
-    type Io: WorkflowIo;
     type EditorFactory: EditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
-
-    /// Timer + shell + fs surface. Production wires
-    /// [`crate::io::real::RealIo`]; tests drag in
-    /// [`crate::io::mock::MockIo`] from `test-utils`.
-    fn io(&self) -> &Self::Io;
 
     /// Factory for the `frances:v1/tools/file` `Editor` primitive. Hands
     /// out a clone of the host's session-scoped `EditSession` so all

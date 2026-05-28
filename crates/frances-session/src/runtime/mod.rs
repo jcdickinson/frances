@@ -63,8 +63,14 @@ impl ChatManagerDeps for ChatDepsImpl {
 /// Concrete `WorkflowDeps` impl. Holds the chat manager and the
 /// per-session DB handle plus the same editor factory the TUI sees, so
 /// `current_env` / `current_cwd` share state with the host.
+///
+/// Generic on the `Io` bundle (`WorkflowIo`); production defaults to
+/// [`RealIo`] (real tokio timer + real bash shell + real `tokio::fs`).
+/// Tests can plug in `frances_workflow::StubIo<MockTimer, ...>` via
+/// [`SessionRuntime::start_with_io`] to control the clock without
+/// affecting production callers.
 #[derive(Clone)]
-pub struct WorkflowDepsImpl {
+pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     pub chat: ChatSessionManager<ChatDepsImpl>,
     pub invocation: Arc<StdMutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
@@ -74,24 +80,33 @@ pub struct WorkflowDepsImpl {
     /// map. Wrapped in `Arc` so clones (one per workflow invocation)
     /// see the same cache.
     pub workflow_dbs: Arc<DashMap<Uuid, Arc<WorkflowDb>>>,
-    /// Production IO bundle (real timer + real shell + real fs).
-    /// Field rather than a unit-stub so future impls (e.g. a
-    /// configurable shell launcher) can hang state here without
-    /// rewiring `WorkflowDeps`.
-    pub io: RealIo,
+    /// IO bundle (timer + shell + fs). Production wires `RealIo`;
+    /// tests wire a `StubIo` variant.
+    pub io: Io,
 }
 
-impl WorkflowDeps for WorkflowDepsImpl {
+impl<Io: frances_workflow::WorkflowIo> frances_workflow::WorkflowIo for WorkflowDepsImpl<Io> {
+    type Timer = Io::Timer;
+    type Shell = Io::Shell;
+    type Fs = Io::Fs;
+
+    fn timer(&self) -> &Self::Timer {
+        self.io.timer()
+    }
+    fn shell(&self) -> &Self::Shell {
+        self.io.shell()
+    }
+    fn fs(&self) -> &Self::Fs {
+        self.io.fs()
+    }
+}
+
+impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
     type ChatSessionManager = ChatSessionManager<ChatDepsImpl>;
-    type Io = RealIo;
     type EditorFactory = SessionEditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
-    }
-
-    fn io(&self) -> &Self::Io {
-        &self.io
     }
 
     fn editor_factory(&self) -> &Self::EditorFactory {
@@ -149,7 +164,12 @@ impl EditorFactory for SessionEditorFactory {
 /// The session runtime. Holds the per-session state; produces frames
 /// into [`EventsChannel`] and accepts prompt / permission input from
 /// the TUI.
-pub struct SessionRuntime {
+///
+/// Generic on the workflow `Io` bundle so tests can inject a
+/// `MockTimer`-bearing IO via [`SessionRuntime::start_with_io`].
+/// Production defaults to [`RealIo`] — every existing caller resolves
+/// to `SessionRuntime<RealIo>` via the default parameter.
+pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     pub session: Session,
     pub invocation: Arc<StdMutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
@@ -165,7 +185,7 @@ pub struct SessionRuntime {
     /// `default_workflow` config binding. `restore_or_seed` reads this
     /// to choose what to push when the `workflow_stack` table is empty.
     pub default_workflow: ConfigBinding<Option<String>>,
-    pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl>>,
+    pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl<Io>>>,
     pub workflow_stack: WorkflowStack,
     /// Control channel into the long-lived workflow driver task. Slash
     /// pushes go here; plain input/interrupts bypass it and land on the
@@ -183,10 +203,32 @@ pub struct SessionRuntime {
     pub cancel: CancellationToken,
 }
 
-impl SessionRuntime {
-    /// Build the runtime, restore the persisted workflow stack, and
-    /// return it alongside the events receiver the TUI should drain.
-    /// Initial scrollback replay is not done here — call
+/// Boxed `FnOnce` over the freshly-built [`ProviderCache`]. Used by
+/// tests to `cache.insert_stub(<id>, Arc::new(StubProvider::new()))`.
+pub type ProviderCacheHook = Box<dyn FnOnce(&ProviderCache) + Send>;
+
+/// Knobs passed to [`SessionRuntime::start_with`] /
+/// [`SessionRuntime::start_with_io`]. Default is the production
+/// behaviour (empty providers vec, no-op cache hook), so callers that
+/// only care about *one* override can build the rest via
+/// `..Default::default()`.
+#[derive(Default)]
+pub struct StartOverrides {
+    /// Extra `ConfigProvider`s appended to the default chain (highest
+    /// priority, "last writer wins"). Tests pass an `InMemoryProvider`
+    /// here to seed `models.default`, `model_providers.<id>`, and
+    /// `workflows.<id>.file` without touching XDG.
+    pub extra_config_providers: Vec<Arc<dyn ConfigProvider>>,
+    /// Closure run against the freshly-built [`ProviderCache`] before
+    /// the [`ChatSessionManager`] is constructed.
+    pub on_cache: Option<ProviderCacheHook>,
+}
+
+impl SessionRuntime<RealIo> {
+    /// Build the runtime with the production IO bundle, restore the
+    /// persisted workflow stack, and return it alongside the events
+    /// receiver the TUI should drain. Initial scrollback replay is
+    /// not done here — call
     /// [`SessionRuntime::replay_initial_scrollback`] after the receiver
     /// is hooked up.
     pub async fn start(
@@ -194,26 +236,40 @@ impl SessionRuntime {
         db: Database,
         invocation: InvocationContext,
     ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)> {
-        Self::start_with(session, db, invocation, |_| {}).await
+        Self::start_with(session, db, invocation, StartOverrides::default()).await
     }
 
-    /// Variant of [`start`](Self::start) that runs `on_cache` against
-    /// the freshly-built [`ProviderCache`] *before* the
-    /// [`ChatSessionManager`] is constructed. Tests use this seam to
-    /// register stub providers (via `ProviderCache::insert_stub` from
-    /// the `frances-llm/test-util` feature) so the runtime resolves
-    /// model lookups to a scripted [`frances_llm::test_util::StubProvider`]
-    /// instead of hitting the wire. Production callers reach for
-    /// [`start`](Self::start), which passes a no-op closure here.
-    pub async fn start_with<F>(
+    /// Production-IO variant of [`start_with_io`](
+    /// SessionRuntime::start_with_io). Tests reach for `start_with_io`
+    /// directly when they need to inject a mock-clock IO.
+    pub async fn start_with(
         session: Session,
         db: Database,
         invocation: InvocationContext,
-        on_cache: F,
-    ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)>
-    where
-        F: FnOnce(&ProviderCache),
-    {
+        overrides: StartOverrides,
+    ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)> {
+        Self::start_with_io(session, db, invocation, overrides, RealIo::default()).await
+    }
+}
+
+impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
+    /// Build the runtime with a caller-supplied IO bundle. Production
+    /// always passes [`RealIo`] (via [`start`](Self::start) /
+    /// [`start_with`](Self::start_with)); tests pass a
+    /// `StubIo<MockTimer, ...>` so the workflow's JS-side `Timer`
+    /// goes through the virtual clock.
+    pub async fn start_with_io(
+        session: Session,
+        db: Database,
+        invocation: InvocationContext,
+        overrides: StartOverrides,
+        io: Io,
+    ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)> {
+        let StartOverrides {
+            extra_config_providers,
+            on_cache,
+        } = overrides;
+
         std::fs::create_dir_all(&session.runtime_dir).map_err(|source| {
             RuntimeError::CreateRuntimeDir {
                 path: session.runtime_dir.clone(),
@@ -224,7 +280,8 @@ impl SessionRuntime {
         let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
 
         let session_provider = Arc::new(SessionConfigProvider::new(db.clone()));
-        let config_providers = build_config_providers(session_provider.clone());
+        let config_providers =
+            build_config_providers(session_provider.clone(), extra_config_providers);
         let config = ConfigHandle::build(config_providers).await?;
         let session_config_writer = session_provider
             .writer()
@@ -234,7 +291,9 @@ impl SessionRuntime {
             .required()
             .map_err(|_| RuntimeError::DefaultModelMissing)?;
         let cache = ProviderCache::new(config.clone())?;
-        on_cache(&cache);
+        if let Some(hook) = on_cache {
+            hook(&cache);
+        }
         let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
         let default_workflow = config.bind::<Option<String>>("default_workflow")?;
 
@@ -255,7 +314,7 @@ impl SessionRuntime {
             editor_factory: editor_factory.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
-            io: RealIo::default(),
+            io,
         })?);
 
         let (events, events_rx) = EventsChannel::new();
@@ -382,11 +441,15 @@ impl SessionRuntime {
 ///   2. XDG user config dir (`XDG_CONFIG_HOME`, default `~/.config`).
 ///   3. `FRANCES__*` env vars.
 ///   4. Per-session DB rows.
+///   5. `extras` — anything the caller wants to override the chain
+///      with (last wins). Production passes an empty vec; tests pass
+///      an `InMemoryProvider`.
 ///
 /// Each TOML file is `.optional()` — running with no config files
 /// present is a supported configuration.
 fn build_config_providers(
     session_provider: Arc<SessionConfigProvider>,
+    extras: Vec<Arc<dyn ConfigProvider>>,
 ) -> Vec<Arc<dyn ConfigProvider>> {
     let xdg_dirs = xdg::BaseDirectories::with_prefix("frances");
 
@@ -405,6 +468,7 @@ fn build_config_providers(
 
     providers.push(Arc::new(EnvProvider::with_prefix("FRANCES")));
     providers.push(session_provider);
+    providers.extend(extras);
 
     providers
 }

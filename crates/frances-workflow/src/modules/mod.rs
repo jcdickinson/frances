@@ -74,7 +74,6 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
-use crate::io::WorkflowIo;
 use crate::runtime::{InboxItem, OutputSenders, caught};
 
 pub mod chat;
@@ -228,7 +227,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 
     let (set_sleep, clear_sleep) = io::build_sleep_primitives(
         ctx,
-        WorkflowIo::timer(deps.io()).clone(),
+        deps.timer().clone(),
         closed.clone(),
         closed_notify.clone(),
     )?;

@@ -91,8 +91,8 @@ const DEFAULT_REASON: &str = "(no reason given)";
 /// Ask the configured judge model whether to auto-approve `request`.
 /// `complete_enforced` forces the `decide` tool and scolds once on a
 /// miss; if it still can't get a call, that's `Indeterminate`.
-pub(crate) async fn judge(
-    runtime: &Arc<SessionRuntime>,
+pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     request: &PermissionRequest,
 ) -> JudgeOutcome {
     let env = runtime.invocation.lock().process.env.clone();

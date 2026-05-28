@@ -349,7 +349,10 @@ impl EmitState {
 /// Called from [`SessionRuntime::prompt`]. Non-blocking: the channel
 /// sends return immediately; the driver and the workflow body pick the
 /// work up on their own tasks.
-pub(crate) fn dispatch_input(runtime: &SessionRuntime, text: &str) {
+pub(crate) fn dispatch_input<Io: frances_workflow::WorkflowIo>(
+    runtime: &SessionRuntime<Io>,
+    text: &str,
+) {
     match parse_slash_command(text) {
         Ok(Some((name, args))) => {
             let _ = runtime.workflow_cmd.send(DriverCmd::Push {
@@ -371,7 +374,7 @@ pub(crate) fn dispatch_input(runtime: &SessionRuntime, text: &str) {
 }
 
 /// Deliver an interrupt to the active workflow's inbox.
-pub(crate) fn dispatch_interrupt(runtime: &SessionRuntime) {
+pub(crate) fn dispatch_interrupt<Io: frances_workflow::WorkflowIo>(runtime: &SessionRuntime<Io>) {
     runtime.workflow_stack.deliver(InboxItem::Interrupt);
 }
 
@@ -384,8 +387,8 @@ pub(crate) fn dispatch_interrupt(runtime: &SessionRuntime) {
 /// Errors during hydration (missing config, migration drift, runtime
 /// error) cascade until a row hydrates cleanly or the live stack is
 /// exhausted. The runtime is always usable when this returns.
-pub(crate) async fn restore_or_seed(
-    runtime: &Arc<SessionRuntime>,
+pub(crate) async fn restore_or_seed<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
 ) -> Result<Option<WorkflowInstance>> {
     let db = &runtime.workflow_stack.db;
 
@@ -412,8 +415,8 @@ pub(crate) async fn restore_or_seed(
 /// `None` when config is missing or migrations fail to read. Frames the
 /// workflow emits during top-level evaluation buffer in
 /// `WorkflowHandle::frames` and flush once the driver starts pumping.
-async fn push_default_workflow(
-    runtime: &Arc<SessionRuntime>,
+async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     name: &str,
 ) -> Result<Option<WorkflowInstance>> {
     let workflows = runtime.workflows.get_or_default();
@@ -458,8 +461,8 @@ async fn push_default_workflow(
 /// instance's scrollback. Returns the new `current` for the driver:
 /// `Some(new)` on success, or `old` unchanged if the push aborted (so a
 /// failed start never leaves the stack empty).
-async fn push(
-    runtime: &Arc<SessionRuntime>,
+async fn push<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     old: Option<WorkflowInstance>,
     name: &str,
     args: Vec<String>,
@@ -547,8 +550,8 @@ async fn push(
 /// Input and interrupts do NOT pass through here — they're delivered
 /// straight to the active inbox via [`WorkflowStack::deliver`], so the
 /// body receives them whenever its JS loop reads, mid-turn or not.
-pub(crate) async fn run_driver(
-    runtime: Arc<SessionRuntime>,
+pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
+    runtime: Arc<SessionRuntime<Io>>,
     mut cmd_rx: UnboundedReceiver<DriverCmd>,
     initial: Option<WorkflowInstance>,
 ) {
@@ -673,8 +676,8 @@ pub(crate) async fn run_driver(
 /// Genuine-termination handling for the active instance: drain any tail
 /// frames, emit a clean `BlockStop` for every still-open block, and
 /// surface a workflow error if the body settled with one.
-async fn finish_done(
-    runtime: &Arc<SessionRuntime>,
+async fn finish_done<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     instance: &mut WorkflowInstance,
     reported: Option<WorkflowError>,
 ) -> Result<()> {
@@ -730,7 +733,10 @@ async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, Workflo
 /// Dropping `instance` at the end aborts the spawned task as a final
 /// fallback — but in practice the body has already exited by the time
 /// we get here unless the timeout fired.
-async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance) -> Result<()> {
+async fn dehydrate<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    mut instance: WorkflowInstance,
+) -> Result<()> {
     instance.handle.request_shutdown();
     let deadline = tokio::time::sleep(DEHYDRATE_TIMEOUT);
     tokio::pin!(deadline);
@@ -780,8 +786,8 @@ async fn dehydrate(runtime: &Arc<SessionRuntime>, mut instance: WorkflowInstance
 
 /// Project a transcript delta onto the wire `StreamFrame` protocol and
 /// persist closed blocks to scrollback.
-async fn emit_transcript(
-    runtime: &Arc<SessionRuntime>,
+async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     state: &mut EmitState,
     delta: TranscriptDelta,
 ) -> Result<()> {
@@ -862,8 +868,8 @@ async fn emit_transcript(
 /// `Set` for an id creates the block, seeding its body from `seed`; a
 /// later `Set` is a metadata-only re-render — it replaces the kind and
 /// emits a no-text delta, leaving the accumulated body untouched.
-fn set_streaming_block(
-    runtime: &Arc<SessionRuntime>,
+fn set_streaming_block<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     state: &mut EmitState,
     frame_id: FrameId,
     block_kind: BlockKind,
@@ -896,8 +902,8 @@ fn set_streaming_block(
 
 /// Open, stop, and persist a one-shot block (ToolUse / Json / Diff) in a
 /// single batch. Never enters `state.open` — there's no body to grow.
-async fn emit_one_shot(
-    runtime: &Arc<SessionRuntime>,
+async fn emit_one_shot<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     state: &mut EmitState,
     kind: BlockKind,
     text: &str,
@@ -915,19 +921,28 @@ async fn emit_one_shot(
 
 /// Workflow-declared chrome (the footer busy indicator). Ephemeral —
 /// never persisted; forwarded to the TUI as-is.
-fn emit_surface(runtime: &Arc<SessionRuntime>, cmd: SurfaceCmd) {
+fn emit_surface<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    cmd: SurfaceCmd,
+) {
     runtime.events.send(StreamFrame::Surface(cmd));
 }
 
 /// LLM token-usage telemetry. Pass-through to the TUI footer; not persisted.
-fn emit_usage(runtime: &Arc<SessionRuntime>, usage: frances_models_llm::Usage) {
+fn emit_usage<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    usage: frances_models_llm::Usage,
+) {
     runtime.events.send(StreamFrame::Usage(usage));
 }
 
 /// A permission request. When `allow_auto`, consult the auto-judge first
 /// and answer on the embedded reply slot on approve; otherwise (or on
 /// reject/indeterminate) forward to the TUI for a human decision.
-async fn emit_permission(runtime: &Arc<SessionRuntime>, request: PermissionRequest) {
+async fn emit_permission<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    request: PermissionRequest,
+) {
     if request.allow_auto {
         let outcome = crate::runtime::auto_judge::judge(runtime, &request).await;
         match outcome {
@@ -981,8 +996,8 @@ fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::event
 /// memory (if any). If hydration fails, recurse — tombstoning the
 /// failed row's branch — until either a row hydrates cleanly or the
 /// live stack is exhausted (top stays `None`).
-async fn drop_active_and_promote(
-    runtime: &Arc<SessionRuntime>,
+async fn drop_active_and_promote<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     instance_id: Uuid,
 ) -> Result<Option<WorkflowInstance>> {
     mark_completed_and_promote(&runtime.workflow_stack.db, instance_id).await?;
@@ -1015,8 +1030,8 @@ async fn drop_active_and_promote(
 /// tombstone the row + everything at or above its position and promote
 /// the next live row; retry. Loops until a row hydrates (returns
 /// `Some`) or the stack runs dry (`None`).
-async fn hydrate_active_or_cascade(
-    runtime: &Arc<SessionRuntime>,
+async fn hydrate_active_or_cascade<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
 ) -> Result<Option<WorkflowInstance>> {
     let db = &runtime.workflow_stack.db;
     loop {
@@ -1043,8 +1058,8 @@ async fn hydrate_active_or_cascade(
 /// Attempt to hydrate a single row: look up its config, load
 /// migrations, start the runtime with the row's `instance_id`
 /// preserved.
-async fn hydrate(
-    runtime: &Arc<SessionRuntime>,
+async fn hydrate<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
     row: &StackRow,
 ) -> Result<WorkflowInstance, WorkflowError> {
     let workflows = runtime.workflows.get_or_default();

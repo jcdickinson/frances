@@ -755,6 +755,7 @@ pub mod test_deps {
     use uuid::Uuid;
 
     use crate::deps::{EditorFactory, WorkflowDeps};
+    use crate::io::WorkflowIo;
     use crate::io::mock::StubIo;
     use crate::storage::{WorkflowDb, WorkflowDbError};
     use tokio::sync::OnceCell;
@@ -801,17 +802,27 @@ pub mod test_deps {
         }
     }
 
+    impl WorkflowIo for StubDeps {
+        type Timer = <DefaultIo as WorkflowIo>::Timer;
+        type Shell = <DefaultIo as WorkflowIo>::Shell;
+        type Fs = <DefaultIo as WorkflowIo>::Fs;
+        fn timer(&self) -> &Self::Timer {
+            self.io.timer()
+        }
+        fn shell(&self) -> &Self::Shell {
+            self.io.shell()
+        }
+        fn fs(&self) -> &Self::Fs {
+            self.io.fs()
+        }
+    }
+
     impl WorkflowDeps for StubDeps {
         type ChatSessionManager = StubManager;
-        type Io = DefaultIo;
         type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
-        }
-
-        fn io(&self) -> &Self::Io {
-            &self.io
         }
 
         fn editor_factory(&self) -> &Self::EditorFactory {
@@ -915,17 +926,27 @@ pub mod test_deps {
         }
     }
 
+    impl WorkflowIo for StubDepsRealShell {
+        type Timer = <DefaultIo as WorkflowIo>::Timer;
+        type Shell = <DefaultIo as WorkflowIo>::Shell;
+        type Fs = <DefaultIo as WorkflowIo>::Fs;
+        fn timer(&self) -> &Self::Timer {
+            self.io.timer()
+        }
+        fn shell(&self) -> &Self::Shell {
+            self.io.shell()
+        }
+        fn fs(&self) -> &Self::Fs {
+            self.io.fs()
+        }
+    }
+
     impl WorkflowDeps for StubDepsRealShell {
         type ChatSessionManager = StubManager;
-        type Io = DefaultIo;
         type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
-        }
-
-        fn io(&self) -> &Self::Io {
-            &self.io
         }
 
         fn editor_factory(&self) -> &Self::EditorFactory {
