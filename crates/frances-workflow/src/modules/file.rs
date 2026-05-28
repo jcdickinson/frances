@@ -41,6 +41,7 @@ use twox_hash::XxHash3_64;
 use frances_edit::{DiffOp, DiffRender, LlmEdit, LoopKey};
 
 use crate::deps::{EditorFactory, WorkflowDeps};
+use crate::io::{WorkflowFs, WorkflowIo};
 
 pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
@@ -195,8 +196,10 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
 /// unchanged file trips the same guard as `file_read`.
 async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
-    let (mtime_ns, size) =
-        stat_file(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let fs = deps.io().fs();
+    let (mtime_ns, size) = stat_file(fs, &resolved)
+        .await
+        .map_err(|e| format!("{}: {e}", resolved.display()))?;
     let key = LoopKey::Read {
         args_hash: hash_read_raw_args(&path),
         mtime_ns,
@@ -209,8 +212,10 @@ async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<Strin
         return Err(loop_error_read(&path));
     }
 
-    let content =
-        fs::read_to_string(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let content = fs
+        .read_to_string(&resolved)
+        .await
+        .map_err(|e| format!("{}: {e}", resolved.display()))?;
     sess.record_loop(key);
     Ok(content)
 }
@@ -225,8 +230,10 @@ struct ReadFileArgs {
 
 async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Result<String, String> {
     let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&args.path));
-    let (mtime_ns, size) =
-        stat_file(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let fs = deps.io().fs();
+    let (mtime_ns, size) = stat_file(fs, &resolved)
+        .await
+        .map_err(|e| format!("{}: {e}", resolved.display()))?;
     let key = LoopKey::Read {
         args_hash: hash_read_file_args(&args),
         mtime_ns,
@@ -239,7 +246,9 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
         return Err(loop_error_read(&args.path));
     }
 
-    let lines = read_file_lines(&resolved).map_err(|e| format!("{}: {e}", resolved.display()))?;
+    let lines = read_file_lines(fs, &resolved)
+        .await
+        .map_err(|e| format!("{}: {e}", resolved.display()))?;
     let total_lines = lines.len();
 
     let full_rendered = sess
@@ -326,17 +335,16 @@ fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
 
 /// Stat without reading content — cheap, used by the loop guard so it
 /// can answer "same file, same mtime+size?" before deciding to read.
-fn stat_file(path: &Path) -> io::Result<(i64, u64)> {
-    let meta = fs::metadata(path)?;
-    let mtime_ns = mtime_ns_from(&meta)?;
-    Ok((mtime_ns, meta.len()))
+async fn stat_file<F: WorkflowFs>(fs: &F, path: &Path) -> io::Result<(i64, u64)> {
+    let meta = fs.metadata(path).await?;
+    Ok((meta.mtime_ns, meta.size))
 }
 
 /// Read content as lines. Caller has typically already stat'd the
 /// file (and used the result to seed the loop-guard key), so we don't
 /// re-stat here.
-fn read_file_lines(path: &Path) -> io::Result<Vec<String>> {
-    let content = fs::read_to_string(path)?;
+async fn read_file_lines<F: WorkflowFs>(fs: &F, path: &Path) -> io::Result<Vec<String>> {
+    let content = fs.read_to_string(path).await?;
     Ok(split_lines(&content))
 }
 

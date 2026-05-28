@@ -29,10 +29,10 @@
 //!    no longer holds a pending sleep. Explicit `_clearSleep(token)`
 //!    is the synchronous variant of the same operation.
 //!
-//! The primitive carries one shared piece of host state: the workflow's
-//! `closed` flag plus its `Notify`. The spawned task observes both,
-//! which is how pending sleeps surface as `"closed"` during graceful
-//! teardown.
+//! The actual wait is delegated to a [`crate::io::WorkflowTimer`] — the
+//! seam that lets tests swap in a virtual clock. Production wires
+//! [`crate::io::real::RealTimer`] (a thin tokio wrapper); tests drag in
+//! [`crate::io::mock::MockTimer`].
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -48,17 +48,22 @@ use rquickjs::{
 };
 use tokio::sync::Notify;
 
+use crate::io::WorkflowTimer;
+
 /// Builds the two stash functions plus the (registered, but
 /// no-constructor) `SleepToken` JsClass. The caller stitches the
 /// returned functions onto the v1 stash under `_setSleep` /
-/// `_clearSleep`.
-pub(crate) fn build_sleep_primitives<'js>(
+/// `_clearSleep`. `timer` is the seam used to spawn the actual wait —
+/// production uses `RealTimer`; tests use `MockTimer`.
+pub(crate) fn build_sleep_primitives<'js, T: WorkflowTimer>(
     ctx: &Ctx<'js>,
+    timer: T,
     workflow_closed: Arc<AtomicBool>,
     workflow_closed_notify: Arc<Notify>,
 ) -> JsResult<(Function<'js>, Function<'js>)> {
     let closed = workflow_closed.clone();
     let closed_notify = workflow_closed_notify.clone();
+    let timer_for_setter = timer;
     let set_sleep = Function::new(
         ctx.clone(),
         move |ctx: Ctx<'js>, ms: Value<'js>| -> JsResult<Class<'js, SleepToken>> {
@@ -76,16 +81,17 @@ pub(crate) fn build_sleep_primitives<'js>(
             let inner = Arc::new(SleepTokenInner {
                 result: Mutex::new(None),
                 settled: Notify::new(),
-                cancel: Notify::new(),
+                cancel: Arc::new(Notify::new()),
             });
 
             // Fast-path: if the workflow has already closed by the time
             // we're constructing the token, settle as "closed" without
-            // ever spawning a task.
+            // ever asking the timer to spawn a wait.
             if closed.load(Ordering::Acquire) {
                 *inner.result.lock() = Some("closed");
             } else {
                 spawn_sleep_task(
+                    &timer_for_setter,
                     inner.clone(),
                     duration,
                     closed.clone(),
@@ -108,40 +114,18 @@ pub(crate) fn build_sleep_primitives<'js>(
     Ok((set_sleep, clear_sleep))
 }
 
-fn spawn_sleep_task(
+fn spawn_sleep_task<T: WorkflowTimer>(
+    timer: &T,
     inner: Arc<SleepTokenInner>,
     duration: Duration,
     workflow_closed: Arc<AtomicBool>,
     workflow_closed_notify: Arc<Notify>,
 ) {
+    let cancel = inner.cancel.clone();
+    let fut = timer.sleep(duration, cancel, workflow_closed, workflow_closed_notify);
     tokio::spawn(async move {
-        let cancel = inner.cancel.notified();
-        let closed = workflow_closed_notify.notified();
-        let sleep = tokio::time::sleep(duration);
-        tokio::pin!(cancel);
-        tokio::pin!(closed);
-        tokio::pin!(sleep);
-
-        // Register cancel + closed waiters before reading the closed
-        // flag, so any pulse that races against us is held as a permit
-        // and the select! sees it.
-        cancel.as_mut().enable();
-        closed.as_mut().enable();
-
-        // If the workflow closed between the fast-path check and now,
-        // surface "closed" immediately.
-        if workflow_closed.load(Ordering::Acquire) {
-            settle(&inner, "closed");
-            return;
-        }
-
-        let reason: &'static str = tokio::select! {
-            biased;
-            () = &mut cancel => "cancelled",
-            () = &mut closed => "closed",
-            () = &mut sleep => "fired",
-        };
-        settle(&inner, reason);
+        let outcome = fut.await;
+        settle(&inner, outcome.as_wire());
     });
 }
 
@@ -162,9 +146,9 @@ struct SleepTokenInner {
     result: Mutex<Option<&'static str>>,
     /// Pulsed when `result` transitions from `None` to `Some(_)`.
     settled: Notify,
-    /// Pulsed by `_clearSleep` (and by `Drop`). The spawned task
-    /// observes this in its `select!`.
-    cancel: Notify,
+    /// Pulsed by `_clearSleep` (and by `Drop`). Handed to the timer's
+    /// `sleep` future so any impl observes the same cancel signal.
+    cancel: Arc<Notify>,
 }
 
 impl Drop for SleepToken {

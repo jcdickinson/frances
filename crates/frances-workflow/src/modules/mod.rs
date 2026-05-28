@@ -74,6 +74,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
+use crate::io::WorkflowIo;
 use crate::runtime::{InboxItem, OutputSenders, caught};
 
 pub mod chat;
@@ -207,7 +208,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("Editor", editor_ctor)?;
     stash.set("EditorDescriptions", file::build_descriptions(ctx)?)?;
 
-    let file_search_ctor = file_find_or_grep::build_file_search_ctor(ctx, deps)?;
+    let file_search_ctor = file_find_or_grep::build_file_search_ctor(ctx, deps.clone())?;
     stash.set("FileSearch", file_search_ctor)?;
     let file_search_desc = Object::new(ctx.clone())?;
     file_search_desc.set(
@@ -225,8 +226,12 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let jaq_eval = jaq::build_jaq_eval(ctx)?;
     stash.set("_jaqEval", jaq_eval)?;
 
-    let (set_sleep, clear_sleep) =
-        io::build_sleep_primitives(ctx, closed.clone(), closed_notify.clone())?;
+    let (set_sleep, clear_sleep) = io::build_sleep_primitives(
+        ctx,
+        WorkflowIo::timer(deps.io()).clone(),
+        closed.clone(),
+        closed_notify.clone(),
+    )?;
     stash.set("_setSleep", set_sleep)?;
     stash.set("_clearSleep", clear_sleep)?;
 

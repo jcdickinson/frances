@@ -51,22 +51,25 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use frances_shell::{QuietReason, ReadEvent, RunOutcome, Shell, ShellOptions, WaitOpts};
 
-use crate::deps::{ShellFactory, WorkflowDeps};
+use crate::deps::WorkflowDeps;
+use crate::io::{WorkflowIo, WorkflowShell};
+
+type ShellOf<D> = <<D as WorkflowDeps>::Io as WorkflowIo>::Shell;
 
 pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
 ) -> JsResult<Constructor<'js>> {
-    Constructor::new_class::<ShellJs<D::ShellFactory>, _, _>(
+    Constructor::new_class::<ShellJs<ShellOf<D>>, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>| -> JsResult<Class<'js, ShellJs<D::ShellFactory>>> {
+        move |ctx: Ctx<'js>| -> JsResult<Class<'js, ShellJs<ShellOf<D>>>> {
             // Construction is sync; the actual `Shell::spawn` is
             // deferred until the first `runOnce` (which is async).
             let (event_tx, event_rx) = mpsc::unbounded_channel();
             Class::instance(
                 ctx.clone(),
                 ShellJs {
-                    factory: deps.shell_factory().clone(),
+                    factory: deps.io().shell().clone(),
                     state: Arc::new(AsyncMutex::new(ShellState {
                         shell: None,
                         running: false,
@@ -80,7 +83,7 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
     )
 }
 
-pub struct ShellJs<F: ShellFactory> {
+pub struct ShellJs<F: WorkflowShell> {
     factory: F,
     state: Arc<AsyncMutex<ShellState>>,
     /// Receiver end of the per-shell event stream. JS pulls events
@@ -103,15 +106,15 @@ struct ShellState {
     event_tx: Option<UnboundedSender<ReadEvent>>,
 }
 
-impl<'js, F: ShellFactory> Trace<'js> for ShellJs<F> {
+impl<'js, F: WorkflowShell> Trace<'js> for ShellJs<F> {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js, F: ShellFactory> JsLifetime<'js> for ShellJs<F> {
+unsafe impl<'js, F: WorkflowShell> JsLifetime<'js> for ShellJs<F> {
     type Changed<'to> = ShellJs<F>;
 }
 
-impl<'js, F: ShellFactory> JsClass<'js> for ShellJs<F> {
+impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
     const NAME: &'static str = "Shell";
     type Mutable = Readable;
 
@@ -239,7 +242,7 @@ impl<'js, F: ShellFactory> JsClass<'js> for ShellJs<F> {
     }
 }
 
-async fn run_once_inner<F: ShellFactory>(
+async fn run_once_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: String,
@@ -267,7 +270,7 @@ async fn run_once_inner<F: ShellFactory>(
 /// Lazy-spawn helper: on first use, ask the factory for a fresh
 /// `Shell`, attach the per-`ShellJs` output sink so streaming pipes
 /// through, and stash it on `guard`. No-op when a shell already exists.
-async fn ensure_shell<F: ShellFactory>(
+async fn ensure_shell<F: WorkflowShell>(
     guard: &mut tokio::sync::MutexGuard<'_, ShellState>,
     factory: &F,
 ) -> Result<(), String> {
@@ -328,7 +331,7 @@ async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), String> {
 /// after the bash run settles. Caller must have already coerced
 /// `value` into a string (raw for string values, JSON for everything
 /// else).
-async fn set_var_inner<F: ShellFactory>(
+async fn set_var_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     name: String,
@@ -362,7 +365,7 @@ async fn set_var_inner<F: ShellFactory>(
 /// empty and we'd store `""` indistinguishably from a real empty
 /// value. The subshell scopes the option change so the persistent
 /// shell's settings aren't disturbed.
-async fn capture_var_inner<F: ShellFactory>(
+async fn capture_var_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     name: String,
@@ -390,7 +393,7 @@ async fn capture_var_inner<F: ShellFactory>(
 /// where Quiet would be a tool-side bug (an infinite-output trap or
 /// equivalent). Re-uses the same closed/busy/spawn checks as
 /// `run_once_inner`.
-async fn run_to_done<F: ShellFactory>(
+async fn run_to_done<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: &str,

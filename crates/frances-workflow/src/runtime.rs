@@ -744,7 +744,6 @@ pub mod test_deps {
         ChatSessionManager, HistoryError, OwnedHistoryInput,
     };
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
-    use frances_shell::{Shell, ShellError, ShellOptions};
     use frances_storage::{EntitySchema, Migration};
     use parking_lot::Mutex;
     use std::borrow::Cow;
@@ -755,14 +754,22 @@ pub mod test_deps {
     use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
-    use crate::deps::{EditorFactory, ShellFactory, WorkflowDeps};
+    use crate::deps::{EditorFactory, WorkflowDeps};
+    use crate::io::mock::StubIo;
     use crate::storage::{WorkflowDb, WorkflowDbError};
     use tokio::sync::OnceCell;
+
+    /// Default `Io` for workflow tests: real timer + mock shell
+    /// (errors on spawn) + real fs. Existing tests measure real
+    /// elapsed time and seed tempdirs through `set_cwd`, so swapping
+    /// timer or fs to mocks would break them. Tests that want
+    /// determinism construct a different `StubIo` variant themselves.
+    type DefaultIo = StubIo;
 
     #[derive(Clone, Default)]
     pub struct StubDeps {
         manager: StubManager,
-        shell_factory: StubShellFactory,
+        io: DefaultIo,
         editor_factory: StubEditorFactory,
         cwd: Arc<Mutex<Option<PathBuf>>>,
         storage: StubStorage,
@@ -786,19 +793,25 @@ pub mod test_deps {
                 state.entities.remove(&entity);
             }
         }
+
+        /// Hand back the IO bundle. Lets tests reach into the mock
+        /// shell or any other swappable sub-piece directly.
+        pub fn io(&self) -> &DefaultIo {
+            &self.io
+        }
     }
 
     impl WorkflowDeps for StubDeps {
         type ChatSessionManager = StubManager;
-        type ShellFactory = StubShellFactory;
+        type Io = DefaultIo;
         type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
         }
 
-        fn shell_factory(&self) -> &Self::ShellFactory {
-            &self.shell_factory
+        fn io(&self) -> &Self::Io {
+            &self.io
         }
 
         fn editor_factory(&self) -> &Self::EditorFactory {
@@ -878,53 +891,41 @@ pub mod test_deps {
         }
     }
 
-    /// Real-bash shell factory for shell-specific tests. Spawns an
-    /// actual bash subprocess. Tests that don't need bash use
-    /// `StubShellFactory` (the default).
-    #[derive(Clone, Default)]
-    pub struct RealShellFactory;
-
-    impl ShellFactory for RealShellFactory {
-        async fn spawn(&self, opts: ShellOptions) -> Result<Shell, ShellError> {
-            Shell::spawn(opts).await
-        }
-    }
-
-    /// Stub shell factory — errors on spawn unless overridden. Most
-    /// tests don't need real bash; the few that do can construct their
-    /// own factory and inject it.
-    #[derive(Clone, Default)]
-    pub struct StubShellFactory;
-
-    impl ShellFactory for StubShellFactory {
-        async fn spawn(&self, _opts: ShellOptions) -> Result<Shell, ShellError> {
-            Err(ShellError::Handshake(
-                "stub shell factory: no real bash available in this test".to_owned(),
-            ))
-        }
-    }
-
-    /// Variant of `StubDeps` that uses `RealShellFactory` for tests that
-    /// need to drive a real bash subprocess.
-    #[derive(Clone, Default)]
+    /// Variant of `StubDeps` for shell tests that need a real bash
+    /// subprocess. Same `StubIo` underneath, but with the shell
+    /// sub-piece swapped for the real-bash impl via
+    /// `StubIo::with_real_shell()`. Timer and fs stay at their
+    /// `StubIo` defaults (real timer + real fs).
+    #[derive(Clone)]
     pub struct StubDepsRealShell {
         manager: StubManager,
-        shell_factory: RealShellFactory,
+        io: DefaultIo,
         editor_factory: StubEditorFactory,
         storage: StubStorage,
     }
 
+    impl Default for StubDepsRealShell {
+        fn default() -> Self {
+            Self {
+                manager: StubManager::default(),
+                io: DefaultIo::with_real_shell(),
+                editor_factory: StubEditorFactory::default(),
+                storage: StubStorage::default(),
+            }
+        }
+    }
+
     impl WorkflowDeps for StubDepsRealShell {
         type ChatSessionManager = StubManager;
-        type ShellFactory = RealShellFactory;
+        type Io = DefaultIo;
         type EditorFactory = StubEditorFactory;
 
         fn chat_session_manager(&self) -> &Self::ChatSessionManager {
             &self.manager
         }
 
-        fn shell_factory(&self) -> &Self::ShellFactory {
-            &self.shell_factory
+        fn io(&self) -> &Self::Io {
+            &self.io
         }
 
         fn editor_factory(&self) -> &Self::EditorFactory {

@@ -17,6 +17,7 @@
 mod config;
 mod deps;
 mod error;
+pub mod io;
 mod modules;
 pub mod permission;
 mod runtime;
@@ -25,8 +26,15 @@ mod storage;
 mod transpile;
 
 pub use config::WorkflowConfig;
-pub use deps::{EditorFactory, ShellFactory, WorkflowDeps};
+pub use deps::{EditorFactory, WorkflowDeps};
+pub use io::{
+    FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer,
+    real::{RealFs, RealIo, RealShell, RealTimer},
+};
+
 pub use error::WorkflowError;
+#[cfg(any(test, feature = "test-utils"))]
+pub use io::mock::{MockFs, MockIo, MockShell, MockTimer, StubIo};
 pub use permission::{PermissionRequest, PermissionResponse, PermissionResponseWire};
 pub use runtime::{
     FrameId, FrameKind, FrameSpec, InboxItem, Invocation, Runtime, ShellState, SurfaceCmd,

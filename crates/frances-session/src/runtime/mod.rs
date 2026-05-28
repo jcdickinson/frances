@@ -31,8 +31,8 @@ use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
 use frances_models_llm::config::ModelConfig;
 use frances_storage::{Database, Migration};
 use frances_workflow::{
-    EditorFactory, PermissionResponse, Runtime as WorkflowRuntime, WorkflowDb, WorkflowDbError,
-    WorkflowDeps,
+    EditorFactory, PermissionResponse, RealIo, Runtime as WorkflowRuntime, WorkflowDb,
+    WorkflowDbError, WorkflowDeps,
 };
 
 pub(crate) mod auto_judge;
@@ -74,19 +74,24 @@ pub struct WorkflowDepsImpl {
     /// map. Wrapped in `Arc` so clones (one per workflow invocation)
     /// see the same cache.
     pub workflow_dbs: Arc<DashMap<Uuid, Arc<WorkflowDb>>>,
+    /// Production IO bundle (real timer + real shell + real fs).
+    /// Field rather than a unit-stub so future impls (e.g. a
+    /// configurable shell launcher) can hang state here without
+    /// rewiring `WorkflowDeps`.
+    pub io: RealIo,
 }
 
 impl WorkflowDeps for WorkflowDepsImpl {
     type ChatSessionManager = ChatSessionManager<ChatDepsImpl>;
-    type ShellFactory = SessionShellFactory;
+    type Io = RealIo;
     type EditorFactory = SessionEditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager {
         &self.chat
     }
 
-    fn shell_factory(&self) -> &Self::ShellFactory {
-        &SessionShellFactory
+    fn io(&self) -> &Self::Io {
+        &self.io
     }
 
     fn editor_factory(&self) -> &Self::EditorFactory {
@@ -125,21 +130,6 @@ impl WorkflowDeps for WorkflowDepsImpl {
 #[derive(Debug, thiserror::Error)]
 #[error("workflow stopped waiting for this permission")]
 pub struct PermissionDropped;
-
-/// Stateless factory that spawns a fresh bash subprocess for each
-/// `new Shell()` call from a workflow script. We use
-/// `ShellOptions::default()`, which inherits the runtime's cwd / env.
-#[derive(Clone, Copy)]
-pub struct SessionShellFactory;
-
-impl frances_workflow::ShellFactory for SessionShellFactory {
-    async fn spawn(
-        &self,
-        opts: frances_shell::ShellOptions,
-    ) -> Result<frances_shell::Shell, frances_shell::ShellError> {
-        frances_shell::Shell::spawn(opts).await
-    }
-}
 
 /// Hands out the session-scoped `EditSession` — same `Arc` every call,
 /// so all workflow invocations share the anchor cache with the host.
@@ -244,6 +234,7 @@ impl SessionRuntime {
             editor_factory: editor_factory.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
+            io: RealIo::default(),
         })?);
 
         let (events, events_rx) = EventsChannel::new();

@@ -13,24 +13,27 @@ use std::sync::Arc;
 
 use frances_edit::{AnchorStore, EditSession};
 use frances_models_llm::chat::ChatSessionManager;
-use frances_shell::{Shell, ShellError, ShellOptions};
 use frances_storage::Migration;
 use tokio::sync::Mutex as AsyncMutex;
 use uuid::Uuid;
 
+use crate::io::WorkflowIo;
 use crate::storage::{WorkflowDb, WorkflowDbError};
 
 pub trait WorkflowDeps: Clone + Send + Sync + 'static {
     type ChatSessionManager: ChatSessionManager;
-    type ShellFactory: ShellFactory;
+    /// Timer + shell + fs bundle. See [`crate::io`] for the sub-trait
+    /// layout — each sub-piece is independently swappable, the umbrella
+    /// is just for convenient routing.
+    type Io: WorkflowIo;
     type EditorFactory: EditorFactory;
 
     fn chat_session_manager(&self) -> &Self::ChatSessionManager;
 
-    /// Factory for the `frances:v1/tools/shell` `Shell` primitive. The
-    /// session-runtime impl wraps `frances_shell::Shell::spawn` with whatever cwd
-    /// / env / init-script policy it cares about; tests stub it out.
-    fn shell_factory(&self) -> &Self::ShellFactory;
+    /// Timer + shell + fs surface. Production wires
+    /// [`crate::io::real::RealIo`]; tests drag in
+    /// [`crate::io::mock::MockIo`] from `test-utils`.
+    fn io(&self) -> &Self::Io;
 
     /// Factory for the `frances:v1/tools/file` `Editor` primitive. Hands
     /// out a clone of the host's session-scoped `EditSession` so all
@@ -65,12 +68,6 @@ pub trait WorkflowDeps: Clone + Send + Sync + 'static {
         entity: Uuid,
         migrations: Cow<'a, [Migration]>,
     ) -> impl Future<Output = Result<Arc<WorkflowDb>, WorkflowDbError>> + Send + 'a;
-}
-
-/// Spawns bash subprocesses for workflows. Async because
-/// `frances_shell::Shell::spawn` is async.
-pub trait ShellFactory: Clone + Send + Sync + 'static {
-    fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send;
 }
 
 /// Hands out the host's session-scoped `EditSession`. The runtime's impl
