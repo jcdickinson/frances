@@ -1,40 +1,41 @@
 use std::sync::Arc;
 
-use frances_session::events::{BlockKind as WireBlockKind, ShellState};
+use crate::tui::status::{StatusTone, status_prefix};
+use frances_session::events::{
+    BlockKind as WireBlockKind, ReasoningState, ShellState, TailedHeader,
+};
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
 
-/// Maximum body lines (post trailing-newline strip) shown for a shell
-/// output block in its compact (unfocused) state. Earlier lines are
+/// Maximum body lines (post trailing-newline strip) shown for a
+/// tailed block in its compact (unfocused) state. Earlier lines are
 /// collapsed into a single `… [N earlier lines]` marker so the visible
 /// tail tracks the action.
-const SHELL_TAIL_LINES: usize = 10;
+const TAIL_LINES: usize = 10;
 
-/// Expanded tail height when the shell block is the alt-view inspector's
+/// Expanded tail height when a tailed block is the alt-view inspector's
 /// selection. Doubles the visible body so the user has room to see more
 /// of the source while paging with `j`/`k`/`u`/`d`.
-const SHELL_TAIL_LINES_FOCUSED: usize = 20;
+const TAIL_LINES_FOCUSED: usize = 20;
 
-fn shell_tail_for(selected: bool) -> usize {
+fn tail_lines_for(selected: bool) -> usize {
     if selected {
-        SHELL_TAIL_LINES_FOCUSED
+        TAIL_LINES_FOCUSED
     } else {
-        SHELL_TAIL_LINES
+        TAIL_LINES
     }
 }
 
 /// Build the right [`Block`] impl for a wire `BlockKind` + accumulated
-/// text. Most kinds map onto a generic [`LabelledBlock`]; `ShellOutput`
-/// has its own structural shape (header + body tail) and gets a
-/// dedicated [`ShellOutputBlock`].
+/// text. Most kinds map onto a generic [`LabelledBlock`]; `Tailed`
+/// (shell output, reasoning) has its own structural shape (header +
+/// body tail) and gets a dedicated [`TailedBlock`].
 pub fn block_for_kind(kind: WireBlockKind, text: String) -> Box<dyn Block> {
     match kind {
-        WireBlockKind::ShellOutput { state, cmd } => {
-            Box::new(ShellOutputBlock::new(state, cmd, text))
-        }
+        WireBlockKind::Tailed { header } => Box::new(TailedBlock::new(header, text)),
         WireBlockKind::Diff { lines } => Box::new(DiffBlock::new(lines)),
         WireBlockKind::ToolUse {
             name,
@@ -152,7 +153,7 @@ impl Block for LabelledBlock {
         match self.kind {
             WireBlockKind::Text { .. } => BlockKind::Text,
             WireBlockKind::ToolUse { .. } => BlockKind::ToolUse,
-            WireBlockKind::ShellOutput { .. } => BlockKind::ShellOutput,
+            WireBlockKind::Tailed { .. } => BlockKind::Tailed,
             WireBlockKind::Diff { .. } => BlockKind::Diff,
         }
     }
@@ -198,18 +199,19 @@ impl Block for LabelledBlock {
     }
 }
 
-/// History row for a shell command's output. Renders as:
-///   `[state] cmd` (the cmd may wrap; continuation rows are unindented)
+/// History row for a tailed streaming-output block (shell command,
+/// model reasoning). Renders as:
+///   `[label] header_body` (the body may wrap; continuation rows are unindented)
 ///   `… [N earlier lines]` (only when the body is longer than the tail)
-///   last-`SHELL_TAIL_LINES` body lines (wrapped, unindented)
+///   last-`TAIL_LINES` body lines (wrapped, unindented)
 ///
-/// `state` drives the prefix label and its colour; `cmd` rides on every
-/// `BlockDelta` so the header stays pinned even while the body keeps
-/// streaming.
+/// `header` drives both the prefix label/colour and any pinned text
+/// after it (shell: the command line; reasoning: empty). It rides on
+/// every `BlockDelta` so the header stays pinned even while the body
+/// keeps streaming.
 #[derive(Serialize, Deserialize)]
-pub struct ShellOutputBlock {
-    pub state: ShellState,
-    pub cmd: Arc<str>,
+pub struct TailedBlock {
+    pub header: TailedHeader,
     pub text: String,
     /// Alt-view-only scroll offset, measured in *source lines* from
     /// the tail. `0` = the window sits at the tail (the canonical
@@ -225,24 +227,32 @@ fn is_zero_u16(v: &u16) -> bool {
     *v == 0
 }
 
-impl ShellOutputBlock {
-    pub fn new(state: ShellState, cmd: Arc<str>, text: String) -> Self {
+impl TailedBlock {
+    pub fn new(header: TailedHeader, text: String) -> Self {
         Self {
-            state,
-            cmd,
+            header,
             text,
             scroll_y: 0,
         }
     }
 
-    fn header_prefix(&self) -> String {
-        shell_state_prefix(&self.state)
+    fn header_prefix(&self) -> (String, Style) {
+        tailed_status(&self.header)
+    }
+
+    /// Text pinned after the status prefix on the first header line.
+    /// Shell: the command line. Reasoning: empty.
+    fn header_body(&self) -> &str {
+        match &self.header {
+            TailedHeader::Shell { cmd, .. } => cmd,
+            TailedHeader::Reasoning { .. } => "",
+        }
     }
 
     fn header_lines(&self, width: u16) -> Vec<String> {
-        let prefix = self.header_prefix();
+        let (prefix, _style) = self.header_prefix();
         let mut out = Vec::new();
-        wrap_into(&prefix, &self.cmd, width.max(1) as usize, &mut out);
+        wrap_into(&prefix, self.header_body(), width.max(1) as usize, &mut out);
         out
     }
 
@@ -303,7 +313,7 @@ impl ShellOutputBlock {
     }
 }
 
-impl Input for ShellOutputBlock {
+impl Input for TailedBlock {
     fn handle_event(
         &mut self,
         _ctx: &mut EventContext<'_>,
@@ -317,8 +327,8 @@ impl Input for ShellOutputBlock {
         }
         // Input events only reach this block when it's the alt-view
         // selection, so the focused tail is the right clamp.
-        let max = self.max_scroll_for(SHELL_TAIL_LINES_FOCUSED);
-        let half: u16 = (SHELL_TAIL_LINES_FOCUSED as u16) / 2;
+        let max = self.max_scroll_for(TAIL_LINES_FOCUSED);
+        let half: u16 = (TAIL_LINES_FOCUSED as u16) / 2;
         match key.code {
             crossterm::event::KeyCode::Char('j') => {
                 self.scroll_y = self.scroll_y.saturating_sub(1);
@@ -341,13 +351,13 @@ impl Input for ShellOutputBlock {
     }
 }
 
-impl Block for ShellOutputBlock {
+impl Block for TailedBlock {
     fn kind(&self) -> BlockKind {
-        BlockKind::ShellOutput
+        BlockKind::Tailed
     }
 
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
-        let tail = shell_tail_for(ctx.selected);
+        let tail = tail_lines_for(ctx.selected);
         let body_rows = self.body_lines_at(ctx.width, 0, tail).len();
         (self.header_lines(ctx.width).len() + body_rows) as u16
     }
@@ -358,13 +368,12 @@ impl Block for ShellOutputBlock {
         // user can page through earlier source lines. The tail grows
         // when this block is the alt-view selection.
         let window_start = if ctx.alt_view { self.scroll_y } else { 0 };
-        let tail = shell_tail_for(ctx.selected);
+        let tail = tail_lines_for(ctx.selected);
         let header = self.header_lines(ctx.area.width);
         let body = self.body_lines_at(ctx.area.width, window_start, tail);
-        let prefix = self.header_prefix();
+        let (prefix, prefix_style) = self.header_prefix();
         let prefix_bytes = prefix.len();
         let prefix_cols = display_width(&prefix) as u16;
-        let prefix_style = shell_state_prefix_style(&self.state);
 
         let src_y = ctx.src_y;
         let area = ctx.area;
@@ -516,19 +525,17 @@ impl Block for ToolUseBlock {
     }
 }
 
-fn shell_state_prefix(state: &ShellState) -> String {
-    match state {
-        ShellState::Running => "[…] ".to_string(),
-        ShellState::Success => "[ok] ".to_string(),
-        ShellState::Exit(n) => format!("[exit {n}] "),
-    }
-}
-
-fn shell_state_prefix_style(state: &ShellState) -> Style {
-    match state {
-        ShellState::Running => Style::default().fg(Color::Cyan),
-        ShellState::Success => Style::default().fg(Color::Green),
-        ShellState::Exit(_) => Style::default().fg(Color::Red),
+fn tailed_status(header: &TailedHeader) -> (String, Style) {
+    match header {
+        TailedHeader::Shell { state, .. } => match state {
+            ShellState::Running => status_prefix("…", StatusTone::Pending),
+            ShellState::Success => status_prefix("ok", StatusTone::Success),
+            ShellState::Exit(n) => status_prefix(&format!("exit {n}"), StatusTone::Failure),
+        },
+        TailedHeader::Reasoning { state } => match state {
+            ReasoningState::Streaming => status_prefix("thinking…", StatusTone::Pending),
+            ReasoningState::Done => status_prefix("thought", StatusTone::Settled),
+        },
     }
 }
 
@@ -677,9 +684,9 @@ pub fn prefix_for(kind: &WireBlockKind) -> String {
         // The `detail`-bearing variant routes through `ToolUseBlock`; the
         // `LabelledBlock` path only sees plain tool-use markers.
         WireBlockKind::ToolUse { name, .. } => format!("→ {name}"),
-        WireBlockKind::ShellOutput { .. } => {
-            // ShellOutput renders through ShellOutputBlock, which owns
-            // its own prefix; LabelledBlock should never see this kind.
+        WireBlockKind::Tailed { .. } => {
+            // Tailed blocks render through TailedBlock, which owns
+            // their own prefix; LabelledBlock should never see this kind.
             String::new()
         }
         WireBlockKind::Diff { .. } => String::new(),
@@ -690,7 +697,7 @@ fn prefix_style(kind: &WireBlockKind) -> Style {
     match kind {
         WireBlockKind::Text { .. } => Style::default(),
         WireBlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
-        WireBlockKind::ShellOutput { .. } => Style::default(),
+        WireBlockKind::Tailed { .. } => Style::default(),
         WireBlockKind::Diff { .. } => Style::default(),
     }
 }
@@ -858,12 +865,41 @@ mod tests {
         }
 
         #[test]
-        fn shell_output_block() {
-            let b = ShellOutputBlock::new(ShellState::Success, "ls".into(), "out".into());
+        fn tailed_shell_block() {
+            let b = TailedBlock::new(
+                TailedHeader::Shell {
+                    state: ShellState::Success,
+                    cmd: "ls".into(),
+                },
+                "out".into(),
+            );
             let r = round_trip(&b);
-            assert_eq!(&*r.cmd, "ls");
             assert_eq!(r.text, "out");
-            assert!(matches!(r.state, ShellState::Success));
+            match r.header {
+                TailedHeader::Shell { state, cmd } => {
+                    assert_eq!(&*cmd, "ls");
+                    assert!(matches!(state, ShellState::Success));
+                }
+                other => panic!("unexpected header: {other:?}"),
+            }
+        }
+
+        #[test]
+        fn tailed_reasoning_block() {
+            let b = TailedBlock::new(
+                TailedHeader::Reasoning {
+                    state: ReasoningState::Streaming,
+                },
+                "thinking…".into(),
+            );
+            let r = round_trip(&b);
+            assert_eq!(r.text, "thinking…");
+            assert!(matches!(
+                r.header,
+                TailedHeader::Reasoning {
+                    state: ReasoningState::Streaming,
+                }
+            ));
         }
 
         #[test]
@@ -875,7 +911,7 @@ mod tests {
         }
     }
 
-    /// Phase D — `ShellOutputBlock` scroll state + alt-view rendering.
+    /// Phase D — `TailedBlock` scroll state + alt-view rendering.
     mod shell_scroll {
         use super::*;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -883,9 +919,15 @@ mod tests {
         use ratatui::buffer::Buffer;
         use ratatui::layout::Rect;
 
-        fn block_with_lines(n: usize) -> ShellOutputBlock {
+        fn block_with_lines(n: usize) -> TailedBlock {
             let body: String = (0..n).map(|i| format!("line{}\n", i + 1)).collect();
-            ShellOutputBlock::new(ShellState::Success, "cmd".into(), body)
+            TailedBlock::new(
+                TailedHeader::Shell {
+                    state: ShellState::Success,
+                    cmd: "cmd".into(),
+                },
+                body,
+            )
         }
 
         fn press(c: char) -> Event {
@@ -897,7 +939,7 @@ mod tests {
             })
         }
 
-        fn dispatch(block: &mut ShellOutputBlock, event: &Event) -> EventOutcome {
+        fn dispatch(block: &mut TailedBlock, event: &Event) -> EventOutcome {
             let mut focus = Focus::new();
             let mut redraw = false;
             let mut ctx = EventContext {
@@ -959,11 +1001,11 @@ mod tests {
             let b0 = block_with_lines(30);
             let mut b5 = block_with_lines(30);
             b5.scroll_y = 5;
-            let lines0 = b0.body_lines_at(80, 0, SHELL_TAIL_LINES);
-            let lines5 = b5.body_lines_at(80, 5, SHELL_TAIL_LINES);
-            // Both runs have 1 marker + SHELL_TAIL_LINES body rows.
-            assert_eq!(lines0.len(), 1 + SHELL_TAIL_LINES);
-            assert_eq!(lines5.len(), 1 + SHELL_TAIL_LINES);
+            let lines0 = b0.body_lines_at(80, 0, TAIL_LINES);
+            let lines5 = b5.body_lines_at(80, 5, TAIL_LINES);
+            // Both runs have 1 marker + TAIL_LINES body rows.
+            assert_eq!(lines0.len(), 1 + TAIL_LINES);
+            assert_eq!(lines5.len(), 1 + TAIL_LINES);
             assert_eq!(lines0[0], "… [20 earlier lines]");
             assert_eq!(lines5[0], "… [15 earlier lines]");
             // Window shifts back by 5 source lines.

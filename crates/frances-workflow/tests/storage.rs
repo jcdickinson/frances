@@ -49,6 +49,10 @@ fn text_of(frame: &TranscriptDelta) -> String {
 {}",
                 spec.seed.clone().unwrap_or_default()
             ),
+            FrameKind::Reasoning { state } => format!(
+                "[reasoning:{state:?}]\n{}",
+                spec.seed.clone().unwrap_or_default()
+            ),
             FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
         TranscriptDelta::Append { delta, .. } => delta.clone(),

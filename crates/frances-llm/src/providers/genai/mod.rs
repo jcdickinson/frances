@@ -226,12 +226,12 @@ impl provider::Provider for Provider {
                 }
                 ChatStreamEvent::Chunk(_) => {}
                 ChatStreamEvent::ReasoningChunk(chunk) if !chunk.content.is_empty() => {
-                    // Reasoning streams to the TUI as visible TextDelta
-                    // (same policy as today) but is held separately for
-                    // round-trip on the assistant `reasoning_content`
-                    // channel — NOT folded into `text`.
+                    // Reasoning rides its own channel — consumers (TUI,
+                    // step-transcript summariser) treat it differently
+                    // from response text. It's also retained verbatim for
+                    // the assistant `reasoning_content` round-trip.
                     reasoning_text.push_str(&chunk.content);
-                    on_event(StreamEvent::TextDelta(chunk.content))?;
+                    on_event(StreamEvent::ReasoningDelta(chunk.content))?;
                 }
                 ChatStreamEvent::ReasoningChunk(_) => {}
                 ChatStreamEvent::ThoughtSignatureChunk(chunk) if !chunk.content.is_empty() => {

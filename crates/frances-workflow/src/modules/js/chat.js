@@ -169,23 +169,39 @@ async function _streamWithDispatch(chat, opts, getHook) {
     return raw;
   })();
 
-  let textStream;
+  let textStream, reasoningStream;
+  // Lazy tee: the first access to `r.text` or `r.reasoning` splits
+  // `events` into two filtered branches. `r.events` and the
+  // `text`/`reasoning` pair are alternative views — touching either
+  // group locks `events` for the other (WHATWG `pipeThrough` /
+  // `tee` semantics).
+  function deriveFiltered() {
+    if (textStream) return;
+    const [forText, forReasoning] = events.tee();
+    textStream = forText.pipeThrough(
+      new TransformStream({
+        transform(ev, controller) {
+          if (ev.type === "text") controller.enqueue(ev.delta);
+        },
+      }),
+    );
+    reasoningStream = forReasoning.pipeThrough(
+      new TransformStream({
+        transform(ev, controller) {
+          if (ev.type === "reasoning") controller.enqueue(ev.delta);
+        },
+      }),
+    );
+  }
   return {
     events,
     get text() {
-      // `pipeThrough` locks `events`, so accessing `r.text` and then
-      // `r.events.getReader()` (or vice versa) will throw per WHATWG
-      // spec — text and events are alternative views of one source.
-      if (!textStream) {
-        textStream = events.pipeThrough(
-          new TransformStream({
-            transform(ev, controller) {
-              if (ev.type === "text") controller.enqueue(ev.delta);
-            },
-          }),
-        );
-      }
+      deriveFiltered();
       return textStream;
+    },
+    get reasoning() {
+      deriveFiltered();
+      return reasoningStream;
     },
     completed,
     signal,

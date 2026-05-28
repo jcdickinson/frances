@@ -22,6 +22,10 @@ use serde_json::Value;
 pub enum StreamEvent {
     /// A fragment of assistant text. Concatenate to obtain the running text.
     TextDelta(String),
+    /// A fragment of model reasoning / chain-of-thought. Kept on a separate
+    /// channel from `TextDelta` so consumers can render it in its own block
+    /// and keep it out of chat-history-derived transcripts.
+    ReasoningDelta(String),
     /// A completed tool call.
     ToolCall(ToolCall),
     /// A wire-shape JSON to be persisted for use as future history.

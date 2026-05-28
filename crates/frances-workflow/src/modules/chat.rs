@@ -988,6 +988,10 @@ impl<'js> IntoJs<'js> for JsStreamEvent {
                 obj.set("type", "text")?;
                 obj.set("delta", delta)?;
             }
+            StreamEvent::ReasoningDelta(delta) => {
+                obj.set("type", "reasoning")?;
+                obj.set("delta", delta)?;
+            }
             StreamEvent::Usage(usage) => {
                 obj.set("type", "usage")?;
                 obj.set("usage", usage_into_js(ctx, &usage)?)?;

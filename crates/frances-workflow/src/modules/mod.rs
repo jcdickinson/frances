@@ -178,6 +178,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         err_ctor,
         json_ctor,
         shell_output_ctor,
+        thought_ctor,
         tool_use_ctor,
         diff_ctor,
     ) = frames::build_frames(ctx, senders.transcript.clone())?;
@@ -186,6 +187,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("ErrorFrame", err_ctor)?;
     stash.set("JsonFrame", json_ctor)?;
     stash.set("ShellOutputFrame", shell_output_ctor)?;
+    stash.set("ThoughtFrame", thought_ctor)?;
     stash.set("ToolUseFrame", tool_use_ctor)?;
     stash.set("DiffFrame", diff_ctor)?;
 

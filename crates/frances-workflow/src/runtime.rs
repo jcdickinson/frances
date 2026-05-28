@@ -164,6 +164,12 @@ pub enum FrameKind {
     /// `state` transitions `Running → Success`/`Exit(N)` via a metadata
     /// re-`Set` as the command completes.
     ShellOutput { state: ShellState, cmd: String },
+    /// `ThoughtFrame` — streaming model reasoning. Mirrors the
+    /// shell-output shape: body extends via append, `state` transitions
+    /// `Streaming → Done` via a metadata re-`Set` when the channel closes.
+    /// Rendered host-side as a `BlockKind::Tailed` block sibling to
+    /// shell output.
+    Reasoning { state: ReasoningState },
     /// `DiffFrame` — one-shot structured diff produced by a file-edit
     /// tool. `lines` is the unified-diff content with line numbers for
     /// context rows only; the session runtime translates each op to
@@ -179,6 +185,15 @@ pub enum ShellState {
     Running,
     Success,
     Exit(i32),
+}
+
+/// Terminal status for [`FrameKind::Reasoning`]. Mirrors
+/// `frances_session::events::ReasoningState`; the session runtime
+/// translates one to the other when it emits the matching `BlockKind`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningState {
+    Streaming,
+    Done,
 }
 
 /// A single user input event delivered to `inbox`.
@@ -1189,6 +1204,10 @@ mod tests {
                     None => format!("→ {name}"),
                 },
                 FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
+                FrameKind::Reasoning { state } => format!(
+                    "[reasoning:{state:?}]\n{}",
+                    spec.seed.clone().unwrap_or_default()
+                ),
                 FrameKind::ShellOutput { state, cmd } => {
                     format!(
                         "[shell:{state:?}] $ {cmd}\n{}",

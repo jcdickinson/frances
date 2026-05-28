@@ -24,6 +24,7 @@ import {
   transcript,
   MarkdownFrame,
   ErrorFrame,
+  ThoughtFrame,
   ToolUseFrame,
 } from "frances:v1/frames";
 import { ChatSession, complete } from "frances:v1/chat";
@@ -294,6 +295,40 @@ async function pipeAssistantTextToFrame(
   const textOut = chunks.join("");
   recordStepTranscript("Assistant", textOut);
   return textOut;
+}
+
+// Reasoning channel: pipe straight to a ThoughtFrame.
+//
+// Two different model-feedback loops to keep straight:
+//   1. Provider history round-trip — reasoning still rides back to the
+//      model on the next assistant turn as `ContentPart::ReasoningContent`
+//      (genai builds that payload from the chunks; we don't touch it).
+//   2. Frances's step summariser (`recordStepTranscript` →
+//      `summarizeStepTranscript` → `renderPlanForPrompt`) — this is the
+//      one we *deliberately* exclude reasoning from. Reasoning is bulky
+//      model-internal scratch work; folding it into the step summary
+//      would dilute the summary and burn tokens for no real benefit.
+async function pipeReasoningToFrame(
+  reasoning: ReadableStream<string>,
+  out: ThoughtFrame,
+): Promise<void> {
+  const reader = reasoning.getReader();
+  const writer = out.writable.getWriter();
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writer.write(value);
+    }
+    await writer.close();
+  } catch (err) {
+    try {
+      await writer.abort(err);
+    } catch (_) {}
+    throw err;
+  } finally {
+    reader.releaseLock();
+  }
 }
 
 function renderPlanForPrompt(): string {
@@ -741,11 +776,18 @@ async function turn(): Promise<TurnEnd> {
     // Push the `frances:` frame eagerly with no content — the TUI tracks
     // the id but defers measure / render, and the daemon skips
     // persistence, until the first text delta materialises the block.
+    // The `thought` frame sits alongside it for the reasoning channel;
+    // for non-thinking models it stays empty and closes immediately.
     const out = new MarkdownFrame({ sender: "frances" });
+    const thought = new ThoughtFrame();
+    transcript.push(thought);
     transcript.push(out);
 
     const round = (async () => {
-      await pipeAssistantTextToFrame(r.text, out);
+      await Promise.all([
+        pipeAssistantTextToFrame(r.text, out),
+        pipeReasoningToFrame(r.reasoning, thought),
+      ]);
       return await r.completed;
     })();
 

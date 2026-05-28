@@ -43,7 +43,7 @@ use crate::widget::{Input, Theme};
 pub enum BlockKind {
     Text,
     ToolUse,
-    ShellOutput,
+    Tailed,
     Diff,
     Raw,
 }

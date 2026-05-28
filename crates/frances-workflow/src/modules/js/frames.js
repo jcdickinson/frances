@@ -8,6 +8,7 @@ export const {
   ErrorFrame,
   JsonFrame,
   ShellOutputFrame,
+  ThoughtFrame,
   ToolUseFrame,
   DiffFrame,
 } = globalThis.__frances_v1_stash__;
@@ -71,3 +72,4 @@ function installWritable(cls) {
 
 installWritable(MarkdownFrame);
 installWritable(ShellOutputFrame);
+installWritable(ThoughtFrame);

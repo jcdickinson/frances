@@ -46,7 +46,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame, TailedHeader};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
@@ -806,9 +806,21 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 state: shell_state,
                 cmd,
             } => {
-                let block_kind = BlockKind::ShellOutput {
-                    state: shell_state_to_protocol(&shell_state),
-                    cmd: Arc::from(cmd),
+                let block_kind = BlockKind::Tailed {
+                    header: TailedHeader::Shell {
+                        state: shell_state_to_protocol(&shell_state),
+                        cmd: Arc::from(cmd),
+                    },
+                };
+                set_streaming_block(runtime, state, frame_id, block_kind, seed);
+            }
+            FrameKind::Reasoning {
+                state: reasoning_state,
+            } => {
+                let block_kind = BlockKind::Tailed {
+                    header: TailedHeader::Reasoning {
+                        state: reasoning_state_to_protocol(&reasoning_state),
+                    },
                 };
                 set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
@@ -986,6 +998,16 @@ fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::event
         W::Running => crate::events::ShellState::Running,
         W::Success => crate::events::ShellState::Success,
         W::Exit(n) => crate::events::ShellState::Exit(*n),
+    }
+}
+
+fn reasoning_state_to_protocol(
+    state: &frances_workflow::ReasoningState,
+) -> crate::events::ReasoningState {
+    use frances_workflow::ReasoningState as W;
+    match state {
+        W::Streaming => crate::events::ReasoningState::Streaming,
+        W::Done => crate::events::ReasoningState::Done,
     }
 }
 

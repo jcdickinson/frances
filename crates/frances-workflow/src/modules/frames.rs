@@ -71,6 +71,7 @@ pub(crate) type BuiltFrames<'js> = (
     Ctor<'js>, // ErrorFrame
     Ctor<'js>, // JsonFrame
     Ctor<'js>, // ShellOutputFrame
+    Ctor<'js>, // ThoughtFrame
     Ctor<'js>, // ToolUseFrame
     Ctor<'js>, // DiffFrame
 );
@@ -92,6 +93,7 @@ pub(crate) fn build_frames<'js>(
     let err_ctor = build_error_ctor(ctx, state.clone())?;
     let json_ctor = build_json_ctor(ctx, state.clone())?;
     let shell_output_ctor = build_shell_output_ctor(ctx, state.clone())?;
+    let thought_ctor = build_thought_ctor(ctx, state.clone())?;
     let tool_use_ctor = build_tool_use_ctor(ctx, state.clone())?;
     let diff_ctor = build_diff_ctor(ctx, state)?;
 
@@ -101,6 +103,7 @@ pub(crate) fn build_frames<'js>(
         err_ctor,
         json_ctor,
         shell_output_ctor,
+        thought_ctor,
         tool_use_ctor,
         diff_ctor,
     ))
@@ -271,9 +274,38 @@ fn push_frame<'js>(
         }
         return Ok(());
     }
+    if let Some(th) = as_frame::<ThoughtFrame>(&frame) {
+        let new_id = state.assign_id();
+        let borrow = th.borrow();
+        borrow.id.store(new_id, Ordering::Release);
+        // Body content rides as `seed` (typically empty — reasoning is
+        // streamed in via `.write()`). State is whatever `done` reports
+        // at push time so a pre-closed frame goes straight to `Done`.
+        let reasoning_state = if borrow.done.load(Ordering::Acquire) {
+            crate::runtime::ReasoningState::Done
+        } else {
+            crate::runtime::ReasoningState::Streaming
+        };
+        let frame = FrameSpec {
+            kind: FrameKind::Reasoning {
+                state: reasoning_state,
+            },
+            seed: Some(borrow.content.clone()),
+        };
+        let _ = state.tx.send(TranscriptDelta::Set {
+            id: FrameId(new_id),
+            frame,
+        });
+        if borrow.closed.load(Ordering::Acquire) {
+            let _ = state.tx.send(TranscriptDelta::Close {
+                id: FrameId(new_id),
+            });
+        }
+        return Ok(());
+    }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, ShellOutputFrame, or ToolUseFrame",
+        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, ShellOutputFrame, ThoughtFrame, or ToolUseFrame",
     )
 }
 
@@ -855,6 +887,112 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
     }
 }
 
+// ---------------------------------------------------------------------
+// ThoughtFrame — streaming model reasoning
+// ---------------------------------------------------------------------
+
+/// `ThoughtFrame` — mirrors [`ShellOutputFrame`] but for the model's
+/// reasoning channel. `state` transitions `Streaming → Done` on close;
+/// there is no body-after-state phase, so `.close()` performs both the
+/// state transition and the seal in one call.
+pub struct ThoughtFrame {
+    state: Arc<FramesState>,
+    id: AtomicU64,
+    /// Initial body captured at construction. Mirrors `MarkdownFrame.content`.
+    content: String,
+    /// Encoded [`crate::runtime::ReasoningState`]. `false` ⇒ Streaming,
+    /// `true` ⇒ Done. Flipped by `.close()`.
+    done: AtomicBool,
+    /// Same close lifecycle as `MarkdownFrame`.
+    closed: AtomicBool,
+}
+
+impl<'js> Trace<'js> for ThoughtFrame {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for ThoughtFrame {
+    type Changed<'to> = ThoughtFrame;
+}
+
+impl<'js> JsClass<'js> for ThoughtFrame {
+    const NAME: &'static str = "ThoughtFrame";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        let proto = Object::new(ctx.clone())?;
+        proto.set(
+            "write",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ThoughtFrame>>, delta: String| {
+                    let b = this.0.borrow();
+                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
+                },
+            )?,
+        )?;
+        // `close()` performs both the `Streaming → Done` state transition
+        // (metadata-only `Set`) and the block seal (`Close`). Idempotent.
+        proto.set(
+            "close",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>,
+                 this: This<Class<'js, ThoughtFrame>>|
+                 -> JsResult<Class<'js, ThoughtFrame>> {
+                    {
+                        let b = this.0.borrow();
+                        finish_thought(&ctx, &b.state, &b.id, &b.done, &b.closed)?;
+                    }
+                    Ok(this.0.clone())
+                },
+            )?,
+        )?;
+        Ok(Some(proto))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+/// Transition a thought frame to `Done` (metadata `Set`) and seal it
+/// (`Close`) in one call. Idempotent on repeated invocation.
+fn finish_thought<'js>(
+    _ctx: &Ctx<'js>,
+    state: &Arc<FramesState>,
+    id: &AtomicU64,
+    done: &AtomicBool,
+    closed: &AtomicBool,
+) -> JsResult<()> {
+    let frame_id = id.load(Ordering::Acquire);
+    if frame_id == 0 {
+        // Frame never pushed; record close-on-push intent.
+        closed.store(true, Ordering::Release);
+        done.store(true, Ordering::Release);
+        return Ok(());
+    }
+    if !done.swap(true, Ordering::AcqRel) {
+        // Metadata-only re-`Set` carrying the new state.
+        let frame = FrameSpec {
+            kind: FrameKind::Reasoning {
+                state: crate::runtime::ReasoningState::Done,
+            },
+            seed: None,
+        };
+        let _ = state.tx.send(TranscriptDelta::Set {
+            id: FrameId(frame_id),
+            frame,
+        });
+    }
+    if !closed.swap(true, Ordering::AcqRel) {
+        let _ = state.tx.send(TranscriptDelta::Close {
+            id: FrameId(frame_id),
+        });
+    }
+    Ok(())
+}
+
 /// Update the frame's state and emit a metadata-only [`TranscriptDelta::Set`].
 /// Throws if the frame hasn't been pushed yet.
 fn set_shell_state<'js>(
@@ -991,6 +1129,27 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
                     content,
                     state_atom: AtomicU64::new(SHELL_STATE_RUNNING),
                     closed: AtomicBool::new(closed),
+                },
+            )
+        },
+    )
+}
+
+/// `new ThoughtFrame()` — no constructor arguments. Reasoning frames
+/// start empty in `Streaming` state and are filled via `.write()` from
+/// the chat session's `r.reasoning` channel.
+fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ThoughtFrame, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| {
+            Class::instance(
+                ctx.clone(),
+                ThoughtFrame {
+                    state: state.clone(),
+                    id: AtomicU64::new(0),
+                    content: String::new(),
+                    done: AtomicBool::new(false),
+                    closed: AtomicBool::new(false),
                 },
             )
         },

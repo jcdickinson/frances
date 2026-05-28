@@ -53,7 +53,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame, TailedHeader};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
@@ -121,11 +121,10 @@ struct ToolUsePayload {
     detail: Option<Arc<str>>,
 }
 
-/// On-disk JSON shape for `kind` = 'shell_output' rows.
+/// On-disk JSON shape for `kind` = 'tailed' rows.
 #[derive(Serialize, Deserialize)]
-struct ShellOutputPayload {
-    state: crate::events::ShellState,
-    cmd: Arc<str>,
+struct TailedPayload {
+    header: TailedHeader,
     text: String,
 }
 
@@ -313,11 +312,10 @@ fn encode_block(
             })
             .map_err(ScrollbackError::Encode)?,
         ),
-        BlockKind::ShellOutput { state, cmd } => (
-            "shell_output",
-            serde_json::to_value(ShellOutputPayload {
-                state: state.clone(),
-                cmd: cmd.clone(),
+        BlockKind::Tailed { header } => (
+            "tailed",
+            serde_json::to_value(TailedPayload {
+                header: header.clone(),
                 text: text.to_owned(),
             })
             .map_err(ScrollbackError::Encode)?,
@@ -369,17 +367,14 @@ fn decode_row(
                 truncated,
             })
         }
-        "shell_output" => {
-            let p: ShellOutputPayload =
+        "tailed" => {
+            let p: TailedPayload =
                 serde_json::from_str(payload_text).map_err(|source| ScrollbackError::Decode {
                     kind: kind.to_owned(),
                     source,
                 })?;
             Ok(StoredRow::Block {
-                kind: BlockKind::ShellOutput {
-                    state: p.state,
-                    cmd: p.cmd,
-                },
+                kind: BlockKind::Tailed { header: p.header },
                 text: p.text,
                 truncated,
             })
@@ -501,7 +496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shell_output_round_trips_each_state() {
+    async fn tailed_shell_round_trips_each_state() {
         use crate::events::ShellState;
         let db = fresh_db().await;
         let instance = Uuid::new_v4();
@@ -513,9 +508,11 @@ mod tests {
             persist_block(
                 &db,
                 instance,
-                &BlockKind::ShellOutput {
-                    state: state.clone(),
-                    cmd: Arc::from(cmd),
+                &BlockKind::Tailed {
+                    header: TailedHeader::Shell {
+                        state: state.clone(),
+                        cmd: Arc::from(cmd),
+                    },
                 },
                 body,
                 false,
@@ -534,17 +531,71 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                BlockKind::ShellOutput {
-                    state: ShellState::Running,
-                    cmd: Arc::from("sleep 1"),
+                BlockKind::Tailed {
+                    header: TailedHeader::Shell {
+                        state: ShellState::Running,
+                        cmd: Arc::from("sleep 1"),
+                    },
                 },
-                BlockKind::ShellOutput {
-                    state: ShellState::Success,
-                    cmd: Arc::from("true"),
+                BlockKind::Tailed {
+                    header: TailedHeader::Shell {
+                        state: ShellState::Success,
+                        cmd: Arc::from("true"),
+                    },
                 },
-                BlockKind::ShellOutput {
-                    state: ShellState::Exit(137),
-                    cmd: Arc::from("sleep 9"),
+                BlockKind::Tailed {
+                    header: TailedHeader::Shell {
+                        state: ShellState::Exit(137),
+                        cmd: Arc::from("sleep 9"),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tailed_reasoning_round_trips_each_state() {
+        use crate::events::ReasoningState;
+        let db = fresh_db().await;
+        let instance = Uuid::new_v4();
+        for (state, body) in [
+            (ReasoningState::Streaming, "thinking…"),
+            (ReasoningState::Done, "settled"),
+        ] {
+            persist_block(
+                &db,
+                instance,
+                &BlockKind::Tailed {
+                    header: TailedHeader::Reasoning {
+                        state: state.clone(),
+                    },
+                },
+                body,
+                false,
+            )
+            .await
+            .unwrap();
+        }
+        let rows = load_for_instance(&db, instance).await.unwrap();
+        let kinds: Vec<_> = rows
+            .iter()
+            .map(|r| match r {
+                StoredRow::Block { kind, .. } => kind.clone(),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                BlockKind::Tailed {
+                    header: TailedHeader::Reasoning {
+                        state: ReasoningState::Streaming,
+                    },
+                },
+                BlockKind::Tailed {
+                    header: TailedHeader::Reasoning {
+                        state: ReasoningState::Done,
+                    },
                 },
             ]
         );

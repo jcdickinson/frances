@@ -123,15 +123,29 @@ pub enum BlockKind {
         name: Arc<str>,
         detail: Option<Arc<str>>,
     },
-    /// Streaming output from a shell command. The body carries the
-    /// accumulated stdout; `cmd` is the bash source that produced it,
-    /// pinned separately so the TUI can render it as a header even when
-    /// the body is truncated. `state` advances from `Running` to
-    /// `Success`/`Exit(N)` as the command completes, with the TUI
-    /// re-rendering on each transition.
-    ShellOutput { state: ShellState, cmd: Arc<str> },
+    /// A tailed streaming-output block — the TUI renders the last N
+    /// lines of `body` with a status-coloured `[label]` header and an
+    /// `… [N earlier lines]` collapse marker. Used for shell output
+    /// (header = shell state + command line) and for model reasoning
+    /// (header = reasoning state). The body advances by delta; the
+    /// `header` field advances by mid-stream `kind` re-emits.
+    Tailed { header: TailedHeader },
     /// A unified diff block.
     Diff { lines: Vec<DiffLine> },
+}
+
+/// Header content for a [`BlockKind::Tailed`] block. Each variant
+/// determines the header label, its colour tone, and any pinned
+/// metadata (the shell command line, the reasoning state).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TailedHeader {
+    /// Shell command output. `cmd` is the bash source pinned to the
+    /// header so it survives body truncation. `state` advances from
+    /// `Running` to `Success`/`Exit(N)` on completion.
+    Shell { state: ShellState, cmd: Arc<str> },
+    /// Streaming model reasoning. `state` advances from `Streaming`
+    /// to `Done` when the channel closes.
+    Reasoning { state: ReasoningState },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +155,7 @@ pub enum DiffLine {
     Removed(Arc<str>),
 }
 
-/// Terminal-status enum for [`BlockKind::ShellOutput`]. Carried on
+/// Terminal-status enum for [`TailedHeader::Shell`]. Carried on
 /// every `BlockDelta` so an in-place transition is just a no-text
 /// delta with the new state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,4 +166,14 @@ pub enum ShellState {
     Success,
     /// Command exited with a non-zero code (or was killed before exit).
     Exit(i32),
+}
+
+/// Terminal-status enum for [`TailedHeader::Reasoning`]. Same
+/// re-emit-on-transition pattern as [`ShellState`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ReasoningState {
+    /// Model is still emitting reasoning content.
+    Streaming,
+    /// Reasoning channel has closed; no further body deltas expected.
+    Done,
 }
