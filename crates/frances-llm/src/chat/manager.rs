@@ -21,9 +21,13 @@ use crate::provider_cache::ProviderCache;
 /// Live snapshot of the entire `models::*` table. Bound once on the
 /// manager; refreshes on any add/remove/change under that path. Sessions
 /// look up by intent on every resolve.
+///
+/// Key is `Arc<str>` so `resolve_name` can hand callers a cheap, owned
+/// reference to the resolved name without copying — it gets threaded
+/// through to providers for per-model config lookups.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(transparent)]
-pub(crate) struct Models(pub(crate) HashMap<String, ModelConfig>);
+pub(crate) struct Models(pub(crate) HashMap<Arc<str>, ModelConfig>);
 
 /// Concrete chat-session manager. Clone-by-value handle; complex state
 /// lives in `Arc<Inner>`.
@@ -76,19 +80,30 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
         (*self.inner.default_model.get()).clone()
     }
 
-    fn model(&self, name: &str) -> Option<ModelConfig> {
-        self.inner.models.get().and_then(|g| g.0.get(name).cloned())
-    }
-
-    /// Walks `intents` in order, returning the first one that resolves.
-    /// Falls through to `default_model`.
-    pub(crate) fn resolve_model<S: AsRef<str>>(&self, intents: &[S]) -> ModelConfig {
-        for name in intents {
-            if let Some(m) = self.model(name.as_ref()) {
-                return m;
+    /// Walks `intents` and returns the first name that resolves to a
+    /// model in the live snapshot. Falls through to `"default"` when
+    /// none match. The returned `Arc<str>` is the actual map key (or a
+    /// fresh `Arc::from("default")` for the fallback).
+    pub(crate) fn resolve_name<S: AsRef<str>>(&self, intents: &[S]) -> Arc<str> {
+        if let Some(models) = self.inner.models.get() {
+            for n in intents {
+                if let Some((k, _)) = models.0.get_key_value(n.as_ref()) {
+                    return k.clone();
+                }
             }
         }
-        self.default_model()
+        Arc::from("default")
+    }
+
+    /// Read the `ModelConfig` for a resolved name, with the
+    /// `RequiredConfigBinding<ModelConfig>` at `models::default` as the
+    /// fallback if the live `models` snapshot doesn't carry the entry.
+    pub(crate) fn model_for(&self, name: &str) -> ModelConfig {
+        self.inner
+            .models
+            .get()
+            .and_then(|g| g.0.get(name).cloned())
+            .unwrap_or_else(|| self.default_model())
     }
 
     /// Same as the trait's `complete`, but the caller observes
@@ -101,7 +116,8 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
         req: CompleteRequest<'_>,
         on_event: &mut (dyn FnMut(StreamEvent) + Send),
     ) -> Result<CompletionOutcome, ChatError> {
-        let model = self.resolve_model(req.intents);
+        let model_name = self.resolve_name(req.intents);
+        let model = self.model_for(&model_name);
         let provider_id = model.model_provider.clone();
         let provider = self
             .inner
@@ -111,6 +127,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
         let cancel = req.cancel.clone();
         let provider_req = ProviderRequest {
             session_id: req.session_id,
+            model_name: &model_name,
             model: &model,
             history: req.history,
             new_inputs: req.new_inputs,

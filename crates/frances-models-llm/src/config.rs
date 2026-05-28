@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use frances_config::EnvString;
@@ -97,14 +97,24 @@ pub struct ModelConfig {
     pub service_tier: Option<u8>,
 }
 
-/// Wire-specific extras for the genai-backed provider. Bound by the
-/// `ProviderCache` at `model_provider_extensions::<provider_id>` and
-/// passed by value to the provider impl's `new` as its associated
-/// `Extras` type. Empty today — the wire selector lives on
-/// `ProviderConfig.kind`, not here. Kept as the binding target so
-/// config tables continue to round-trip and new knobs have a home.
+/// One entry under `[openrouter.models.<name>]`. Keyed by the same
+/// model name as the corresponding `[models.<name>]` binding.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct GenAIExtras {}
+pub struct OpenRouterModelConfig {
+    /// Repair non-scalar tool-call args that arrived as JSON-encoded
+    /// strings. See `docs/todo/qwen-tool-arg-repair.md` for the
+    /// upstream quirk this works around.
+    #[serde(default)]
+    pub qwen_quirks: bool,
+}
+
+/// Top-level `[openrouter]` config block. Bound by the genai provider
+/// at construction time when its `kind` is `openrouter`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct OpenRouterConfig {
+    #[serde(default)]
+    pub models: HashMap<String, OpenRouterModelConfig>,
+}
 
 fn default_request_max_retries() -> u32 {
     4

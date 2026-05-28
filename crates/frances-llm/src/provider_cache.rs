@@ -26,7 +26,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use frances_models_llm::ErasedError;
-use frances_models_llm::config::{GenAIExtras, ProviderConfig};
+use frances_models_llm::config::ProviderConfig;
 
 use crate::provider::{ErasedProvider, Provider, erase};
 use crate::providers::genai;
@@ -185,26 +185,17 @@ fn build_genai_entry(
             path: format!("model_providers::{id}"),
             source,
         })?;
-    let ex = handle
-        .bind::<GenAIExtras>(["model_provider_extensions", id])
-        .map_err(|source| ProviderCacheError::Bind {
-            path: format!("model_provider_extensions::{id}"),
-            source,
-        })?;
 
-    let initial = build_provider::<genai::Provider>(&pc, &ex)?;
+    let initial = build_provider::<genai::Provider>(&pc, handle)?;
 
     let mut pc_stream = pc.subscribe();
-    let mut ex_stream = ex.subscribe();
     let pc_for_refresh = pc.clone();
-    let ex_for_refresh = ex.clone();
+    let handle_for_refresh = handle.clone();
     let refresh: RefreshFn = Box::new(move || {
-        let pc_fired = drain_stream(&mut pc_stream);
-        let ex_fired = drain_stream(&mut ex_stream);
-        if !pc_fired && !ex_fired {
+        if !drain_stream(&mut pc_stream) {
             return None;
         }
-        match build_provider::<genai::Provider>(&pc_for_refresh, &ex_for_refresh) {
+        match build_provider::<genai::Provider>(&pc_for_refresh, &handle_for_refresh) {
             Ok(p) => Some(p),
             Err(e) => {
                 warn!(error = %e, "provider rebuild failed; retaining previous");
@@ -221,7 +212,7 @@ fn build_genai_entry(
 
 fn build_provider<P>(
     pc: &ConfigBinding<ProviderConfig>,
-    ex: &ConfigBinding<P::Extras>,
+    handle: &ConfigHandle,
 ) -> std::result::Result<Arc<ErasedProvider>, ProviderCacheError>
 where
     P: Provider + 'static,
@@ -232,8 +223,7 @@ where
         .get()
         .ok_or(ProviderCacheError::ProviderConfigMissing)?
         .clone();
-    let extras = ex.get().map(|g| (*g).clone()).unwrap_or_default();
-    let arc = P::new(cfg, extras).map_err(|e| ProviderCacheError::Build(e.into()))?;
+    let arc = P::new(cfg, handle.clone()).map_err(|e| ProviderCacheError::Build(e.into()))?;
     Ok(erase(arc))
 }
 

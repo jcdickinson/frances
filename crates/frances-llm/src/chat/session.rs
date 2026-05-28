@@ -176,7 +176,8 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             }
         }
 
-        let model = self.inner.manager.resolve_model(&self.inner.model_intents);
+        let model_name = self.inner.manager.resolve_name(&self.inner.model_intents);
+        let model = self.inner.manager.model_for(&model_name);
         let provider_id = model.model_provider.clone();
         let provider = self
             .inner
@@ -196,6 +197,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
 
         let req = ProviderRequest {
             session_id: &self.inner.session_id,
+            model_name: &model_name,
             model: &model,
             history: &history,
             new_inputs: &new_inputs,

@@ -8,8 +8,8 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use frances_config::ConfigHandle;
 use futures::future::BoxFuture;
-use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
@@ -32,6 +32,10 @@ use frances_models_llm::{
 /// include in the request body.
 pub struct ProviderRequest<'a> {
     pub session_id: &'a str,
+    /// The toml binding key the resolved model came from (e.g.
+    /// `"default"`). Providers use this to look up per-model
+    /// per-provider config — see `OpenRouterConfig::models`.
+    pub model_name: &'a str,
     pub model: &'a ModelConfig,
     pub history: &'a [Value],
     pub new_inputs: &'a [HistoryInput<'a>],
@@ -50,7 +54,6 @@ pub struct ProviderRequest<'a> {
 /// before storage.
 #[async_trait]
 pub trait Provider: Send + Sync {
-    type Extras: DeserializeOwned + Default + Clone + Send + Sync + 'static;
     type BuildError: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
     type Error: std::fmt::Debug + std::fmt::Display + Send + Sync + 'static;
 
@@ -59,9 +62,13 @@ pub trait Provider: Send + Sync {
     /// Conventionally each impl returns a `'static` literal.
     fn kind(&self) -> &'static str;
 
+    /// Construct the provider. The handle is the live config root; impls
+    /// can bind any per-kind sections they care about (e.g.
+    /// `[openrouter]`) directly and read live values per request, with
+    /// no rebuild required when those sections change.
     fn new(
         provider_config: ProviderConfig,
-        extras: Self::Extras,
+        handle: ConfigHandle,
     ) -> Result<Arc<Self>, Self::BuildError>
     where
         Self: Sized;

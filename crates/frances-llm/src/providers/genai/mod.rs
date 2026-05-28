@@ -33,8 +33,9 @@ use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
 
+use frances_config::{ConfigBinding, ConfigHandle};
 use frances_core::Truncated;
-use frances_models_llm::config::{GenAIExtras, ProviderConfig};
+use frances_models_llm::config::{OpenRouterConfig, ProviderConfig};
 use frances_models_llm::{
     CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolCall, ToolChoice, ToolDef, Usage,
 };
@@ -56,6 +57,10 @@ pub struct Provider {
     /// genai adapter the resolved kind maps to. Bound on every `Client`
     /// we build via `ClientBuilder::with_adapter_kind`.
     adapter: AdapterKind,
+    /// Live binding to the top-level `[openrouter]` config block — only
+    /// populated when this provider's `kind` is `openrouter`. Other
+    /// adapters that grow their own quirks would gain sibling fields here.
+    openrouter: Option<ConfigBinding<OpenRouterConfig>>,
 }
 
 #[derive(Debug, ThisError)]
@@ -66,6 +71,12 @@ pub enum Error {
     RequestPlan(#[from] request_plan::Error),
     #[error("genai: {0}")]
     GenAI(#[source] genai::Error),
+    #[error("bind {path}: {source}")]
+    Bind {
+        path: &'static str,
+        #[source]
+        source: frances_config::ConfigBindError,
+    },
     #[error("history row {index} is not a chat message: {source}")]
     DecodeHistory {
         index: usize,
@@ -86,7 +97,6 @@ impl From<ErasedError> for Error {
 
 #[async_trait]
 impl provider::Provider for Provider {
-    type Extras = GenAIExtras;
     type BuildError = Error;
     type Error = Error;
 
@@ -96,13 +106,26 @@ impl provider::Provider for Provider {
 
     fn new(
         provider_config: ProviderConfig,
-        _extras: GenAIExtras,
+        handle: ConfigHandle,
     ) -> std::result::Result<Arc<Self>, Error> {
         let (kind, adapter) = parse_kind(&provider_config.kind)?;
+        let openrouter = if matches!(adapter, AdapterKind::OpenRouter) {
+            Some(
+                handle
+                    .bind::<OpenRouterConfig>("openrouter")
+                    .map_err(|source| Error::Bind {
+                        path: "openrouter",
+                        source,
+                    })?,
+            )
+        } else {
+            None
+        };
         Ok(Arc::new(Self {
             provider_config,
             kind,
             adapter,
+            openrouter,
         }))
     }
 
@@ -127,6 +150,7 @@ impl provider::Provider for Provider {
             return Err(Error::Cancelled);
         }
         let max_tool_calls = req.max_tool_calls;
+        let qwen_quirks = self.qwen_quirks_for(req.model_name);
         let plan = RequestPlan::build(&self.provider_config, req.model, req.env)?;
 
         // Trace incoming tool-related inputs before forge so the round-
@@ -239,7 +263,10 @@ impl provider::Provider for Provider {
                 }
                 ChatStreamEvent::ThoughtSignatureChunk(_) => {}
                 ChatStreamEvent::ToolCallChunk(tc) => {
-                    let call = map_tool_call(tc.tool_call);
+                    let mut call = map_tool_call(tc.tool_call);
+                    if qwen_quirks {
+                        frances_models_llm::tool_args::repair_qwen_quirks(&mut call, req.tools);
+                    }
                     trace!(
                         call_id = %call.id,
                         name = %call.name,
@@ -286,6 +313,25 @@ impl provider::Provider for Provider {
         on_event(StreamEvent::History(assistant))?;
 
         Ok(CompletionOutcome { text, tool_calls })
+    }
+}
+
+impl Provider {
+    /// Read the per-model `qwen_quirks` flag from the live `[openrouter]`
+    /// binding. Returns `false` when the provider isn't openrouter, when
+    /// the config block is absent, or when the model has no entry.
+    fn qwen_quirks_for(&self, model_name: &str) -> bool {
+        let Some(binding) = &self.openrouter else {
+            return false;
+        };
+        let Some(guard) = binding.get() else {
+            return false;
+        };
+        guard
+            .models
+            .get(model_name)
+            .map(|m| m.qwen_quirks)
+            .unwrap_or(false)
     }
 }
 
@@ -596,6 +642,66 @@ mod tests {
         };
         let mapped = map_tool_call(call);
         assert_eq!(mapped.arguments, Value::String("not json".into()));
+    }
+
+    use crate::provider::Provider as _;
+    use frances_config::{ConfigHandle, ConfigProvider, InMemoryProvider};
+    use frances_models_llm::config::{AuthMethod, ProviderConfig};
+
+    async fn handle_with(entries: &[(&str, bool)]) -> ConfigHandle {
+        let mut p = InMemoryProvider::new();
+        for (path, val) in entries {
+            p = p.set(*path, *val);
+        }
+        let provider: std::sync::Arc<dyn ConfigProvider> = std::sync::Arc::new(p);
+        ConfigHandle::build(vec![provider]).await.unwrap()
+    }
+
+    fn openrouter_provider_config() -> ProviderConfig {
+        ProviderConfig {
+            kind: "openrouter".into(),
+            name: None,
+            base_url: "https://openrouter.ai/api/v1".parse().unwrap(),
+            auth: AuthMethod::Token {
+                token: "stub".into(),
+            },
+            http_headers: Default::default(),
+            query_params: Default::default(),
+            supports_websockets: false,
+            request_max_retries: 0,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: 1000,
+        }
+    }
+
+    #[tokio::test]
+    async fn qwen_quirks_for_reads_from_openrouter_binding() {
+        let handle = handle_with(&[
+            ("openrouter::models::qwen::qwen_quirks", true),
+            ("openrouter::models::gpt::qwen_quirks", false),
+        ])
+        .await;
+        let provider = Provider::new(openrouter_provider_config(), handle).unwrap();
+        assert!(provider.qwen_quirks_for("qwen"));
+        assert!(!provider.qwen_quirks_for("gpt"));
+        assert!(!provider.qwen_quirks_for("unset-model"));
+    }
+
+    #[tokio::test]
+    async fn qwen_quirks_for_returns_false_when_block_absent() {
+        let handle = handle_with(&[]).await;
+        let provider = Provider::new(openrouter_provider_config(), handle).unwrap();
+        assert!(!provider.qwen_quirks_for("anything"));
+    }
+
+    #[tokio::test]
+    async fn non_openrouter_provider_does_not_bind_openrouter_config() {
+        let handle = handle_with(&[("openrouter::models::qwen::qwen_quirks", true)]).await;
+        let mut anthropic_cfg = openrouter_provider_config();
+        anthropic_cfg.kind = "anthropic".into();
+        let provider = Provider::new(anthropic_cfg, handle).unwrap();
+        assert!(provider.openrouter.is_none());
+        assert!(!provider.qwen_quirks_for("qwen"));
     }
 
     #[test]

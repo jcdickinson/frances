@@ -6,9 +6,9 @@
 //! against the former so a malformed call can be turned into an error tool
 //! result (the model then self-corrects on the next round).
 //!
-//! Note: the qwen3-coder family double-encodes non-scalar args as JSON
-//! strings, which `validate` will reject until the deterministic repair
-//! lands — see `docs/todo/qwen-tool-arg-repair.md`.
+//! The qwen3-coder family ships non-scalar tool-call args as JSON-encoded
+//! strings — [`repair_qwen_quirks`] swaps those back to their structured
+//! form before validation runs.
 
 use serde_json::Value;
 
@@ -31,6 +31,41 @@ pub fn annotate(calls: &mut [ToolCall], tools: &[ToolDef]) {
                 expected_schema: schema.clone(),
                 message,
             });
+        }
+    }
+}
+
+/// Repair the qwen3-coder family's "non-scalar args as JSON strings" quirk
+/// in-place on one tool call: for each top-level argument whose declared
+/// schema type is `object` or `array` but whose value arrived as a
+/// `Value::String`, attempt `serde_json::from_str` and substitute the
+/// parsed value. Schema-driven so well-behaved providers are untouched
+/// (only object/array slots are considered); shallow because the quirk
+/// only ever stringifies the top-level parameter, never nested values.
+pub fn repair_qwen_quirks(call: &mut ToolCall, tools: &[ToolDef]) {
+    let Some(schema) = tools
+        .iter()
+        .find_map(|ToolDef::Function(f)| (f.name == call.name).then_some(&f.parameters))
+    else {
+        return;
+    };
+    let Some(props) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(args) = call.arguments.as_object_mut() else {
+        return;
+    };
+    for (key, prop_schema) in props {
+        let Some(slot) = args.get_mut(key) else {
+            continue;
+        };
+        let Value::String(raw) = slot else { continue };
+        let expected = prop_schema.get("type").and_then(Value::as_str);
+        if !matches!(expected, Some("object" | "array")) {
+            continue;
+        }
+        if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
+            *slot = parsed;
         }
     }
 }
@@ -163,6 +198,112 @@ mod tests {
         assert!(!err.message.is_empty());
         assert_eq!(err.expected_schema, decide_schema());
         assert!(calls[2].error.is_none(), "unknown tool isn't ours to flag");
+    }
+
+    fn report_schema() -> Value {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "title": { "type": "string" },
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "owner": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "name": { "type": "string" },
+                    },
+                    "required": ["name"],
+                },
+            },
+            "required": ["title", "tags", "owner"],
+        })
+    }
+
+    fn report_tools() -> Vec<ToolDef> {
+        use crate::{ToolDef, ToolFunction};
+        vec![ToolDef::Function(ToolFunction {
+            name: "submit_report".into(),
+            description: String::new(),
+            parameters: report_schema(),
+        })]
+    }
+
+    fn mk_call(args: Value) -> ToolCall {
+        ToolCall {
+            id: "c".into(),
+            name: "submit_report".into(),
+            arguments: args,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn repair_unstringifies_array_and_object_args() {
+        let tools = report_tools();
+        let mut call = mk_call(json!({
+            "title": "Q3",
+            "tags": "[\"a\",\"b\"]",
+            "owner": "{\"name\":\"Alice\"}",
+        }));
+        repair_qwen_quirks(&mut call, &tools);
+        assert_eq!(
+            call.arguments,
+            json!({ "title": "Q3", "tags": ["a", "b"], "owner": { "name": "Alice" } })
+        );
+    }
+
+    #[test]
+    fn repair_leaves_scalar_args_alone_even_when_quoted_looking() {
+        // String-typed `title` stays a string even if its content
+        // happens to be a JSON literal.
+        let tools = report_tools();
+        let mut call = mk_call(json!({
+            "title": "[\"not\",\"an\",\"array\"]",
+            "tags": ["a"],
+            "owner": { "name": "Alice" },
+        }));
+        repair_qwen_quirks(&mut call, &tools);
+        assert_eq!(call.arguments["title"], json!("[\"not\",\"an\",\"array\"]"));
+    }
+
+    #[test]
+    fn repair_leaves_malformed_strings_alone() {
+        let tools = report_tools();
+        let mut call = mk_call(json!({
+            "title": "Q3",
+            "tags": "not-json",
+            "owner": { "name": "Alice" },
+        }));
+        repair_qwen_quirks(&mut call, &tools);
+        assert_eq!(call.arguments["tags"], json!("not-json"));
+    }
+
+    #[test]
+    fn repair_noop_when_already_structured() {
+        let tools = report_tools();
+        let before = json!({
+            "title": "Q3",
+            "tags": ["a", "b"],
+            "owner": { "name": "Alice" },
+        });
+        let mut call = mk_call(before.clone());
+        repair_qwen_quirks(&mut call, &tools);
+        assert_eq!(call.arguments, before);
+    }
+
+    #[test]
+    fn repair_noop_when_tool_unknown() {
+        let tools = report_tools();
+        let before = json!({ "tags": "[\"a\"]" });
+        let mut call = ToolCall {
+            id: "c".into(),
+            name: "other_tool".into(),
+            arguments: before.clone(),
+            error: None,
+        };
+        repair_qwen_quirks(&mut call, &tools);
+        assert_eq!(call.arguments, before);
     }
 
     #[test]

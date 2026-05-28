@@ -18,7 +18,9 @@ pub use chat::{
     HistoryError, RowId, RowSeq,
 };
 pub use completion::{CompletionOutcome, StreamEvent, ToolCall, ToolCallError, Usage};
-pub use config::{AuthCommand, AuthMethod, GenAIExtras, ModelConfig, ProviderConfig};
+pub use config::{
+    AuthCommand, AuthMethod, ModelConfig, OpenRouterConfig, OpenRouterModelConfig, ProviderConfig,
+};
 pub use erased::{ChunkAbort, ErasedError, ErasedResult};
 pub use history::{HistoryInput, OwnedHistoryInput};
 pub use tool::{ToolChoice, ToolDef, ToolFunction};

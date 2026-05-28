@@ -25,7 +25,7 @@ pub use provider_cache::{ProviderCache, ProviderCacheError};
 // where it's still convenient. New code should import from
 // `frances_models_llm::*` directly.
 pub use frances_models_llm::config::{
-    AuthCommand, AuthMethod, GenAIExtras, ModelConfig, ProviderConfig,
+    AuthCommand, AuthMethod, ModelConfig, OpenRouterConfig, OpenRouterModelConfig, ProviderConfig,
 };
 pub use frances_models_llm::{
     ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent, ToolCall,

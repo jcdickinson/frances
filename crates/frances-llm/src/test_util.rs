@@ -10,6 +10,7 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use frances_config::ConfigHandle;
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -114,7 +115,6 @@ fn history_input_into_owned(input: &HistoryInput<'_>) -> OwnedHistoryInput {
 
 #[async_trait]
 impl Provider for StubProvider {
-    type Extras = ();
     type BuildError = ErasedError;
     type Error = ErasedError;
 
@@ -122,7 +122,7 @@ impl Provider for StubProvider {
         "stub"
     }
 
-    fn new(_: ProviderConfig, _: Self::Extras) -> Result<Arc<Self>, Self::BuildError> {
+    fn new(_: ProviderConfig, _: ConfigHandle) -> Result<Arc<Self>, Self::BuildError> {
         Ok(Arc::new(Self::new()))
     }
 
