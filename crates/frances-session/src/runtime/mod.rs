@@ -194,6 +194,26 @@ impl SessionRuntime {
         db: Database,
         invocation: InvocationContext,
     ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)> {
+        Self::start_with(session, db, invocation, |_| {}).await
+    }
+
+    /// Variant of [`start`](Self::start) that runs `on_cache` against
+    /// the freshly-built [`ProviderCache`] *before* the
+    /// [`ChatSessionManager`] is constructed. Tests use this seam to
+    /// register stub providers (via `ProviderCache::insert_stub` from
+    /// the `frances-llm/test-util` feature) so the runtime resolves
+    /// model lookups to a scripted [`frances_llm::test_util::StubProvider`]
+    /// instead of hitting the wire. Production callers reach for
+    /// [`start`](Self::start), which passes a no-op closure here.
+    pub async fn start_with<F>(
+        session: Session,
+        db: Database,
+        invocation: InvocationContext,
+        on_cache: F,
+    ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)>
+    where
+        F: FnOnce(&ProviderCache),
+    {
         std::fs::create_dir_all(&session.runtime_dir).map_err(|source| {
             RuntimeError::CreateRuntimeDir {
                 path: session.runtime_dir.clone(),
@@ -214,6 +234,7 @@ impl SessionRuntime {
             .required()
             .map_err(|_| RuntimeError::DefaultModelMissing)?;
         let cache = ProviderCache::new(config.clone())?;
+        on_cache(&cache);
         let workflows = config.bind::<HashMap<String, WorkflowConfig>>("workflows")?;
         let default_workflow = config.bind::<Option<String>>("default_workflow")?;
 
