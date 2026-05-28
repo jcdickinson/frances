@@ -127,7 +127,10 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             .stream(provider_req, cancel.clone(), &mut wrapped)
             .await
         {
-            Ok(c) => Ok(c),
+            Ok(mut c) => {
+                frances_models_llm::tool_args::annotate(&mut c.tool_calls, req.tools);
+                Ok(c)
+            }
             Err(_) if cancel.is_cancelled() => Err(ChatError::Cancelled),
             Err(source) => Err(log_and_typed(&provider_id, source)),
         }

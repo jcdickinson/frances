@@ -143,6 +143,7 @@ fn parse_tool_call<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> JsResult<Option<T
         .map_err(|e| throw(ctx, &format!("approve: `toolCall.arguments`: {e}")))?;
 
     Ok(Some(ToolCall {
+        error: None,
         id,
         name,
         arguments,

@@ -79,6 +79,42 @@ pub enum OwnedHistoryInput {
 }
 
 impl OwnedHistoryInput {
+    /// Owning copy of a borrowed [`HistoryInput`] — the inverse of
+    /// [`as_borrowed`](Self::as_borrowed). Lets callers that need to grow
+    /// an input list across rounds (e.g. `complete_enforced`'s scold loop)
+    /// keep everything owned.
+    pub fn from_borrowed(input: &HistoryInput<'_>) -> Self {
+        match *input {
+            HistoryInput::System { text } => Self::System {
+                text: text.to_owned(),
+            },
+            HistoryInput::User { text } => Self::User {
+                text: text.to_owned(),
+            },
+            HistoryInput::Assistant { text } => Self::Assistant {
+                text: text.to_owned(),
+            },
+            HistoryInput::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Self::ToolCall {
+                id: id.to_owned(),
+                name: name.to_owned(),
+                arguments: arguments.clone(),
+            },
+            HistoryInput::ToolResult {
+                call_id,
+                content,
+                is_error,
+            } => Self::ToolResult {
+                call_id: call_id.to_owned(),
+                content: content.to_owned(),
+                is_error,
+            },
+        }
+    }
+
     pub fn as_borrowed(&self) -> HistoryInput<'_> {
         match self {
             Self::System { text } => HistoryInput::System { text },

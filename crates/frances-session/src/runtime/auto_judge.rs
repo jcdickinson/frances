@@ -167,6 +167,7 @@ mod tests {
 
     fn decide(args: serde_json::Value) -> ToolCall {
         ToolCall {
+            error: None,
             id: "1".into(),
             name: "decide".into(),
             arguments: args,

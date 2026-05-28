@@ -171,7 +171,7 @@ pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
                 };
                 CompletionResult(result.map(|outcome| CompletedJs {
                     text: outcome.text,
-                    tool_calls: validate_tool_calls(outcome.tool_calls, &tools),
+                    tool_calls: outcome.tool_calls,
                     usage: None,
                 }))
             });
@@ -812,10 +812,6 @@ fn start_stream<'js, D: WorkflowDeps>(
     let cancel = CancellationToken::new();
     let cancel_for_task = cancel.clone();
 
-    // `run` consumes `tool_defs`; keep a copy to validate the returned
-    // tool-call args against their schemas.
-    let tool_defs_for_validation = tool_defs.clone();
-
     tokio::spawn({
         let usage_capture = usage_capture.clone();
         async move {
@@ -848,7 +844,7 @@ fn start_stream<'js, D: WorkflowDeps>(
             drop(event_tx);
             let mapped = result.map(|outcome| CompletedJs {
                 text: outcome.text,
-                tool_calls: validate_tool_calls(outcome.tool_calls, &tool_defs_for_validation),
+                tool_calls: outcome.tool_calls,
                 usage,
             });
             let _ = completed_tx.send(mapped);
@@ -1020,35 +1016,9 @@ impl<'js> IntoJs<'js> for CompletionResult {
     }
 }
 
-/// A tool call paired with the result of validating its arguments against
-/// the called tool's JSON schema. `schema_error` is `None` when the args
-/// validate (or the tool/schema couldn't be matched).
-struct ValidatedToolCall {
-    call: ToolCall,
-    schema_error: Option<String>,
-}
-
-/// Validate each tool call's arguments against the matching tool's schema.
-/// Surfaced to JS as `schemaError` so the dispatch loop can hand back an
-/// error result for a malformed call instead of invoking its handler.
-fn validate_tool_calls(calls: Vec<ToolCall>, tools: &[ToolDef]) -> Vec<ValidatedToolCall> {
-    calls
-        .into_iter()
-        .map(|call| {
-            let schema = tools
-                .iter()
-                .find_map(|ToolDef::Function(f)| (f.name == call.name).then_some(&f.parameters));
-            let schema_error = schema.and_then(|schema| {
-                frances_models_llm::tool_args::validate(&call.arguments, schema).err()
-            });
-            ValidatedToolCall { call, schema_error }
-        })
-        .collect()
-}
-
 struct CompletedJs {
     text: String,
-    tool_calls: Vec<ValidatedToolCall>,
+    tool_calls: Vec<ToolCall>,
     usage: Option<frances_models_llm::wire::Usage>,
 }
 
@@ -1057,15 +1027,28 @@ impl<'js> IntoJs<'js> for CompletedJs {
         let obj = Object::new(ctx.clone())?;
         obj.set("text", self.text)?;
 
+        // Each call carries an optional `error` (set by the chat layer when
+        // its arguments failed the called tool's schema). Surfaced as
+        // `error` + `expectedSchema` so the JS dispatch loop hands back an
+        // error result for a bad call instead of invoking its handler.
         let calls = Array::new(ctx.clone())?;
-        for (i, vc) in self.tool_calls.iter().enumerate() {
+        for (i, call) in self.tool_calls.iter().enumerate() {
             let entry = Object::new(ctx.clone())?;
-            entry.set("id", vc.call.id.clone())?;
-            entry.set("name", vc.call.name.clone())?;
-            entry.set("arguments", json_value_into_js(ctx, &vc.call.arguments)?)?;
-            match &vc.schema_error {
-                Some(err) => entry.set("schemaError", err.clone())?,
-                None => entry.set("schemaError", Value::new_null(ctx.clone()))?,
+            entry.set("id", call.id.clone())?;
+            entry.set("name", call.name.clone())?;
+            entry.set("arguments", json_value_into_js(ctx, &call.arguments)?)?;
+            match &call.error {
+                Some(e) => {
+                    entry.set("error", e.message.clone())?;
+                    entry.set(
+                        "expectedSchema",
+                        json_value_into_js(ctx, &e.expected_schema)?,
+                    )?;
+                }
+                None => {
+                    entry.set("error", Value::new_null(ctx.clone()))?;
+                    entry.set("expectedSchema", Value::new_null(ctx.clone()))?;
+                }
             }
             calls.set(i, entry)?;
         }

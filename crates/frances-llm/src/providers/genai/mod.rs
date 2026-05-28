@@ -377,6 +377,7 @@ fn map_tool_call(call: GenaiToolCall) -> ToolCall {
         other => other,
     };
     ToolCall {
+        error: None,
         id: call.call_id,
         name: call.fn_name,
         arguments,
@@ -546,6 +547,7 @@ mod tests {
         // The History event we emit must deserialise back into a typed
         // ChatMessage next turn — that's the bridge into the SDK request.
         let calls = vec![ToolCall {
+            error: None,
             id: "call_1".into(),
             name: "edit".into(),
             arguments: json!({"path": "a.txt"}),

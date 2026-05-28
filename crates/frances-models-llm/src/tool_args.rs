@@ -12,6 +12,29 @@
 
 use serde_json::Value;
 
+use crate::wire::{ToolCall, ToolCallError, ToolDef};
+
+/// Validate each call's arguments against the called tool's declared schema,
+/// flagging mismatches in-place via [`ToolCall::error`]. A call to a tool not
+/// present in `tools` (no schema to check) is left untouched — the dispatch
+/// layer reports "tool not found" for it as before.
+pub fn annotate(calls: &mut [ToolCall], tools: &[ToolDef]) {
+    for call in calls {
+        let Some(schema) = tools
+            .iter()
+            .find_map(|ToolDef::Function(f)| (f.name == call.name).then_some(&f.parameters))
+        else {
+            continue;
+        };
+        if let Err(message) = validate(&call.arguments, schema) {
+            call.error = Some(ToolCallError {
+                expected_schema: schema.clone(),
+                message,
+            });
+        }
+    }
+}
+
 /// Validate `args` against a tool's `parameters` JSON schema. Returns a
 /// concise, model-facing error string on mismatch.
 ///
@@ -113,6 +136,33 @@ mod tests {
     fn uncompilable_schema_skips() {
         // A nonsense schema can't compile → we don't block the call.
         assert!(validate(&json!({ "type": "definitely-not-a-type" }), &json!(42)).is_ok());
+    }
+
+    #[test]
+    fn annotate_flags_only_bad_calls() {
+        use crate::wire::{ToolCall, ToolDef, ToolFunction};
+        let tools = vec![ToolDef::Function(ToolFunction {
+            name: "decide".into(),
+            description: String::new(),
+            parameters: decide_schema(),
+        })];
+        let mk = |name: &str, args: Value| ToolCall {
+            id: "c".into(),
+            name: name.into(),
+            arguments: args,
+            error: None,
+        };
+        let mut calls = vec![
+            mk("decide", json!({ "verdict": "approve", "reason": "ok" })),
+            mk("decide", json!({ "verdict": "maybe" })),
+            mk("unknown", json!({ "anything": true })),
+        ];
+        annotate(&mut calls, &tools);
+        assert!(calls[0].error.is_none(), "valid call stays clean");
+        let err = calls[1].error.as_ref().expect("bad args flagged");
+        assert!(!err.message.is_empty());
+        assert_eq!(err.expected_schema, decide_schema());
+        assert!(calls[2].error.is_none(), "unknown tool isn't ours to flag");
     }
 
     #[test]

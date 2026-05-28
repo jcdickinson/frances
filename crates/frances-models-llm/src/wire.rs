@@ -80,8 +80,11 @@ impl std::fmt::Display for ChunkAbort {
 impl std::error::Error for ChunkAbort {}
 
 /// Final result of a provider stream call. `text` is the concatenation of
-/// all `TextDelta` events; `tool_calls` is the parsed tool-call list
-/// (ordered by index).
+/// all `TextDelta` events; `tool_calls` is the parsed tool-call list, ordered
+/// as the model emitted them. Each call carries an optional
+/// [`ToolCallError`](ToolCall::error): the chat layer validates arguments
+/// against the called tool's schema (`tool_args::annotate`) and flags the
+/// ones that don't, so dispatch can hand the model a corrective error result.
 #[derive(Debug, Clone)]
 pub struct CompletionOutcome {
     pub text: String,
@@ -139,12 +142,26 @@ impl Serialize for ToolChoice {
 pub struct ToolCall {
     pub id: String,
     pub name: String,
-    /// JSON-shaped args from the LLM. Serialized through
-    /// `json_value_as_string` so non-self-describing formats (bincode)
-    /// can carry it — `serde_json::Value` itself uses
-    /// `deserialize_any`, which bincode rejects.
-    #[serde(with = "json_value_as_string")]
+    /// JSON-shaped args the model supplied for this call.
     pub arguments: Value,
+    /// `Some` when the chat layer validated `arguments` against the called
+    /// tool's declared schema and they didn't match. The call was still
+    /// emitted by the model (so it stays in `tool_calls` and gets persisted);
+    /// dispatch turns it into an error tool result the model can correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ToolCallError>,
+}
+
+/// Why a [`ToolCall`]'s arguments failed schema validation, plus the schema
+/// they were expected to satisfy. Enough for the caller to build a corrective
+/// error result the model can self-correct against.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ToolCallError {
+    /// The JSON schema the arguments were checked against. Encoded as a string
+    /// for the same bincode reason as [`ToolCall::arguments`].
+    #[serde(with = "json_value_as_string")]
+    pub expected_schema: Value,
+    pub message: String,
 }
 
 mod json_value_as_string {

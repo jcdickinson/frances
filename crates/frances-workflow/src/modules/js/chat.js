@@ -199,10 +199,10 @@ async function _dispatchSlot(chat, call, hook, session, idx) {
     // Rust validated the call's arguments against the tool's JSON schema;
     // a mismatch becomes an error result so the model self-corrects next
     // round (rather than handing bad args to the handler).
-    if (call.schemaError) {
+    if (call.error) {
       return _errorResult(
         call.id,
-        `arguments did not match the tool's schema: ${call.schemaError}`,
+        `arguments did not match the tool's schema: ${call.error}`,
       );
     }
     const tool = chat.tools.find((t) => t.name === call.name);

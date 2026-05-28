@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::error::ChatError;
-use crate::wire::{CompletionOutcome, HistoryInput, ToolChoice, ToolDef};
+use crate::wire::{CompletionOutcome, HistoryInput, ToolCall, ToolChoice, ToolDef};
 
 /// Inputs to [`ChatSessionManager::complete`](super::ChatSessionManager::complete).
 /// Bundled so the call site reads as `chat.complete(CompleteRequest { … })`
@@ -55,16 +55,37 @@ impl Demand {
         }
     }
 
-    /// Whether `outcome` honours the demand.
-    pub fn satisfied_by(&self, outcome: &CompletionOutcome) -> bool {
+    /// Whether a call matches what this demand asks for, ignoring validity.
+    fn matches(&self, call: &ToolCall) -> bool {
         match self {
-            Demand::Required => !outcome.tool_calls.is_empty(),
-            Demand::Function(name) => outcome.tool_calls.iter().any(|c| &c.name == name),
+            Demand::Required => true,
+            Demand::Function(name) => &call.name == name,
         }
     }
 
-    pub(crate) fn scold(&self) -> String {
-        match self {
+    /// Whether `outcome` honours the demand. A call whose arguments failed
+    /// schema validation ([`ToolCall::error`]) doesn't count — the model
+    /// asked for the tool but botched the arguments, so it isn't satisfied.
+    pub fn satisfied_by(&self, outcome: &CompletionOutcome) -> bool {
+        outcome
+            .tool_calls
+            .iter()
+            .any(|c| c.error.is_none() && self.matches(c))
+    }
+
+    /// Validation error of a demanded call the model *did* emit but with bad
+    /// arguments, if any — fed back into the scold so it can self-correct.
+    fn demanded_error<'a>(&self, outcome: &'a CompletionOutcome) -> Option<&'a str> {
+        outcome
+            .tool_calls
+            .iter()
+            .filter(|c| self.matches(c))
+            .find_map(|c| c.error.as_ref())
+            .map(|e| e.message.as_str())
+    }
+
+    pub(crate) fn scold(&self, outcome: &CompletionOutcome) -> String {
+        let base = match self {
             Demand::Required => {
                 "Your last response didn't call any tool. Respond with exactly one tool call."
                     .to_owned()
@@ -73,13 +94,21 @@ impl Demand {
                 "Your last response didn't call the required `{name}` tool. \
                  Respond with exactly one call to `{name}`."
             ),
+        };
+        match self.demanded_error(outcome) {
+            Some(err) => format!("{base} The previous arguments were invalid: {err}"),
+            None => base,
         }
     }
 
-    pub(crate) fn unsatisfied_detail(&self) -> String {
-        match self {
+    pub(crate) fn unsatisfied_detail(&self, outcome: &CompletionOutcome) -> String {
+        let base = match self {
             Demand::Required => "expected at least one tool call".to_owned(),
             Demand::Function(name) => format!("expected a call to `{name}`"),
+        };
+        match self.demanded_error(outcome) {
+            Some(err) => format!("{base} (last call had invalid arguments: {err})"),
+            None => base,
         }
     }
 }

@@ -75,10 +75,12 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
 
     /// Like [`complete`](Self::complete), but *demands* a tool call and
     /// distrusts the provider: after each round it checks the outcome
-    /// against `demand`, and on a miss appends a generic structural
-    /// scold and retries (up to `retries` times). The demand drives
-    /// `tool_choice` — any `tool_choice` on `req` is ignored. Generic
-    /// over `complete`, so it's a provided default.
+    /// against `demand` (a call with schema-invalid arguments does **not**
+    /// satisfy), and on a miss appends a scold — carrying the validation
+    /// error when the model emitted the demanded tool with bad arguments —
+    /// then retries (up to `retries` times). The demand drives `tool_choice`
+    /// — any `tool_choice` on `req` is ignored. Generic over `complete`, so
+    /// it's a provided default.
     async fn complete_enforced(
         &self,
         req: CompleteRequest<'_>,
@@ -86,18 +88,23 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
         retries: u8,
     ) -> Result<CompletionOutcome, EnforceError> {
         let tool_choice = demand.to_tool_choice();
-        let scold = demand.scold();
-        // Own the inputs so we can grow them with scolds across rounds;
-        // covariance lets the borrowed clones sit alongside `&scold`.
-        let mut inputs: Vec<HistoryInput> = req.new_inputs.to_vec();
+        // Own the inputs so each round can append a fresh scold string and
+        // still hand `complete` a borrowed view.
+        let mut owned: Vec<OwnedHistoryInput> = req
+            .new_inputs
+            .iter()
+            .map(OwnedHistoryInput::from_borrowed)
+            .collect();
         let mut attempts_left = retries;
         loop {
+            let new_inputs: Vec<HistoryInput> =
+                owned.iter().map(OwnedHistoryInput::as_borrowed).collect();
             let round = CompleteRequest {
                 intents: req.intents,
                 session_id: req.session_id,
                 env: req.env,
                 history: req.history,
-                new_inputs: &inputs,
+                new_inputs: &new_inputs,
                 tools: req.tools,
                 tool_choice: Some(&tool_choice),
                 cancel: req.cancel.clone(),
@@ -109,10 +116,12 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
             }
             if attempts_left == 0 {
                 return Err(EnforceError::Unsatisfied {
-                    detail: demand.unsatisfied_detail(),
+                    detail: demand.unsatisfied_detail(&outcome),
                 });
             }
-            inputs.push(HistoryInput::User { text: &scold });
+            owned.push(OwnedHistoryInput::User {
+                text: demand.scold(&outcome),
+            });
             attempts_left -= 1;
         }
     }

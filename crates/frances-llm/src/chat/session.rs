@@ -214,11 +214,12 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             other => on_event(other).map_err(into_erased),
         };
 
-        let completion = match provider.stream(req, cancel.clone(), &mut wrapped).await {
+        let mut completion = match provider.stream(req, cancel.clone(), &mut wrapped).await {
             Ok(c) => c,
             Err(_) if cancel.is_cancelled() => return Err(ChatError::Cancelled),
             Err(source) => return Err(log_and_typed(&provider_id, source)),
         };
+        frances_models_llm::tool_args::annotate(&mut completion.tool_calls, &tools);
 
         if let Some(id) = id {
             store
@@ -478,6 +479,7 @@ mod tests {
 
     fn tool_call_script(call_id: &str, name: &str, arguments: Value) -> StubScript {
         let call = ToolCall {
+            error: None,
             id: call_id.to_owned(),
             name: name.to_owned(),
             arguments,
@@ -610,16 +612,19 @@ mod tests {
         let three_calls = StubScript {
             events: vec![
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c1".into(),
                     name: "a".into(),
                     arguments: json!({"i": 1}),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c2".into(),
                     name: "b".into(),
                     arguments: json!({"i": 2}),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c3".into(),
                     name: "c".into(),
                     arguments: json!({"i": 3}),
@@ -629,16 +634,19 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![
                     ToolCall {
+                        error: None,
                         id: "c1".into(),
                         name: "a".into(),
                         arguments: json!({"i": 1}),
                     },
                     ToolCall {
+                        error: None,
                         id: "c2".into(),
                         name: "b".into(),
                         arguments: json!({"i": 2}),
                     },
                     ToolCall {
+                        error: None,
                         id: "c3".into(),
                         name: "c".into(),
                         arguments: json!({"i": 3}),
@@ -671,16 +679,19 @@ mod tests {
         let three_calls = StubScript {
             events: vec![
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c1".into(),
                     name: "a".into(),
                     arguments: json!({}),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c2".into(),
                     name: "b".into(),
                     arguments: json!({}),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "c3".into(),
                     name: "c".into(),
                     arguments: json!({}),
@@ -690,16 +701,19 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![
                     ToolCall {
+                        error: None,
                         id: "c1".into(),
                         name: "a".into(),
                         arguments: json!({}),
                     },
                     ToolCall {
+                        error: None,
                         id: "c2".into(),
                         name: "b".into(),
                         arguments: json!({}),
                     },
                     ToolCall {
+                        error: None,
                         id: "c3".into(),
                         name: "c".into(),
                         arguments: json!({}),
@@ -782,6 +796,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn run_flags_schema_invalid_tool_call() {
+        let (manager, _store, stub) = build_manager().await;
+        // `decide` called with the required `verdict` missing.
+        stub.push_script(tool_call_script("c1", "decide", json!({ "reason": "x" })));
+
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "verdict": { "type": "string", "enum": ["approve", "decline"] },
+                "reason": { "type": "string" },
+            },
+            "required": ["verdict", "reason"],
+        });
+        let decide = vec![frances_models_llm::wire::ToolDef::Function(
+            frances_models_llm::wire::ToolFunction {
+                name: "decide".into(),
+                description: String::new(),
+                parameters: schema.clone(),
+            },
+        )];
+
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        let outcome = session
+            .run(
+                std::collections::HashMap::new(),
+                decide,
+                None,
+                tokio_util::sync::CancellationToken::new(),
+                None,
+                Box::new(|_| Ok(())),
+            )
+            .await
+            .expect("run succeeds even with a bad call");
+        // The call stays in `tool_calls` (it was emitted), flagged with its error.
+        assert_eq!(outcome.tool_calls.len(), 1);
+        let err = outcome.tool_calls[0]
+            .error
+            .as_ref()
+            .expect("invalid args flagged");
+        assert!(!err.message.is_empty());
+        assert_eq!(err.expected_schema, schema);
+    }
+
+    #[tokio::test]
     async fn complete_enforced_scolds_once_then_succeeds() {
         let (manager, _store, stub) = build_manager().await;
         // Round 1: a bare assistant turn (no tool call) → one scold.
@@ -811,6 +870,59 @@ mod tests {
         assert!(
             caps[1].new_inputs.len() > caps[0].new_inputs.len(),
             "the scold should have been appended on the retry",
+        );
+    }
+
+    #[tokio::test]
+    async fn complete_enforced_retries_on_invalid_args_then_succeeds() {
+        let (manager, _store, stub) = build_manager().await;
+        // Round 1: `decide` is called, but the args are missing the required
+        // `verdict` — the chat layer flags it, so the demand isn't satisfied.
+        stub.push_script(tool_call_script("c1", "decide", json!({ "reason": "x" })));
+        // Round 2: a well-formed `decide` call.
+        stub.push_script(tool_call_script(
+            "c2",
+            "decide",
+            json!({ "verdict": "approve", "reason": "ok" }),
+        ));
+
+        // Declared first so its borrow outlives the request built below.
+        let decide = [frances_models_llm::wire::ToolDef::Function(
+            frances_models_llm::wire::ToolFunction {
+                name: "decide".into(),
+                description: String::new(),
+                parameters: json!({
+                    "type": "object",
+                    "additionalProperties": false,
+                    "properties": {
+                        "verdict": { "type": "string", "enum": ["approve", "decline"] },
+                        "reason": { "type": "string" },
+                    },
+                    "required": ["verdict", "reason"],
+                }),
+            },
+        )];
+        let env = std::collections::HashMap::new();
+        let inputs = [HistoryInput::User { text: "may I?" }];
+        let mut req = enforce_req(&env, &inputs);
+        req.tools = &decide;
+        let outcome = manager
+            .complete_enforced(req, Demand::Function("decide".into()), 1)
+            .await
+            .expect("the valid retry satisfies the demand");
+        assert!(
+            outcome
+                .tool_calls
+                .iter()
+                .any(|c| c.name == "decide" && c.error.is_none()),
+            "the satisfying call validates cleanly",
+        );
+
+        let caps = stub.captured();
+        assert_eq!(caps.len(), 2, "one bad-args round + one success");
+        assert!(
+            caps[1].new_inputs.len() > caps[0].new_inputs.len(),
+            "the scold (carrying the validation error) is appended on retry",
         );
     }
 

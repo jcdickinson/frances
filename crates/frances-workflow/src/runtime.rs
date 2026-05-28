@@ -1054,14 +1054,18 @@ pub mod test_deps {
 
         async fn complete(
             &self,
-            _req: frances_models_llm::chat::CompleteRequest<'_>,
+            req: frances_models_llm::chat::CompleteRequest<'_>,
         ) -> Result<CompletionOutcome, ChatError> {
             // Reuse the same script queue as `StubSession::run`; each
             // call pops one scripted outcome (events are ignored — a
             // one-shot complete has no event sink). `complete_enforced`
             // is the trait default, so it pops one script per round.
+            // Annotate like the real chat layer so tests see bad-arg flags.
             match self.next_script.lock().pop_front() {
-                Some(s) => Ok(s.outcome),
+                Some(mut s) => {
+                    frances_models_llm::tool_args::annotate(&mut s.outcome.tool_calls, req.tools);
+                    Ok(s.outcome)
+                }
                 None => Err(ChatError::ProviderUnavailable(
                     "stub manager: no script wired for complete".to_owned(),
                 )),
@@ -1090,7 +1094,7 @@ pub mod test_deps {
         async fn run(
             &self,
             _env: HashMap<OsString, OsString>,
-            _tools: Vec<ToolDef>,
+            tools: Vec<ToolDef>,
             _tool_choice: Option<ToolChoice>,
             cancel: tokio_util::sync::CancellationToken,
             _max_tool_calls: Option<usize>,
@@ -1101,10 +1105,13 @@ pub mod test_deps {
             }
             let script = self.next_script.lock().pop_front();
             match script {
-                Some(s) => {
+                Some(mut s) => {
                     for ev in s.events {
                         on_event(ev)?;
                     }
+                    // Annotate like the real chat layer so workflow tests
+                    // see schema-invalid calls flagged on `tool_calls`.
+                    frances_models_llm::tool_args::annotate(&mut s.outcome.tool_calls, &tools);
                     Ok(s.outcome)
                 }
                 None => Err(ChatError::ProviderUnavailable(
@@ -2617,6 +2624,7 @@ mod tests {
             vec![
                 StreamEvent::TextDelta("Calling tool...".to_owned()),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "call_1".to_owned(),
                     name: "echo".to_owned(),
                     arguments: json!({ "text": "hi" }),
@@ -2625,6 +2633,7 @@ mod tests {
             CompletionOutcome {
                 text: "Calling tool...".to_owned(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "call_1".to_owned(),
                     name: "echo".to_owned(),
                     arguments: json!({ "text": "hi" }),
@@ -2780,6 +2789,7 @@ mod tests {
         // Round 1: model emits a tool call.
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "echo".to_owned(),
                 arguments: json!({ "text": "from round 1" }),
@@ -2787,6 +2797,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "echo".to_owned(),
                     arguments: json!({ "text": "from round 1" }),
@@ -2883,6 +2894,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "echo".to_owned(),
                 arguments: json!({ "text": "hi" }),
@@ -2890,6 +2902,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "echo".to_owned(),
                     arguments: json!({ "text": "hi" }),
@@ -2960,6 +2973,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "echo".to_owned(),
                 arguments: json!({}),
@@ -2967,6 +2981,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "echo".to_owned(),
                     arguments: json!({}),
@@ -3026,6 +3041,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "nonexistent".to_owned(),
                 arguments: json!({}),
@@ -3033,6 +3049,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "nonexistent".to_owned(),
                     arguments: json!({}),
@@ -3087,6 +3104,7 @@ mod tests {
         // Outer round: LLM calls `outer`.
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "outer1".to_owned(),
                 name: "outer".to_owned(),
                 arguments: json!({}),
@@ -3094,6 +3112,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "outer1".to_owned(),
                     name: "outer".to_owned(),
                     arguments: json!({}),
@@ -3104,6 +3123,7 @@ mod tests {
         // LLM calls `inner`.
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "inner1".to_owned(),
                 name: "inner".to_owned(),
                 arguments: json!({}),
@@ -3111,6 +3131,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "inner1".to_owned(),
                     name: "inner".to_owned(),
                     arguments: json!({}),
@@ -3320,6 +3341,7 @@ mod tests {
         let deps = StubDepsRealShell::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "shell_run".to_owned(),
                 arguments: json!({ "cmd": "echo from-run-tool" }),
@@ -3327,6 +3349,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "shell_run".to_owned(),
                     arguments: json!({ "cmd": "echo from-run-tool" }),
@@ -3402,6 +3425,7 @@ mod tests {
         let deps = StubDepsRealShell::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "shell_run".to_owned(),
                 arguments: json!({ "cmd": "sleep 3 && echo finished" }),
@@ -3409,6 +3433,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "shell_run".to_owned(),
                     arguments: json!({ "cmd": "sleep 3 && echo finished" }),
@@ -3419,6 +3444,7 @@ mod tests {
             let id = format!("w-{i}");
             deps.script_next_run(
                 vec![StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: id.clone(),
                     name: "shell_wait".to_owned(),
                     arguments: json!({}),
@@ -3426,6 +3452,7 @@ mod tests {
                 CompletionOutcome {
                     text: String::new(),
                     tool_calls: vec![ToolCall {
+                        error: None,
                         id,
                         name: "shell_wait".to_owned(),
                         arguments: json!({}),
@@ -3520,6 +3547,7 @@ mod tests {
         // Round 1: shell_run on a long-running command.
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "shell_run".to_owned(),
                 arguments: json!({ "cmd": "sleep 30 && echo done" }),
@@ -3527,6 +3555,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "shell_run".to_owned(),
                     arguments: json!({ "cmd": "sleep 30 && echo done" }),
@@ -3639,6 +3668,7 @@ mod tests {
         let deps = StubDepsRealShell::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "shell_run".to_owned(),
                 arguments: json!({ "cmd": "sleep 30 && echo done" }),
@@ -3646,6 +3676,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "shell_run".to_owned(),
                     arguments: json!({ "cmd": "sleep 30 && echo done" }),
@@ -3656,6 +3687,7 @@ mod tests {
             let id = format!("offscript-{i}");
             deps.script_next_run(
                 vec![StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: id.clone(),
                     name: "read_file".to_owned(),
                     arguments: json!({}),
@@ -3663,6 +3695,7 @@ mod tests {
                 CompletionOutcome {
                     text: String::new(),
                     tool_calls: vec![ToolCall {
+                        error: None,
                         id,
                         name: "read_file".to_owned(),
                         arguments: json!({}),
@@ -3782,6 +3815,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "checker".to_owned(),
                 arguments: json!({}),
@@ -3789,6 +3823,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "checker".to_owned(),
                     arguments: json!({}),
@@ -3850,11 +3885,13 @@ mod tests {
         deps.script_next_run(
             vec![
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "first".to_owned(),
                     name: "slow".to_owned(),
                     arguments: json!({}),
                 }),
                 StreamEvent::ToolCall(ToolCall {
+                    error: None,
                     id: "second".to_owned(),
                     name: "fast".to_owned(),
                     arguments: json!({}),
@@ -3864,11 +3901,13 @@ mod tests {
                 text: String::new(),
                 tool_calls: vec![
                     ToolCall {
+                        error: None,
                         id: "first".to_owned(),
                         name: "slow".to_owned(),
                         arguments: json!({}),
                     },
                     ToolCall {
+                        error: None,
                         id: "second".to_owned(),
                         name: "fast".to_owned(),
                         arguments: json!({}),
@@ -3927,6 +3966,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "starter".to_owned(),
                 arguments: json!({}),
@@ -3934,6 +3974,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "starter".to_owned(),
                     arguments: json!({}),
@@ -3942,6 +3983,7 @@ mod tests {
         );
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c2".to_owned(),
                 name: "followup".to_owned(),
                 arguments: json!({}),
@@ -3949,6 +3991,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c2".to_owned(),
                     name: "followup".to_owned(),
                     arguments: json!({}),
@@ -4029,6 +4072,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "outer".to_owned(),
                 name: "gated".to_owned(),
                 arguments: json!({}),
@@ -4036,6 +4080,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "outer".to_owned(),
                     name: "gated".to_owned(),
                     arguments: json!({}),
@@ -4044,6 +4089,7 @@ mod tests {
         );
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "offscript".to_owned(),
                 name: "forbidden".to_owned(),
                 arguments: json!({}),
@@ -4051,6 +4097,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "offscript".to_owned(),
                     name: "forbidden".to_owned(),
                     arguments: json!({}),
@@ -4130,6 +4177,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "double".to_owned(),
                 arguments: json!({}),
@@ -4137,6 +4185,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "double".to_owned(),
                     arguments: json!({}),
@@ -4204,6 +4253,7 @@ mod tests {
         let deps = StubDeps::default();
         deps.script_next_run(
             vec![StreamEvent::ToolCall(ToolCall {
+                error: None,
                 id: "c1".to_owned(),
                 name: "thrower".to_owned(),
                 arguments: json!({}),
@@ -4211,6 +4261,7 @@ mod tests {
             CompletionOutcome {
                 text: String::new(),
                 tool_calls: vec![ToolCall {
+                    error: None,
                     id: "c1".to_owned(),
                     name: "thrower".to_owned(),
                     arguments: json!({}),
@@ -5471,6 +5522,7 @@ mod tests {
 
     fn decide_call() -> frances_models_llm::wire::ToolCall {
         frances_models_llm::wire::ToolCall {
+            error: None,
             id: "c1".into(),
             name: "decide".into(),
             arguments: serde_json::json!({ "verdict": "approve" }),
@@ -5611,5 +5663,45 @@ mod tests {
             rendered.starts_with("threw:") && rendered.contains("forced tool not satisfied"),
             "expected an enforce rejection, got {rendered:?}",
         );
+    }
+
+    #[tokio::test]
+    async fn complete_flags_schema_invalid_tool_call() {
+        let deps = StubDeps::default();
+        // `decide_call` supplies only `verdict`; the schema also requires
+        // `reason`, so the chat layer flags the call.
+        deps.script_next_run(Vec::new(), outcome("", vec![decide_call()]));
+        let rt = Runtime::new(deps.clone()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { complete } from "frances:v1/chat";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const r = await complete({
+                intents: ["default"],
+                input: [{ role: "user", content: "decide" }],
+                tools: [{ name: "decide", description: "d", parameters: {
+                    type: "object",
+                    additionalProperties: false,
+                    properties: { verdict: { type: "string" }, reason: { type: "string" } },
+                    required: ["verdict", "reason"],
+                } }],
+            });
+            const c = r.tool_calls[0];
+            const ok = c.error && c.expectedSchema && c.expectedSchema.required.includes("reason");
+            transcript.push(new MarkdownFrame({ content: ok ? "flagged:" + c.name : "clean" }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, result) = drive_to_done(&mut handle).await;
+        assert!(result.is_ok(), "got {result:?}");
+        assert_eq!(text_of(&frames[0]), "flagged:decide");
     }
 }
