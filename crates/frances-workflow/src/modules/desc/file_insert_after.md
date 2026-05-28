@@ -6,7 +6,10 @@ Args: `{ path, anchor, text }`
   anchor:  full rendered anchor line that the new content will be inserted AFTER — `Word§content`, exactly as `file_read` produced it.
   text:    the raw content of the new line(s) and NOTHING ELSE. Use `\n` for newlines. Multi-line is fine.
 
-CRITICAL: `text` must NEVER contain a `Word§` prefix. Anchors are read-only metadata — they belong in `anchor`, never in `text`. The engine mints fresh anchors for inserted lines. If you write `text: "Until§ratatui-textarea = \"0.9\""`, the literal `Until§` is written into the file and your edit is broken. Pass only the line content: `text: "ratatui-textarea = \"0.9\""`.
+CRITICAL: `text` must NEVER contain a `Word§` prefix unless you genuinely want those literal characters in the file (editing the anchor engine itself, a test fixture, prose with `Word§`). Anchors are read-only metadata the engine assigns — they're not part of line content. If you paste back the rendered prefixes from a `file_read`, they get written verbatim and your edit is broken.
+
+  WRONG → text: "Apple§def hello():\nBanana§    print(\"hi\")"
+  RIGHT → text: "def hello():\n    print(\"hi\")"
 
 Provide exactly one of `text` or `from`:
 

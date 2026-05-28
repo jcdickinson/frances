@@ -30,6 +30,8 @@ pub enum LlmEdit {
         anchor: String,
         end_anchor: String,
         text: String,
+        #[serde(default)]
+        bypass_anchor_guard: bool,
     },
     ReplaceAll {
         path: PathBuf,
@@ -41,11 +43,15 @@ pub enum LlmEdit {
         path: PathBuf,
         anchor: String,
         text: String,
+        #[serde(default)]
+        bypass_anchor_guard: bool,
     },
     InsertBefore {
         path: PathBuf,
         anchor: String,
         text: String,
+        #[serde(default)]
+        bypass_anchor_guard: bool,
     },
     New {
         path: PathBuf,
@@ -54,6 +60,8 @@ pub enum LlmEdit {
     Overwrite {
         path: PathBuf,
         text: String,
+        #[serde(default)]
+        bypass_anchor_guard: bool,
     },
 }
 
@@ -73,6 +81,15 @@ pub enum EditError {
     },
     #[error("malformed anchor '{field}': expected '<Word>§<content>'")]
     MalformedAnchor { field: String },
+    #[error(
+        "edit `text` payload looks like pasted-back anchor renders: every \
+         non-blank line begins with `Word§`. Anchors are assigned by the \
+         engine — `text` should be the bare line content with no anchor \
+         prefixes. You wrote: {anchors}. Remove the prefixes and resubmit. \
+         (If these characters are genuinely intended as literal file \
+         content, resubmit with `bypass_anchor_guard: true`.)"
+    )]
+    AnchorPastebackDetected { anchors: String },
     #[error("invalid anchor word '{word}': {source}")]
     BadAnchorWord {
         word: String,

@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
+
+use regex::Regex;
 
 use crate::loop_guard::LoopSet;
 use crate::render::DiffRender;
@@ -88,17 +91,30 @@ impl<S: AnchorStore> EditSession<S> {
         self.loop_set.clear();
         match edit {
             LlmEdit::New { path, text } => self.apply_new(&path, &text, &mut on_draft).await,
-            LlmEdit::Overwrite { path, text } => {
-                self.apply_overwrite(&path, &text, &mut on_draft).await
+            LlmEdit::Overwrite {
+                path,
+                text,
+                bypass_anchor_guard,
+            } => {
+                self.apply_overwrite(&path, &text, bypass_anchor_guard, &mut on_draft)
+                    .await
             }
             LlmEdit::ReplaceLines {
                 path,
                 anchor,
                 end_anchor,
                 text,
+                bypass_anchor_guard,
             } => {
-                self.apply_replace(&path, &anchor, &end_anchor, &text, &mut on_draft)
-                    .await
+                self.apply_replace(
+                    &path,
+                    &anchor,
+                    &end_anchor,
+                    &text,
+                    bypass_anchor_guard,
+                    &mut on_draft,
+                )
+                .await
             }
             LlmEdit::ReplaceAll {
                 path,
@@ -109,12 +125,22 @@ impl<S: AnchorStore> EditSession<S> {
                 self.apply_replace_all(&path, &find, &replacement, count, &mut on_draft)
                     .await
             }
-            LlmEdit::InsertAfter { path, anchor, text } => {
-                self.apply_insert_after(&path, &anchor, &text, &mut on_draft)
+            LlmEdit::InsertAfter {
+                path,
+                anchor,
+                text,
+                bypass_anchor_guard,
+            } => {
+                self.apply_insert_after(&path, &anchor, &text, bypass_anchor_guard, &mut on_draft)
                     .await
             }
-            LlmEdit::InsertBefore { path, anchor, text } => {
-                self.apply_insert_before(&path, &anchor, &text, &mut on_draft)
+            LlmEdit::InsertBefore {
+                path,
+                anchor,
+                text,
+                bypass_anchor_guard,
+            } => {
+                self.apply_insert_before(&path, &anchor, &text, bypass_anchor_guard, &mut on_draft)
                     .await
             }
         }
@@ -133,6 +159,38 @@ impl<S: AnchorStore> EditSession<S> {
 /// matches what the model wrote.
 fn split_text_to_lines(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_owned).collect()
+}
+
+/// Detect "anchor paste-back" in an edit `text` payload: every non-blank
+/// line begins with an anchor-shaped prefix like `Apple§` or
+/// `Apple-Banana§`. Returns the comma-joined deduped anchor words (capped
+/// at 20) when the pattern is uniform; `None` otherwise. A partial match
+/// (one prefixed line among unprefixed ones) is evidence *against*
+/// paste-back, so the gate requires uniformity across non-blank lines.
+fn detect_anchor_pasteback(text: &str) -> Option<String> {
+    static PATTERN: OnceLock<Regex> = OnceLock::new();
+    let re = PATTERN.get_or_init(|| Regex::new(r"^([A-Z][\w-]*)§").unwrap());
+    let mut non_blank_lines = 0usize;
+    let mut matches = 0usize;
+    let mut anchors: Vec<String> = Vec::new();
+    for line in text.split('\n') {
+        if line.trim().is_empty() {
+            continue;
+        }
+        non_blank_lines += 1;
+        if let Some(caps) = re.captures(line) {
+            matches += 1;
+            let word = caps.get(1).unwrap().as_str();
+            if anchors.len() < 20 && !anchors.iter().any(|a| a == word) {
+                anchors.push(word.to_owned());
+            }
+        }
+    }
+    if non_blank_lines > 0 && non_blank_lines == matches {
+        Some(anchors.join(", "))
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

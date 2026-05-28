@@ -5,6 +5,11 @@ Args: `{ path, text }`
   path:  the file to overwrite. You MUST have called `file_read` on this path this turn — overwrite is destructive, so the engine requires you to have seen the prior content first.
   text:  the new content. Use `\n` for newlines.
 
+CRITICAL: `text` must NEVER contain a `Word§` prefix unless you genuinely want those literal characters in the file (editing the anchor engine itself, a test fixture, prose with `Word§`). Anchors are read-only metadata the engine assigns — they're not part of line content. If you paste back the rendered prefixes from a `file_read`, they get written verbatim and your edit is broken.
+
+  WRONG → text: "Apple§def hello():\nBanana§    print(\"hi\")"
+  RIGHT → text: "def hello():\n    print(\"hi\")"
+
 Provide exactly one of `text` or `from`:
 
   from:  a Frances variable name. Its value is used as the new content (string values pass through verbatim; non-string values are JSON-encoded). Use this when the content was prepared via `variable_set` / `variable_assign` / `file_read into:` / `shell_capture`, to avoid re-emitting a long payload in a tool-call.

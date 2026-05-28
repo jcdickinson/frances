@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::types::{EditError, EditResult};
-use super::{DIFF_CONTEXT, EditSession, split_text_to_lines};
+use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 const ANCHOR_SEP: char = '§';
 
@@ -22,11 +22,15 @@ impl<S: AnchorStore> EditSession<S> {
         anchor: &str,
         end_anchor: &str,
         text: &str,
+        bypass_anchor_guard: bool,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
+        if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
+            return Err(EditError::AnchorPastebackDetected { anchors });
+        }
         let working = self.cached_working(path)?;
         let (from_anchor, from_idx) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
         let (to_anchor, to_idx) = resolve_anchor(end_anchor, &working.state, &working.lines, path)?;
@@ -88,11 +92,15 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         anchor: &str,
         text: &str,
+        bypass_anchor_guard: bool,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
+        if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
+            return Err(EditError::AnchorPastebackDetected { anchors });
+        }
         let working = self.cached_working(path)?;
         let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
         let op = EditOp::InsertAfter {
@@ -108,11 +116,15 @@ impl<S: AnchorStore> EditSession<S> {
         path: &Path,
         anchor: &str,
         text: &str,
+        bypass_anchor_guard: bool,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
+        if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
+            return Err(EditError::AnchorPastebackDetected { anchors });
+        }
         let working = self.cached_working(path)?;
         let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
         let op = EditOp::InsertBefore {
@@ -286,6 +298,7 @@ mod tests {
                     anchor: target.clone(),
                     end_anchor: target,
                     text: "B2".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -311,6 +324,7 @@ mod tests {
                     path: path.clone(),
                     anchor: target,
                     text: "X\nY".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -338,6 +352,7 @@ mod tests {
                     path: path.clone(),
                     anchor: target,
                     text: "X".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -362,6 +377,7 @@ mod tests {
                     path: path.clone(),
                     anchor: format!("{unused}§a"),
                     text: "X".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -390,6 +406,7 @@ mod tests {
                     anchor: trimmed_match.clone(),
                     end_anchor: trimmed_match,
                     text: "world".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -411,6 +428,7 @@ mod tests {
                     anchor: wrong.clone(),
                     end_anchor: wrong,
                     text: "x".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -434,6 +452,7 @@ mod tests {
                     path: path.clone(),
                     anchor: "no-section-sigil-here".into(),
                     text: "X".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -451,12 +470,254 @@ mod tests {
                     path: "/uncached".into(),
                     anchor: "Apple§a".into(),
                     text: "X".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not cached"));
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_rejected_uniform() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb\nc"), 100, 5)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        let err = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "Apple§foo\nBanana§bar".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        let EditError::AnchorPastebackDetected { anchors } = err else {
+            panic!("expected AnchorPastebackDetected, got {err:?}");
+        };
+        assert!(anchors.contains("Apple"), "missing Apple in {anchors}");
+        assert!(anchors.contains("Banana"), "missing Banana in {anchors}");
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_detector_is_structural() {
+        // Invented anchor words (not in the file's live anchor set) still
+        // trip the guard — the detector is structural, not membership-based.
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb\nc"), 100, 5)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+        let invented_a = unused_dict_word(&session, &path);
+
+        let err = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: format!("{invented_a}§foo\n{invented_a}§bar"),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_single_line_rejected() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        let err = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "Apple§foo".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_mixed_payload_passes() {
+        // One coincidental `Word§` line among real content is evidence
+        // *against* paste-back — the model is editing legitimately.
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "Apple§foo\nreal code here".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["a", "Apple§foo", "real code here", "b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_blank_separators_dont_defeat() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        let err = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "Apple§foo\n\nBanana§bar".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_legit_content_passes() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "fn main() {}\n    let x = 1;".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["a", "fn main() {}", "    let x = 1;", "b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_override_allows_through() {
+        // With `bypass_anchor_guard: true`, anchor-shaped payload is
+        // written verbatim — for the rare legitimate case of editing the
+        // anchor engine itself, a test fixture, or prose.
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "Apple§foo\nBanana§bar".into(),
+                    bypass_anchor_guard: true,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["a", "Apple§foo", "Banana§bar", "b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_anchor_pasteback_preserves_cache() {
+        // Same contract as edit_validation_failure_preserves_cache:
+        // a guard rejection must not corrupt the session cache.
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb\nc"), 100, 5)
+            .await
+            .unwrap();
+        let target = anchor_field(&session, &path, 0);
+
+        let err = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target.clone(),
+                    text: "Apple§foo\nBanana§bar".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
+
+        // Retry with clean content succeeds.
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "real new line".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["a", "real new line", "b", "c"]
+        );
     }
 
     #[tokio::test]
@@ -474,6 +735,7 @@ mod tests {
                     path: path.clone(),
                     anchor: "MissingWord§a".into(),
                     text: "X".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -490,6 +752,7 @@ mod tests {
                     anchor: target.clone(),
                     end_anchor: target,
                     text: "B2".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -614,6 +877,7 @@ mod tests {
                     anchor: target.clone(),
                     end_anchor: target,
                     text: "A2".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )

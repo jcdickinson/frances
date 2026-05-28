@@ -5,7 +5,7 @@ use crate::render::{DiffRender, render_diff_block};
 use crate::{AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile};
 
 use super::types::{EditError, EditResult};
-use super::{DIFF_CONTEXT, EditSession, split_text_to_lines};
+use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 impl<S: AnchorStore> EditSession<S> {
     /// Create a brand-new file. Fails if the file already exists on disk —
@@ -53,11 +53,15 @@ impl<S: AnchorStore> EditSession<S> {
         &mut self,
         path: &Path,
         text: &str,
+        bypass_anchor_guard: bool,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
     {
+        if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
+            return Err(EditError::AnchorPastebackDetected { anchors });
+        }
         let working = self
             .open_files
             .get(path)
@@ -187,6 +191,7 @@ mod tests {
                 LlmEdit::Overwrite {
                     path: path.clone(),
                     text: "x\ny\nz".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
@@ -202,6 +207,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_overwrite_anchor_pasteback_rejected() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+
+        let err = session
+            .edit(
+                LlmEdit::Overwrite {
+                    path: path.clone(),
+                    text: "Apple§foo\nBanana§bar".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
+        assert_eq!(session.open_files[&path].lines, vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn edit_overwrite_anchor_pasteback_override_allows_through() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("a\nb"), 100, 3)
+            .await
+            .unwrap();
+
+        session
+            .edit(
+                LlmEdit::Overwrite {
+                    path: path.clone(),
+                    text: "Apple§foo\nBanana§bar".into(),
+                    bypass_anchor_guard: true,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["Apple§foo", "Banana§bar"]
+        );
+    }
+
+    #[tokio::test]
     async fn edit_overwrite_without_read_errors() {
         let mut session = fresh_session();
         let err = session
@@ -209,6 +264,7 @@ mod tests {
                 LlmEdit::Overwrite {
                     path: "/never-read".into(),
                     text: "x".into(),
+                    bypass_anchor_guard: false,
                 },
                 no_format,
             )
