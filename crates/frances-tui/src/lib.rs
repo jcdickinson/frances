@@ -25,7 +25,8 @@ pub use block::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
 pub use widget::{
-    Border, EventContext, EventOutcome, Flex, FlexChild, FlexDirection, Focus, FocusId,
-    FocusManager, Grid, HStack, Input, ParaWidget, RenderContext, TEXT_INPUT_HEIGHT, TextInput,
-    TextLine, Theme, VStack, Widget, WidgetState,
+    AnimationGate, AnimationLease, AtomicFrameTime, Border, EventContext, EventOutcome,
+    FixedFrameTime, Flex, FlexChild, FlexDirection, Focus, FocusId, FocusManager, FrameTime, Grid,
+    HStack, Input, ParaWidget, RenderContext, TEXT_INPUT_HEIGHT, TextInput, TextLine, Theme,
+    VStack, WallClockFrameTime, Widget, WidgetState,
 };

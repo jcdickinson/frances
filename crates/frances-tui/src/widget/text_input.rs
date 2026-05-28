@@ -8,13 +8,18 @@
 //! terminal cursor stays hidden upstream — same model as the
 //! pre-Phase-B `FooterBlock`.
 
+use std::cell::RefCell;
+
 use crossterm::event::Event;
-use ratatui::style::Style;
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders};
 use ratatui_textarea::TextArea;
 
-use super::{EventContext, EventOutcome, FocusManager, Input, RenderContext, Widget, WidgetState};
+use super::{
+    AnimationLease, EventContext, EventOutcome, FocusManager, Input, RenderContext, Widget,
+    WidgetState,
+};
 
 /// Total rows occupied by a single-line `TextInput`: top + bottom
 /// border = 2 + 1 row of text. Mirrors the pre-Phase-B
@@ -23,7 +28,12 @@ pub const TEXT_INPUT_HEIGHT: u16 = 3;
 
 pub struct TextInput {
     textarea: TextArea<'static>,
-    status: Option<String>,
+    status: Option<(String, Color)>,
+    /// Animation lease held while `status` is `Some`. Reconciled in
+    /// `render` (which is where we have access to the gate via
+    /// [`RenderContext`]); cleared one render after [`set_status`]
+    /// drops the status text.
+    animation_lease: RefCell<Option<AnimationLease>>,
     state: WidgetState,
 }
 
@@ -38,6 +48,7 @@ impl TextInput {
         Self {
             textarea,
             status: None,
+            animation_lease: RefCell::new(None),
             state: WidgetState {
                 focus_id: Some(focus.allocate()),
                 ..WidgetState::default()
@@ -62,9 +73,15 @@ impl TextInput {
     }
 
     /// Set the status text inset on the top border (e.g.
-    /// `┌─ streaming… ─────┐`). `None` clears it.
-    pub fn set_status(&mut self, status: Option<impl Into<String>>) {
-        self.status = status.map(Into::into);
+    /// `┌─ [working…] ─────┐`). `None` clears it. The text is rendered
+    /// in the dim variant of `color`; a single bright cell pulses
+    /// across the line, paced by the [`FrameTime`] in the active
+    /// [`RenderContext`](super::RenderContext) so the animation stays
+    /// steady regardless of redraw frequency.
+    ///
+    /// [`FrameTime`]: super::FrameTime
+    pub fn set_status(&mut self, status: Option<(impl Into<String>, Color)>) {
+        self.status = status.map(|(s, color)| (s.into(), color));
     }
 }
 
@@ -100,19 +117,31 @@ impl Widget for TextInput {
         if ctx.area.width == 0 || ctx.area.height == 0 {
             return;
         }
+        // Reconcile the animation lease with the current status:
+        // we hold one iff there's something to animate.
+        let want_lease = self.status.as_ref().is_some_and(|(s, _)| !s.is_empty());
+        let mut lease_slot = self.animation_lease.borrow_mut();
+        match (want_lease, lease_slot.is_some()) {
+            (true, false) => *lease_slot = Some(ctx.animation_lease()),
+            (false, true) => *lease_slot = None,
+            _ => {}
+        }
+        drop(lease_slot);
+
         // Re-apply the border each frame so the status-title text
         // can change between frames without redoing the textarea's
         // internal state. The clone is cheap — TextArea owns Strings
         // and styles; no internal handles or animations.
-        let block = match self.status.as_deref().filter(|s| !s.is_empty()) {
-            Some(s) => Block::default()
-                .borders(Borders::ALL)
-                .style(ctx.theme.border)
-                .title(Line::from(vec![
-                    Span::raw("─ "),
-                    Span::styled(s.to_string(), ctx.theme.status),
-                    Span::raw(" "),
-                ])),
+        let block = match self.status.as_ref().filter(|(s, _)| !s.is_empty()) {
+            Some((s, color)) => {
+                let mut spans = vec![Span::raw("─ ")];
+                spans.extend(pulse_spans(s, *color, ctx.frame_time.get_frame()));
+                spans.push(Span::raw(" "));
+                Block::default()
+                    .borders(Borders::ALL)
+                    .style(ctx.theme.border)
+                    .title(Line::from(spans))
+            }
             None => Block::default()
                 .borders(Borders::ALL)
                 .style(ctx.theme.border),
@@ -120,6 +149,74 @@ impl Widget for TextInput {
         let mut snapshot = self.textarea.clone();
         snapshot.set_block(block);
         ratatui::widgets::Widget::render(&snapshot, ctx.area, &mut *ctx.buf);
+    }
+}
+
+/// Render `text` as a `DarkGray` base with a two-cell "comet" walking
+/// right-to-left: a bright cell (the bright ANSI variant of `color`)
+/// followed by a regular `color` cell. The pair wraps around the
+/// right edge with no rest gap.
+///
+/// Cell 0 is special — it's painted at the bright variant regardless
+/// of the comet's position. Callers prefix a spinner glyph there so
+/// the indicator's lead stays visible at all times.
+///
+/// `frame` is in 60fps units (see [`FrameTime`](super::FrameTime)); the
+/// comet steps one cell every six frames (~10 Hz) regardless of host
+/// redraw frequency.
+fn pulse_spans(text: &str, color: Color, frame: f64) -> Vec<Span<'static>> {
+    let chars: Vec<char> = text.chars().collect();
+    let n = chars.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let bright = Style::default().fg(brighter(color));
+    let normal = Style::default().fg(color);
+    let bg = Style::default().fg(Color::DarkGray);
+
+    // Cell 0 is the always-bright spinner; the comet rides over cells
+    // 1..n. With one comet cell (text of length 2) we collapse the
+    // pair onto a single position.
+    let comet_len = n.saturating_sub(1);
+    let (head_pos, tail_pos) = if comet_len == 0 {
+        (None, None)
+    } else {
+        let step = (frame / 6.0).rem_euclid(comet_len as f64) as usize;
+        let head_rel = (comet_len - 1) - step;
+        let tail_rel = (head_rel + 1) % comet_len;
+        (Some(head_rel + 1), Some(tail_rel + 1))
+    };
+
+    chars
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let style = if i == 0 || Some(i) == head_pos {
+                bright
+            } else if Some(i) == tail_pos {
+                normal
+            } else {
+                bg
+            };
+            Span::styled(c.to_string(), style)
+        })
+        .collect()
+}
+
+/// Bright variant of an ANSI 16-colour foreground. The standard
+/// `Color::Red` etc. map to their `Light*` counterparts; anything
+/// already bright (or outside the named palette) is returned as-is.
+fn brighter(color: Color) -> Color {
+    match color {
+        Color::Black => Color::DarkGray,
+        Color::Red => Color::LightRed,
+        Color::Green => Color::LightGreen,
+        Color::Yellow => Color::LightYellow,
+        Color::Blue => Color::LightBlue,
+        Color::Magenta => Color::LightMagenta,
+        Color::Cyan => Color::LightCyan,
+        Color::Gray => Color::White,
+        other => other,
     }
 }
 
@@ -198,12 +295,15 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let theme = Theme::default();
         let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
         let mut ctx = RenderContext {
             area,
             buf: &mut buf,
             theme: &theme,
             focus: &focus,
-            frame: 0,
+            frame_time: &frame_time,
+            animation: &animation,
         };
         input.render(&mut ctx);
         assert_eq!(buf[(0, 0)].symbol(), "┌");
@@ -216,18 +316,21 @@ mod tests {
     fn status_title_lands_on_top_border() {
         let mut mgr = FocusManager::new();
         let mut input = TextInput::new(&mut mgr, "hi");
-        input.set_status(Some("streaming"));
+        input.set_status(Some(("streaming", Color::Cyan)));
         let area = Rect::new(0, 0, 20, 3);
         input.layout(area);
         let mut buf = Buffer::empty(area);
         let theme = Theme::default();
         let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
         let mut ctx = RenderContext {
             area,
             buf: &mut buf,
             theme: &theme,
             focus: &focus,
-            frame: 0,
+            frame_time: &frame_time,
+            animation: &animation,
         };
         input.render(&mut ctx);
         // Top border row contains "─ streaming " somewhere after the
@@ -239,5 +342,84 @@ mod tests {
             row.contains("streaming"),
             "expected status text on top border, got `{row}`"
         );
+    }
+
+    #[test]
+    fn animation_lease_tracks_status_presence() {
+        let mut mgr = FocusManager::new();
+        let mut input = TextInput::new(&mut mgr, "hi");
+        let area = Rect::new(0, 0, 20, 3);
+        input.layout(area);
+        let theme = Theme::default();
+        let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
+
+        let render = |input: &TextInput| {
+            let mut buf = Buffer::empty(area);
+            let mut ctx = RenderContext {
+                area,
+                buf: &mut buf,
+                theme: &theme,
+                focus: &focus,
+                frame_time: &frame_time,
+                animation: &animation,
+            };
+            input.render(&mut ctx);
+        };
+
+        // No status → no lease taken.
+        render(&input);
+        assert_eq!(animation.active(), 0);
+
+        // Setting status → render acquires a lease.
+        input.set_status(Some(("streaming", Color::Cyan)));
+        render(&input);
+        assert_eq!(animation.active(), 1);
+
+        // Re-rendering doesn't double-acquire.
+        render(&input);
+        assert_eq!(animation.active(), 1);
+
+        // Clearing status → next render drops the lease.
+        input.set_status(Option::<(&str, Color)>::None);
+        render(&input);
+        assert_eq!(animation.active(), 0);
+    }
+
+    #[test]
+    fn pulse_spans_walks_comet_right_to_left() {
+        use crate::widget::{AtomicFrameTime, FrameTime};
+
+        let clock = AtomicFrameTime::new(0.0);
+        // 6-char text → spinner at 0, comet over 1..6 (5 positions).
+        // At frame 0 the head sits at the rightmost comet cell.
+        let spans = pulse_spans("Sabcde", Color::Red, clock.get_frame());
+        let styles: Vec<Style> = spans.iter().map(|s| s.style).collect();
+
+        let bright = Style::default().fg(Color::LightRed);
+        let normal = Style::default().fg(Color::Red);
+        let bg = Style::default().fg(Color::DarkGray);
+
+        // Spinner column is always bright.
+        assert_eq!(styles[0], bright);
+        // Comet head at the right edge; tail wraps to position 1.
+        assert_eq!(styles[5], bright);
+        assert_eq!(styles[1], normal);
+        assert_eq!(styles[2], bg);
+        assert_eq!(styles[3], bg);
+        assert_eq!(styles[4], bg);
+
+        // One step later (6 frames at 60fps == one cell): head moves
+        // one cell left, tail follows.
+        clock.set(6.0);
+        let styles: Vec<Style> = pulse_spans("Sabcde", Color::Red, clock.get_frame())
+            .iter()
+            .map(|s| s.style)
+            .collect();
+        assert_eq!(styles[0], bright);
+        assert_eq!(styles[4], bright);
+        assert_eq!(styles[5], normal);
+        assert_eq!(styles[1], bg);
     }
 }

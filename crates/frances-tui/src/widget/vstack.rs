@@ -166,12 +166,15 @@ mod tests {
         let mut buf = Buffer::empty(area);
         let theme = Theme::default();
         let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
         let mut ctx = RenderContext {
             area,
             buf: &mut buf,
             theme: &theme,
             focus: &focus,
-            frame: 0,
+            frame_time: &frame_time,
+            animation: &animation,
         };
         stack.render(&mut ctx);
         buf

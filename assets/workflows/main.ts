@@ -769,7 +769,7 @@ type TurnEnd = "idle" | "interjected";
 async function turn(): Promise<TurnEnd> {
   let resetCount = 0;
   while (true) {
-    setStatus("thinking…");
+    setStatus("working…");
     const cp = await chat.checkpoint();
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });

@@ -71,7 +71,10 @@ use crossterm::event::Event;
 
 use crate::block::{Block, BlockMeasureContext, BlockRenderContext, SIGIL_WIDTH};
 use crate::scrollback_backend::{BackendMode, ScrollbackBackend, SyncGuard};
-use crate::widget::{EventContext, EventOutcome, Focus, RenderContext, Theme, Widget};
+use crate::widget::{
+    AnimationGate, AnimationLease, EventContext, EventOutcome, Focus, FrameTime, RenderContext,
+    Theme, Widget,
+};
 
 /// Per-frame state the container threads through to the footer
 /// widget's [`Widget::render`]. Bundled so [`ScrollbackContainer::draw`]
@@ -80,7 +83,8 @@ use crate::widget::{EventContext, EventOutcome, Focus, RenderContext, Theme, Wid
 pub struct DrawContext<'a> {
     pub theme: &'a Theme,
     pub focus: &'a Focus,
-    pub frame: u64,
+    pub frame_time: &'a dyn FrameTime,
+    pub animation: &'a AnimationGate,
 }
 
 /// Adapter: lets ratatui render any [`crate::widget::Widget`] through
@@ -91,7 +95,8 @@ struct WidgetRenderAdapter<'a> {
     widget: &'a dyn Widget,
     theme: &'a Theme,
     focus: &'a Focus,
-    frame: u64,
+    frame_time: &'a dyn FrameTime,
+    animation: &'a AnimationGate,
 }
 
 impl<'a> RatatuiWidget for WidgetRenderAdapter<'a> {
@@ -101,7 +106,8 @@ impl<'a> RatatuiWidget for WidgetRenderAdapter<'a> {
             buf,
             theme: self.theme,
             focus: self.focus,
-            frame: self.frame,
+            frame_time: self.frame_time,
+            animation: self.animation,
         };
         self.widget.render(&mut ctx);
     }
@@ -252,13 +258,18 @@ pub struct ScrollbackContainer {
     /// pushes land at the bottom — they just bump the ordinal
     /// distance from the selected block, never invalidate it.
     selected_from_newest: Option<u16>,
-    /// When `Some(frame)`, every entry in `active` gets a spinner glyph
+    /// When `true`, every entry in `active` gets a spinner glyph
     /// painted over the rightmost non-blank cell of its last row, so
     /// users can see at a glance which blocks haven't been committed
-    /// yet. The app drives the animation via `bump_spinner`; left
-    /// `None` (the default) the container behaves as if spinners
-    /// didn't exist, which is what the tests rely on.
-    spinner_frame: Option<u8>,
+    /// yet. The container picks the current glyph from
+    /// [`DrawContext::frame_time`] on each draw — no external bump.
+    /// Default `false` means the container behaves as if spinners
+    /// didn't exist, which is what most tests rely on.
+    spinner_enabled: bool,
+    /// Animation lease held while the spinner is on and there's at
+    /// least one entry to draw it over. Tells the host's redraw loop
+    /// to keep ticking; cleared when the spinner has nothing to show.
+    spinner_lease: Option<AnimationLease>,
 }
 
 /// Braille-dot frames cycled through by `bump_spinner`. Single-cell
@@ -303,32 +314,48 @@ impl ScrollbackContainer {
             scrollback_active: false,
             scrollback_offset: 0,
             selected_from_newest: None,
-            spinner_frame: None,
+            spinner_enabled: false,
+            spinner_lease: None,
         }
     }
 
     /// Turn on the active-block spinner overlay. After this every
     /// entry in `active` gets a single-cell braille glyph painted over
-    /// the rightmost non-blank cell of its last visible row. Call
-    /// `bump_spinner` periodically to advance the glyph.
+    /// the rightmost non-blank cell of its last visible row, advancing
+    /// in lockstep with [`DrawContext::frame_time`].
     pub fn enable_spinner(&mut self) {
-        if self.spinner_frame.is_none() {
-            self.spinner_frame = Some(0);
-        }
+        self.spinner_enabled = true;
     }
 
-    /// Advance the spinner one frame and mark every currently-tracked
-    /// active entry damaged so the next `draw` repaints them with
-    /// the new glyph. No-op when the spinner hasn't been enabled, or
-    /// when there are no active entries.
-    pub fn bump_spinner(&mut self) {
-        let Some(frame) = self.spinner_frame.as_mut() else {
-            return;
-        };
-        *frame = frame.wrapping_add(1);
-        for (_, entry) in self.active.iter_mut() {
-            if let Some(state) = entry.render.as_mut() {
-                state.damaged = true;
+    /// Frame to paint inside the spinner overlay this draw, plus
+    /// whether the container wants to hold an animation lease.
+    /// `None` when the spinner is off or there's nothing to draw it
+    /// over.
+    fn current_spinner_frame(&self, frame_time: &dyn FrameTime) -> Option<u8> {
+        if !self.spinner_enabled || self.active.is_empty() {
+            return None;
+        }
+        let idx = ((frame_time.get_frame() / 6.0).rem_euclid(SPINNER_FRAMES.len() as f64)) as u8;
+        Some(idx)
+    }
+
+    /// Reconcile the spinner's animation lease with the current state.
+    /// Call at the top of any draw path: takes a fresh lease when the
+    /// spinner first has something to show, drops it when it doesn't.
+    /// Also marks every active entry damaged when the spinner is on so
+    /// the glyph re-renders against this frame's `frame_time` value.
+    fn reconcile_spinner(&mut self, ctx: &DrawContext<'_>) {
+        let want = self.spinner_enabled && !self.active.is_empty();
+        match (want, self.spinner_lease.is_some()) {
+            (true, false) => self.spinner_lease = Some(ctx.animation.lease()),
+            (false, true) => self.spinner_lease = None,
+            _ => {}
+        }
+        if want {
+            for (_, entry) in self.active.iter_mut() {
+                if let Some(state) = entry.render.as_mut() {
+                    state.damaged = true;
+                }
             }
         }
     }
@@ -770,7 +797,7 @@ impl ScrollbackContainer {
                 // mark damaged so the next draw repaints the cell the
                 // spinner glyph overwrote with its real content.
                 let mut render = entry.render;
-                if self.spinner_frame.is_some()
+                if self.spinner_enabled
                     && let Some(state) = render.as_mut()
                 {
                     state.damaged = true;
@@ -879,6 +906,7 @@ impl ScrollbackContainer {
     where
         B: Backend<Error = io::Error> + Write,
     {
+        self.reconcile_spinner(ctx);
         let term_size = terminal.backend().terminal_size();
         let width = term_size.width;
         let terminal_h = term_size.height;
@@ -989,7 +1017,7 @@ impl ScrollbackContainer {
         // `active_order` only because an older entry hasn't drained yet,
         // and painting the spinner over them would misrepresent them as
         // still in flight.
-        let spinner_frame = self.spinner_frame;
+        let spinner_frame = self.current_spinner_frame(ctx.frame_time);
         for &id in self.active_order.iter() {
             let entry = match self.active.get_mut(id) {
                 Some(e) => e,
@@ -1149,7 +1177,8 @@ impl ScrollbackContainer {
                 widget: &*footer,
                 theme: ctx.theme,
                 focus: ctx.focus,
-                frame: ctx.frame,
+                frame_time: ctx.frame_time,
+                animation: ctx.animation,
             };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
@@ -1379,7 +1408,7 @@ impl ScrollbackContainer {
         // spinner is suppressed on entries already flagged
         // `safe_to_commit` (same reasoning as the natural-scroll path
         // above).
-        let spinner_frame = self.spinner_frame;
+        let spinner_frame = self.current_spinner_frame(ctx.frame_time);
         for (i, id) in visible_active_ids.iter().enumerate() {
             let entry = match self.active.get(*id) {
                 Some(e) => e,
@@ -1447,7 +1476,8 @@ impl ScrollbackContainer {
                 widget: &*footer,
                 theme: ctx.theme,
                 focus: ctx.focus,
-                frame: ctx.frame,
+                frame_time: ctx.frame_time,
+                animation: ctx.animation,
             };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
@@ -1539,6 +1569,7 @@ impl ScrollbackContainer {
     where
         B: Backend<Error = io::Error> + Write,
     {
+        self.reconcile_spinner(ctx);
         let term_size = terminal.backend().terminal_size();
         let width = term_size.width;
         let height = term_size.height;
@@ -1632,7 +1663,8 @@ impl ScrollbackContainer {
                 widget: &*footer,
                 theme: ctx.theme,
                 focus: ctx.focus,
-                frame: ctx.frame,
+                frame_time: ctx.frame_time,
+                animation: ctx.animation,
             };
             terminal.draw(|frame| {
                 frame.render_widget(footer_widget, frame.area());
@@ -2069,6 +2101,8 @@ mod tests {
         footer: ParaWidget,
         theme: Theme,
         focus: Focus,
+        frame_time: crate::widget::AtomicFrameTime,
+        animation: crate::widget::AnimationGate,
     }
 
     impl Rig {
@@ -2078,6 +2112,8 @@ mod tests {
                 footer: (*footer).into(),
                 theme: Theme::default(),
                 focus: Focus::new(),
+                frame_time: crate::widget::AtomicFrameTime::new(0.0),
+                animation: crate::widget::AnimationGate::new(),
             }
         }
 
@@ -2092,7 +2128,8 @@ mod tests {
             let ctx = DrawContext {
                 theme: &self.theme,
                 focus: &self.focus,
-                frame: 0,
+                frame_time: &self.frame_time,
+                animation: &self.animation,
             };
             self.container.draw(terminal, &mut self.footer, &ctx)
         }
@@ -2107,7 +2144,8 @@ mod tests {
             let ctx = DrawContext {
                 theme: &self.theme,
                 focus: &self.focus,
-                frame: 0,
+                frame_time: &self.frame_time,
+                animation: &self.animation,
             };
             self.container
                 .paint_scrollback(terminal, &mut self.footer, &ctx)
@@ -2874,7 +2912,7 @@ mod tests {
             status: TextLine::new("status"),
             state: WidgetState::default(),
         };
-        footer.input.set_status(Some("streaming"));
+        footer.input.set_status(Some(("streaming", Color::Cyan)));
 
         let mut terminal = mk_term_terminal(32, 14);
         let mut container = ScrollbackContainer::new(5);
@@ -2883,10 +2921,13 @@ mod tests {
 
         let theme = Theme::default();
         let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
         let ctx = DrawContext {
             theme: &theme,
             focus: &focus,
-            frame: 0,
+            frame_time: &frame_time,
+            animation: &animation,
         };
         container.draw(&mut terminal, &mut footer, &ctx).unwrap();
 
@@ -3002,11 +3043,11 @@ mod tests {
     }
 
     /// Same as [`growing_active_block_does_not_leak_block_borders`]
-    /// but with the spinner enabled — bump_spinner marks the active
-    /// entry damaged every spinner tick, so the active block goes
-    /// through the redraw path even when its measure hasn't changed,
-    /// and a spinner glyph is overlaid on its last row. The real
-    /// streaming scenario always has the spinner on.
+    /// but with the spinner enabled — every draw marks the active
+    /// entry damaged, so the active block goes through the redraw
+    /// path even when its measure hasn't changed, and a spinner glyph
+    /// is overlaid on its last row. The real streaming scenario
+    /// always has the spinner on.
     #[test]
     fn growing_active_block_with_spinner_does_not_leak_block_borders() {
         use ratatui::widgets::{Block as RatBlock, Borders};
@@ -3035,8 +3076,11 @@ mod tests {
             vec!["A1", "A2", "A3", "A4"],
             vec!["A1", "A2", "A3", "A4", "A5"],
         ];
-        for new_lines in &updates {
-            rig.bump_spinner();
+        for (i, new_lines) in updates.iter().enumerate() {
+            // Advance the rig's frame clock past the next spinner-glyph
+            // boundary (one glyph step is 6 frames at 60fps) so each
+            // iteration paints the next braille frame.
+            rig.frame_time.set(((i + 1) * 6) as f64);
             rig.update_active(active, multi_text(&new_lines.to_vec()));
             rig.draw(&mut terminal).unwrap();
         }
@@ -4231,11 +4275,11 @@ mod tests {
         );
     }
 
-    /// `bump_spinner` advances the glyph and marks every active entry
-    /// damaged, so the next draw repaints with the new frame in the
-    /// trailing slot.
+    /// Advancing `frame_time` past the next spinner-glyph boundary
+    /// (one glyph = 6 frames at 60fps) flips the rendered glyph on
+    /// the next draw.
     #[test]
-    fn bump_spinner_advances_glyph_on_next_draw() {
+    fn frame_time_advance_flips_spinner_glyph_on_next_draw() {
         let mut terminal = mk_term_terminal(80, 5);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.enable_spinner();
@@ -4244,7 +4288,7 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠋");
 
-        container.bump_spinner();
+        container.frame_time.set(6.0);
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠙");
     }

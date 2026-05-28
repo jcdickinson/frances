@@ -27,10 +27,12 @@
 //! on the widget keeps render closures small and lets parent
 //! containers reach into a child's resolved rect when needed.
 
+pub mod animation;
 pub mod border;
 pub mod context;
 pub mod flex;
 pub mod focus;
+pub mod frame_time;
 pub mod grid;
 pub mod hstack;
 pub mod input;
@@ -41,10 +43,12 @@ pub mod text_line;
 pub mod theme;
 pub mod vstack;
 
+pub use animation::{AnimationGate, AnimationLease};
 pub use border::Border;
 pub use context::{EventContext, RenderContext};
 pub use flex::{Flex, FlexChild, FlexDirection};
 pub use focus::{Focus, FocusId, FocusManager};
+pub use frame_time::{AtomicFrameTime, FixedFrameTime, FrameTime, WallClockFrameTime};
 pub use grid::Grid;
 pub use hstack::HStack;
 pub use input::{EventOutcome, Input};

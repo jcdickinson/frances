@@ -51,8 +51,8 @@ use frances_tui::block::Sigil;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{
-    Block, BlockId, BlockKind, BlockMeasureContext, BlockRenderContext, Focus, ParaWidget,
-    ScrollbackBackend, ScrollbackContainer, Theme,
+    AnimationGate, Block, BlockId, BlockKind, BlockMeasureContext, BlockRenderContext, Focus,
+    ParaWidget, ScrollbackBackend, ScrollbackContainer, Theme, WallClockFrameTime,
 };
 
 const VARSIZE_MAX: u16 = 5;
@@ -95,6 +95,8 @@ fn run() -> io::Result<()> {
     let mut footer_content: u16 = 2;
     let mut container = ScrollbackContainer::new(cursor_row);
     let theme = Theme::default();
+    let frame_time = WallClockFrameTime::new();
+    let animation = AnimationGate::new();
     let mut focus = Focus::new();
     // Declared but uninitialised: every loop iteration overwrites
     // `footer` before reading it. Rust's CFG accepts this.
@@ -116,7 +118,8 @@ fn run() -> io::Result<()> {
         let ctx = DrawContext {
             theme: &theme,
             focus: &focus,
-            frame: 0,
+            frame_time: &frame_time,
+            animation: &animation,
         };
         if container.scrollback() {
             container.paint_scrollback(&mut terminal, &mut footer, &ctx)?;
@@ -209,7 +212,8 @@ fn run() -> io::Result<()> {
                             let ctx = DrawContext {
                                 theme: &theme,
                                 focus: &focus,
-                                frame: 0,
+                                frame_time: &frame_time,
+                                animation: &animation,
                             };
                             container.draw(&mut terminal, &mut footer, &ctx)?;
                             container.update_active(

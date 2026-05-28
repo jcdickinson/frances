@@ -5,9 +5,6 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub struct Theme {
-    /// Streaming-status text inset on a [`TextInput`](super::TextInput)
-    /// border title.
-    pub status: Style,
     /// Box-drawing characters for borders.
     pub border: Style,
     /// Title text styling on bordered widgets.
@@ -23,7 +20,6 @@ impl Theme {
     /// Default palette tuned for a dark terminal.
     pub fn default_dark() -> Self {
         Self {
-            status: Style::default().fg(Color::DarkGray),
             border: Style::default(),
             border_title: Style::default(),
             dim: Style::default().fg(Color::DarkGray),

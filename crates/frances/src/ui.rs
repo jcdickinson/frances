@@ -30,8 +30,8 @@ use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::{
-    BlockId as ContainerBlockId, EventContext, Focus, FocusManager, Input, ScrollbackBackend,
-    ScrollbackContainer, Theme, Widget,
+    AnimationGate, BlockId as ContainerBlockId, EventContext, Focus, FocusManager, FrameTime,
+    Input, ScrollbackBackend, ScrollbackContainer, Theme, WallClockFrameTime, Widget,
 };
 
 use crate::tui::{Footer, RawBlock, block_for_kind};
@@ -201,10 +201,11 @@ impl App<'_> {
         .context("init terminal")?;
 
         let theme = Theme::default();
+        let frame_time = WallClockFrameTime::new();
+        let animation = AnimationGate::new();
         let mut focus_manager = FocusManager::new();
         let mut focus = Focus::new();
         let mut footer = Footer::new(&mut focus_manager, "type a message…");
-        let mut frame_counter: u64 = 0;
         let mut container = ScrollbackContainer::new(cursor_row);
         container.enable_spinner();
         for (i, line) in self.banner_lines().into_iter().enumerate() {
@@ -231,24 +232,19 @@ impl App<'_> {
         let mut latest_usage: Option<Usage> = None;
         let mut spinner_tick = time::interval(Duration::from_millis(120));
         spinner_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // Wall-clock-paced frame index for the status spinner. Bumped on
-        // every `spinner_tick` so the cadence stays stable regardless of
-        // whether the indicator is currently shown.
-        let mut status_frame: u8 = 0;
 
         loop {
-            frame_counter = frame_counter.wrapping_add(1);
-            redraw(
-                &mut terminal,
-                &mut container,
-                &mut footer,
-                &theme,
-                &mut focus,
-                frame_counter,
-                status.as_deref(),
-                status_frame,
-                latest_usage.as_ref(),
-            )?;
+            redraw(RedrawArgs {
+                terminal: &mut terminal,
+                container: &mut container,
+                footer: &mut footer,
+                theme: &theme,
+                focus: &mut focus,
+                frame_time: &frame_time,
+                animation: &animation,
+                status: status.as_deref(),
+                latest_usage: latest_usage.as_ref(),
+            })?;
 
             tokio::select! {
                 Some(event) = events.next() => {
@@ -352,11 +348,10 @@ impl App<'_> {
                         _ => {}
                     }
                 }
-                _ = spinner_tick.tick() => {
-                    status_frame = status_frame.wrapping_add(1);
-                    if container.active_count() > 0 {
-                        container.bump_spinner();
-                    }
+                _ = spinner_tick.tick(), if animation.active() > 0 => {
+                    // Wake-up only — animated widgets hold leases on
+                    // `animation`; this branch is disabled when no one
+                    // does. Repaint happens at the top of the loop.
                 }
                 Some(frame) = frame_rx.recv() => {
                     // The busy indicator is workflow-driven: a `Surface`
@@ -397,30 +392,45 @@ impl App<'_> {
 /// vocabulary keeps the two animations feeling like one family.
 const STATUS_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Render the workflow-set status text with the current spinner glyph.
-fn status_line(text: &str, frame: u8) -> String {
-    let glyph = STATUS_FRAMES[(frame as usize) % STATUS_FRAMES.len()];
-    format!("{glyph} {text}")
+/// Render the workflow-set status text as `{spinner} [text]`, sharing
+/// the bracketed-pill convention with block headers (shell, reasoning).
+/// The [`TextInput`](frances_tui::TextInput) widget paints it as dim
+/// text with a single bright cell pulsing across the line; the colour
+/// here picks the hue of that pulse. `frame` is in 60fps units; the
+/// glyph advances one cell every six frames (~10 Hz).
+fn status_line(text: &str, frame: f64) -> (String, Color) {
+    let glyph = STATUS_FRAMES[((frame / 6.0) as usize) % STATUS_FRAMES.len()];
+    (format!("{glyph} [{text}]"), Color::Cyan)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "redraw threads frame-state by-ref; bundling into a struct just renames the pain."
-)]
-fn redraw(
-    terminal: &mut AppTerminal,
-    container: &mut ScrollbackContainer,
-    footer: &mut Footer,
-    theme: &Theme,
-    focus: &mut Focus,
-    frame: u64,
-    status: Option<&str>,
-    status_frame: u8,
-    latest_usage: Option<&Usage>,
-) -> std::io::Result<()> {
+struct RedrawArgs<'a> {
+    terminal: &'a mut AppTerminal,
+    container: &'a mut ScrollbackContainer,
+    footer: &'a mut Footer,
+    theme: &'a Theme,
+    focus: &'a mut Focus,
+    frame_time: &'a dyn FrameTime,
+    animation: &'a AnimationGate,
+    status: Option<&'a str>,
+    latest_usage: Option<&'a Usage>,
+}
+
+fn redraw(args: RedrawArgs<'_>) -> std::io::Result<()> {
+    let RedrawArgs {
+        terminal,
+        container,
+        footer,
+        theme,
+        focus,
+        frame_time,
+        animation,
+        status,
+        latest_usage,
+    } = args;
+
     footer
         .input
-        .set_status(status.map(|text| status_line(text, status_frame)));
+        .set_status(status.map(|text| status_line(text, frame_time.get_frame())));
     let token_text = latest_usage
         .map(format_token_status)
         .unwrap_or_else(|| "tokens: —".to_string());
@@ -433,7 +443,8 @@ fn redraw(
     let ctx = DrawContext {
         theme,
         focus,
-        frame,
+        frame_time,
+        animation,
     };
 
     if container.scrollback() {
