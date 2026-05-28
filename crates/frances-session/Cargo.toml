@@ -45,3 +45,10 @@ frances-workflow.workspace = true
 
 [dev-dependencies]
 frances-edit = { workspace = true, features = ["test-utils"] }
+frances-config = { workspace = true, features = ["test-util"] }
+frances-llm = { workspace = true, features = ["test-util"] }
+frances-workflow = { workspace = true, features = ["test-utils"] }
+frances-models-llm = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
