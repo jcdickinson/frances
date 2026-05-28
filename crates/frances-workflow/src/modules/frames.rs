@@ -41,7 +41,7 @@ use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as Js
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{FrameId, FrameKind, FrameSpec, TranscriptDelta};
+use crate::runtime::{FrameId, FrameKind, FrameSpec, Source, TranscriptDelta};
 
 /// Shared state for the v1 frames surface. One per workflow invocation.
 pub(crate) struct FramesState {
@@ -163,7 +163,7 @@ fn push_frame<'js>(
         borrow.id.store(new_id, Ordering::Release);
         let frame = FrameSpec {
             kind: FrameKind::Markdown {
-                sender: borrow.sender.clone(),
+                source: borrow.source,
             },
             seed: borrow.content.clone(),
         };
@@ -328,8 +328,10 @@ pub struct MarkdownFrame {
     /// straight to the host channel; we don't reconstruct the full text
     /// here.
     content: Option<String>,
-    /// Optional speaker label. `None` ⇒ the host renders no prefix.
-    sender: Option<String>,
+    /// Speaker for the frame. Drives the host-side sigil. Defaults to
+    /// [`Source::Internal`] when the workflow omits `source` — that's the
+    /// "no prefix" / chrome case (greetings, plan dumps, tag bodies).
+    source: Source,
     /// Flipped by [`close_frame`] (either explicit `.close()` or the
     /// writable's auto-close hook on the JS side). Subsequent writes
     /// throw; subsequent closes are no-ops.
@@ -1043,14 +1045,14 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-            let (content, sender, closed) = parse_markdown_arg(&ctx, &arg)?;
+            let (content, source, closed) = parse_markdown_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
                 MarkdownFrame {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     content,
-                    sender,
+                    source,
                     closed: AtomicBool::new(closed),
                 },
             )
@@ -1214,24 +1216,24 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
 }
 
-/// Parse `new MarkdownFrame({ content?, sender?, closed? })`. `content`
-/// and `sender` are both optional; absent / `undefined` / `null` map to
-/// `None`. `closed` is an optional bool defaulting to `false`; when
-/// `true` the frame's `closed` flag is pre-set so `transcript.push`
-/// emits a `Close` immediately after the `Push` — useful for one-shot
-/// frames like a greeting or echoed user message. Anything other than
-/// a string for the text fields or a bool for `closed` throws.
+/// Parse `new MarkdownFrame({ content?, source?, closed? })`. `content`
+/// is optional; absent / `undefined` / `null` map to `None`. `source`
+/// is one of `"user"`, `"assistant"`, `"internal"`; absent → `Internal`.
+/// `closed` is an optional bool defaulting to `false`; when `true` the
+/// frame's `closed` flag is pre-set so `transcript.push` emits a `Close`
+/// immediately after the `Push` — useful for one-shot frames like a
+/// greeting or echoed user message. Anything else throws.
 fn parse_markdown_arg<'js>(
     ctx: &Ctx<'js>,
     arg: &Value<'js>,
-) -> JsResult<(Option<String>, Option<String>, bool)> {
+) -> JsResult<(Option<String>, Source, bool)> {
     if arg.is_undefined() || arg.is_null() {
-        return Ok((None, None, false));
+        return Ok((None, Source::Internal, false));
     }
     let Some(obj) = arg.as_object() else {
         return Err(throw_err(
             ctx,
-            "new MarkdownFrame: expected { content?: string, sender?: string } or no argument",
+            "new MarkdownFrame: expected { content?: string, source?: \"user\"|\"assistant\"|\"internal\" } or no argument",
         ));
     };
     let content_val: Value<'js> = obj
@@ -1250,24 +1252,36 @@ fn parse_markdown_arg<'js>(
             "new MarkdownFrame: `content` must be a string when present",
         ));
     };
-    let sender_val: Value<'js> = obj
-        .get("sender")
+    let source_val: Value<'js> = obj
+        .get("source")
         .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
-    let sender =
-        if sender_val.is_undefined() || sender_val.is_null() {
-            None
-        } else if let Some(s) = sender_val.as_string() {
-            Some(s.to_string().map_err(|_| {
-                throw_err(ctx, "new MarkdownFrame: `sender` must be a UTF-8 string")
-            })?)
-        } else {
-            return Err(throw_err(
-                ctx,
-                "new MarkdownFrame: `sender` must be a string when present",
-            ));
-        };
+    let source = if source_val.is_undefined() || source_val.is_null() {
+        Source::Internal
+    } else if let Some(s) = source_val.as_string() {
+        let s = s
+            .to_string()
+            .map_err(|_| throw_err(ctx, "new MarkdownFrame: `source` must be UTF-8"))?;
+        match s.as_str() {
+            "user" => Source::User,
+            "assistant" => Source::Assistant,
+            "internal" => Source::Internal,
+            other => {
+                return Err(throw_err(
+                    ctx,
+                    &format!(
+                        "new MarkdownFrame: `source` must be \"user\", \"assistant\", or \"internal\" (got {other:?})"
+                    ),
+                ));
+            }
+        }
+    } else {
+        return Err(throw_err(
+            ctx,
+            "new MarkdownFrame: `source` must be a string when present",
+        ));
+    };
     let closed = parse_optional_bool(ctx, obj, "closed", "new MarkdownFrame: `closed`")?;
-    Ok((content, sender, closed))
+    Ok((content, source, closed))
 }
 
 /// Parse an optional bool field. Absent / `undefined` / `null` →

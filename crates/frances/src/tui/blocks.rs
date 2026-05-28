@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use crate::tui::status::{StatusTone, status_prefix};
 use frances_session::events::{
-    BlockKind as WireBlockKind, ReasoningState, ShellState, TailedHeader,
+    BlockKind as WireBlockKind, ReasoningState, ShellState, Source, TailedHeader,
 };
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
@@ -249,6 +249,24 @@ impl TailedBlock {
         }
     }
 
+    /// Left padding applied to body rows. Reasoning gets 2 cols so the
+    /// thought text reads as a visually subordinate aside.
+    fn body_indent(&self) -> u16 {
+        match &self.header {
+            TailedHeader::Reasoning { .. } => 2,
+            TailedHeader::Shell { .. } => 0,
+        }
+    }
+
+    /// Paint style for body rows. Reasoning is dimmed; shell output
+    /// stays default so it remains scannable.
+    fn body_style(&self) -> Style {
+        match &self.header {
+            TailedHeader::Reasoning { .. } => Style::default().add_modifier(Modifier::DIM),
+            TailedHeader::Shell { .. } => Style::default(),
+        }
+    }
+
     fn header_lines(&self, width: u16) -> Vec<String> {
         let (prefix, _style) = self.header_prefix();
         let mut out = Vec::new();
@@ -290,7 +308,8 @@ impl TailedBlock {
         if source.is_empty() {
             return Vec::new();
         }
-        let max = width.max(1) as usize;
+        let body_width = width.saturating_sub(self.body_indent());
+        let max = body_width.max(1) as usize;
         let mut out = Vec::new();
         if source.len() > tail {
             let start_offset = window_start.min(self.max_scroll_for(tail)) as usize;
@@ -403,6 +422,8 @@ impl Block for TailedBlock {
             }
             src_idx = src_idx.saturating_add(1);
         }
+        let body_indent = self.body_indent();
+        let body_style = self.body_style();
         for line in body.iter() {
             if src_idx >= src_y {
                 let dst_row = src_idx - src_y;
@@ -410,8 +431,12 @@ impl Block for TailedBlock {
                     paint_truncation_marker_if_set(ctx);
                     return;
                 }
-                ctx.buf
-                    .set_string(area.x, area.y + dst_row, line, Style::default());
+                ctx.buf.set_string(
+                    area.x.saturating_add(body_indent),
+                    area.y + dst_row,
+                    line,
+                    body_style,
+                );
             }
             src_idx = src_idx.saturating_add(1);
         }
@@ -679,8 +704,15 @@ impl<'a, 'b> RowWriter<'a, 'b> {
 
 pub fn prefix_for(kind: &WireBlockKind) -> String {
     match kind {
-        WireBlockKind::Text { sender: Some(s) } => format!("{s}: "),
-        WireBlockKind::Text { sender: None } => String::new(),
+        WireBlockKind::Text {
+            source: Source::User,
+        } => "> ".to_owned(),
+        WireBlockKind::Text {
+            source: Source::Assistant,
+        } => "◆ ".to_owned(),
+        WireBlockKind::Text {
+            source: Source::Internal,
+        } => String::new(),
         // The `detail`-bearing variant routes through `ToolUseBlock`; the
         // `LabelledBlock` path only sees plain tool-use markers.
         WireBlockKind::ToolUse { name, .. } => format!("→ {name}"),
@@ -756,70 +788,64 @@ mod tests {
     use super::*;
     use frances_session::events::DiffLine;
 
-    fn frances() -> WireBlockKind {
+    fn assistant() -> WireBlockKind {
         WireBlockKind::Text {
-            sender: Some("frances".into()),
+            source: Source::Assistant,
         }
     }
 
     #[test]
     fn no_trailing_newline_is_unchanged() {
-        let lines = wrapped_block_lines(&frances(), "Hello", 80);
-        assert_eq!(lines, vec!["frances: Hello"]);
+        let lines = wrapped_block_lines(&assistant(), "Hello", 80);
+        assert_eq!(lines, vec!["◆ Hello"]);
     }
 
     #[test]
     fn single_trailing_newline_is_stripped() {
-        let lines = wrapped_block_lines(&frances(), "Hello\n", 80);
+        let lines = wrapped_block_lines(&assistant(), "Hello\n", 80);
         assert_eq!(
             lines,
-            vec!["frances: Hello"],
+            vec!["◆ Hello"],
             "trailing `\\n` should not produce an indent-only continuation row"
         );
     }
 
     #[test]
     fn multiple_trailing_newlines_are_stripped() {
-        let lines = wrapped_block_lines(&frances(), "Hello\n\n\n", 80);
-        assert_eq!(lines, vec!["frances: Hello"]);
+        let lines = wrapped_block_lines(&assistant(), "Hello\n\n\n", 80);
+        assert_eq!(lines, vec!["◆ Hello"]);
     }
 
     #[test]
     fn mid_text_paragraph_break_is_preserved() {
-        let lines = wrapped_block_lines(&frances(), "One\n\nTwo", 80);
+        let lines = wrapped_block_lines(&assistant(), "One\n\nTwo", 80);
         assert_eq!(
             lines,
-            vec![
-                "frances: One".to_string(),
-                "         ".to_string(),
-                "         Two".to_string(),
-            ],
+            vec!["◆ One".to_string(), "  ".to_string(), "  Two".to_string(),],
             "an internal `\\n\\n` is a real paragraph break and stays"
         );
     }
 
     #[test]
     fn mid_text_paragraph_break_with_trailing_newline_keeps_only_the_break() {
-        let lines = wrapped_block_lines(&frances(), "One\n\nTwo\n", 80);
+        let lines = wrapped_block_lines(&assistant(), "One\n\nTwo\n", 80);
         assert_eq!(
             lines,
-            vec![
-                "frances: One".to_string(),
-                "         ".to_string(),
-                "         Two".to_string(),
-            ]
+            vec!["◆ One".to_string(), "  ".to_string(), "  Two".to_string(),]
         );
     }
 
     #[test]
     fn newline_only_text_collapses_to_just_the_prefix() {
-        let lines = wrapped_block_lines(&frances(), "\n", 80);
-        assert_eq!(lines, vec!["frances: "]);
+        let lines = wrapped_block_lines(&assistant(), "\n", 80);
+        assert_eq!(lines, vec!["◆ "]);
     }
 
     #[test]
-    fn senderless_text_block_with_trailing_newline_does_not_emit_blank_row() {
-        let kind = WireBlockKind::Text { sender: None };
+    fn internal_text_block_with_trailing_newline_does_not_emit_blank_row() {
+        let kind = WireBlockKind::Text {
+            source: Source::Internal,
+        };
         let lines = wrapped_block_lines(&kind, "Hello\n", 80);
         assert_eq!(lines, vec!["Hello"]);
     }
@@ -852,14 +878,14 @@ mod tests {
         fn labelled_block_text() {
             let b = LabelledBlock::new(
                 WireBlockKind::Text {
-                    sender: Some("frances".into()),
+                    source: Source::Assistant,
                 },
                 "hello".into(),
             );
             let r = round_trip(&b);
             assert_eq!(r.text, "hello");
             match r.kind {
-                WireBlockKind::Text { sender: Some(s) } => assert_eq!(&*s, "frances"),
+                WireBlockKind::Text { source } => assert_eq!(source, Source::Assistant),
                 _ => panic!("kind not preserved"),
             }
         }

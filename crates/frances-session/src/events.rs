@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
-pub use frances_workflow::SurfaceCmd;
+pub use frances_workflow::{Source, SurfaceCmd};
 
 use crate::llm::Usage;
 
@@ -110,12 +110,12 @@ pub enum ScrollbackFrame {
 /// carries a `BlockKind`, so cloning is on the hot path.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
-    /// A free-form text block. `sender` labels the speaker; the TUI
-    /// renders it as a prefix when present, and renders nothing in
-    /// front of the body when `None`. Workflows pick the sender via
-    /// `new MarkdownFrame({ content, sender })` — there is no
-    /// host-side meaning beyond the label.
-    Text { sender: Option<Arc<str>> },
+    /// A free-form text block. `source` names the speaker; the TUI maps
+    /// it to a single-grapheme sigil (`User` → `>`, `Assistant` → `◆`,
+    /// `Internal` → no prefix). Workflows pick it via `new
+    /// MarkdownFrame({ source })`; `Internal` is the default when the
+    /// workflow omits the field (chrome, JSON tag bodies, greetings).
+    Text { source: Source },
     /// `detail` is an optional human-readable suffix sourced from the
     /// tool's `describe(call)` method (e.g. the file path + ranges for
     /// `file_read`). The TUI renders it after `name` in a dim style.

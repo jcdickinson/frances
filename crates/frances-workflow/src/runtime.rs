@@ -130,14 +130,26 @@ pub struct FrameSpec {
     pub seed: Option<String>,
 }
 
+/// Who produced a text frame. Chooses the rendered sigil host-side
+/// (`User` → `>`, `Assistant` → `◆`, `Internal` → none). Closed set on
+/// purpose — adding a fourth speaker is a deliberate vocabulary change,
+/// not a free-form label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Source {
+    User,
+    Assistant,
+    Internal,
+}
+
 #[derive(Debug, Clone)]
 pub enum FrameKind {
-    /// `MarkdownFrame` — text body extended with `append`. `sender`
-    /// labels the speaker (e.g. `"you"`, `"frances"`); the host renders
-    /// it as a block prefix. `None` ⇒ no prefix. The initial body, if
-    /// any, rides as `FrameSpec::seed`; `None` seed ⇒ the client tracks
-    /// the id but doesn't measure/render until the first `append`.
-    Markdown { sender: Option<String> },
+    /// `MarkdownFrame` — text body extended with `append`. `source`
+    /// names the speaker; the host renders the matching sigil. The
+    /// initial body, if any, rides as `FrameSpec::seed`; `None` seed ⇒
+    /// the client tracks the id but doesn't measure/render until the
+    /// first `append`.
+    Markdown { source: Source },
     /// `ErrorFrame` — one-shot text (rendered as an error). The message
     /// rides as `FrameSpec::seed`.
     Error,
@@ -1710,7 +1722,7 @@ mod tests {
         );
     }
 
-    /// `new MarkdownFrame({ sender })` (and `{ content: undefined }`
+    /// `new MarkdownFrame({ source })` (and `{ content: undefined }`
     /// and `{ content: null }`) all produce `FrameKind::Markdown` with
     /// `content: None`. The wire opener carries no body, so the TUI
     /// defers measure / render until the workflow writes into it.
@@ -1721,7 +1733,7 @@ mod tests {
             "js",
             r#"
             import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ sender: "frances" }));
+            transcript.push(new MarkdownFrame({ source: "assistant" }));
             transcript.push(new MarkdownFrame({ content: undefined }));
             transcript.push(new MarkdownFrame({ content: null }));
             "#,
@@ -1736,12 +1748,15 @@ mod tests {
             .unwrap();
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
-        for (i, expect_sender) in [Some("frances"), None, None].iter().enumerate() {
+        for (i, expect_source) in [Source::Assistant, Source::Internal, Source::Internal]
+            .iter()
+            .enumerate()
+        {
             match &frames[i] {
                 TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-                    FrameKind::Markdown { sender } => {
+                    FrameKind::Markdown { source } => {
                         assert!(spec.seed.is_none(), "frame {i} should have no seed");
-                        assert_eq!(sender.as_deref(), *expect_sender, "frame {i} sender");
+                        assert_eq!(source, expect_source, "frame {i} source");
                     }
                     other => panic!("frame {i} unexpected kind {other:?}"),
                 },
@@ -1761,7 +1776,7 @@ mod tests {
             "js",
             r#"
             import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const f = new MarkdownFrame({ sender: "frances" });
+            const f = new MarkdownFrame({ source: "assistant" });
             transcript.push(f);
             await f.writable.close();
             "#,
@@ -1821,13 +1836,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_frame_carries_sender() {
+    async fn markdown_frame_carries_source() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
             import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "hi", sender: "you" }));
+            transcript.push(new MarkdownFrame({ content: "hi", source: "user" }));
             transcript.push(new MarkdownFrame({ content: "ok" }));
             "#,
         );
@@ -1844,25 +1859,25 @@ mod tests {
         assert!(matches!(
             &frames[0],
             TranscriptDelta::Set { frame: spec, .. }
-                if matches!(&spec.kind, FrameKind::Markdown { sender: Some(s) } if s == "you")
+                if matches!(&spec.kind, FrameKind::Markdown { source: Source::User })
                     && spec.seed.as_deref() == Some("hi")
         ));
         assert!(matches!(
             &frames[1],
             TranscriptDelta::Set { frame: spec, .. }
-                if matches!(&spec.kind, FrameKind::Markdown { sender: None })
+                if matches!(&spec.kind, FrameKind::Markdown { source: Source::Internal })
                     && spec.seed.as_deref() == Some("ok")
         ));
     }
 
     #[tokio::test]
-    async fn markdown_frame_rejects_non_string_sender() {
+    async fn markdown_frame_rejects_non_string_source() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
             import { transcript, MarkdownFrame } from "frances:v1/frames";
-            new MarkdownFrame({ content: "hi", sender: 42 });
+            new MarkdownFrame({ content: "hi", source: 42 });
             "#,
         );
         let mut handle = rt
@@ -1876,8 +1891,34 @@ mod tests {
         let (_frames, done) = drive_one_cycle(&mut handle).await;
         let err = done.expect("workflow done").expect_err("expected throw");
         assert!(
-            format!("{err}").contains("sender"),
-            "error should mention sender: {err}"
+            format!("{err}").contains("source"),
+            "error should mention source: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn markdown_frame_rejects_unknown_source_string() {
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            new MarkdownFrame({ content: "hi", source: "frances" });
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (_frames, done) = drive_one_cycle(&mut handle).await;
+        let err = done.expect("workflow done").expect_err("expected throw");
+        assert!(
+            format!("{err}").contains("source"),
+            "error should mention source: {err}"
         );
     }
 
@@ -2419,7 +2460,7 @@ mod tests {
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
-            const out = new MarkdownFrame({ sender: "frances" });
+            const out = new MarkdownFrame({ source: "assistant" });
             transcript.push(out);
             await r.text.pipeTo(out.writable);
             await r.completed;

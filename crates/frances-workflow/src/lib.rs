@@ -38,7 +38,7 @@ pub use io::mock::{MockFs, MockIo, MockShell, MockTimer, StubIo};
 pub use permission::{PermissionRequest, PermissionResponse, PermissionResponseWire};
 pub use runtime::{
     FrameId, FrameKind, FrameSpec, InboxItem, Invocation, ReasoningState, Runtime, ShellState,
-    SurfaceCmd, TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
+    Source, SurfaceCmd, TranscriptDelta, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

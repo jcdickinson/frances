@@ -486,7 +486,7 @@ class PlanUpdate {
       transcript.push(
         new MarkdownFrame({
           content: `Plan updated.\n\n\`\`\`\n${renderPlanForPrompt()}\n\`\`\``,
-          sender: "frances",
+          source: "assistant",
           closed: true,
         }),
       );
@@ -740,7 +740,7 @@ async function handlePendingCompletion(): Promise<boolean> {
         `Outcome: ${completed.outcome}\n\n` +
         `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\`\n\n` +
         `Transcript summary:\n\n${completed.transcript_summary || "(none)"}`,
-      sender: "frances",
+      source: "assistant",
       closed: true,
     }),
   );
@@ -778,7 +778,7 @@ async function turn(): Promise<TurnEnd> {
     // persistence, until the first text delta materialises the block.
     // The `thought` frame sits alongside it for the reasoning channel;
     // for non-thinking models it stays empty and closes immediately.
-    const out = new MarkdownFrame({ sender: "frances" });
+    const out = new MarkdownFrame({ source: "assistant" });
     const thought = new ThoughtFrame();
     transcript.push(thought);
     transcript.push(out);
@@ -864,12 +864,12 @@ async function ourLoop(): Promise<void> {
 
     const msg = value.content.trim();
     transcript.push(
-      new MarkdownFrame({ content: msg, sender: "you", closed: true }),
+      new MarkdownFrame({ content: msg, source: "user", closed: true }),
     );
     recordStepTranscript("User", msg);
     if (msg === "quit") {
       transcript.push(
-        new MarkdownFrame({ content: "bye", sender: "frances", closed: true }),
+        new MarkdownFrame({ content: "bye", source: "assistant", closed: true }),
       );
       exit();
       break;

@@ -689,7 +689,7 @@ mod tests {
         let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
         let kind_a = BlockKind::Text {
-            sender: Some("user".into()),
+            source: frances_session::events::Source::User,
         };
         let kind_b = BlockKind::ToolUse {
             name: "shell".into(),
@@ -760,30 +760,33 @@ mod tests {
     }
 
     /// A run of `text: None` deltas between two completed blocks —
-    /// covering both `sender: Some(_)` and `sender: None` shapes, plus
-    /// closing some of them while leaving others tracked — must not
-    /// insert anything into the container. Guards against the case
-    /// where a `transcript.push(new MarkdownFrame({ sender }))` /
+    /// covering each `Source` variant, plus closing some of them while
+    /// leaving others tracked — must not insert anything into the
+    /// container. Guards against the case where a
+    /// `transcript.push(new MarkdownFrame({ source }))` /
     /// `transcript.push(new MarkdownFrame({ content: null }))` pair
     /// would somehow surface as a blank row between the real frames
     /// either side of it.
     #[test]
     fn none_text_frames_between_completed_blocks_add_no_rows() {
+        use frances_session::events::Source;
         let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
-        let frances = || BlockKind::Text {
-            sender: Some("frances".into()),
+        let assistant = || BlockKind::Text {
+            source: Source::Assistant,
         };
-        let bare = || BlockKind::Text { sender: None };
-        let you = || BlockKind::Text {
-            sender: Some("you".into()),
+        let internal = || BlockKind::Text {
+            source: Source::Internal,
+        };
+        let user = || BlockKind::Text {
+            source: Source::User,
         };
 
         // Completed block A.
         state.delta(
             &mut container,
             frances_session::events::BlockId(1),
-            frances(),
+            assistant(),
             Some("first".to_owned()),
         );
         let a_id = state
@@ -798,25 +801,25 @@ mod tests {
         state.delta(
             &mut container,
             frances_session::events::BlockId(2),
-            frances(),
+            assistant(),
             None,
         );
         state.delta(
             &mut container,
             frances_session::events::BlockId(3),
-            bare(),
+            internal(),
             None,
         );
         state.delta(
             &mut container,
             frances_session::events::BlockId(4),
-            you(),
+            user(),
             None,
         );
         state.delta(
             &mut container,
             frances_session::events::BlockId(5),
-            bare(),
+            internal(),
             None,
         );
         assert_eq!(
@@ -845,7 +848,7 @@ mod tests {
         state.delta(
             &mut container,
             frances_session::events::BlockId(6),
-            frances(),
+            assistant(),
             Some("second".to_owned()),
         );
         let b_id = state
@@ -870,7 +873,7 @@ mod tests {
         let mut container = ScrollbackContainer::new(0);
         let mut state = LiveBlocks::new();
         let kind = BlockKind::Text {
-            sender: Some("user".into()),
+            source: frances_session::events::Source::User,
         };
 
         // Open id 1.

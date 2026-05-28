@@ -46,7 +46,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame, TailedHeader};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
@@ -200,7 +200,7 @@ pub(crate) struct WorkflowInstance {
 ///
 /// Workflow frames map to wire blocks like this:
 ///
-/// - `MarkdownFrame` push: open a new `Text { sender }` block, write
+/// - `MarkdownFrame` push: open a new `Text { source }` block, write
 ///   initial content; the block stays open so subsequent `append`s
 ///   stream into it. The JS side sends `Close` for the prior active
 ///   markdown before pushing a new one — multiple blocks can be open
@@ -218,7 +218,7 @@ pub(crate) struct WorkflowInstance {
 ///   persist a scrollback row of kind 'error'. Does NOT touch any
 ///   open block — error frames are side-channel.
 /// - `JsonFrame` push: open + immediately close a one-shot
-///   `Text { sender: None }` block rendering `[tag] body`.
+///   `Text { source: Source::Internal }` block rendering `[tag] body`.
 ///
 /// On workflow termination every remaining open block is closed so the
 /// UI's `BlockState` ends up Idle. `EmitState` accumulates the delta
@@ -796,10 +796,8 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
             id: frame_id,
             frame: FrameSpec { kind, seed },
         } => match kind {
-            FrameKind::Markdown { sender } => {
-                let block_kind = BlockKind::Text {
-                    sender: sender.map(Arc::from),
-                };
+            FrameKind::Markdown { source } => {
+                let block_kind = BlockKind::Text { source };
                 set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
             FrameKind::ShellOutput {
@@ -843,7 +841,15 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 let body =
                     serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
                 let text = format!("[{tag}] {body}");
-                emit_one_shot(runtime, state, BlockKind::Text { sender: None }, &text).await?;
+                emit_one_shot(
+                    runtime,
+                    state,
+                    BlockKind::Text {
+                        source: Source::Internal,
+                    },
+                    &text,
+                )
+                .await?;
             }
             FrameKind::Diff { lines } => {
                 let wire_lines: Vec<crate::events::DiffLine> =

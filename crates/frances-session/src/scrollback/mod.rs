@@ -53,7 +53,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, StreamFrame, TailedHeader};
+use crate::events::{BlockId, BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
@@ -99,13 +99,12 @@ pub enum StoredRow {
     },
 }
 
-/// On-disk JSON shape for `kind` = 'text' rows. `sender` mirrors the
-/// wire-level `BlockKind::Text { sender: Option<Arc<str>> }`; `Arc<str>`
-/// serializes through serde the same way `String` does, so the on-disk
-/// JSON shape is identical to a `Option<String>` / `String` schema.
+/// On-disk JSON shape for `kind` = 'text' rows. `source` mirrors the
+/// wire-level `BlockKind::Text { source }`. Serializes as the
+/// snake-case strings `"user"` / `"assistant"` / `"internal"`.
 #[derive(Serialize, Deserialize)]
 struct TextPayload {
-    sender: Option<Arc<str>>,
+    source: Source,
     text: String,
 }
 
@@ -295,10 +294,10 @@ fn encode_block(
     text: &str,
 ) -> std::result::Result<(&'static str, String), ScrollbackError> {
     let (kind_text, payload): (&'static str, Value) = match kind {
-        BlockKind::Text { sender } => (
+        BlockKind::Text { source } => (
             "text",
             serde_json::to_value(TextPayload {
-                sender: sender.clone(),
+                source: *source,
                 text: text.to_owned(),
             })
             .map_err(ScrollbackError::Encode)?,
@@ -346,7 +345,7 @@ fn decode_row(
                     source,
                 })?;
             Ok(StoredRow::Block {
-                kind: BlockKind::Text { sender: p.sender },
+                kind: BlockKind::Text { source: p.source },
                 text: p.text,
                 truncated,
             })
@@ -445,7 +444,7 @@ mod tests {
             &db,
             instance,
             &BlockKind::Text {
-                sender: Some("user".into()),
+                source: Source::User,
             },
             "hello world",
             false,
@@ -457,7 +456,7 @@ mod tests {
             rows,
             vec![StoredRow::Block {
                 kind: BlockKind::Text {
-                    sender: Some("user".into())
+                    source: Source::User
                 },
                 text: "hello world".into(),
                 truncated: false,
@@ -620,12 +619,28 @@ mod tests {
         let db = fresh_db().await;
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
-        persist_block(&db, a, &BlockKind::Text { sender: None }, "a", false)
-            .await
-            .unwrap();
-        persist_block(&db, b, &BlockKind::Text { sender: None }, "b", false)
-            .await
-            .unwrap();
+        persist_block(
+            &db,
+            a,
+            &BlockKind::Text {
+                source: Source::Internal,
+            },
+            "a",
+            false,
+        )
+        .await
+        .unwrap();
+        persist_block(
+            &db,
+            b,
+            &BlockKind::Text {
+                source: Source::Internal,
+            },
+            "b",
+            false,
+        )
+        .await
+        .unwrap();
         let rows_a = load_for_instance(&db, a).await.unwrap();
         let rows_b = load_for_instance(&db, b).await.unwrap();
         assert_eq!(rows_a.len(), 1);
@@ -648,7 +663,7 @@ mod tests {
             &db,
             instance,
             &BlockKind::Text {
-                sender: Some("user".into()),
+                source: Source::User,
             },
             "hi",
             false,
@@ -686,7 +701,9 @@ mod tests {
         assert!(matches!(
             frames.get(1),
             Some(StreamFrame::Scrollback(ScrollbackFrame::Block {
-                kind: BlockKind::Text { sender: Some(_) },
+                kind: BlockKind::Text {
+                    source: Source::User,
+                },
                 ..
             })),
         ));
