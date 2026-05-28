@@ -157,26 +157,9 @@ pub struct ToolCall {
 /// error result the model can self-correct against.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ToolCallError {
-    /// The JSON schema the arguments were checked against. Encoded as a string
-    /// for the same bincode reason as [`ToolCall::arguments`].
-    #[serde(with = "json_value_as_string")]
+    /// The JSON schema the arguments were checked against.
     pub expected_schema: Value,
     pub message: String,
-}
-
-mod json_value_as_string {
-    use serde::{Deserialize, Deserializer, Serializer};
-    use serde_json::Value;
-
-    pub fn serialize<S: Serializer>(value: &Value, serializer: S) -> Result<S::Ok, S::Error> {
-        let s = serde_json::to_string(value).map_err(serde::ser::Error::custom)?;
-        serializer.serialize_str(&s)
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Value, D::Error> {
-        let s = String::deserialize(deserializer)?;
-        serde_json::from_str(&s).map_err(serde::de::Error::custom)
-    }
 }
 
 /// Token-usage report. Universal shape; `cached_input_tokens` mirrors
