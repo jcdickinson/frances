@@ -47,6 +47,7 @@ use ratatui::text::Line;
 use ratatui::widgets;
 use ratatui::widgets::{Borders, Paragraph};
 
+use frances_tui::block::Sigil;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{
@@ -366,7 +367,7 @@ impl Block for FakeShellBlock {
         1 + self.lines.min(tail)
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
         let header_style = Style::default().fg(Color::Cyan);
         let header = format!(
             "[fakeshell #{:>3}] {} lines (scroll_y={})",
@@ -397,7 +398,7 @@ impl Block for FakeShellBlock {
             if src_idx >= src_y {
                 let dst = src_idx - src_y;
                 if dst >= area.height {
-                    return;
+                    return Sigil::blank();
                 }
                 let text = format!("  line {:>3} of {:>3}", line_no + 1, self.lines);
                 ctx.buf
@@ -405,5 +406,6 @@ impl Block for FakeShellBlock {
             }
             src_idx += 1;
         }
+        Sigil::blank()
     }
 }

@@ -69,7 +69,7 @@ use slotmap::{SlotMap, new_key_type};
 
 use crossterm::event::Event;
 
-use crate::block::{Block, BlockMeasureContext, BlockRenderContext};
+use crate::block::{Block, BlockMeasureContext, BlockRenderContext, SIGIL_WIDTH};
 use crate::scrollback_backend::{BackendMode, ScrollbackBackend, SyncGuard};
 use crate::widget::{EventContext, EventOutcome, Focus, RenderContext, Theme, Widget};
 
@@ -699,7 +699,7 @@ impl ScrollbackContainer {
     /// constructs its own contexts with the correct `selected` flag.
     fn measure_ctx(&self, width: u16) -> BlockMeasureContext<'_> {
         BlockMeasureContext {
-            width,
+            width: width.saturating_sub(SIGIL_WIDTH),
             selected: false,
             theme: &self.theme,
         }
@@ -712,6 +712,7 @@ impl ScrollbackContainer {
     /// height the block actually paints.
     pub fn measure_history(&self, width: u16) -> u16 {
         let count = self.history_count();
+        let body_width = width.saturating_sub(SIGIL_WIDTH);
         let mut total: u32 = 0;
         for (i, (block, _)) in self.iter_history().enumerate() {
             let is_selected = self.selected_from_newest.is_some_and(|sel| {
@@ -720,7 +721,7 @@ impl ScrollbackContainer {
                     .is_some_and(|fn_| sel as usize == fn_)
             });
             let mctx = BlockMeasureContext {
-                width,
+                width: body_width,
                 selected: is_selected,
                 theme: &self.theme,
             };
@@ -1343,9 +1344,9 @@ impl ScrollbackContainer {
             let slot_h = content_h.saturating_add(BLOCK_GAP_ROWS);
             let area = Rect::new(0, 0, width, slot_h);
             let mut buf = Buffer::empty(area);
-            let content_area = Rect::new(0, 0, width, content_h);
+            let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
             let mut rctx = BlockRenderContext {
-                area: content_area,
+                area: body_area,
                 buf: &mut buf,
                 src_y: 0,
                 truncated: false,
@@ -1353,7 +1354,8 @@ impl ScrollbackContainer {
                 selected: false,
                 theme: &self.theme,
             };
-            safe_entry.block.render(&mut rctx);
+            let sigil = safe_entry.block.render(&mut rctx);
+            paint_sigil(&mut buf, 0, 0, &sigil);
             for row_idx in 0..slot_h {
                 let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
                 backend.write_row(cells.into_iter())?;
@@ -1390,9 +1392,9 @@ impl ScrollbackContainer {
             let slot_h = content_h.saturating_add(BLOCK_GAP_ROWS);
             let area = Rect::new(0, 0, width, slot_h);
             let mut buf = Buffer::empty(area);
-            let content_area = Rect::new(0, 0, width, content_h);
+            let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
             let mut rctx = BlockRenderContext {
-                area: content_area,
+                area: body_area,
                 buf: &mut buf,
                 src_y: 0,
                 truncated: false,
@@ -1400,14 +1402,15 @@ impl ScrollbackContainer {
                 selected: false,
                 theme: &self.theme,
             };
-            entry.block.render(&mut rctx);
+            let sigil = entry.block.render(&mut rctx);
+            paint_sigil(&mut buf, 0, 0, &sigil);
             let entry_spinner = if entry.safe_to_commit {
                 None
             } else {
                 spinner_frame
             };
             if let Some(frame) = entry_spinner {
-                overlay_spinner(&mut buf, content_area, frame);
+                overlay_spinner(&mut buf, body_area, frame);
             }
             let skip = if i == 0 { boundary_skip_rows } else { 0 };
             for row_idx in skip..slot_h {
@@ -1657,13 +1660,12 @@ impl ScrollbackContainer {
     /// inside the block — blocks honour `src_y` + `area.height` to
     /// paint only the overlapping slice.
     ///
-    /// Phase D additions:
-    /// - Reserve `area.x` (column 0 of the content area) as a selection
-    ///   gutter; each block renders at `area.x + 1` with one column
-    ///   trimmed. The gutter is only inserted when `area.width >= 2`.
-    /// - When `selected_from_newest` points at a block whose visible
-    ///   slice has at least one row in this window, paint a cyan `▶`
-    ///   into the gutter on the block's topmost on-screen row.
+    /// Inspector layout reserves `SIGIL_WIDTH` columns on the left as the
+    /// block gutter (same as the live path); each block renders into
+    /// the remaining cols. The container paints the block's [`Sigil`]
+    /// into the gutter on the block's topmost on-screen row, and when
+    /// the block is the current selection, overlays a cyan `▶` in
+    /// col 0 of that row (replacing the first sigil cell).
     fn paint_history_window(&self, area: Rect, src_y_offset: u16, frame_buf: &mut Buffer) {
         if area.height == 0 || area.width == 0 {
             return;
@@ -1671,10 +1673,14 @@ impl ScrollbackContainer {
         let window_end = src_y_offset.saturating_add(area.height);
 
         let total = self.history_count();
-        let has_gutter = area.width >= 2;
-        let block_x = if has_gutter { area.x + 1 } else { area.x };
+        let has_gutter = area.width > SIGIL_WIDTH;
+        let block_x = if has_gutter {
+            area.x + SIGIL_WIDTH
+        } else {
+            area.x
+        };
         let block_w = if has_gutter {
-            area.width - 1
+            area.width - SIGIL_WIDTH
         } else {
             area.width
         };
@@ -1732,11 +1738,19 @@ impl ScrollbackContainer {
                         selected: is_selected,
                         theme: &self.theme,
                     };
-                    block.render(&mut rctx);
+                    let sigil = block.render(&mut rctx);
 
-                    // Selection gutter: paint `▶` in column 0 of the block's
-                    // topmost on-screen row.
-                    if has_gutter && is_selected {
+                    // Paint the sigil into the gutter at the block's
+                    // topmost on-screen row — that is, the row where
+                    // src_start == 0. If the block is scrolled so that
+                    // its row 0 is above the window, the gutter stays
+                    // blank for the visible slice.
+                    if has_gutter && src_start == 0 {
+                        paint_sigil(frame_buf, area.x, area.y + dst_start, &sigil);
+                    }
+                    // Selection indicator overrides col 0 of the gutter
+                    // on the block's topmost on-screen row.
+                    if has_gutter && is_selected && src_start == 0 {
                         let indicator = Style::default().fg(Color::Cyan);
                         frame_buf.set_string(area.x, area.y + dst_start, "▶", indicator);
                     }
@@ -1791,6 +1805,18 @@ fn paint_status_bar_bottom(buf: &mut Buffer, width: u16, y: u16, below: u16) {
         Paragraph::new(Line::from(Span::styled(hint, dim)))
             .render(Rect::new(left_w, y, hint_w, 1), buf);
     }
+}
+
+/// Paint `sigil` into the [`SIGIL_WIDTH`]-cell gutter at `(x, y)` of
+/// `buf`. The block declared the glyph; this is the only place the
+/// container actually puts ink in the gutter. Trailing cells inside
+/// the gutter that the sigil doesn't cover stay as `Buffer::empty`
+/// defaults (blank).
+fn paint_sigil(buf: &mut Buffer, x: u16, y: u16, sigil: &crate::block::Sigil) {
+    if sigil.text.is_empty() {
+        return;
+    }
+    buf.set_string(x, y, &sigil.text, sigil.style);
 }
 
 /// Build a single-row `Buffer` containing `•••` centered in `width`
@@ -1903,12 +1929,14 @@ where
             // Build a slot-sized buffer (content + 1 gap row) so the
             // bottom row gets emitted as a clean blank and we don't
             // leave stale paint from a previous redraw underneath the
-            // block.
+            // block. The block paints into the body area (cols
+            // SIGIL_WIDTH..width); the container then paints its sigil
+            // into the left gutter on row 0.
             let area = Rect::new(0, 0, width, h);
             let mut buf = Buffer::empty(area);
-            let content_area = Rect::new(0, 0, width, content_h);
+            let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
             let mut rctx = BlockRenderContext {
-                area: content_area,
+                area: body_area,
                 buf: &mut buf,
                 src_y: 0,
                 truncated: false,
@@ -1916,9 +1944,10 @@ where
                 selected: false,
                 theme,
             };
-            block.render(&mut rctx);
+            let sigil = block.render(&mut rctx);
+            paint_sigil(&mut buf, 0, 0, &sigil);
             if let Some(frame) = spinner_frame {
-                overlay_spinner(&mut buf, content_area, frame);
+                overlay_spinner(&mut buf, body_area, frame);
             }
             for row_idx in 0..h {
                 write_row_at_cursor(backend, &buf, row_idx, width, true, cursor, terminal_h)?;
@@ -2389,11 +2418,13 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multiline-a");
-            assert_eq!(b.screen_row(1), "multiline-b");
-            assert_eq!(b.screen_row(2), "multiline-c");
+            // Block content lives at col 2 onward; cols 0..1 are the
+            // sigil gutter the container reserves on every block row.
+            assert_eq!(b.screen_row(0), "  multiline-a");
+            assert_eq!(b.screen_row(1), "  multiline-b");
+            assert_eq!(b.screen_row(2), "  multiline-c");
             assert_eq!(b.screen_row(3), "", "gap row below multi-block");
-            assert_eq!(b.screen_row(4), "singleline");
+            assert_eq!(b.screen_row(4), "  singleline");
             assert_eq!(b.screen_row(5), "", "gap row below singleline");
             assert_eq!(b.screen_row(6), "bottom");
             assert_eq!(b.scrollback_len(), 0);
@@ -2408,44 +2439,44 @@ mod tests {
             // Push 1: scrolls multi-a then multi-b into SB.
             (
                 [
-                    "multiline-c",
+                    "  multiline-c",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
                     "bottom",
                 ],
                 2usize,
-                ["multiline-b", "multiline-a"],
+                ["  multiline-b", "  multiline-a"],
             ),
             // Push 2: scrolls multi-c then its trailing gap into SB.
             (
                 [
-                    "singleline",
+                    "  singleline",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
                     "bottom",
                 ],
                 4,
-                ["", "multiline-c"],
+                ["", "  multiline-c"],
             ),
             // Push 3: scrolls the original singleline then its gap.
             (
                 [
-                    "singleline",
+                    "  singleline",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
-                    "singleline",
+                    "  singleline",
                     "",
                     "bottom",
                 ],
                 6,
-                ["", "singleline"],
+                ["", "  singleline"],
             ),
         ];
 
@@ -2490,11 +2521,11 @@ mod tests {
             "",
             "depth 1: original singleline's gap"
         );
-        assert_eq!(b.scrollback_row(2), "singleline");
+        assert_eq!(b.scrollback_row(2), "  singleline");
         assert_eq!(b.scrollback_row(3), "", "depth 3: multi-block's gap");
-        assert_eq!(b.scrollback_row(4), "multiline-c");
-        assert_eq!(b.scrollback_row(5), "multiline-b");
-        assert_eq!(b.scrollback_row(6), "multiline-a");
+        assert_eq!(b.scrollback_row(4), "  multiline-c");
+        assert_eq!(b.scrollback_row(5), "  multiline-b");
+        assert_eq!(b.scrollback_row(6), "  multiline-a");
         assert_eq!(b.scrollback_len(), 6);
     }
 
@@ -2519,11 +2550,12 @@ mod tests {
         {
             let b = terminal.backend().inner();
             // Each block reserves a trailing gap row (BLOCK_GAP_ROWS = 1).
-            assert_eq!(b.screen_row(0), "block-a");
+            // Block content lives at col 2 (cols 0..1 are the sigil gutter).
+            assert_eq!(b.screen_row(0), "  block-a");
             assert_eq!(b.screen_row(1), ""); // gap
-            assert_eq!(b.screen_row(2), "block-b");
+            assert_eq!(b.screen_row(2), "  block-b");
             assert_eq!(b.screen_row(3), ""); // gap
-            assert_eq!(b.screen_row(4), "block-c");
+            assert_eq!(b.screen_row(4), "  block-c");
         }
 
         // Externally wipe the terminal — the renderer must NOT see
@@ -2555,7 +2587,7 @@ mod tests {
         );
         assert_eq!(
             b.screen_row(2),
-            "block-B!",
+            "  block-B!",
             "B was damaged — must be repainted with the new content",
         );
         assert_eq!(
@@ -2589,13 +2621,14 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "a");
+            // Block content lives at col 2 (cols 0..1 are the sigil gutter).
+            assert_eq!(b.screen_row(0), "  a");
             assert_eq!(b.screen_row(1), "", "gap row below `a`");
-            assert_eq!(b.screen_row(2), "b");
+            assert_eq!(b.screen_row(2), "  b");
             assert_eq!(b.screen_row(3), "", "gap row below `b`");
-            assert_eq!(b.screen_row(4), "c");
+            assert_eq!(b.screen_row(4), "  c");
             assert_eq!(b.screen_row(5), "", "gap row below `c`");
-            assert_eq!(b.screen_row(6), "d");
+            assert_eq!(b.screen_row(6), "  d");
             assert_eq!(b.screen_row(7), "", "gap row below `d`");
             assert_eq!(b.screen_row(8), "footer");
             assert_eq!(b.scrollback_len(), 0);
@@ -2607,18 +2640,18 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "b");
+            assert_eq!(b.screen_row(0), "  b");
             assert_eq!(b.screen_row(1), "", "gap row below `b`");
-            assert_eq!(b.screen_row(2), "c");
+            assert_eq!(b.screen_row(2), "  c");
             assert_eq!(b.screen_row(3), "", "gap row below `c`");
-            assert_eq!(b.screen_row(4), "d");
+            assert_eq!(b.screen_row(4), "  d");
             assert_eq!(b.screen_row(5), "", "gap row below `d`");
-            assert_eq!(b.screen_row(6), "e");
+            assert_eq!(b.screen_row(6), "  e");
             assert_eq!(b.screen_row(7), "", "gap row below `e`");
             assert_eq!(b.screen_row(8), "footer");
             assert_eq!(b.scrollback_len(), 2);
             assert_eq!(b.scrollback_row(1), "", "gap row below `a`");
-            assert_eq!(b.scrollback_row(2), "a");
+            assert_eq!(b.scrollback_row(2), "  a");
             assert_eq!(container.committed_count(), 1);
             assert_eq!(container.safe_count(), 4);
         }
@@ -2640,7 +2673,7 @@ mod tests {
         }
         // Scrollback is preserved by `CSI J`.
         assert_eq!(b.scrollback_row(1), "", "gap row below `a`");
-        assert_eq!(b.scrollback_row(2), "a");
+        assert_eq!(b.scrollback_row(2), "  a");
         assert_eq!(b.scrollback_len(), 2);
     }
 
@@ -2665,11 +2698,12 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multi-1");
-            assert_eq!(b.screen_row(1), "multi-2");
-            assert_eq!(b.screen_row(2), "multi-3");
+            // Block content lives at col 2 (cols 0..1 are the sigil gutter).
+            assert_eq!(b.screen_row(0), "  multi-1");
+            assert_eq!(b.screen_row(1), "  multi-2");
+            assert_eq!(b.screen_row(2), "  multi-3");
             assert_eq!(b.screen_row(3), "", "gap row below multi-block");
-            assert_eq!(b.screen_row(4), "single1");
+            assert_eq!(b.screen_row(4), "  single1");
             assert_eq!(b.screen_row(5), "", "gap row below single1");
             assert_eq!(b.screen_row(6), "footer");
             assert_eq!(b.scrollback_len(), 0);
@@ -2686,20 +2720,20 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multi-3");
+            assert_eq!(b.screen_row(0), "  multi-3");
             assert_eq!(
                 b.screen_row(1),
                 "",
                 "was multi-block gap, now scrolled into row 1"
             );
-            assert_eq!(b.screen_row(2), "single1");
+            assert_eq!(b.screen_row(2), "  single1");
             assert_eq!(b.screen_row(3), "", "gap below single1");
-            assert_eq!(b.screen_row(4), "single2");
+            assert_eq!(b.screen_row(4), "  single2");
             assert_eq!(b.screen_row(5), "", "gap below single2");
             assert_eq!(b.screen_row(6), "footer");
             assert_eq!(b.scrollback_len(), 2);
-            assert_eq!(b.scrollback_row(1), "multi-2");
-            assert_eq!(b.scrollback_row(2), "multi-1");
+            assert_eq!(b.scrollback_row(1), "  multi-2");
+            assert_eq!(b.scrollback_row(2), "  multi-1");
             assert_eq!(
                 container.committed_count(),
                 1,
@@ -2726,8 +2760,8 @@ mod tests {
         for row in 0..=6 {
             assert_eq!(b.screen_row(row), "", "row {row}: undamaged, no repaint");
         }
-        assert_eq!(b.scrollback_row(1), "multi-2");
-        assert_eq!(b.scrollback_row(2), "multi-1");
+        assert_eq!(b.scrollback_row(1), "  multi-2");
+        assert_eq!(b.scrollback_row(2), "  multi-1");
         assert_eq!(b.scrollback_len(), 2);
     }
 
@@ -3084,13 +3118,15 @@ mod tests {
             );
         }
         // Positively: rows 2..=6 should contain the active block's
-        // A1..A5 markers.
+        // A1..A5 markers. Block content starts at col 2 (the sigil
+        // gutter occupies cols 0..1), so each row starts with "  Ai".
         for (i, expected) in ["A1", "A2", "A3", "A4", "A5"].iter().enumerate() {
             let y = 2 + i;
             let row = b.screen_row(y);
+            let prefixed = format!("  {expected}");
             assert!(
-                row.starts_with(expected),
-                "row {y} expected block content `{expected}`, got {row:?}",
+                row.starts_with(&prefixed),
+                "row {y} expected block content `{prefixed}`, got {row:?}",
             );
         }
     }
@@ -3243,13 +3279,14 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multiline-a");
-            assert_eq!(b.screen_row(1), "multiline-b");
-            assert_eq!(b.screen_row(2), "multiline-c");
-            assert_eq!(b.screen_row(3), "multiline-d");
-            assert_eq!(b.screen_row(4), "multiline-e");
+            // Block content lives at col 2 (cols 0..1 are the sigil gutter).
+            assert_eq!(b.screen_row(0), "  multiline-a");
+            assert_eq!(b.screen_row(1), "  multiline-b");
+            assert_eq!(b.screen_row(2), "  multiline-c");
+            assert_eq!(b.screen_row(3), "  multiline-d");
+            assert_eq!(b.screen_row(4), "  multiline-e");
             assert_eq!(b.screen_row(5), "", "gap row below multiline");
-            assert_eq!(b.screen_row(6), "other-content");
+            assert_eq!(b.screen_row(6), "  other-content");
             assert_eq!(b.screen_row(7), "", "gap row below other-content");
             assert_eq!(b.screen_row(8), "footer");
             assert_eq!(b.scrollback_len(), 0);
@@ -3264,13 +3301,13 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multiline-a");
-            assert_eq!(b.screen_row(1), "multiline-b");
-            assert_eq!(b.screen_row(2), "multiline-c");
+            assert_eq!(b.screen_row(0), "  multiline-a");
+            assert_eq!(b.screen_row(1), "  multiline-b");
+            assert_eq!(b.screen_row(2), "  multiline-c");
             assert_eq!(b.screen_row(3), "", "gap row below multiline");
             assert_eq!(
                 b.screen_row(4),
-                "other-content",
+                "  other-content",
                 "block below shrunken block must pack up to fill the gap",
             );
             assert_eq!(b.screen_row(5), "", "gap row below other-content");
@@ -3289,9 +3326,9 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(0), "  multiline-a");
             assert_eq!(b.screen_row(1), "", "gap row below multiline");
-            assert_eq!(b.screen_row(2), "other-content");
+            assert_eq!(b.screen_row(2), "  other-content");
             assert_eq!(b.screen_row(3), "", "gap row below other-content");
             for slack_row in 4..=7 {
                 assert_eq!(b.screen_row(slack_row), "", "slack row {slack_row}");
@@ -3306,11 +3343,11 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "multiline-a");
+            assert_eq!(b.screen_row(0), "  multiline-a");
             assert_eq!(b.screen_row(1), "", "gap row below multiline");
-            assert_eq!(b.screen_row(2), "other-content");
+            assert_eq!(b.screen_row(2), "  other-content");
             assert_eq!(b.screen_row(3), "", "gap row below first other-content");
-            assert_eq!(b.screen_row(4), "other-content");
+            assert_eq!(b.screen_row(4), "  other-content");
             assert_eq!(b.screen_row(5), "", "gap row below second other-content");
             assert_eq!(b.screen_row(6), "", "two slack rows left");
             assert_eq!(b.screen_row(7), "", "two slack rows left");
@@ -3322,13 +3359,13 @@ mod tests {
         container.push_active(multi_text(&["other-content"]));
         container.draw(&mut terminal).unwrap();
         let b = terminal.backend().inner();
-        assert_eq!(b.screen_row(0), "multiline-a");
+        assert_eq!(b.screen_row(0), "  multiline-a");
         assert_eq!(b.screen_row(1), "", "gap row below multiline");
-        assert_eq!(b.screen_row(2), "other-content");
+        assert_eq!(b.screen_row(2), "  other-content");
         assert_eq!(b.screen_row(3), "", "gap row");
-        assert_eq!(b.screen_row(4), "other-content");
+        assert_eq!(b.screen_row(4), "  other-content");
         assert_eq!(b.screen_row(5), "", "gap row");
-        assert_eq!(b.screen_row(6), "other-content");
+        assert_eq!(b.screen_row(6), "  other-content");
         assert_eq!(b.screen_row(7), "", "gap row");
         assert_eq!(b.screen_row(8), "footer");
         assert_eq!(
@@ -3378,8 +3415,9 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
-            assert_eq!(b.screen_row(0), "streaming-0");
-            assert_eq!(b.screen_row(1), "streaming-1");
+            // Block content lives at col 2 (cols 0..1 are the sigil gutter).
+            assert_eq!(b.screen_row(0), "  streaming-0");
+            assert_eq!(b.screen_row(1), "  streaming-1");
             assert_eq!(b.screen_row(2), "", "gap row below streaming");
             assert_eq!(b.screen_row(3), "footer");
         }
@@ -3398,12 +3436,12 @@ mod tests {
 
         container.draw(&mut terminal).unwrap();
         let b = terminal.backend().inner();
-        assert_eq!(b.screen_row(0), "streaming-0");
-        assert_eq!(b.screen_row(1), "streaming-1");
+        assert_eq!(b.screen_row(0), "  streaming-0");
+        assert_eq!(b.screen_row(1), "  streaming-1");
         assert_eq!(b.screen_row(2), "", "gap row below streaming");
         assert_eq!(
             b.screen_row(3),
-            "history",
+            "  history",
             "pushed block lands BELOW the still-active streaming block",
         );
         assert_eq!(b.screen_row(4), "", "gap row below history");
@@ -3450,10 +3488,12 @@ mod tests {
         container.draw(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
+        // Block content lives at col 2 (cols 0..1 are the sigil gutter);
+        // the ellipsis row is painted full-width without a gutter.
         assert_eq!(b.screen_row(0), centered_ellipsis(80));
-        assert_eq!(b.screen_row(1), "L7");
-        assert_eq!(b.screen_row(2), "L8");
-        assert_eq!(b.screen_row(3), "L9");
+        assert_eq!(b.screen_row(1), "  L7");
+        assert_eq!(b.screen_row(2), "  L8");
+        assert_eq!(b.screen_row(3), "  L9");
         assert_eq!(b.screen_row(4), "", "gap row below the active block");
         assert_eq!(b.screen_row(5), "footer");
         assert_eq!(
@@ -3487,10 +3527,12 @@ mod tests {
         container.draw(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
+        // Block content lives at col 2 (cols 0..1 are the sigil gutter);
+        // the ellipsis row is painted full-width without a gutter.
         assert_eq!(b.screen_row(0), centered_ellipsis(80));
-        assert_eq!(b.screen_row(1), "A7");
-        assert_eq!(b.screen_row(2), "A8");
-        assert_eq!(b.screen_row(3), "A9");
+        assert_eq!(b.screen_row(1), "  A7");
+        assert_eq!(b.screen_row(2), "  A8");
+        assert_eq!(b.screen_row(3), "  A9");
         assert_eq!(b.screen_row(4), "", "gap row below the active block");
         assert_eq!(b.screen_row(5), "footer");
         assert_eq!(
@@ -3527,20 +3569,22 @@ mod tests {
         let b = terminal.backend().inner();
         // Natural-scroll commit: L0..L5 evict into native scrollback;
         // L6..L9 stay visible as the orphaned remnant, with the gap
-        // row landing between L9 and the footer.
-        assert_eq!(b.screen_row(0), "L6");
-        assert_eq!(b.screen_row(1), "L7");
-        assert_eq!(b.screen_row(2), "L8");
-        assert_eq!(b.screen_row(3), "L9");
+        // row landing between L9 and the footer. Block content lives
+        // at col 2 (cols 0..1 are the sigil gutter), both on screen
+        // and once it has scrolled into native scrollback.
+        assert_eq!(b.screen_row(0), "  L6");
+        assert_eq!(b.screen_row(1), "  L7");
+        assert_eq!(b.screen_row(2), "  L8");
+        assert_eq!(b.screen_row(3), "  L9");
         assert_eq!(b.screen_row(4), "", "gap row below the now-safe block");
         assert_eq!(b.screen_row(5), "footer");
         assert_eq!(b.scrollback_len(), 6);
-        assert_eq!(b.scrollback_row(1), "L5");
-        assert_eq!(b.scrollback_row(2), "L4");
-        assert_eq!(b.scrollback_row(3), "L3");
-        assert_eq!(b.scrollback_row(4), "L2");
-        assert_eq!(b.scrollback_row(5), "L1");
-        assert_eq!(b.scrollback_row(6), "L0");
+        assert_eq!(b.scrollback_row(1), "  L5");
+        assert_eq!(b.scrollback_row(2), "  L4");
+        assert_eq!(b.scrollback_row(3), "  L3");
+        assert_eq!(b.scrollback_row(4), "  L2");
+        assert_eq!(b.scrollback_row(5), "  L1");
+        assert_eq!(b.scrollback_row(6), "  L0");
         assert_eq!(container.committed_count(), 1);
         assert_eq!(container.safe_count(), 0);
         assert_eq!(container.active_count(), 0);
@@ -3573,12 +3617,15 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         {
             let b = terminal.backend().inner();
+            // Block content lives at col 2 (cols 0..1 are the sigil
+            // gutter); the ellipsis row is painted full-width without
+            // a gutter.
             assert_eq!(b.screen_row(0), centered_ellipsis(80));
-            assert_eq!(b.screen_row(1), "d");
+            assert_eq!(b.screen_row(1), "  d");
             assert_eq!(b.screen_row(2), "", "gap row below `d`");
-            assert_eq!(b.screen_row(3), "e");
+            assert_eq!(b.screen_row(3), "  e");
             assert_eq!(b.screen_row(4), "", "gap row below `e`");
-            assert_eq!(b.screen_row(5), "f");
+            assert_eq!(b.screen_row(5), "  f");
             assert_eq!(b.screen_row(6), "", "gap row below `f`");
             assert_eq!(b.screen_row(7), "footer");
             assert_eq!(b.scrollback_len(), 0);
@@ -3592,11 +3639,11 @@ mod tests {
         {
             let b = terminal.backend().inner();
             assert_eq!(b.screen_row(0), centered_ellipsis(80));
-            assert_eq!(b.screen_row(1), "d");
+            assert_eq!(b.screen_row(1), "  d");
             assert_eq!(b.screen_row(2), "", "gap row below `d`");
-            assert_eq!(b.screen_row(3), "e");
+            assert_eq!(b.screen_row(3), "  e");
             assert_eq!(b.screen_row(4), "", "gap row below `e`");
-            assert_eq!(b.screen_row(5), "F");
+            assert_eq!(b.screen_row(5), "  F");
             assert_eq!(b.screen_row(6), "", "gap row below `F`");
             assert_eq!(b.screen_row(7), "footer");
             assert_eq!(b.scrollback_len(), 0);
@@ -3609,11 +3656,11 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         let b = terminal.backend().inner();
         assert_eq!(b.screen_row(0), centered_ellipsis(80));
-        assert_eq!(b.screen_row(1), "d");
+        assert_eq!(b.screen_row(1), "  d");
         assert_eq!(b.screen_row(2), "", "gap row below `d`");
-        assert_eq!(b.screen_row(3), "e");
+        assert_eq!(b.screen_row(3), "  e");
         assert_eq!(b.screen_row(4), "", "gap row below `e`");
-        assert_eq!(b.screen_row(5), "F");
+        assert_eq!(b.screen_row(5), "  F");
         assert_eq!(b.screen_row(6), "", "gap row below `F`");
         assert_eq!(b.screen_row(7), "footer");
         assert_eq!(
@@ -3659,22 +3706,25 @@ mod tests {
         let b = terminal.backend().inner();
         // Visible: ellipsis row + d, e, f (each followed by a gap row)
         // + footer. `c` is the topmost active and is fully truncated —
-        // its absence is signalled by the ellipsis.
+        // its absence is signalled by the ellipsis. Block content lives
+        // at col 2 (cols 0..1 are the sigil gutter); ellipsis is full
+        // width without a gutter.
         assert_eq!(b.screen_row(0), centered_ellipsis(80));
-        assert_eq!(b.screen_row(1), "d");
+        assert_eq!(b.screen_row(1), "  d");
         assert_eq!(b.screen_row(2), "", "gap row below `d`");
-        assert_eq!(b.screen_row(3), "e");
+        assert_eq!(b.screen_row(3), "  e");
         assert_eq!(b.screen_row(4), "", "gap row below `e`");
-        assert_eq!(b.screen_row(5), "f");
+        assert_eq!(b.screen_row(5), "  f");
         assert_eq!(b.screen_row(6), "", "gap row below `f`");
         assert_eq!(b.screen_row(7), "footer");
         // Scrollback (newest first): b's gap, b, a's gap, a. The gap
-        // rows scroll into native scrollback alongside the content.
+        // rows scroll into native scrollback alongside the content;
+        // content keeps the col-2 sigil-gutter offset.
         assert_eq!(b.scrollback_len(), 4);
         assert_eq!(b.scrollback_row(1), "", "gap row below `b`");
-        assert_eq!(b.scrollback_row(2), "b");
+        assert_eq!(b.scrollback_row(2), "  b");
         assert_eq!(b.scrollback_row(3), "", "gap row below `a`");
-        assert_eq!(b.scrollback_row(4), "a");
+        assert_eq!(b.scrollback_row(4), "  a");
         assert_eq!(container.committed_count(), 2);
         assert_eq!(container.safe_count(), 0);
         assert_eq!(container.active_count(), 4);
@@ -3755,13 +3805,14 @@ mod tests {
         // Layout: row 0 top bar, rows 1..8 content, row 8 bottom bar,
         // row 9 footer. Content area = 7 rows; each block has a slot
         // height of 2 (1 content + 1 gap), so total_h = 4, bottom-
-        // aligned at rows 4..8 (pad = 3). Phase D: column 0 is the
-        // selection gutter — `▶` on the newest (selected) row, blank
-        // on the others. Gap rows are blank.
+        // aligned at rows 4..8 (pad = 3). The 2-col sigil gutter sits
+        // at cols 0-1; block content starts at col 2. `▶` overlays
+        // col 0 of the selected (newest) block's first row, leaving
+        // col 1 blank. Gap rows are blank.
         assert_eq!(b.screen_row(0), "", "no above marker when at bottom");
-        assert_eq!(b.screen_row(4), " one");
+        assert_eq!(b.screen_row(4), "  one");
         assert_eq!(b.screen_row(5), "", "gap row below `one`");
-        assert_eq!(b.screen_row(6), "▶two");
+        assert_eq!(b.screen_row(6), "▶ two");
         assert_eq!(b.screen_row(7), "", "gap row below `two`");
         let bottom = b.screen_row(8);
         assert!(
@@ -3791,18 +3842,18 @@ mod tests {
 
         let b = terminal.backend().inner();
         // Visible at bottom: e (row 1), gap (row 2), f (row 3), gap
-        // (row 4). Phase D gutter shifts each row right by 1 col; `f`
-        // is the newest and therefore selected, so its gutter holds
-        // `▶` instead of a space.
+        // (row 4). 2-col sigil gutter at cols 0-1, content from col 2.
+        // `f` is the newest and therefore selected, so `▶` sits at col
+        // 0 of its first row with col 1 blank.
         let top = b.screen_row(0);
         assert!(top.contains("▲"), "expected ▲ marker, got {top:?}");
         assert!(
             top.contains("8"),
             "expected '8 more rows above', got {top:?}"
         );
-        assert_eq!(b.screen_row(1), " e");
+        assert_eq!(b.screen_row(1), "  e");
         assert_eq!(b.screen_row(2), "", "gap row below `e`");
-        assert_eq!(b.screen_row(3), "▶f");
+        assert_eq!(b.screen_row(3), "▶ f");
         assert_eq!(b.screen_row(4), "", "gap row below `f`");
         let bottom = b.screen_row(5);
         assert!(
@@ -3829,14 +3880,14 @@ mod tests {
         // max_offset = 12 - 4 = 8, scroll = 1 → y_offset = 7, above = 7,
         // below = 1. Visible src 7..11: gap(d), e, gap(e), f. The
         // selected block (newest = "f") starts at the bottom row of the
-        // window so its gutter cell holds `▶`.
+        // window so `▶` sits at col 0 of that row with col 1 blank.
         let top = b.screen_row(0);
         assert!(top.contains("▲"));
         assert!(top.contains("7"));
         assert_eq!(b.screen_row(1), "", "gap row below `d`");
-        assert_eq!(b.screen_row(2), " e");
+        assert_eq!(b.screen_row(2), "  e");
         assert_eq!(b.screen_row(3), "", "gap row below `e`");
-        assert_eq!(b.screen_row(4), "▶f");
+        assert_eq!(b.screen_row(4), "▶ f");
         let bottom = b.screen_row(5);
         assert!(bottom.contains("▼"), "expected ▼ marker, got {bottom:?}");
         assert!(bottom.contains("1"));
@@ -3858,15 +3909,15 @@ mod tests {
         c.paint_scrollback(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
-        // Phase D gutter is blank on every visible row — the selected
+        // 2-col sigil gutter is blank on every visible row — the selected
         // block (newest = "f") sits below the visible window when
         // we're scrolled all the way to the top. Visible src 0..4 =
         // a + gap + b + gap.
         let top = b.screen_row(0);
         assert!(!top.contains("▲"), "no above marker at top, got {top:?}");
-        assert_eq!(b.screen_row(1), " a");
+        assert_eq!(b.screen_row(1), "  a");
         assert_eq!(b.screen_row(2), "", "gap row below `a`");
-        assert_eq!(b.screen_row(3), " b");
+        assert_eq!(b.screen_row(3), "  b");
         assert_eq!(b.screen_row(4), "", "gap row below `b`");
         let bottom = b.screen_row(5);
         assert!(bottom.contains("▼"));
@@ -3902,14 +3953,15 @@ mod tests {
         // Content area = 7 rows; each block slot_h = 2 → total_h = 12,
         // which exceeds content_h so the window scrolls. max_offset =
         // 5, y_offset = 5, above = 5. Visible src 5..12 = gap(c), d,
-        // gap, e, gap, f, gap. Phase D gutter shifts content right by
-        // one column; `f` is the selected newest, so it carries `▶`.
+        // gap, e, gap, f, gap. 2-col sigil gutter at cols 0-1, content
+        // from col 2; `f` is the selected newest, so `▶` overlays col
+        // 0 of its first row.
         assert_eq!(b.screen_row(1), "", "gap row below `c`");
-        assert_eq!(b.screen_row(2), " d");
+        assert_eq!(b.screen_row(2), "  d");
         assert_eq!(b.screen_row(3), "", "gap row below `d`");
-        assert_eq!(b.screen_row(4), " e");
+        assert_eq!(b.screen_row(4), "  e");
         assert_eq!(b.screen_row(5), "", "gap row below `e`");
-        assert_eq!(b.screen_row(6), "▶f");
+        assert_eq!(b.screen_row(6), "▶ f");
         assert_eq!(b.screen_row(7), "", "gap row below `f`");
         assert_eq!(b.screen_row(9), "footer");
     }
@@ -4092,12 +4144,13 @@ mod tests {
         container.draw(&mut terminal).unwrap();
 
         let b = terminal.backend().inner();
-        // Previous-history row stays where it was.
-        assert_eq!(b.screen_row(0), "old-row");
+        // Previous-history row stays where it was. Block content lives
+        // at col 2 (cols 0..1 are the sigil gutter).
+        assert_eq!(b.screen_row(0), "  old-row");
         // New row took the previous footer slot.
         assert_eq!(
             b.screen_row(footer_anchor_before as usize),
-            "new-row",
+            "  new-row",
             "new block must appear right after the previous history",
         );
         // Footer slid down by the new block's slot height (content +
@@ -4165,15 +4218,15 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         assert_eq!(
             terminal.backend().inner().screen_row(0),
-            "hello⠋",
-            "spinner glyph appears immediately after the content",
+            "  hello⠋",
+            "spinner glyph appears immediately after the content (cols 0..1 are the sigil gutter)",
         );
 
         container.mark_safe(id);
         container.draw(&mut terminal).unwrap();
         assert_eq!(
             terminal.backend().inner().screen_row(0),
-            "hello",
+            "  hello",
             "mark_safe promotes out of active; the spinner cell is repainted",
         );
     }
@@ -4189,11 +4242,11 @@ mod tests {
         container.push_active(multi_text(&["hi"]));
 
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "hi⠋");
+        assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠋");
 
         container.bump_spinner();
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "hi⠙");
+        assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠙");
     }
 
     /// When the last row's content already fills the row to the right
@@ -4201,7 +4254,9 @@ mod tests {
     /// back to overwriting the final character.
     #[test]
     fn spinner_overwrites_last_char_when_content_fills_row() {
-        let mut terminal = mk_term_terminal(5, 5);
+        // Width 7 = 2-col sigil gutter + 5-col body. "hello" fills the
+        // body exactly, leaving no trailing slot for the spinner.
+        let mut terminal = mk_term_terminal(7, 5);
         let mut container = Rig::new(multi_text(&["foot."]), 0);
         container.enable_spinner();
 
@@ -4209,7 +4264,7 @@ mod tests {
         container.draw(&mut terminal).unwrap();
         assert_eq!(
             terminal.backend().inner().screen_row(0),
-            "hell⠋",
+            "  hell⠋",
             "content reaches the right edge, so the spinner overwrites the last char",
         );
     }
@@ -4222,7 +4277,7 @@ mod tests {
         let mut container = Rig::new(multi_text(&["footer"]), 0);
         container.push_active(multi_text(&["hello"]));
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "hello");
+        assert_eq!(terminal.backend().inner().screen_row(0), "  hello");
     }
 
     /// An entry flagged `safe_to_commit` that's still pinned in
@@ -4245,10 +4300,11 @@ mod tests {
         container.draw(&mut terminal).unwrap();
 
         // Layout: older at row 0, gap at row 1, newer at row 2, gap
-        // at row 3, footer at row 4.
+        // at row 3, footer at row 4. Each block content starts at
+        // col 2 (the sigil gutter occupies cols 0..1).
         assert_eq!(
             terminal.backend().inner().screen_row(0),
-            "older⠋",
+            "  older⠋",
             "older still-active entry keeps the spinner glyph",
         );
         assert_eq!(
@@ -4258,7 +4314,7 @@ mod tests {
         );
         assert_eq!(
             terminal.backend().inner().screen_row(2),
-            "newer",
+            "  newer",
             "newer safe-flagged entry renders verbatim — no spinner overlay",
         );
 
@@ -4266,9 +4322,9 @@ mod tests {
         // rendering as their real last char.
         container.mark_safe(older);
         container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "older");
+        assert_eq!(terminal.backend().inner().screen_row(0), "  older");
         assert_eq!(terminal.backend().inner().screen_row(1), "");
-        assert_eq!(terminal.backend().inner().screen_row(2), "newer");
+        assert_eq!(terminal.backend().inner().screen_row(2), "  newer");
     }
 
     // ------------------------------------------------------------------
@@ -4401,7 +4457,9 @@ mod tests {
             fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
                 1
             }
-            fn render(&self, _ctx: &mut BlockRenderContext<'_>) {}
+            fn render(&self, _ctx: &mut BlockRenderContext<'_>) -> crate::block::Sigil {
+                crate::block::Sigil::blank()
+            }
         }
 
         let mut c = Rig::new(para("footer"), 0);

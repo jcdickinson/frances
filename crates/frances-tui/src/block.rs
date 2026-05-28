@@ -32,9 +32,43 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use ratatui::style::Style;
 use serde::{Deserialize, Serialize};
 
 use crate::widget::{Input, Theme};
+
+/// Container-reserved left gutter width, in columns. Every block's
+/// rendered content lives at `area.x + SIGIL_WIDTH..area.x + area.width`;
+/// the container paints the block's [`Block::sigil`] into the first
+/// `SIGIL_WIDTH` cells of the block's topmost row.
+pub const SIGIL_WIDTH: u16 = 2;
+
+/// A glyph painted by the container into the left gutter at the
+/// block's first on-screen row. The container always reserves
+/// [`SIGIL_WIDTH`] cells regardless of `text`'s display width — `text`
+/// is just what (if anything) gets drawn at column 0 of the gutter.
+/// Blank == empty string, not whitespace; the gutter is reserved by
+/// the container, not by the sigil's content.
+#[derive(Debug, Clone, Default)]
+pub struct Sigil {
+    pub text: String,
+    pub style: Style,
+}
+
+impl Sigil {
+    /// No glyph — the container's reserved gutter stays empty for this
+    /// block's first row.
+    pub fn blank() -> Self {
+        Self::default()
+    }
+
+    pub fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
 
 /// Closed tag for the concrete block types this binary ships. Returned
 /// by [`Block::kind`] so persistence layers can route a `Box<dyn Block>`
@@ -107,12 +141,21 @@ pub trait Block: Input + 'static {
 
     fn kind(&self) -> BlockKind;
 
-    /// Total rendered row count if wrapped at `ctx.width`. Must be
-    /// deterministic for a given context — the container caches layout
-    /// decisions on this.
+    /// Total rendered row count if wrapped at `ctx.width`. Note that
+    /// `ctx.width` is already the *body* width — the container has
+    /// deducted [`SIGIL_WIDTH`] for the left gutter, so blocks compute
+    /// wrap exclusively against the body region. Must be deterministic
+    /// for a given context — the container caches layout decisions on
+    /// this.
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16;
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>);
+    /// Paint the block's body into `ctx.area` (which already excludes
+    /// the container's left gutter), and return the [`Sigil`] the
+    /// container should paint into the gutter at the block's topmost
+    /// row. Returning the sigil from `render` (instead of a separate
+    /// method) keeps the body content and its sigil in lockstep — they
+    /// can't drift on streaming updates.
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil;
 }
 
 /// Adapter so a `ratatui::widgets::Paragraph` can be used as a `Block`
@@ -142,7 +185,7 @@ impl Block for ratatui::widgets::Paragraph<'static> {
         self.line_count(ctx.width) as u16
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
         use ratatui::widgets::Widget;
         // Paragraph has no native src_y; for the straddle path the
         // container shouldn't be calling Paragraph directly. If src_y
@@ -155,5 +198,6 @@ impl Block for ratatui::widgets::Paragraph<'static> {
             ctx.area.height + ctx.src_y,
         );
         Widget::render(self.clone(), shifted, ctx.buf);
+        Sigil::blank()
     }
 }

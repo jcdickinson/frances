@@ -4,6 +4,7 @@ use crate::tui::status::{StatusTone, status_prefix};
 use frances_session::events::{
     BlockKind as WireBlockKind, ReasoningState, ShellState, Source, TailedHeader,
 };
+use frances_tui::block::Sigil;
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
 use ratatui::style::{Color, Modifier, Style};
@@ -89,7 +90,7 @@ impl Block for DiffBlock {
         count
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
         let max = ctx.area.width.max(1) as usize;
         let mut row_writer = RowWriter::new(ctx);
         for line in &self.lines {
@@ -115,11 +116,12 @@ impl Block for DiffBlock {
                 let written = row_writer.write_styled(&wrapped_line, style);
                 if !written && row_writer.finished() {
                     paint_truncation_marker_if_set(row_writer.ctx);
-                    return;
+                    return Sigil::blank();
                 }
             }
         }
         paint_truncation_marker_if_set(row_writer.ctx);
+        Sigil::blank()
     }
 }
 
@@ -135,6 +137,17 @@ pub struct LabelledBlock {
 impl LabelledBlock {
     pub fn new(kind: WireBlockKind, text: String) -> Self {
         Self { kind, text }
+    }
+
+    /// Body content rendered into the block area. For plain `ToolUse`
+    /// markers the tool name lives in the kind (the `text` payload is
+    /// empty), so we surface the name as the body — the `→ ` sigil
+    /// already lives in the gutter.
+    fn body_text(&self) -> &str {
+        match &self.kind {
+            WireBlockKind::ToolUse { name, .. } => name,
+            _ => &self.text,
+        }
     }
 }
 
@@ -159,15 +172,11 @@ impl Block for LabelledBlock {
     }
 
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
-        wrapped_block_lines(&self.kind, &self.text, ctx.width).len() as u16
+        wrapped_body_lines(self.body_text(), ctx.width).len() as u16
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
-        let lines = wrapped_block_lines(&self.kind, &self.text, ctx.area.width);
-        let prefix = prefix_for(&self.kind);
-        let prefix_bytes = prefix.len();
-        let prefix_cols = display_width(&prefix) as u16;
-        let prefix_style = prefix_style(&self.kind);
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
+        let lines = wrapped_body_lines(self.body_text(), ctx.area.width);
         let src_y = ctx.src_y;
         let area = ctx.area;
         for (i, line) in lines.iter().enumerate() {
@@ -179,23 +188,11 @@ impl Block for LabelledBlock {
             if dst_row >= area.height {
                 break;
             }
-            let y = area.y + dst_row;
-            if i == 0 && line.starts_with(&prefix) {
-                ctx.buf
-                    .set_string(area.x, y, &line[..prefix_bytes], prefix_style);
-                if line.len() > prefix_bytes {
-                    ctx.buf.set_string(
-                        area.x + prefix_cols,
-                        y,
-                        &line[prefix_bytes..],
-                        Style::default(),
-                    );
-                }
-            } else {
-                ctx.buf.set_string(area.x, y, line, Style::default());
-            }
+            ctx.buf
+                .set_string(area.x, area.y + dst_row, line, Style::default());
         }
         paint_truncation_marker_if_set(ctx);
+        sigil_for(&self.kind)
     }
 }
 
@@ -249,22 +246,22 @@ impl TailedBlock {
         }
     }
 
-    /// Left padding applied to body rows. Reasoning gets 2 cols so the
-    /// thought text reads as a visually subordinate aside.
-    fn body_indent(&self) -> u16 {
+    /// Paint style for body rows. Reasoning bodies render in DarkGray
+    /// so thoughts read as a subordinate aside without relying on the
+    /// terminal honouring the DIM SGR (which many don't). Shell output
+    /// stays default — it's meant to be scannable.
+    fn body_style(&self) -> Style {
         match &self.header {
-            TailedHeader::Reasoning { .. } => 2,
-            TailedHeader::Shell { .. } => 0,
+            TailedHeader::Reasoning { .. } => Style::default().fg(Color::DarkGray),
+            TailedHeader::Shell { .. } => Style::default(),
         }
     }
 
-    /// Paint style for body rows. Reasoning is dimmed; shell output
-    /// stays default so it remains scannable.
-    fn body_style(&self) -> Style {
-        match &self.header {
-            TailedHeader::Reasoning { .. } => Style::default().add_modifier(Modifier::DIM),
-            TailedHeader::Shell { .. } => Style::default(),
-        }
+    /// Reasoning blocks with no body are hidden — the empty `[thought]`
+    /// pill on its own is just noise. Shell blocks always show their
+    /// header (the command line + status) even when the body is empty.
+    fn is_empty(&self) -> bool {
+        matches!(self.header, TailedHeader::Reasoning { .. }) && self.source_lines().is_empty()
     }
 
     fn header_lines(&self, width: u16) -> Vec<String> {
@@ -308,8 +305,7 @@ impl TailedBlock {
         if source.is_empty() {
             return Vec::new();
         }
-        let body_width = width.saturating_sub(self.body_indent());
-        let max = body_width.max(1) as usize;
+        let max = width.max(1) as usize;
         let mut out = Vec::new();
         if source.len() > tail {
             let start_offset = window_start.min(self.max_scroll_for(tail)) as usize;
@@ -376,12 +372,18 @@ impl Block for TailedBlock {
     }
 
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
+        if self.is_empty() {
+            return 0;
+        }
         let tail = tail_lines_for(ctx.selected);
         let body_rows = self.body_lines_at(ctx.width, 0, tail).len();
         (self.header_lines(ctx.width).len() + body_rows) as u16
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
+        if self.is_empty() {
+            return Sigil::blank();
+        }
         // Live view always shows the tail (window_start = 0).
         // Alt view honours the block's internal scroll position so the
         // user can page through earlier source lines. The tail grows
@@ -402,7 +404,7 @@ impl Block for TailedBlock {
                 let dst_row = src_idx - src_y;
                 if dst_row >= area.height {
                     paint_truncation_marker_if_set(ctx);
-                    return;
+                    return Sigil::blank();
                 }
                 let y = area.y + dst_row;
                 if i == 0 && line.starts_with(&prefix) {
@@ -422,25 +424,21 @@ impl Block for TailedBlock {
             }
             src_idx = src_idx.saturating_add(1);
         }
-        let body_indent = self.body_indent();
         let body_style = self.body_style();
         for line in body.iter() {
             if src_idx >= src_y {
                 let dst_row = src_idx - src_y;
                 if dst_row >= area.height {
                     paint_truncation_marker_if_set(ctx);
-                    return;
+                    return Sigil::blank();
                 }
-                ctx.buf.set_string(
-                    area.x.saturating_add(body_indent),
-                    area.y + dst_row,
-                    line,
-                    body_style,
-                );
+                ctx.buf
+                    .set_string(area.x, area.y + dst_row, line, body_style);
             }
             src_idx = src_idx.saturating_add(1);
         }
         paint_truncation_marker_if_set(ctx);
+        Sigil::blank()
     }
 }
 
@@ -462,8 +460,11 @@ impl ToolUseBlock {
         Self { name, detail }
     }
 
+    /// Lead text on the first body row — the tool name plus a two-space
+    /// gap before the detail. The `→` glyph lives in the container's
+    /// gutter as the [`Sigil`]; the body owns just the name + detail.
     fn name_prefix(&self) -> String {
-        format!("→ {}  ", self.name)
+        format!("{}  ", self.name)
     }
 
     fn wrapped_lines(&self, width: u16) -> Vec<String> {
@@ -512,16 +513,16 @@ impl Block for ToolUseBlock {
         self.wrapped_lines(ctx.width).len() as u16
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
         let lines = self.wrapped_lines(ctx.area.width);
         let prefix = self.name_prefix();
-        // Split the prefix into the colored arrow+name segment (yellow)
-        // and the trailing two spaces that bridge into the dim detail.
-        // The arrow+name byte count is `prefix.len() - 2` because the
-        // suffix is exactly `"  "` (two ASCII spaces).
-        let arrow_bytes = prefix.len() - 2;
+        // Split the prefix into the colored name segment (yellow,
+        // matching the gutter `→`) and the trailing two spaces that
+        // bridge into the dim detail. The name byte count is
+        // `prefix.len() - 2` because the suffix is exactly `"  "`.
+        let name_bytes = prefix.len() - 2;
         let prefix_cols = display_width(&prefix) as u16;
-        let arrow_style = Style::default().fg(Color::Yellow);
+        let name_style = Style::default().fg(Color::Yellow);
         let dim_style = Style::default().add_modifier(Modifier::DIM);
         let src_y = ctx.src_y;
         let area = ctx.area;
@@ -537,7 +538,7 @@ impl Block for ToolUseBlock {
             let y = area.y + dst_row;
             if i == 0 && line.starts_with(&prefix) {
                 ctx.buf
-                    .set_string(area.x, y, &line[..arrow_bytes], arrow_style);
+                    .set_string(area.x, y, &line[..name_bytes], name_style);
                 if line.len() > prefix.len() {
                     ctx.buf
                         .set_string(area.x + prefix_cols, y, &line[prefix.len()..], dim_style);
@@ -547,6 +548,7 @@ impl Block for ToolUseBlock {
             }
         }
         paint_truncation_marker_if_set(ctx);
+        Sigil::new("→ ", Style::default().fg(Color::Yellow))
     }
 }
 
@@ -615,7 +617,7 @@ impl Block for RawBlock {
         self.lines.len() as u16
     }
 
-    fn render(&self, ctx: &mut BlockRenderContext<'_>) {
+    fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
         let src_y = ctx.src_y;
         let area = ctx.area;
         for (i, line) in self.lines.iter().enumerate() {
@@ -631,6 +633,7 @@ impl Block for RawBlock {
                 .set_string(area.x, area.y + dst_row, line, self.style);
         }
         paint_truncation_marker_if_set(ctx);
+        Sigil::blank()
     }
 }
 
@@ -702,61 +705,45 @@ impl<'a, 'b> RowWriter<'a, 'b> {
     }
 }
 
-pub fn prefix_for(kind: &WireBlockKind) -> String {
+/// Sigil for a [`LabelledBlock`] of the given wire kind. The renderer
+/// reserves the 2-col gutter; this just declares what glyph (if any)
+/// belongs there.
+pub fn sigil_for(kind: &WireBlockKind) -> Sigil {
     match kind {
         WireBlockKind::Text {
             source: Source::User,
-        } => "> ".to_owned(),
+        } => Sigil::new("> ", Style::default()),
         WireBlockKind::Text {
             source: Source::Assistant,
-        } => "◆ ".to_owned(),
+        } => Sigil::new("◆ ", Style::default()),
         WireBlockKind::Text {
             source: Source::Internal,
-        } => String::new(),
+        } => Sigil::blank(),
         // The `detail`-bearing variant routes through `ToolUseBlock`; the
-        // `LabelledBlock` path only sees plain tool-use markers.
-        WireBlockKind::ToolUse { name, .. } => format!("→ {name}"),
-        WireBlockKind::Tailed { .. } => {
-            // Tailed blocks render through TailedBlock, which owns
-            // their own prefix; LabelledBlock should never see this kind.
-            String::new()
-        }
-        WireBlockKind::Diff { .. } => String::new(),
+        // `LabelledBlock` path only sees plain tool-use markers (no detail).
+        WireBlockKind::ToolUse { .. } => Sigil::new("→ ", Style::default().fg(Color::Yellow)),
+        WireBlockKind::Tailed { .. } => Sigil::blank(),
+        WireBlockKind::Diff { .. } => Sigil::blank(),
     }
 }
 
-fn prefix_style(kind: &WireBlockKind) -> Style {
-    match kind {
-        WireBlockKind::Text { .. } => Style::default(),
-        WireBlockKind::ToolUse { .. } => Style::default().fg(Color::Yellow),
-        WireBlockKind::Tailed { .. } => Style::default(),
-        WireBlockKind::Diff { .. } => Style::default(),
-    }
-}
-
-pub fn wrapped_block_lines(kind: &WireBlockKind, text: &str, width: u16) -> Vec<String> {
-    let prefix = prefix_for(kind);
-    let indent = " ".repeat(display_width(&prefix));
+/// Wrap `text` to `width` columns, one row per wrapped line. The
+/// container is responsible for the left gutter; this function doesn't
+/// know about sigils.
+pub fn wrapped_body_lines(text: &str, width: u16) -> Vec<String> {
     let max = width.max(1) as usize;
     // LLM completions routinely end with one or more trailing `\n`s.
     // Without stripping, `split('\n')` yields an empty trailing element
-    // that renders as an indent-only continuation row — visually a
-    // blank line between this block and whatever comes next. Embedded
-    // blank lines (`\n\n` mid-text) are preserved as real paragraph
-    // breaks.
+    // that renders as a blank continuation row. Embedded blank lines
+    // (`\n\n` mid-text) are preserved as real paragraph breaks.
     let text = text.trim_end_matches('\n');
 
     let mut out = Vec::new();
-    for (i, source_line) in text.split('\n').enumerate() {
-        let lead = if i == 0 {
-            prefix.as_str()
-        } else {
-            indent.as_str()
-        };
-        wrap_into(lead, source_line, max, &mut out);
+    for source_line in text.split('\n') {
+        wrap_into("", source_line, max, &mut out);
     }
     if out.is_empty() {
-        out.push(prefix);
+        out.push(String::new());
     }
     out
 }
@@ -788,66 +775,82 @@ mod tests {
     use super::*;
     use frances_session::events::DiffLine;
 
-    fn assistant() -> WireBlockKind {
-        WireBlockKind::Text {
-            source: Source::Assistant,
-        }
-    }
-
     #[test]
     fn no_trailing_newline_is_unchanged() {
-        let lines = wrapped_block_lines(&assistant(), "Hello", 80);
-        assert_eq!(lines, vec!["◆ Hello"]);
+        let lines = wrapped_body_lines("Hello", 80);
+        assert_eq!(lines, vec!["Hello"]);
     }
 
     #[test]
     fn single_trailing_newline_is_stripped() {
-        let lines = wrapped_block_lines(&assistant(), "Hello\n", 80);
+        let lines = wrapped_body_lines("Hello\n", 80);
         assert_eq!(
             lines,
-            vec!["◆ Hello"],
-            "trailing `\\n` should not produce an indent-only continuation row"
+            vec!["Hello"],
+            "trailing `\\n` should not produce a blank continuation row"
         );
     }
 
     #[test]
     fn multiple_trailing_newlines_are_stripped() {
-        let lines = wrapped_block_lines(&assistant(), "Hello\n\n\n", 80);
-        assert_eq!(lines, vec!["◆ Hello"]);
+        let lines = wrapped_body_lines("Hello\n\n\n", 80);
+        assert_eq!(lines, vec!["Hello"]);
     }
 
     #[test]
     fn mid_text_paragraph_break_is_preserved() {
-        let lines = wrapped_block_lines(&assistant(), "One\n\nTwo", 80);
+        let lines = wrapped_body_lines("One\n\nTwo", 80);
         assert_eq!(
             lines,
-            vec!["◆ One".to_string(), "  ".to_string(), "  Two".to_string(),],
+            vec!["One".to_string(), "".to_string(), "Two".to_string()],
             "an internal `\\n\\n` is a real paragraph break and stays"
         );
     }
 
     #[test]
     fn mid_text_paragraph_break_with_trailing_newline_keeps_only_the_break() {
-        let lines = wrapped_block_lines(&assistant(), "One\n\nTwo\n", 80);
+        let lines = wrapped_body_lines("One\n\nTwo\n", 80);
         assert_eq!(
             lines,
-            vec!["◆ One".to_string(), "  ".to_string(), "  Two".to_string(),]
+            vec!["One".to_string(), "".to_string(), "Two".to_string()]
         );
     }
 
     #[test]
-    fn newline_only_text_collapses_to_just_the_prefix() {
-        let lines = wrapped_block_lines(&assistant(), "\n", 80);
-        assert_eq!(lines, vec!["◆ "]);
+    fn newline_only_text_collapses_to_one_blank_row() {
+        let lines = wrapped_body_lines("\n", 80);
+        assert_eq!(lines, vec![""]);
     }
 
     #[test]
-    fn internal_text_block_with_trailing_newline_does_not_emit_blank_row() {
-        let kind = WireBlockKind::Text {
-            source: Source::Internal,
-        };
-        let lines = wrapped_block_lines(&kind, "Hello\n", 80);
-        assert_eq!(lines, vec!["Hello"]);
+    fn empty_text_yields_one_blank_row() {
+        let lines = wrapped_body_lines("", 80);
+        assert_eq!(lines, vec![""]);
+    }
+
+    #[test]
+    fn sigil_for_each_text_source() {
+        assert_eq!(
+            sigil_for(&WireBlockKind::Text {
+                source: Source::User,
+            })
+            .text,
+            "> ",
+        );
+        assert_eq!(
+            sigil_for(&WireBlockKind::Text {
+                source: Source::Assistant,
+            })
+            .text,
+            "◆ ",
+        );
+        assert_eq!(
+            sigil_for(&WireBlockKind::Text {
+                source: Source::Internal,
+            })
+            .text,
+            "",
+        );
     }
 
     /// One round-trip-serde test per serializable block variant.
