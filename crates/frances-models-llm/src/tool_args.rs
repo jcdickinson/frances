@@ -12,7 +12,7 @@
 
 use serde_json::Value;
 
-use crate::wire::{ToolCall, ToolCallError, ToolDef};
+use crate::{ToolCall, ToolCallError, ToolDef};
 
 /// Validate each call's arguments against the called tool's declared schema,
 /// flagging mismatches in-place via [`ToolCall::error`]. A call to a tool not
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn annotate_flags_only_bad_calls() {
-        use crate::wire::{ToolCall, ToolDef, ToolFunction};
+        use crate::{ToolCall, ToolDef, ToolFunction};
         let tools = vec![ToolDef::Function(ToolFunction {
             name: "decide".into(),
             description: String::new(),

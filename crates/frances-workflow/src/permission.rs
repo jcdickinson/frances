@@ -20,7 +20,7 @@
 //! consume. The JS bridge has its own `IntoJs` impls emitting the
 //! `{ type, ... }` shape the JS module expects.
 
-use frances_models_llm::wire::ToolCall;
+use frances_models_llm::ToolCall;
 use tokio::sync::oneshot;
 
 /// A permission request emitted on the workflow's `permissions` output.

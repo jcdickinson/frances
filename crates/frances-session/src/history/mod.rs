@@ -46,7 +46,7 @@ impl TursoHistoryStore {
         provider: &P,
         provider_id: &str,
     ) -> Result<(), HistoryError> {
-        use frances_models_llm::wire::HistoryInput;
+        use frances_models_llm::HistoryInput;
 
         let conn = self.db.connect().await;
         conn.execute(

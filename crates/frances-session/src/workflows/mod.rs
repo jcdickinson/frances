@@ -556,7 +556,7 @@ pub(crate) async fn run_driver(
         Transcript(TranscriptDelta),
         Surface(SurfaceCmd),
         Permission(PermissionRequest),
-        Usage(frances_models_llm::wire::Usage),
+        Usage(frances_models_llm::Usage),
         Done(Option<WorkflowError>),
         Push { name: String, args: Vec<String> },
         Shutdown,
@@ -920,7 +920,7 @@ fn emit_surface(runtime: &Arc<SessionRuntime>, cmd: SurfaceCmd) {
 }
 
 /// LLM token-usage telemetry. Pass-through to the TUI footer; not persisted.
-fn emit_usage(runtime: &Arc<SessionRuntime>, usage: frances_models_llm::wire::Usage) {
+fn emit_usage(runtime: &Arc<SessionRuntime>, usage: frances_models_llm::Usage) {
     runtime.events.send(StreamFrame::Usage(usage));
 }
 

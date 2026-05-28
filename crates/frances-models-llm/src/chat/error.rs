@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::wire::ErasedError;
+use crate::ErasedError;
 
 use super::types::ChatSessionId;
 

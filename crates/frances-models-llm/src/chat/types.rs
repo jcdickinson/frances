@@ -1,7 +1,5 @@
 use crate::chat::builder::ModelIntents;
-use crate::wire::HistoryInput;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -51,93 +49,4 @@ pub struct ChatSessionRow {
     /// Ordered list of `models::<intent>` config keys the session walks
     /// when resolving a model for the next call.
     pub model_intents: ModelIntents,
-}
-
-/// A primitive row read back from storage; mirrors [`HistoryInput`] but
-/// owns its strings so it can outlive the SQL row buffer.
-#[derive(Debug, Clone, PartialEq)]
-pub enum OwnedHistoryInput {
-    System {
-        text: String,
-    },
-    User {
-        text: String,
-    },
-    Assistant {
-        text: String,
-    },
-    ToolCall {
-        id: String,
-        name: String,
-        arguments: Value,
-    },
-    ToolResult {
-        call_id: String,
-        content: String,
-        is_error: bool,
-    },
-}
-
-impl OwnedHistoryInput {
-    /// Owning copy of a borrowed [`HistoryInput`] — the inverse of
-    /// [`as_borrowed`](Self::as_borrowed). Lets callers that need to grow
-    /// an input list across rounds (e.g. `complete_enforced`'s scold loop)
-    /// keep everything owned.
-    pub fn from_borrowed(input: &HistoryInput<'_>) -> Self {
-        match *input {
-            HistoryInput::System { text } => Self::System {
-                text: text.to_owned(),
-            },
-            HistoryInput::User { text } => Self::User {
-                text: text.to_owned(),
-            },
-            HistoryInput::Assistant { text } => Self::Assistant {
-                text: text.to_owned(),
-            },
-            HistoryInput::ToolCall {
-                id,
-                name,
-                arguments,
-            } => Self::ToolCall {
-                id: id.to_owned(),
-                name: name.to_owned(),
-                arguments: arguments.clone(),
-            },
-            HistoryInput::ToolResult {
-                call_id,
-                content,
-                is_error,
-            } => Self::ToolResult {
-                call_id: call_id.to_owned(),
-                content: content.to_owned(),
-                is_error,
-            },
-        }
-    }
-
-    pub fn as_borrowed(&self) -> HistoryInput<'_> {
-        match self {
-            Self::System { text } => HistoryInput::System { text },
-            Self::User { text } => HistoryInput::User { text },
-            Self::Assistant { text } => HistoryInput::Assistant { text },
-            Self::ToolCall {
-                id,
-                name,
-                arguments,
-            } => HistoryInput::ToolCall {
-                id,
-                name,
-                arguments,
-            },
-            Self::ToolResult {
-                call_id,
-                content,
-                is_error,
-            } => HistoryInput::ToolResult {
-                call_id,
-                content,
-                is_error: *is_error,
-            },
-        }
-    }
 }

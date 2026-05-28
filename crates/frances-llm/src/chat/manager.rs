@@ -8,7 +8,7 @@ use frances_models_llm::chat::{
     ChatSessionRow, CompleteRequest,
 };
 use frances_models_llm::config::ModelConfig;
-use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent};
+use frances_models_llm::{CompletionOutcome, ErasedError, StreamEvent};
 use serde::Deserialize;
 use tracing::error;
 

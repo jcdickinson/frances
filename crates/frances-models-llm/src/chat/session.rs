@@ -10,12 +10,12 @@ use std::ffi::OsString;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::wire::{CompletionOutcome, HistoryInput, StreamEvent, ToolChoice, ToolDef};
+use crate::{CompletionOutcome, HistoryInput, OwnedHistoryInput, StreamEvent, ToolChoice, ToolDef};
 
 use super::builder::ChatSessionBuilder;
 use super::complete::{CompleteRequest, Demand, EnforceError};
 use super::error::ChatError;
-use super::types::{ChatCheckpoint, ChatSessionId, OwnedHistoryInput};
+use super::types::{ChatCheckpoint, ChatSessionId};
 
 #[async_trait]
 pub trait ChatSession: Clone + Send + Sync + 'static {

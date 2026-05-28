@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::chat::OwnedHistoryInput;
 use frances_models_llm::config::ProviderConfig;
-use frances_models_llm::wire::{CompletionOutcome, ErasedError, HistoryInput, StreamEvent};
+use frances_models_llm::{CompletionOutcome, ErasedError, HistoryInput, StreamEvent};
 
 use crate::provider::{Provider, ProviderRequest};
 
@@ -160,7 +160,7 @@ impl Provider for StubProvider {
                 )
             })?;
         let cap = req.max_tool_calls;
-        let mut emitted_calls: Vec<frances_models_llm::wire::ToolCall> = Vec::new();
+        let mut emitted_calls: Vec<frances_models_llm::ToolCall> = Vec::new();
         for ev in script.events {
             // Mirror the OpenAI provider's truncation: once we've
             // emitted `cap` tool calls, drop everything further on the

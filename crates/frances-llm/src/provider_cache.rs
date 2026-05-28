@@ -25,8 +25,8 @@ use parking_lot::Mutex;
 use thiserror::Error;
 use tracing::warn;
 
+use frances_models_llm::ErasedError;
 use frances_models_llm::config::{GenAIExtras, ProviderConfig};
-use frances_models_llm::wire::ErasedError;
 
 use crate::provider::{ErasedProvider, Provider, erase};
 use crate::providers::genai;

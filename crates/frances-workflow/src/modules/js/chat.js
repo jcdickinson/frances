@@ -116,11 +116,14 @@ async function _streamWithDispatch(chat, opts, getHook) {
     try {
       raw = await inner.completed;
     } catch (err) {
-      // The Rust side rejects with the `__cancelled__` sentinel on
-      // `ChatError::Cancelled`. Either way, if the user aborted, the
-      // user-visible rejection should match `events`/`text`: throw
-      // `signal.reason`, not the internal error string.
-      if (signal && signal.aborted) throw signal.reason;
+      // Rust rejects with a structurally-tagged Error (`err.cancelled`) on
+      // `ChatError::Cancelled`. When the user aborted, surface `signal.reason`
+      // so the `completed` rejection matches `events`/`text` (both errored
+      // with `signal.reason`); otherwise (GC/shutdown teardown) propagate the
+      // cancellation as-is.
+      if (err && err.cancelled) {
+        throw signal && signal.aborted ? signal.reason : err;
+      }
       throw err;
     }
     const hook = getHook();

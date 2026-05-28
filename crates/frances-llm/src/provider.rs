@@ -14,7 +14,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::config::{ModelConfig, ProviderConfig};
-use frances_models_llm::wire::{
+use frances_models_llm::{
     ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent,
     ToolChoice, ToolDef,
 };

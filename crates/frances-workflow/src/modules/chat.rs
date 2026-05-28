@@ -60,7 +60,7 @@ use frances_models_llm::chat::{
     ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, ModelIntents,
     OwnedHistoryInput, RowId,
 };
-use frances_models_llm::wire::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
+use frances_models_llm::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
 
 use crate::deps::WorkflowDeps;
 
@@ -75,7 +75,7 @@ type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManager
 pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
-    usage_tx: UnboundedSender<frances_models_llm::wire::Usage>,
+    usage_tx: UnboundedSender<frances_models_llm::Usage>,
 ) -> JsResult<(Constructor<'js>, Function<'js>)> {
     let ctor_usage_tx = usage_tx.clone();
     let ctor = Constructor::new_class::<ChatSessionJs<D>, _, _>(
@@ -169,11 +169,14 @@ pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
                         .map_err(|e| e.to_string()),
                     None => manager.complete(req).await.map_err(|e| e.to_string()),
                 };
-                CompletionResult(result.map(|outcome| CompletedJs {
-                    text: outcome.text,
-                    tool_calls: outcome.tool_calls,
-                    usage: None,
-                }))
+                match result {
+                    Ok(outcome) => CompletionResult::Completed(CompletedJs {
+                        text: outcome.text,
+                        tool_calls: outcome.tool_calls,
+                        usage: None,
+                    }),
+                    Err(msg) => CompletionResult::Failed(msg),
+                }
             });
             promised.into_js(&ctx)
         },
@@ -392,7 +395,7 @@ pub struct ChatSessionJs<D: WorkflowDeps> {
     /// Side-channel for emitting `Usage` when the LLM stream reports
     /// token usage. Independent of the JS-visible event stream so
     /// workflows don't have to remember to forward it.
-    usage_tx: UnboundedSender<frances_models_llm::wire::Usage>,
+    usage_tx: UnboundedSender<frances_models_llm::Usage>,
     /// Flipped once the first `user` message is pushed. After that,
     /// `system` pushes throw.
     system_locked: AtomicBool,
@@ -806,7 +809,7 @@ fn start_stream<'js, D: WorkflowDeps>(
 
     // Mirror the latest `Usage` event into the completion result so
     // `pipeTo` callers (who don't iterate `r.events`) still see it.
-    let usage_capture: Arc<parking_lot::Mutex<Option<frances_models_llm::wire::Usage>>> =
+    let usage_capture: Arc<parking_lot::Mutex<Option<frances_models_llm::Usage>>> =
         Arc::new(parking_lot::Mutex::new(None));
 
     let cancel = CancellationToken::new();
@@ -862,14 +865,13 @@ fn start_stream<'js, D: WorkflowDeps>(
 
     let completed_promise = Promised::from(async move {
         match completed_rx.await {
-            Ok(Ok(c)) => CompletionResult(Ok(c)),
-            // Sentinel string the JS wrapper (`chat.js`) pattern-matches
-            // to convert into `throw signal.reason`, so all three
-            // observables (`events`, `text`, `completed`) reject with
-            // the user's abort reason uniformly.
-            Ok(Err(ChatError::Cancelled)) => CompletionResult(Err("__cancelled__".to_owned())),
-            Ok(Err(e)) => CompletionResult(Err(format!("chat stream failed: {e}"))),
-            Err(_) => CompletionResult(Err("chat stream task aborted".to_owned())),
+            Ok(Ok(c)) => CompletionResult::Completed(c),
+            // `chat.js` recognizes the structurally-tagged cancellation
+            // rejection and rethrows the user's abort reason, so all three
+            // observables (`events`, `text`, `completed`) reject uniformly.
+            Ok(Err(ChatError::Cancelled)) => CompletionResult::Cancelled,
+            Ok(Err(e)) => CompletionResult::Failed(format!("chat stream failed: {e}")),
+            Err(_) => CompletionResult::Failed("chat stream task aborted".to_owned()),
         }
     });
 
@@ -1005,13 +1007,18 @@ impl<'js> IntoJs<'js> for JsStreamEvent {
     }
 }
 
-struct CompletionResult(Result<CompletedJs, String>);
+enum CompletionResult {
+    Completed(CompletedJs),
+    Cancelled,
+    Failed(String),
+}
 
 impl<'js> IntoJs<'js> for CompletionResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
-        match self.0 {
-            Ok(c) => c.into_js(ctx),
-            Err(msg) => Err(throw(ctx, &msg)),
+        match self {
+            CompletionResult::Completed(c) => c.into_js(ctx),
+            CompletionResult::Cancelled => Err(throw_cancelled(ctx)),
+            CompletionResult::Failed(msg) => Err(throw(ctx, &msg)),
         }
     }
 }
@@ -1019,7 +1026,7 @@ impl<'js> IntoJs<'js> for CompletionResult {
 struct CompletedJs {
     text: String,
     tool_calls: Vec<ToolCall>,
-    usage: Option<frances_models_llm::wire::Usage>,
+    usage: Option<frances_models_llm::Usage>,
 }
 
 impl<'js> IntoJs<'js> for CompletedJs {
@@ -1061,10 +1068,7 @@ impl<'js> IntoJs<'js> for CompletedJs {
     }
 }
 
-fn usage_into_js<'js>(
-    ctx: &Ctx<'js>,
-    usage: &frances_models_llm::wire::Usage,
-) -> JsResult<Object<'js>> {
+fn usage_into_js<'js>(ctx: &Ctx<'js>, usage: &frances_models_llm::Usage) -> JsResult<Object<'js>> {
     let u = Object::new(ctx.clone())?;
     u.set("promptTokens", usage.prompt_tokens)?;
     u.set("completionTokens", usage.completion_tokens)?;
@@ -1182,4 +1186,17 @@ fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
         Ok(exc) => exc.throw(),
         Err(e) => e,
     }
+}
+
+/// Rejects with an `Error` carrying a `cancelled === true` flag so `chat.js`
+/// recognizes a cancelled stream structurally rather than by message string.
+fn throw_cancelled<'js>(ctx: &Ctx<'js>) -> rquickjs::Error {
+    let exc = match Exception::from_message(ctx.clone(), "chat stream cancelled") {
+        Ok(exc) => exc,
+        Err(e) => return e,
+    };
+    if let Err(e) = exc.as_object().set("cancelled", true) {
+        return e;
+    }
+    exc.throw()
 }

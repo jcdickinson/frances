@@ -12,7 +12,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::chat::error::ChatError;
-use crate::wire::{CompletionOutcome, HistoryInput, ToolCall, ToolChoice, ToolDef};
+use crate::{CompletionOutcome, HistoryInput, ToolCall, ToolChoice, ToolDef};
 
 /// Inputs to [`ChatSessionManager::complete`](super::ChatSessionManager::complete).
 /// Bundled so the call site reads as `chat.complete(CompleteRequest { … })`

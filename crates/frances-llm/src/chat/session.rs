@@ -7,7 +7,7 @@ use frances_models_llm::chat::{
     ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryError,
     ModelIntents, OwnedHistoryInput,
 };
-use frances_models_llm::wire::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
+use frances_models_llm::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -296,7 +296,7 @@ mod tests {
         OwnedHistoryInput, RowId,
     };
     use frances_models_llm::config::ModelConfig;
-    use frances_models_llm::wire::{CompletionOutcome, HistoryInput, StreamEvent, ToolCall};
+    use frances_models_llm::{CompletionOutcome, HistoryInput, StreamEvent, ToolCall};
     use serde_json::{Value, json};
 
     use crate::chat::deps::ChatManagerDeps;
@@ -810,8 +810,8 @@ mod tests {
             },
             "required": ["verdict", "reason"],
         });
-        let decide = vec![frances_models_llm::wire::ToolDef::Function(
-            frances_models_llm::wire::ToolFunction {
+        let decide = vec![frances_models_llm::ToolDef::Function(
+            frances_models_llm::ToolFunction {
                 name: "decide".into(),
                 description: String::new(),
                 parameters: schema.clone(),
@@ -887,8 +887,8 @@ mod tests {
         ));
 
         // Declared first so its borrow outlives the request built below.
-        let decide = [frances_models_llm::wire::ToolDef::Function(
-            frances_models_llm::wire::ToolFunction {
+        let decide = [frances_models_llm::ToolDef::Function(
+            frances_models_llm::ToolFunction {
                 name: "decide".into(),
                 description: String::new(),
                 parameters: json!({

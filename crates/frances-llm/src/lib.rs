@@ -27,7 +27,7 @@ pub use provider_cache::{ProviderCache, ProviderCacheError};
 pub use frances_models_llm::config::{
     AuthCommand, AuthMethod, GenAIExtras, ModelConfig, ProviderConfig,
 };
-pub use frances_models_llm::wire::{
+pub use frances_models_llm::{
     ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent, ToolCall,
     ToolChoice, ToolDef, ToolFunction, Usage,
 };

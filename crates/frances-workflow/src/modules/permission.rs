@@ -26,7 +26,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
-use frances_models_llm::wire::ToolCall;
+use frances_models_llm::ToolCall;
 use rquickjs::promise::Promised;
 use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Result as JsResult, Value};
 use tokio::sync::Notify;

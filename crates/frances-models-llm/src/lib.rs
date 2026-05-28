@@ -6,16 +6,19 @@
 //! pull in HTTP / SSE machinery.
 
 pub mod chat;
+pub mod completion;
 pub mod config;
+pub mod erased;
+pub mod history;
+pub mod tool;
 pub mod tool_args;
-pub mod wire;
 
 pub use chat::{
     ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager, ChatSessionRow,
-    HistoryError, OwnedHistoryInput, RowId, RowSeq,
+    HistoryError, RowId, RowSeq,
 };
+pub use completion::{CompletionOutcome, StreamEvent, ToolCall, ToolCallError, Usage};
 pub use config::{AuthCommand, AuthMethod, GenAIExtras, ModelConfig, ProviderConfig};
-pub use wire::{
-    ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent, ToolCall,
-    ToolChoice, ToolDef, ToolFunction, Usage,
-};
+pub use erased::{ChunkAbort, ErasedError, ErasedResult};
+pub use history::{HistoryInput, OwnedHistoryInput};
+pub use tool::{ToolChoice, ToolDef, ToolFunction};

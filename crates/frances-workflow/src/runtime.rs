@@ -99,7 +99,7 @@ pub struct WorkflowOutputs {
     pub permissions: UnboundedReceiver<PermissionRequest>,
     /// LLM token-usage telemetry. Side-channel; opens/closes no block and
     /// is never persisted (the TUI drops it during replay).
-    pub usage: UnboundedReceiver<frances_models_llm::wire::Usage>,
+    pub usage: UnboundedReceiver<frances_models_llm::Usage>,
 }
 
 /// Paired senders for [`WorkflowOutputs`], bundled so `V1HostState` stays
@@ -109,7 +109,7 @@ pub(crate) struct OutputSenders {
     pub transcript: UnboundedSender<TranscriptDelta>,
     pub surfaces: UnboundedSender<SurfaceCmd>,
     pub permissions: UnboundedSender<PermissionRequest>,
-    pub usage: UnboundedSender<frances_models_llm::wire::Usage>,
+    pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
 /// Frame identity, scoped to one invocation. Monotonically assigned by
@@ -414,7 +414,7 @@ async fn start_impl<D: WorkflowDeps>(
     let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptDelta>();
     let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<SurfaceCmd>();
     let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionRequest>();
-    let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::wire::Usage>();
+    let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::Usage>();
     let (done_tx, done_rx) = oneshot::channel::<Result<(), WorkflowError>>();
     let shutdown_notify = Arc::new(Notify::new());
     #[cfg(any(test, feature = "test-utils"))]
@@ -743,7 +743,7 @@ pub mod test_deps {
         ChatCheckpoint, ChatError, ChatSession, ChatSessionBuilder, ChatSessionId,
         ChatSessionManager, HistoryError, OwnedHistoryInput,
     };
-    use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
+    use frances_models_llm::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
     use frances_shell::{Shell, ShellError, ShellOptions};
     use frances_storage::{EntitySchema, Migration};
     use parking_lot::Mutex;
@@ -2359,7 +2359,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_session_text_pipe_closes_markdown_frame_on_completion() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent};
+        use frances_models_llm::{CompletionOutcome, StreamEvent};
 
         let deps = StubDeps::default();
         deps.script_next_run(
@@ -2521,6 +2521,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_session_completed_rejects_with_abort_reason_on_cancel() {
+        // The `completed` promise rejects via the structurally-tagged
+        // cancellation error (Rust sets `err.cancelled`), which chat.js
+        // converts into `signal.reason` to match the events/text streams.
+        let rt = Runtime::new(StubDeps::default()).unwrap();
+        let file = write_source(
+            "js",
+            r#"
+            import { ChatSession } from "frances:v1/chat";
+            import { AbortController } from "whatwg:abortcontroller";
+            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            const s = new ChatSession({ model_intents: ["x"] });
+            s.push({ role: "user", content: "hi" });
+            const ac = new AbortController();
+            ac.abort("user wanted out");
+            const r = await s.stream({ signal: ac.signal });
+            let caught;
+            try {
+                await r.completed;
+                caught = "no-throw";
+            } catch (e) {
+                caught = String(e);
+            }
+            transcript.push(new MarkdownFrame({ content: caught }));
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(text_of(&frames[0]), "user wanted out");
+    }
+
+    #[tokio::test]
     async fn chat_tools_array_is_per_instance_and_initially_empty() {
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
@@ -2616,7 +2656,7 @@ mod tests {
 
     #[tokio::test]
     async fn chat_stream_surfaces_tool_calls_in_completed_and_events() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -2782,7 +2822,7 @@ mod tests {
         // chat.stream() owns dispatch: when the LLM emits tool calls,
         // their handlers run inside the stream call and their results
         // get pushed back into the session before the next round.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -2888,7 +2928,7 @@ mod tests {
         // chat.toolCall is middleware around every dispatch: it can
         // pre-process, swap in a different result, or `await invoke()`
         // to fall through to the default behaviour.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -2967,7 +3007,7 @@ mod tests {
 
     #[tokio::test]
     async fn tool_call_hook_throw_becomes_error_result() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -3035,7 +3075,7 @@ mod tests {
     async fn missing_tool_pushes_synthetic_error_result() {
         // LLM hallucinates a tool name not in chat.tools — dispatch
         // synthesises an is_error: true result instead of crashing.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -3097,7 +3137,7 @@ mod tests {
         // A handler that sets `scope.toolCall` and calls `scope.stream()`
         // gets its hook used for the nested round. The outer chat's
         // `toolCall` is unaffected.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -3335,7 +3375,7 @@ mod tests {
         // Wire the Run tool through chat.tools and dispatch a fake
         // shell_run tool call via the stubbed provider.
         use super::test_deps::StubDepsRealShell;
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDepsRealShell::default();
@@ -3419,7 +3459,7 @@ mod tests {
         // arrives, especially under load — Run's turn will loop until
         // one of them catches Done.
         use super::test_deps::StubDepsRealShell;
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDepsRealShell::default();
@@ -3540,7 +3580,7 @@ mod tests {
         // rounds: Run should scold up to `maxScolds` times, then SIGKILL
         // the in-flight command and push a "killed" notice.
         use super::test_deps::StubDepsRealShell;
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDepsRealShell::default();
@@ -3662,7 +3702,7 @@ mod tests {
         // tool_results; the no-progress counter still ticks and the
         // shell is eventually killed.
         use super::test_deps::StubDepsRealShell;
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDepsRealShell::default();
@@ -3809,7 +3849,7 @@ mod tests {
     async fn scope_lock_runs_after_batch_push() {
         // The post-batch turn registered via scope.lock fires AFTER all
         // initial tool_results have been pushed to chat history.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -3878,7 +3918,7 @@ mod tests {
     async fn scope_lock_turns_run_in_finish_order() {
         // Two tools register turns. "fast" finishes before "slow"; turns
         // run in finish order, not tool_calls order.
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -3960,7 +4000,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_lock_turn_can_drive_followup_stream() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -4066,7 +4106,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_lock_gating_hook_scolds_off_script_calls() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -4171,7 +4211,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_lock_double_register_throws() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -4247,7 +4287,7 @@ mod tests {
 
     #[tokio::test]
     async fn scope_lock_turn_fn_throw_does_not_crash_round() {
-        use frances_models_llm::wire::{CompletionOutcome, StreamEvent, ToolCall};
+        use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
         use serde_json::json;
 
         let deps = StubDeps::default();
@@ -5512,16 +5552,16 @@ mod tests {
 
     fn outcome(
         text: &str,
-        tool_calls: Vec<frances_models_llm::wire::ToolCall>,
-    ) -> frances_models_llm::wire::CompletionOutcome {
-        frances_models_llm::wire::CompletionOutcome {
+        tool_calls: Vec<frances_models_llm::ToolCall>,
+    ) -> frances_models_llm::CompletionOutcome {
+        frances_models_llm::CompletionOutcome {
             text: text.to_owned(),
             tool_calls,
         }
     }
 
-    fn decide_call() -> frances_models_llm::wire::ToolCall {
-        frances_models_llm::wire::ToolCall {
+    fn decide_call() -> frances_models_llm::ToolCall {
+        frances_models_llm::ToolCall {
             error: None,
             id: "c1".into(),
             name: "decide".into(),

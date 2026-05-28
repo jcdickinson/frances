@@ -27,7 +27,7 @@ use frances_llm::{CompleteRequest, Demand};
 // The trait, in scope (as `_`) so `complete_enforced` resolves on the
 // concrete `runtime.chat` manager.
 use frances_models_llm::chat::ChatSessionManager as _;
-use frances_models_llm::wire::{HistoryInput, ToolCall, ToolDef, ToolFunction};
+use frances_models_llm::{HistoryInput, ToolCall, ToolDef, ToolFunction};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use tracing::warn;

@@ -10,7 +10,7 @@ the difference, so reasoning ends up in the scrollback DB and in
 
 To distinguish properly:
 
-- add `StreamEvent::ReasoningDelta(String)` to `frances-models-llm/wire.rs`
+- add `StreamEvent::ReasoningDelta(String)` to `frances-models-llm/completion.rs`
 - emit it from `providers/genai/mod.rs` on the
   `ChatStreamEvent::ReasoningChunk` arm, instead of folding into
   `TextDelta`

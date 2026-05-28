@@ -35,7 +35,7 @@ use tracing::{debug, trace, warn};
 
 use frances_core::Truncated;
 use frances_models_llm::config::{GenAIExtras, ProviderConfig};
-use frances_models_llm::wire::{
+use frances_models_llm::{
     CompletionOutcome, ErasedError, HistoryInput, StreamEvent, ToolCall, ToolChoice, ToolDef, Usage,
 };
 
