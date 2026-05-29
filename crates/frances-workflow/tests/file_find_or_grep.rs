@@ -2,13 +2,13 @@
 //! `FileSearch` primitive and the LLM-facing `Search` tool class. Each
 //! test drives a JS script through the workflow runtime against a
 //! `StubDeps` with a tempdir cwd, then asserts on what the script
-//! pushed back via `MarkdownFrame`.
+//! pushed back via `MarkdownSection`.
 
 use std::io::Write;
 use std::path::PathBuf;
 
 use frances_workflow::{
-    FrameKind, Invocation, Runtime, TranscriptDelta, test_deps::StubDeps,
+    Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 
@@ -21,28 +21,30 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn text_of(frame: &TranscriptDelta) -> String {
+fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
-            FrameKind::ToolUse { name, detail } => match detail {
+        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+            SectionKind::Markdown { .. } | SectionKind::Error => {
+                spec.seed.clone().unwrap_or_default()
+            }
+            SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
-            FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput { state, cmd } => format!(
+            SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
+            SectionKind::ShellOutput { state, cmd } => format!(
                 "[shell:{state:?}] $ {cmd}
 {}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Reasoning { state } => format!(
+            SectionKind::Reasoning { state } => format!(
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+            SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        TranscriptDelta::Append { delta, .. } => delta.clone(),
-        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Append { delta, .. } => delta.clone(),
+        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
     }
 }
 
@@ -52,7 +54,7 @@ fn deps_with_cwd(cwd: PathBuf) -> StubDeps {
     deps
 }
 
-async fn run_script(deps: StubDeps, script: &str) -> Vec<TranscriptDelta> {
+async fn run_script(deps: StubDeps, script: &str) -> Vec<SectionTranscript> {
     let rt = Runtime::new(deps).unwrap();
     let file = write_source(script);
     let mut handle = rt
@@ -69,13 +71,13 @@ async fn run_script(deps: StubDeps, script: &str) -> Vec<TranscriptDelta> {
 }
 
 /// Runs the FileSearch primitive directly and emits the raw JSON
-/// payload via a MarkdownFrame so tests can parse it.
+/// payload via a MarkdownSection so tests can parse it.
 const DUMP_RAW: &str = r#"
 import { FileSearch } from "frances:v1/tools/file_find_or_grep";
-import { transcript, MarkdownFrame } from "frances:v1/frames";
+import { transcript, MarkdownSection } from "frances:v1/sections";
 const fs = new FileSearch();
 const json = await fs.search(ARGS);
-transcript.push(new MarkdownFrame({ content: json }));
+transcript.push(new MarkdownSection({ content: json }));
 "#;
 
 fn dump_raw_script(args_literal: &str) -> String {
@@ -139,7 +141,7 @@ async fn empty_paths_without_search_rejects() {
     // Catch the thrown rejection and surface its message via transcript.
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         let msg;
         try {
@@ -148,7 +150,7 @@ async fn empty_paths_without_search_rejects() {
         } catch (e) {
             msg = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownFrame({ content: msg }));
+        transcript.push(new MarkdownSection({ content: msg }));
     "#;
     let frames = run_script(deps, script).await;
     let msg = text_of(&frames[0]);
@@ -306,7 +308,7 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
     let script = r#"
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         const vars = new Variables();
         const tool = new Search(fs, vars);
@@ -315,9 +317,9 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
                     arguments: { search: "hello", into: "hits" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
         const stashed = vars.get("hits");
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(stashed) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(stashed) }));
     "#;
     let frames = run_script(deps, script).await;
 
@@ -348,14 +350,14 @@ async fn search_tool_without_into_returns_compact_text() {
     let script = r#"
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const tool = new Search(new FileSearch(), new Variables());
         const r = await tool.handler({
             call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "hello" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
     "#;
     let frames = run_script(deps, script).await;
     let tool_result = text_of(&frames[0]);
@@ -376,7 +378,7 @@ async fn loop_guard_blocks_identical_search() {
     deps.set_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         await fs.search({ search: "hello" });
         let caught = "no-throw";
@@ -385,7 +387,7 @@ async fn loop_guard_blocks_identical_search() {
         } catch (e) {
             caught = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownFrame({ content: caught }));
+        transcript.push(new MarkdownSection({ content: caught }));
     "#;
     let frames = run_script(deps, script).await;
     let msg = text_of(&frames[0]);
@@ -405,7 +407,7 @@ async fn loop_guard_search_clears_after_edit() {
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         const editor = new Editor();
         await fs.search({ search: "hello" });
@@ -422,7 +424,7 @@ async fn loop_guard_search_clears_after_edit() {
         // Same search args as before — but the edit cleared the ring,
         // so this should succeed.
         const second = await fs.search({ search: "hello" });
-        transcript.push(new MarkdownFrame({ content: second }));
+        transcript.push(new MarkdownSection({ content: second }));
     "#;
     let frames = run_script(deps, script).await;
     let payload = text_of(&frames[0]);
@@ -441,12 +443,12 @@ async fn loop_guard_search_distinguishes_query() {
     deps.set_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         await fs.search({ search: "hello" });
         // Different query → different args hash → no collision.
         const second = await fs.search({ search: "world" });
-        transcript.push(new MarkdownFrame({ content: second }));
+        transcript.push(new MarkdownSection({ content: second }));
     "#;
     let frames = run_script(deps, script).await;
     let payload = text_of(&frames[0]);

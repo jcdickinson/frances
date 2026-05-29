@@ -34,19 +34,19 @@
 //     new Overwrite(editor, vars),
 //   );
 
-import { transcript, DiffFrame } from "frances:v1/frames";
+import { transcript, DiffSection } from "frances:v1/sections";
 
 const { Editor, EditorDescriptions: desc } = globalThis.__frances_v1_stash__;
 
 // Ship the structured diff portion of `editor.edit()`'s result to the
-// TUI as a one-shot `DiffFrame`. The string portion is returned to the
+// TUI as a one-shot `DiffSection`. The string portion is returned to the
 // LLM as the tool's content; the structured ops only travel to the
 // transcript. Skips empty payloads so no-op edits (replace_all with
 // zero matches, overwrites that didn't change anything) don't paint a
 // blank diff block.
-function _pushDiffFrame(diff) {
+function _pushDiffSection(diff) {
   if (Array.isArray(diff) && diff.length > 0) {
-    transcript.push(new DiffFrame({ lines: diff }));
+    transcript.push(new DiffSection({ lines: diff }));
   }
 }
 
@@ -268,7 +268,7 @@ class ReplaceLines {
         end_anchor: call.arguments.end_anchor,
         text,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -303,7 +303,7 @@ class ReplaceAll {
         replacement: call.arguments.replacement,
         count: call.arguments.count,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -340,7 +340,7 @@ class InsertAfter {
         anchor: call.arguments.anchor,
         text,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -377,7 +377,7 @@ class InsertBefore {
         anchor: call.arguments.anchor,
         text,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -413,7 +413,7 @@ class New {
         path: call.arguments.path,
         text,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);
@@ -449,7 +449,7 @@ class Overwrite {
         path: call.arguments.path,
         text,
       });
-      _pushDiffFrame(diff);
+      _pushDiffSection(diff);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);

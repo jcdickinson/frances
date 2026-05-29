@@ -1,16 +1,16 @@
-// `frances:v1/frames` — transcript proxy + frame constructors.
+// `frances:v1/sections` — transcript proxy + frame constructors.
 
 import { WritableStream } from "whatwg:web-streams";
 
 export const {
   transcript,
-  MarkdownFrame,
-  ErrorFrame,
-  JsonFrame,
-  ShellOutputFrame,
-  ThoughtFrame,
-  ToolUseFrame,
-  DiffFrame,
+  MarkdownSection,
+  ErrorSection,
+  JsonSection,
+  ShellOutputSection,
+  ReasoningSection,
+  ToolUseSection,
+  DiffSection,
 } = globalThis.__frances_v1_stash__;
 
 // Each writable-capable frame class composes a WHATWG WritableStream
@@ -70,6 +70,6 @@ function installWritable(cls) {
   });
 }
 
-installWritable(MarkdownFrame);
-installWritable(ShellOutputFrame);
-installWritable(ThoughtFrame);
+installWritable(MarkdownSection);
+installWritable(ShellOutputSection);
+installWritable(ReasoningSection);

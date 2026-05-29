@@ -774,8 +774,8 @@ mod tests {
     /// covering each `Source` variant, plus closing some of them while
     /// leaving others tracked — must not insert anything into the
     /// container. Guards against the case where a
-    /// `transcript.push(new MarkdownFrame({ source }))` /
-    /// `transcript.push(new MarkdownFrame({ content: null }))` pair
+    /// `transcript.push(new MarkdownSection({ source }))` /
+    /// `transcript.push(new MarkdownSection({ content: null }))` pair
     /// would somehow surface as a blank row between the real frames
     /// either side of it.
     #[test]

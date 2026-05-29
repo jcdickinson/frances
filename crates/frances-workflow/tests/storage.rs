@@ -8,7 +8,7 @@ use std::io::Write;
 
 use frances_storage::Migration;
 use frances_workflow::{
-    FrameKind, Invocation, Runtime, TranscriptDelta, test_deps::StubDeps,
+    Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 use uuid::Uuid;
@@ -35,28 +35,30 @@ fn migration(name: &'static str, sql: &str) -> Migration {
     }
 }
 
-fn text_of(frame: &TranscriptDelta) -> String {
+fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
-            FrameKind::ToolUse { name, detail } => match detail {
+        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+            SectionKind::Markdown { .. } | SectionKind::Error => {
+                spec.seed.clone().unwrap_or_default()
+            }
+            SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
-            FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput { state, cmd } => format!(
+            SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
+            SectionKind::ShellOutput { state, cmd } => format!(
                 "[shell:{state:?}] $ {cmd}
 {}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Reasoning { state } => format!(
+            SectionKind::Reasoning { state } => format!(
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+            SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        TranscriptDelta::Append { delta, .. } => delta.clone(),
-        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Append { delta, .. } => delta.clone(),
+        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
     }
 }
 
@@ -66,20 +68,20 @@ async fn exec_query_and_query_stream_round_trip() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, MarkdownFrame, JsonFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection, JsonSection } from "frances:v1/sections";
 
         const inserted = await db.exec(
             `INSERT INTO notes (text) VALUES (?)`,
             ["alpha"],
         );
-        transcript.push(new MarkdownFrame({
+        transcript.push(new MarkdownSection({
             content: `inserted:${inserted.rowsAffected}:${inserted.lastInsertRowid}`,
         }));
 
         await db.exec(`INSERT INTO notes (text) VALUES (?)`, ["beta"]);
 
         const rows = await db.query(`SELECT id, text FROM notes ORDER BY id`);
-        transcript.push(new JsonFrame({ tag: "query", value: rows }));
+        transcript.push(new JsonSection({ tag: "query", value: rows }));
 
         const collected = [];
         const stream = db.queryStream(`SELECT text FROM notes ORDER BY id`);
@@ -89,7 +91,7 @@ async fn exec_query_and_query_stream_round_trip() {
             if (done) break;
             collected.push(value.text);
         }
-        transcript.push(new JsonFrame({ tag: "stream", value: collected }));
+        transcript.push(new JsonSection({ tag: "stream", value: collected }));
         "#,
     );
     let mut handle = rt
@@ -118,7 +120,7 @@ async fn transaction_commits_on_success() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, JsonFrame } from "frances:v1/frames";
+        import { transcript, JsonSection } from "frances:v1/sections";
 
         await db.transaction(async (tx) => {
             await tx.exec(`INSERT INTO notes (text) VALUES (?)`, ["one"]);
@@ -126,7 +128,7 @@ async fn transaction_commits_on_success() {
         });
 
         const rows = await db.query(`SELECT text FROM notes ORDER BY id`);
-        transcript.push(new JsonFrame({ tag: "after", value: rows.map(r => r.text) }));
+        transcript.push(new JsonSection({ tag: "after", value: rows.map(r => r.text) }));
         "#,
     );
     let mut handle = rt
@@ -150,7 +152,7 @@ async fn transaction_rolls_back_on_throw() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, JsonFrame } from "frances:v1/frames";
+        import { transcript, JsonSection } from "frances:v1/sections";
 
         let caught;
         try {
@@ -163,8 +165,8 @@ async fn transaction_rolls_back_on_throw() {
         }
 
         const rows = await db.query(`SELECT text FROM notes`);
-        transcript.push(new JsonFrame({ tag: "caught", value: caught }));
-        transcript.push(new JsonFrame({ tag: "rows", value: rows }));
+        transcript.push(new JsonSection({ tag: "caught", value: caught }));
+        transcript.push(new JsonSection({ tag: "rows", value: rows }));
         "#,
     );
     let mut handle = rt
@@ -189,7 +191,7 @@ async fn explicit_commit_then_throw_keeps_committed_rows() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, JsonFrame } from "frances:v1/frames";
+        import { transcript, JsonSection } from "frances:v1/sections";
 
         try {
             await db.transaction(async (tx) => {
@@ -200,7 +202,7 @@ async fn explicit_commit_then_throw_keeps_committed_rows() {
         } catch (_e) {}
 
         const rows = await db.query(`SELECT text FROM notes`);
-        transcript.push(new JsonFrame({ tag: "rows", value: rows.map(r => r.text) }));
+        transcript.push(new JsonSection({ tag: "rows", value: rows.map(r => r.text) }));
         "#,
     );
     let mut handle = rt
@@ -224,7 +226,7 @@ async fn unsupported_param_type_throws_typeerror() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         let caught;
         try {
@@ -232,7 +234,7 @@ async fn unsupported_param_type_throws_typeerror() {
         } catch (e) {
             caught = e.message;
         }
-        transcript.push(new MarkdownFrame({ content: caught ?? "no error" }));
+        transcript.push(new MarkdownSection({ content: caught ?? "no error" }));
         "#,
     );
     let mut handle = rt

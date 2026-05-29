@@ -218,14 +218,14 @@ fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) ->
 // Tests
 // =========================================================================
 
-/// Sanity test: workflow starts, pushes a MarkdownFrame, ends.
+/// Sanity test: workflow starts, pushes a MarkdownSection, ends.
 /// Proves the harness wiring is correct independent of LLM scripting.
 #[tokio::test]
 async fn smoke_workflow_starts_and_pushes_frame() {
     let mut h = harness(
         r#"
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
-        transcript.push(new MarkdownFrame({ content: "hello from harness" }));
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        transcript.push(new MarkdownSection({ content: "hello from harness" }));
         "#,
     )
     .await;

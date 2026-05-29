@@ -33,7 +33,7 @@ pub enum DiffOp {
 /// Combined output of [`render_diff_block`]: the LLM-facing unified-diff
 /// string (with anchors, sigils, and line numbers) and a structured set
 /// of ops carrying just the raw line content — the latter is what the
-/// TUI consumes via the workflow `DiffFrame`.
+/// TUI consumes via the workflow `DiffSection`.
 #[derive(Debug, Clone)]
 pub struct DiffRender {
     pub text: String,

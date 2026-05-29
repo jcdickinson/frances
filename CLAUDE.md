@@ -11,7 +11,7 @@ wasn't created.
 
 ## Project
 
-Frances is an agentic coding tool. The `frances` binary is a single-process TUI: it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens a per-session turso (libsql) database, constructs an in-process `SessionRuntime`, and runs the TUI directly against it. LLM completions stream via OpenRouter.
+Frances is an agentic coding tool. The `frances` binary is a single-process TUI: it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens a per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), constructs an in-process `SessionRuntime`, and runs the TUI directly against it. LLM completions stream via OpenRouter.
 
 ## Workspace layout
 

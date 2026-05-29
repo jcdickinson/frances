@@ -3,6 +3,9 @@
 //!
 //! There is no inter-process boundary — these types travel through an
 //! in-process `tokio::sync::mpsc` from the session runtime to the TUI.
+//! Do not call this a "wire" or "protocol" in comments or variable
+//! names; it's a channel of Rust enums. The term "wire" is reserved for
+//! the LLM provider's HTTP boundary (see `frances-llm::Provider::kind`).
 
 use std::sync::Arc;
 
@@ -113,7 +116,7 @@ pub enum BlockKind {
     /// A free-form text block. `source` names the speaker; the TUI maps
     /// it to a single-grapheme sigil (`User` → `>`, `Assistant` → `◆`,
     /// `Internal` → no prefix). Workflows pick it via `new
-    /// MarkdownFrame({ source })`; `Internal` is the default when the
+    /// MarkdownSection({ source })`; `Internal` is the default when the
     /// workflow omits the field (chrome, JSON tag bodies, greetings).
     Text { source: Source },
     /// `detail` is an optional human-readable suffix sourced from the

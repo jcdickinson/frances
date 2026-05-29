@@ -11,7 +11,7 @@
 //!
 //! - `import { exit } from "frances:v1/workflow"`
 //! - `import { inbox } from "frances:v1/inbox"`
-//! - `import { transcript, MarkdownFrame, ErrorFrame, JsonFrame } from "frances:v1/frames"`
+//! - `import { transcript, MarkdownSection, ErrorSection, JsonSection } from "frances:v1/sections"`
 //! - `import { ChatSession } from "frances:v1/chat"` (LLM backend pending)
 //! - `import.meta.args` — per-invocation slash-command args.
 
@@ -51,7 +51,7 @@ const USER_MODULE_NAME: &str = "frances:user-script";
 /// on its own channel. The host maps these onto the wire `StreamFrame`
 /// protocol; this enum is the host-API contract, not the protocol itself.
 #[derive(Debug, Clone)]
-pub enum TranscriptDelta {
+pub enum SectionTranscript {
     /// Declarative upsert of the frame with the given id. The first
     /// `Set` for an id creates the block (with `frame.seed` as its
     /// initial body, if any); a later `Set` replaces its kind + bounded
@@ -60,16 +60,16 @@ pub enum TranscriptDelta {
     /// frame type chooses when it's done (markdown emits `Close` for its
     /// predecessor before its own `Set`; shell output `Close`s when its
     /// state goes terminal).
-    Set { id: FrameId, frame: FrameSpec },
+    Set { id: SectionId, section: SectionSpec },
     /// Append text to the frame with the given id. Valid for as long
     /// as the frame remains open; the JS side enforces per-frame-type
     /// rules (active-markdown slot, ShellOutput's open flag). The body
     /// grows by delta — a full-value `Set` per chunk would be O(n²).
-    Append { id: FrameId, delta: String },
+    Append { id: SectionId, delta: String },
     /// Close the frame with the given id. The host emits a `BlockStop`
     /// and persists the row. Idempotent on unknown ids (the JS side
     /// suppresses double-close).
-    Close { id: FrameId },
+    Close { id: SectionId },
 }
 
 /// Chrome a workflow declares — the `surfaces` output. Declarative
@@ -91,7 +91,7 @@ pub enum SurfaceCmd {
 /// independent concerns with no cross-channel ordering constraint.
 pub struct WorkflowOutputs {
     /// Block-lifecycle stream (persisted to scrollback by the driver).
-    pub transcript: UnboundedReceiver<TranscriptDelta>,
+    pub transcript: UnboundedReceiver<SectionTranscript>,
     /// Chrome the workflow declares (footer busy indicator today). Set
     /// via `setStatus` from `frances:v1/workflow`. Never persisted.
     pub surfaces: UnboundedReceiver<SurfaceCmd>,
@@ -106,7 +106,7 @@ pub struct WorkflowOutputs {
 /// readable. Cloned per emitter at install time.
 #[derive(Clone)]
 pub(crate) struct OutputSenders {
-    pub transcript: UnboundedSender<TranscriptDelta>,
+    pub transcript: UnboundedSender<SectionTranscript>,
     pub surfaces: UnboundedSender<SurfaceCmd>,
     pub permissions: UnboundedSender<PermissionRequest>,
     pub usage: UnboundedSender<frances_models_llm::Usage>,
@@ -116,17 +116,17 @@ pub(crate) struct OutputSenders {
 /// `transcript.push`. Useful for the host to map back to its own block
 /// ids.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct FrameId(pub u64);
+pub struct SectionId(pub u64);
 
-/// What a [`TranscriptDelta::Set`] carries: the frame's kind + bounded
+/// What a [`SectionTranscript::Set`] carries: the frame's kind + bounded
 /// metadata, plus an optional `seed` — the initial body chunk for
 /// text-bodied kinds (Markdown / ShellOutput / Error). One-shot data
 /// kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave it
 /// `None`. The streaming body never lives here; it grows via
-/// [`TranscriptDelta::Append`].
+/// [`SectionTranscript::Append`].
 #[derive(Debug, Clone)]
-pub struct FrameSpec {
-    pub kind: FrameKind,
+pub struct SectionSpec {
+    pub kind: SectionKind,
     pub seed: Option<String>,
 }
 
@@ -143,17 +143,17 @@ pub enum Source {
 }
 
 #[derive(Debug, Clone)]
-pub enum FrameKind {
-    /// `MarkdownFrame` — text body extended with `append`. `source`
+pub enum SectionKind {
+    /// `MarkdownSection` — text body extended with `append`. `source`
     /// names the speaker; the host renders the matching sigil. The
-    /// initial body, if any, rides as `FrameSpec::seed`; `None` seed ⇒
+    /// initial body, if any, rides as `SectionSpec::seed`; `None` seed ⇒
     /// the client tracks the id but doesn't measure/render until the
     /// first `append`.
     Markdown { source: Source },
-    /// `ErrorFrame` — one-shot text (rendered as an error). The message
-    /// rides as `FrameSpec::seed`.
+    /// `ErrorSection` — one-shot text (rendered as an error). The message
+    /// rides as `SectionSpec::seed`.
     Error,
-    /// `ToolUseFrame` — one-shot marker that names a tool the workflow
+    /// `ToolUseSection` — one-shot marker that names a tool the workflow
     /// is about to invoke. The host renders this as a small "→ name"
     /// row so the user can see the tool being called even when the
     /// tool itself emits no other frames. `detail` is an optional
@@ -163,33 +163,33 @@ pub enum FrameKind {
         name: String,
         detail: Option<String>,
     },
-    /// `JsonFrame` — single tagged JSON value. Immutable after push.
+    /// `JsonSection` — single tagged JSON value. Immutable after push.
     Json {
         tag: String,
         value: serde_json::Value,
     },
-    /// `ShellOutputFrame` — streaming output from one shell command.
+    /// `ShellOutputSection` — streaming output from one shell command.
     /// `cmd` is the bash source that produced the output; it rides on
     /// every `Set` so the host can keep it pinned even after the body
     /// has been truncated for display. The initial body (output captured
-    /// before the first `Set`, if any) rides as `FrameSpec::seed`.
+    /// before the first `Set`, if any) rides as `SectionSpec::seed`.
     /// `state` transitions `Running → Success`/`Exit(N)` via a metadata
     /// re-`Set` as the command completes.
     ShellOutput { state: ShellState, cmd: String },
-    /// `ThoughtFrame` — streaming model reasoning. Mirrors the
+    /// `ReasoningSection` — streaming model reasoning. Mirrors the
     /// shell-output shape: body extends via append, `state` transitions
     /// `Streaming → Done` via a metadata re-`Set` when the channel closes.
     /// Rendered host-side as a `BlockKind::Tailed` block sibling to
     /// shell output.
     Reasoning { state: ReasoningState },
-    /// `DiffFrame` — one-shot structured diff produced by a file-edit
+    /// `DiffSection` — one-shot structured diff produced by a file-edit
     /// tool. `lines` is the unified-diff content with line numbers for
     /// context rows only; the session runtime translates each op to
     /// `events::DiffLine` and emits a `BlockKind::Diff` block.
     Diff { lines: Vec<frances_edit::DiffOp> },
 }
 
-/// Terminal status for [`FrameKind::ShellOutput`]. Mirrors
+/// Terminal status for [`SectionKind::ShellOutput`]. Mirrors
 /// `frances_session::events::ShellState`; the session runtime translates
 /// one to the other when it emits the matching `BlockKind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,7 +199,7 @@ pub enum ShellState {
     Exit(i32),
 }
 
-/// Terminal status for [`FrameKind::Reasoning`]. Mirrors
+/// Terminal status for [`SectionKind::Reasoning`]. Mirrors
 /// `frances_session::events::ReasoningState`; the session runtime
 /// translates one to the other when it emits the matching `BlockKind`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -438,7 +438,7 @@ async fn start_impl<D: WorkflowDeps>(
         .await?;
 
     let (input_tx, input_rx) = mpsc::unbounded_channel::<InboxItem>();
-    let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<TranscriptDelta>();
+    let (transcript_tx, transcript_rx) = mpsc::unbounded_channel::<SectionTranscript>();
     let (surfaces_tx, surfaces_rx) = mpsc::unbounded_channel::<SurfaceCmd>();
     let (permissions_tx, permissions_rx) = mpsc::unbounded_channel::<PermissionRequest>();
     let (usage_tx, usage_rx) = mpsc::unbounded_channel::<frances_models_llm::Usage>();
@@ -687,7 +687,7 @@ pub mod test_drive {
     //! assert against. The other outputs (surfaces / permissions / usage)
     //! buffer on their own channels; the few tests that care read them
     //! directly off [`WorkflowHandle::outputs`].
-    use super::{TranscriptDelta, WorkflowError, WorkflowHandle};
+    use super::{SectionTranscript, WorkflowError, WorkflowHandle};
 
     /// Hard ceiling on how long an individual cycle is allowed to run.
     /// Real workflow turns are interactive (a body can wait for input
@@ -699,7 +699,7 @@ pub mod test_drive {
     /// Panics if `CYCLE_TIMEOUT` is exceeded so tests fail fast.
     pub async fn drive_one_cycle(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<TranscriptDelta>, Option<Result<(), WorkflowError>>) {
+    ) -> (Vec<SectionTranscript>, Option<Result<(), WorkflowError>>) {
         match tokio::time::timeout(CYCLE_TIMEOUT, drive_one_cycle_inner(handle)).await {
             Ok(result) => result,
             Err(_) => panic!("drive_one_cycle timed out after {CYCLE_TIMEOUT:?} — workflow hung"),
@@ -715,7 +715,7 @@ pub mod test_drive {
     /// tests use `drive_one_cycle` and feed input between calls.
     pub async fn drive_to_done(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<TranscriptDelta>, Result<(), WorkflowError>) {
+    ) -> (Vec<SectionTranscript>, Result<(), WorkflowError>) {
         let mut frames = Vec::new();
         loop {
             let (mut batch, outcome) = drive_one_cycle(handle).await;
@@ -728,7 +728,7 @@ pub mod test_drive {
 
     async fn drive_one_cycle_inner(
         handle: &mut WorkflowHandle,
-    ) -> (Vec<TranscriptDelta>, Option<Result<(), WorkflowError>>) {
+    ) -> (Vec<SectionTranscript>, Option<Result<(), WorkflowError>>) {
         let mut out = Vec::new();
         loop {
             while let Ok(delta) = handle.outputs.transcript.try_recv() {
@@ -1205,31 +1205,31 @@ mod tests {
 
     use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle, drive_to_done};
 
-    fn text_of(delta: &TranscriptDelta) -> String {
+    fn text_of(delta: &SectionTranscript) -> String {
         match delta {
-            TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-                FrameKind::Markdown { .. } | FrameKind::Error => {
+            SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+                SectionKind::Markdown { .. } | SectionKind::Error => {
                     spec.seed.clone().unwrap_or_default()
                 }
-                FrameKind::ToolUse { name, detail } => match detail {
+                SectionKind::ToolUse { name, detail } => match detail {
                     Some(d) => format!("→ {name}  {d}"),
                     None => format!("→ {name}"),
                 },
-                FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-                FrameKind::Reasoning { state } => format!(
+                SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
+                SectionKind::Reasoning { state } => format!(
                     "[reasoning:{state:?}]\n{}",
                     spec.seed.clone().unwrap_or_default()
                 ),
-                FrameKind::ShellOutput { state, cmd } => {
+                SectionKind::ShellOutput { state, cmd } => {
                     format!(
                         "[shell:{state:?}] $ {cmd}\n{}",
                         spec.seed.clone().unwrap_or_default()
                     )
                 }
-                FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+                SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             },
-            TranscriptDelta::Append { delta, .. } => delta.clone(),
-            TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
+            SectionTranscript::Append { delta, .. } => delta.clone(),
+            SectionTranscript::Close { id } => format!("[close:{}]", id.0),
         }
     }
 
@@ -1278,10 +1278,10 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { exit } from "frances:v1/workflow";
             for await (const input of inbox) {
-                transcript.push(new MarkdownFrame({ content: "got:" + input.content }));
+                transcript.push(new MarkdownSection({ content: "got:" + input.content }));
                 if (input.content === "stop") { exit(); break; }
             }
             "#,
@@ -1336,8 +1336,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "hi" }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: "hi" }));
             "#,
         );
         let mut handle = rt
@@ -1364,10 +1364,10 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "before" }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: "before" }));
             await new Promise(() => {});
-            transcript.push(new MarkdownFrame({ content: "unreachable" }));
+            transcript.push(new MarkdownSection({ content: "unreachable" }));
             "#,
         );
         let mut handle = rt
@@ -1397,8 +1397,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: import.meta.args.join('|') }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: import.meta.args.join('|') }));
             "#,
         );
         let mut handle = rt
@@ -1421,8 +1421,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: import.meta.instance }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: import.meta.instance }));
             "#,
         );
         let instance = uuid::Uuid::from_u128(0xfeed_face_0000_0000_0000_0000_0000_0001);
@@ -1451,14 +1451,14 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { lifecycle } from "frances:v1/lifecycle";
 
             lifecycle.shutdown = async () => {
-                transcript.push(new MarkdownFrame({ content: "bye" }));
+                transcript.push(new MarkdownSection({ content: "bye" }));
             };
             for await (const _ of inbox) {
-                transcript.push(new MarkdownFrame({ content: "got input" }));
+                transcript.push(new MarkdownSection({ content: "got input" }));
             }
             "#,
         );
@@ -1489,16 +1489,16 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { lifecycle } from "frances:v1/lifecycle";
             import { exit } from "frances:v1/workflow";
 
             lifecycle.shutdown = async () => {
-                transcript.push(new MarkdownFrame({ content: "bye" }));
+                transcript.push(new MarkdownSection({ content: "bye" }));
             };
             queueMicrotask(() => exit());
             for await (const _ of inbox) {
-                transcript.push(new MarkdownFrame({ content: "got input" }));
+                transcript.push(new MarkdownSection({ content: "got input" }));
             }
             "#,
         );
@@ -1551,9 +1551,9 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             globalThis.__counter = (globalThis.__counter ?? 0) + 1;
-            transcript.push(new MarkdownFrame({ content: String(globalThis.__counter) }));
+            transcript.push(new MarkdownSection({ content: String(globalThis.__counter) }));
             "#,
         );
         let path = file.path().to_path_buf();
@@ -1584,13 +1584,13 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { exit } from "frances:v1/workflow";
             queueMicrotask(() => exit());
             for await (const _ of inbox) {
-                transcript.push(new MarkdownFrame({ content: "got input" }));
+                transcript.push(new MarkdownSection({ content: "got input" }));
             }
-            transcript.push(new MarkdownFrame({ content: "after-loop" }));
+            transcript.push(new MarkdownSection({ content: "after-loop" }));
             "#,
         );
         let mut handle = rt
@@ -1613,10 +1613,10 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { exit } from "frances:v1/workflow";
             const it = inbox[Symbol.asyncIterator]();
-            transcript.push(new MarkdownFrame({ content: it === inbox ? "same" : "different" }));
+            transcript.push(new MarkdownSection({ content: it === inbox ? "same" : "different" }));
             exit();
             "#,
         );
@@ -1640,12 +1640,12 @@ mod tests {
             "js",
             r#"
             import { inbox } from "frances:v1/inbox";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { exit } from "frances:v1/workflow";
             const a = inbox.next();
             const b = inbox.next();
             const [ra, rb] = await Promise.all([a, b]);
-            transcript.push(new MarkdownFrame({ content: `${ra.value.content},${rb.value.content}` }));
+            transcript.push(new MarkdownSection({ content: `${ra.value.content},${rb.value.content}` }));
             exit();
             "#,
         );
@@ -1684,9 +1684,9 @@ mod tests {
         let file = write_source(
             "ts",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const args: string[] = import.meta.args;
-            transcript.push(new MarkdownFrame({ content: args.length.toString() }));
+            transcript.push(new MarkdownSection({ content: args.length.toString() }));
             "#,
         );
         let mut handle = rt
@@ -1722,8 +1722,8 @@ mod tests {
         );
     }
 
-    /// `new MarkdownFrame({ source })` (and `{ content: undefined }`
-    /// and `{ content: null }`) all produce `FrameKind::Markdown` with
+    /// `new MarkdownSection({ source })` (and `{ content: undefined }`
+    /// and `{ content: null }`) all produce `SectionKind::Markdown` with
     /// `content: None`. The wire opener carries no body, so the TUI
     /// defers measure / render until the workflow writes into it.
     #[tokio::test]
@@ -1732,10 +1732,10 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ source: "assistant" }));
-            transcript.push(new MarkdownFrame({ content: undefined }));
-            transcript.push(new MarkdownFrame({ content: null }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ source: "assistant" }));
+            transcript.push(new MarkdownSection({ content: undefined }));
+            transcript.push(new MarkdownSection({ content: null }));
             "#,
         );
         let mut handle = rt
@@ -1753,8 +1753,8 @@ mod tests {
             .enumerate()
         {
             match &frames[i] {
-                TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-                    FrameKind::Markdown { source } => {
+                SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+                    SectionKind::Markdown { source } => {
                         assert!(spec.seed.is_none(), "frame {i} should have no seed");
                         assert_eq!(source, expect_source, "frame {i} source");
                     }
@@ -1775,8 +1775,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const f = new MarkdownFrame({ source: "assistant" });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            const f = new MarkdownSection({ source: "assistant" });
             transcript.push(f);
             await f.writable.close();
             "#,
@@ -1793,14 +1793,14 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))));
         assert!(matches!(
             &frames[0],
-            TranscriptDelta::Set { frame: spec, .. }
-                if matches!(&spec.kind, FrameKind::Markdown { .. }) && spec.seed.is_none()
+            SectionTranscript::Set { section: spec, .. }
+                if matches!(&spec.kind, SectionKind::Markdown { .. }) && spec.seed.is_none()
         ));
-        assert!(matches!(&frames[1], TranscriptDelta::Close { .. }));
+        assert!(matches!(&frames[1], SectionTranscript::Close { .. }));
         assert!(
             !frames
                 .iter()
-                .any(|f| matches!(f, TranscriptDelta::Append { .. })),
+                .any(|f| matches!(f, SectionTranscript::Append { .. })),
             "no Append should be emitted for a never-written frame"
         );
     }
@@ -1811,8 +1811,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const f = new MarkdownFrame({ content: "hello" });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            const f = new MarkdownSection({ content: "hello" });
             transcript.push(f);
             const w = f.writable.getWriter();
             await w.write(" world");
@@ -1830,9 +1830,9 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))));
         assert!(
-            matches!(&frames[0], TranscriptDelta::Set { frame: spec, .. } if matches!(&spec.kind, FrameKind::Markdown { .. }) && spec.seed.as_deref() == Some("hello"))
+            matches!(&frames[0], SectionTranscript::Set { section: spec, .. } if matches!(&spec.kind, SectionKind::Markdown { .. }) && spec.seed.as_deref() == Some("hello"))
         );
-        assert!(matches!(&frames[1], TranscriptDelta::Append { delta, .. } if delta == " world"));
+        assert!(matches!(&frames[1], SectionTranscript::Append { delta, .. } if delta == " world"));
     }
 
     #[tokio::test]
@@ -1841,9 +1841,9 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "hi", source: "user" }));
-            transcript.push(new MarkdownFrame({ content: "ok" }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: "hi", source: "user" }));
+            transcript.push(new MarkdownSection({ content: "ok" }));
             "#,
         );
         let mut handle = rt
@@ -1858,14 +1858,14 @@ mod tests {
         assert!(matches!(done, Some(Ok(()))));
         assert!(matches!(
             &frames[0],
-            TranscriptDelta::Set { frame: spec, .. }
-                if matches!(&spec.kind, FrameKind::Markdown { source: Source::User })
+            SectionTranscript::Set { section: spec, .. }
+                if matches!(&spec.kind, SectionKind::Markdown { source: Source::User })
                     && spec.seed.as_deref() == Some("hi")
         ));
         assert!(matches!(
             &frames[1],
-            TranscriptDelta::Set { frame: spec, .. }
-                if matches!(&spec.kind, FrameKind::Markdown { source: Source::Internal })
+            SectionTranscript::Set { section: spec, .. }
+                if matches!(&spec.kind, SectionKind::Markdown { source: Source::Internal })
                     && spec.seed.as_deref() == Some("ok")
         ));
     }
@@ -1876,8 +1876,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            new MarkdownFrame({ content: "hi", source: 42 });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            new MarkdownSection({ content: "hi", source: 42 });
             "#,
         );
         let mut handle = rt
@@ -1902,8 +1902,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            new MarkdownFrame({ content: "hi", source: "frances" });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            new MarkdownSection({ content: "hi", source: "frances" });
             "#,
         );
         let mut handle = rt
@@ -1932,10 +1932,10 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const a = new MarkdownFrame({ content: "a" });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            const a = new MarkdownSection({ content: "a" });
             transcript.push(a);
-            transcript.push(new MarkdownFrame({ content: "b" }));
+            transcript.push(new MarkdownSection({ content: "b" }));
             const w = a.writable.getWriter();
             await w.write(" extra");
             "#,
@@ -1956,7 +1956,7 @@ mod tests {
         let appends: Vec<_> = frames
             .iter()
             .filter_map(|f| match f {
-                TranscriptDelta::Append { id, delta } => Some((*id, delta.clone())),
+                SectionTranscript::Append { id, delta } => Some((*id, delta.clone())),
                 _ => None,
             })
             .collect();
@@ -1966,14 +1966,14 @@ mod tests {
 
     #[tokio::test]
     async fn shell_output_frame_pushes_streams_transitions_and_closes() {
-        // Exercise the ShellOutputFrame lifecycle: push (Running), pipe
+        // Exercise the ShellOutputSection lifecycle: push (Running), pipe
         // stdout in, transition to exit, autoclose seals the block.
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
-            import { transcript, ShellOutputFrame } from "frances:v1/frames";
-            const f = new ShellOutputFrame({ cmd: "ls" });
+            import { transcript, ShellOutputSection } from "frances:v1/sections";
+            const f = new ShellOutputSection({ cmd: "ls" });
             transcript.push(f);
             const w = f.writable.getWriter();
             await w.write("a\n");
@@ -1996,9 +1996,9 @@ mod tests {
         // Expect: one Set (Running, seed ""), two Appends ("a\n",
         // "b\n"), one metadata Set (Exit(0)), one Close.
         let frame_id = match frames.first() {
-            Some(TranscriptDelta::Set { id, frame: spec }) => {
+            Some(SectionTranscript::Set { id, section: spec }) => {
                 match &spec.kind {
-                    FrameKind::ShellOutput {
+                    SectionKind::ShellOutput {
                         state: ShellState::Running,
                         cmd,
                     } => {
@@ -2015,7 +2015,7 @@ mod tests {
         let appends: Vec<&String> = frames
             .iter()
             .filter_map(|f| match f {
-                TranscriptDelta::Append { id, delta } if *id == frame_id => Some(delta),
+                SectionTranscript::Append { id, delta } if *id == frame_id => Some(delta),
                 _ => None,
             })
             .collect();
@@ -2027,14 +2027,14 @@ mod tests {
         let saw_exit = frames.iter().any(|f| {
             matches!(
                 f,
-                TranscriptDelta::Set { id, frame: spec } if *id == frame_id && matches!(&spec.kind, FrameKind::ShellOutput { state: ShellState::Exit(0), .. }),
+                SectionTranscript::Set { id, section: spec } if *id == frame_id && matches!(&spec.kind, SectionKind::ShellOutput { state: ShellState::Exit(0), .. }),
             )
         });
         assert!(saw_exit, "expected a metadata Set(Exit(0)) for the frame");
 
         let saw_close = frames
             .iter()
-            .any(|f| matches!(f, TranscriptDelta::Close { id } if *id == frame_id));
+            .any(|f| matches!(f, SectionTranscript::Close { id } if *id == frame_id));
         assert!(saw_close, "expected Close for the frame");
     }
 
@@ -2044,8 +2044,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            const f = new MarkdownFrame({ content: "" });
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            const f = new MarkdownSection({ content: "" });
             f.autoclose = false;
             transcript.push(f);
             const w = f.writable.getWriter();
@@ -2064,7 +2064,7 @@ mod tests {
         let (frames, _result) = drive_one_cycle(&mut handle).await;
         let close_count = frames
             .iter()
-            .filter(|f| matches!(f, TranscriptDelta::Close { .. }))
+            .filter(|f| matches!(f, SectionTranscript::Close { .. }))
             .count();
         assert_eq!(close_count, 0, "autoclose=false should suppress Close");
     }
@@ -2096,11 +2096,11 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["summarize"] });
             s.push({ role: "system", content: "you are a summariser" });
             s.push({ role: "user", content: "hi" });
-            transcript.push(new MarkdownFrame({ content: "ok" }));
+            transcript.push(new MarkdownSection({ content: "ok" }));
             "#,
         );
         let mut handle = rt
@@ -2237,12 +2237,12 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "system", content: "be terse" });
             s.push({ role: "system", content: "answer in english" });
             s.push({ role: "user", content: "hi" });
-            transcript.push(new MarkdownFrame({ content: "ok" }));
+            transcript.push(new MarkdownSection({ content: "ok" }));
             "#,
         );
         let mut handle = rt
@@ -2335,11 +2335,11 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const protoKeys = Object.getOwnPropertyNames(ChatSession.prototype)
                 .filter((k) => k !== "constructor");
             const stashGone = typeof globalThis.__frances_v1_stash__ === "undefined";
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `proto=${protoKeys.sort().join(",")} stash=${stashGone}`,
             }));
             "#,
@@ -2374,7 +2374,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
@@ -2382,7 +2382,7 @@ mod tests {
             let locked = false;
             try { r.events.getReader(); }
             catch (_) { locked = true; }
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `locked=${locked} stableText=${r.text === _text}`,
             }));
             "#,
@@ -2405,21 +2405,21 @@ mod tests {
         // Stub emits zero events, so the pipe completes when the
         // source closes (Rust drops the sender after the run errors).
         // We're verifying the wiring: pipeTo from `r.text` into a
-        // MarkdownFrame's `.writable` resolves without throwing.
+        // MarkdownSection's `.writable` resolves without throwing.
         let rt = Runtime::new(StubDeps::default()).unwrap();
         let file = write_source(
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
-            const out = new MarkdownFrame({ content: "" });
+            const out = new MarkdownSection({ content: "" });
             transcript.push(out);
             await r.text.pipeTo(out.writable);
             try { await r.completed; } catch (_) { /* stub error — expected */ }
-            transcript.push(new MarkdownFrame({ content: "piped-ok" }));
+            transcript.push(new MarkdownSection({ content: "piped-ok" }));
             "#,
         );
         let mut handle = rt
@@ -2456,11 +2456,11 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
-            const out = new MarkdownFrame({ source: "assistant" });
+            const out = new MarkdownSection({ source: "assistant" });
             transcript.push(out);
             await r.text.pipeTo(out.writable);
             await r.completed;
@@ -2477,24 +2477,24 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(TranscriptDelta::Set { id, .. }) => *id,
+            Some(SectionTranscript::Set { id, .. }) => *id,
             other => panic!("expected first frame push, got {other:?}"),
         };
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, TranscriptDelta::Append { id, delta } if *id == push_id && delta == "hello")),
+                .any(|f| matches!(f, SectionTranscript::Append { id, delta } if *id == push_id && delta == "hello")),
             "expected text append for markdown frame: {frames:?}"
         );
         assert!(
             frames
                 .iter()
-                .any(|f| matches!(f, TranscriptDelta::Close { id } if *id == push_id)),
+                .any(|f| matches!(f, SectionTranscript::Close { id } if *id == push_id)),
             "expected markdown frame to close after text pipe: {frames:?}"
         );
     }
 
-    /// `new MarkdownFrame({ ..., closed: true })` pre-seals the frame:
+    /// `new MarkdownSection({ ..., closed: true })` pre-seals the frame:
     /// `transcript.push` emits the `Close` immediately after the `Push`
     /// so the TUI never paints the active-block spinner over the
     /// frame. Mirrors the workflow's one-shot patterns (greeting,
@@ -2505,8 +2505,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "hi", closed: true }));
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: "hi", closed: true }));
             "#,
         );
         let mut handle = rt
@@ -2520,16 +2520,16 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(TranscriptDelta::Set { id, .. }) => *id,
+            Some(SectionTranscript::Set { id, .. }) => *id,
             other => panic!("expected push first, got {other:?}"),
         };
         assert!(
-            matches!(frames.get(1), Some(TranscriptDelta::Close { id }) if *id == push_id),
+            matches!(frames.get(1), Some(SectionTranscript::Close { id }) if *id == push_id),
             "second frame must be the matching Close: {frames:?}"
         );
     }
 
-    /// `new MarkdownFrame(...).close()` returns `this`, so the
+    /// `new MarkdownSection(...).close()` returns `this`, so the
     /// construct-and-seal idiom can be a one-liner. Same wire effect
     /// as the `{ closed: true }` ctor option: pre-push close just
     /// records the intent; `transcript.push` emits Push then Close.
@@ -2539,8 +2539,8 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
-            transcript.push(new MarkdownFrame({ content: "hi" }).close());
+            import { transcript, MarkdownSection } from "frances:v1/sections";
+            transcript.push(new MarkdownSection({ content: "hi" }).close());
             "#,
         );
         let mut handle = rt
@@ -2554,11 +2554,11 @@ mod tests {
         let (frames, done) = drive_one_cycle(&mut handle).await;
         assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
         let push_id = match frames.first() {
-            Some(TranscriptDelta::Set { id, .. }) => *id,
+            Some(SectionTranscript::Set { id, .. }) => *id,
             other => panic!("expected push first, got {other:?}"),
         };
         assert!(
-            matches!(frames.get(1), Some(TranscriptDelta::Close { id }) if *id == push_id),
+            matches!(frames.get(1), Some(SectionTranscript::Close { id }) if *id == push_id),
             "expected Push then Close: {frames:?}"
         );
     }
@@ -2573,7 +2573,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const ac = new AbortController();
@@ -2586,7 +2586,7 @@ mod tests {
             } catch (e) {
                 caught = String(e);
             }
-            transcript.push(new MarkdownFrame({ content: caught }));
+            transcript.push(new MarkdownSection({ content: caught }));
             "#,
         );
         let mut handle = rt
@@ -2613,7 +2613,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const ac = new AbortController();
@@ -2626,7 +2626,7 @@ mod tests {
             } catch (e) {
                 caught = String(e);
             }
-            transcript.push(new MarkdownFrame({ content: caught }));
+            transcript.push(new MarkdownSection({ content: caught }));
             "#,
         );
         let mut handle = rt
@@ -2649,11 +2649,11 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const a = new ChatSession({ model_intents: ["x"] });
             const b = new ChatSession({ model_intents: ["x"] });
             const shape = `a=${Array.isArray(a.tools)} len=${a.tools.length} distinct=${a.tools !== b.tools}`;
-            transcript.push(new MarkdownFrame({ content: shape }));
+            transcript.push(new MarkdownSection({ content: shape }));
             "#,
         );
         let mut handle = rt
@@ -2676,16 +2676,16 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
             s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
             s.push({ role: "user", content: "hi" });
             try {
                 await s.stream();
-                transcript.push(new ErrorFrame({ content: "BUG: stream did not throw" }));
+                transcript.push(new ErrorSection({ content: "BUG: stream did not throw" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({ content: String(e) }));
+                transcript.push(new MarkdownSection({ content: String(e) }));
             }
             "#,
         );
@@ -2710,15 +2710,15 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({ name: "echo" }); // missing description / parameters
             s.push({ role: "user", content: "hi" });
             try {
                 await s.stream();
-                transcript.push(new ErrorFrame({ content: "BUG: stream did not throw" }));
+                transcript.push(new ErrorSection({ content: "BUG: stream did not throw" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({ content: String(e) }));
+                transcript.push(new MarkdownSection({ content: String(e) }));
             }
             "#,
         );
@@ -2768,7 +2768,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let handlerCalls = 0;
             s.tools.push({
@@ -2796,7 +2796,7 @@ mod tests {
             }
             const final = await r.completed;
             const summary = `events=${toolCallSeen} text="${final.text}" calls=${final.tool_calls.length} first=${final.tool_calls[0].name}(${final.tool_calls[0].arguments.text}) handlerCalls=${handlerCalls}`;
-            transcript.push(new MarkdownFrame({ content: summary }));
+            transcript.push(new MarkdownSection({ content: summary }));
             "#,
         );
         let mut handle = rt
@@ -2823,11 +2823,11 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             s.push({ role: "tool", call_id: "abc", content: "result body", is_error: false });
-            transcript.push(new MarkdownFrame({ content: "ok" }));
+            transcript.push(new MarkdownSection({ content: "ok" }));
             "#,
         );
         let mut handle = rt
@@ -2873,7 +2873,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame, ErrorFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let caught = "";
             try {
@@ -2882,7 +2882,7 @@ mod tests {
             } catch (e) {
                 caught = String(e);
             }
-            transcript.push(new MarkdownFrame({ content: caught }));
+            transcript.push(new MarkdownSection({ content: caught }));
             "#,
         );
         let mut handle = rt
@@ -2940,7 +2940,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let handlerCalls = 0;
             s.tools.push({
@@ -2967,7 +2967,7 @@ mod tests {
                 finalText = text;
                 if (tool_calls.length === 0) break;
             }
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `text="${finalText}" handlerCalls=${handlerCalls}`,
             }));
             "#,
@@ -3037,7 +3037,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let preCount = 0, postCount = 0;
             s.tools.push({
@@ -3058,7 +3058,7 @@ mod tests {
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `pre=${preCount} post=${postCount}`,
             }));
             "#,
@@ -3116,7 +3116,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({
                 name: "echo", description: "", parameters: {},
@@ -3128,7 +3128,7 @@ mod tests {
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3184,12 +3184,12 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3266,7 +3266,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let scopeHookCalls = 0;
             s.tools.push({
@@ -3293,7 +3293,7 @@ mod tests {
             s.push({ role: "user", content: "hi" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3341,12 +3341,12 @@ mod tests {
             "js",
             r#"
             import { Shell } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const sh = new Shell();
             const outcome = await sh.runOnce("echo hello-shell");
             const summary = `kind=${outcome.kind} exit=${outcome.exit_code} hasOutput=${outcome.output.includes("hello-shell")}`;
             await sh.close();
-            transcript.push(new MarkdownFrame({ content: summary }));
+            transcript.push(new MarkdownSection({ content: summary }));
             "#,
         );
         let mut handle = rt
@@ -3370,7 +3370,7 @@ mod tests {
             "js",
             r#"
             import { Shell } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const sh = new Shell();
             // First run goes Quiet (sleeps past the default 1s quiet
             // threshold).
@@ -3387,7 +3387,7 @@ mod tests {
             await sh.kill();
             try { await sh.keepWaiting(); } catch (_) {}
             await sh.close();
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `firstKind=${first.kind} caught=${caught.includes("busy") ? "busy" : caught}`,
             }));
             "#,
@@ -3413,7 +3413,7 @@ mod tests {
             "js",
             r#"
             import { Shell } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const sh = new Shell();
             // Background a sleep + then echo. The first runOnce will go
             // Quiet (because sleep is silent for >1s), and keepWaiting
@@ -3426,7 +3426,7 @@ mod tests {
                 final_ = await sh.keepWaiting();
             }
             await sh.close();
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `firstKind=${first.kind} finalKind=${final_.kind} exit=${final_.exit_code} hasFinished=${final_.output.includes("finished")}`,
             }));
             "#,
@@ -3485,7 +3485,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const chat = new ChatSession({ model_intents: ["x"] });
             const sh = new Shell();
             chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
@@ -3496,7 +3496,7 @@ mod tests {
             reader.releaseLock();
             await r.completed;
             await sh.close();
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3589,7 +3589,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const chat = new ChatSession({ model_intents: ["x"] });
             const sh = new Shell();
             const wait = new Wait(sh);
@@ -3602,7 +3602,7 @@ mod tests {
             reader.releaseLock();
             await r.completed;
             await sh.close();
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3702,7 +3702,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const chat = new ChatSession({ model_intents: ["x"] });
             const sh = new Shell();
             const wait = new Wait(sh);
@@ -3715,7 +3715,7 @@ mod tests {
             reader.releaseLock();
             await r.completed;
             await sh.close();
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3832,7 +3832,7 @@ mod tests {
             r#"
             import { ChatSession } from "frances:v1/chat";
             import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const chat = new ChatSession({ model_intents: ["x"] });
             const sh = new Shell();
             const wait = new Wait(sh);
@@ -3845,7 +3845,7 @@ mod tests {
             reader.releaseLock();
             await r.completed;
             await sh.close();
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -3958,7 +3958,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             let turnRan = false;
             s.tools.push({
@@ -3971,7 +3971,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: `turnRan=${turnRan}` }));
+            transcript.push(new MarkdownSection({ content: `turnRan=${turnRan}` }));
             "#,
         );
         let mut handle = rt
@@ -4043,7 +4043,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             const turnOrder = [];
             s.tools.push({
@@ -4064,7 +4064,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: `turns=${turnOrder.join(",")}` }));
+            transcript.push(new MarkdownSection({ content: `turns=${turnOrder.join(",")}` }));
             "#,
         );
         let mut handle = rt
@@ -4126,7 +4126,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({
                 name: "starter", description: "", parameters: { type: "object" },
@@ -4150,7 +4150,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -4232,7 +4232,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({
                 name: "gated", description: "", parameters: { type: "object" },
@@ -4259,7 +4259,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -4320,7 +4320,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({
                 name: "double", description: "", parameters: { type: "object" },
@@ -4342,7 +4342,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "done" }));
+            transcript.push(new MarkdownSection({ content: "done" }));
             "#,
         );
         let mut handle = rt
@@ -4396,7 +4396,7 @@ mod tests {
             "js",
             r#"
             import { ChatSession } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const s = new ChatSession({ model_intents: ["x"] });
             s.tools.push({
                 name: "thrower", description: "", parameters: { type: "object" },
@@ -4408,7 +4408,7 @@ mod tests {
             s.push({ role: "user", content: "go" });
             const r = await s.stream();
             await r.completed;
-            transcript.push(new MarkdownFrame({ content: "survived" }));
+            transcript.push(new MarkdownSection({ content: "survived" }));
             "#,
         );
         let mut handle = rt
@@ -4445,14 +4445,14 @@ mod tests {
         let file = write_source(
             "js",
             r#"
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { WritableStream } from "whatwg:web-streams";
-            const f = new MarkdownFrame({ content: "hi" });
+            const f = new MarkdownSection({ content: "hi" });
             transcript.push(f);
             const w1 = f.writable;
             const w2 = f.writable;
-            const shape = `ws=${w1 instanceof WritableStream} stable=${w1 === w2} hasWrite=${typeof MarkdownFrame.prototype.write}`;
-            transcript.push(new MarkdownFrame({ content: shape }));
+            const shape = `ws=${w1 instanceof WritableStream} stable=${w1 === w2} hasWrite=${typeof MarkdownSection.prototype.write}`;
+            transcript.push(new MarkdownSection({ content: shape }));
             "#,
         );
         let mut handle = rt
@@ -4478,11 +4478,11 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const start = Date.now();
             await new Timer(20);
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownFrame({ content: elapsed >= 15 ? "ok" : `too fast: ${elapsed}` }));
+            transcript.push(new MarkdownSection({ content: elapsed >= 15 ? "ok" : `too fast: ${elapsed}` }));
             "#,
         );
         let mut handle = rt
@@ -4505,13 +4505,13 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);  // long enough that the test would hang if fire() didn't work
             queueMicrotask(() => t.fire());
             const start = Date.now();
             await t;
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownFrame({ content: elapsed < 1000 ? "fast" : `slow: ${elapsed}` }));
+            transcript.push(new MarkdownSection({ content: elapsed < 1000 ? "fast" : `slow: ${elapsed}` }));
             "#,
         );
         let mut handle = rt
@@ -4538,7 +4538,7 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             queueMicrotask(() => {
                 t.disable();
@@ -4547,7 +4547,7 @@ mod tests {
             const start = Date.now();
             await t;
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: elapsed < 1000 ? "fast" : `slow: ${elapsed}`,
             }));
             "#,
@@ -4574,15 +4574,15 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             const original = new Error("nope");
             queueMicrotask(() => t.reject(original));
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `same=${e === original} msg=${e.message}`,
                 }));
             }
@@ -4610,7 +4610,7 @@ mod tests {
             "js",
             r#"
             import { Timer, TimerError } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             t.reject(new Error("done"));
             const results = [];
@@ -4624,7 +4624,7 @@ mod tests {
                 try { op[1](); results.push(`${op[0]}: no-throw`); }
                 catch (e) { results.push(`${op[0]}: threw`); }
             }
-            transcript.push(new MarkdownFrame({ content: results.join("; ") }));
+            transcript.push(new MarkdownSection({ content: results.join("; ") }));
             "#,
         );
         let mut handle = rt
@@ -4653,14 +4653,14 @@ mod tests {
             "js",
             r#"
             import { Timer, TimerError } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             queueMicrotask(() => t.reject(new TimerError("boom")));
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `te=${e instanceof TimerError} err=${e instanceof Error} msg=${e.message}`,
                 }));
             }
@@ -4686,14 +4686,14 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             queueMicrotask(() => t.reject());
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `caught: error=${e instanceof Error} name=${e.name} msg=${e.message}`,
                 }));
             }
@@ -4724,12 +4724,12 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer({ delay: 10 });
             t.disable();
             t.enable();
             await t;
-            transcript.push(new MarkdownFrame({ content: t.enabled ? "enabled" : "still-off" }));
+            transcript.push(new MarkdownSection({ content: t.enabled ? "enabled" : "still-off" }));
             "#,
         );
         let mut handle = rt
@@ -4752,12 +4752,12 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer({ delay: 100, interval: 50 });
             const before = `enabled=${t.enabled} delay=${t.delay} interval=${t.interval}`;
             t.disable();
             const after = `enabled=${t.enabled} delay=${t.delay} interval=${t.interval}`;
-            transcript.push(new MarkdownFrame({ content: `${before} | ${after}` }));
+            transcript.push(new MarkdownSection({ content: `${before} | ${after}` }));
             "#,
         );
         let mut handle = rt
@@ -4784,12 +4784,12 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const tick = new Timer({ interval: 5 });
             let count = 0;
             for (let i = 0; i < 3; i += 1) { await tick; count += 1; }
             tick.disable();
-            transcript.push(new MarkdownFrame({ content: `count=${count}` }));
+            transcript.push(new MarkdownSection({ content: `count=${count}` }));
             "#,
         );
         let mut handle = rt
@@ -4812,13 +4812,13 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(10);
             await t;
             const start = Date.now();
             await t;  // already fired — no wait
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownFrame({ content: elapsed < 5 ? "instant" : `slow: ${elapsed}` }));
+            transcript.push(new MarkdownSection({ content: elapsed < 5 ? "instant" : `slow: ${elapsed}` }));
             "#,
         );
         let mut handle = rt
@@ -4867,9 +4867,9 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             await new Timer({ delay: 5 });
-            transcript.push(new MarkdownFrame({ content: "fired" }));
+            transcript.push(new MarkdownSection({ content: "fired" }));
             "#,
         );
         let mut handle = rt
@@ -4894,7 +4894,7 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const tick = new Timer({ delay: 30, interval: 5 });
             const t0 = Date.now();
             await tick;
@@ -4905,7 +4905,7 @@ mod tests {
             const third = Date.now() - t0;
             tick.disable();
             const ok = first >= 25 && (second - first) < 25 && (third - second) < 25;
-            transcript.push(new MarkdownFrame({ content: ok ? "ok" : `bad: ${first} ${second} ${third}` }));
+            transcript.push(new MarkdownSection({ content: ok ? "ok" : `bad: ${first} ${second} ${third}` }));
             "#,
         );
         let mut handle = rt
@@ -4955,13 +4955,13 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             t.disable();
             // Cancelled — without set(), the next await would reject.
             t.set({ delay: 10 });
             await t;
-            transcript.push(new MarkdownFrame({ content: "ok" }));
+            transcript.push(new MarkdownSection({ content: "ok" }));
             "#,
         );
         let mut handle = rt
@@ -4986,7 +4986,7 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer({ delay: 5 });
             await t;             // fires, fired_once = true
             t.set({ interval: 15 });
@@ -4994,7 +4994,7 @@ mod tests {
             await t;
             await t;
             const elapsed = Date.now() - t0;
-            transcript.push(new MarkdownFrame({ content: elapsed >= 25 ? "ok" : `too fast: ${elapsed}` }));
+            transcript.push(new MarkdownSection({ content: elapsed >= 25 ? "ok" : `too fast: ${elapsed}` }));
             "#,
         );
         let mut handle = rt
@@ -5044,12 +5044,12 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             import { exit } from "frances:v1/workflow";
             const t = new Timer(60_000);
             queueMicrotask(() => exit());
             await t;  // should resolve when the workflow closes, not reject
-            transcript.push(new MarkdownFrame({ content: "after-await" }));
+            transcript.push(new MarkdownSection({ content: "after-await" }));
             "#,
         );
         let mut handle = rt
@@ -5074,15 +5074,15 @@ mod tests {
             "js",
             r#"
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const t = new Timer(60_000);
             const payload = { kind: "custom", n: 42 };
             queueMicrotask(() => t.reject(payload));
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `same=${e === payload} kind=${e.kind} n=${e.n}`,
                 }));
             }
@@ -5109,17 +5109,17 @@ mod tests {
             r#"
             import { Timer } from "frances:v1/io";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const ac = new AbortController();
             ac.abort("pre-aborted");
             const t = new Timer({ delay: 60_000, signal: ac.signal });
             const start = Date.now();
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
                 const elapsed = Date.now() - start;
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `caught=${e} fast=${elapsed < 100}`,
                 }));
             }
@@ -5146,17 +5146,17 @@ mod tests {
             r#"
             import { Timer } from "frances:v1/io";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const ac = new AbortController();
             const t = new Timer({ delay: 60_000, signal: ac.signal });
             queueMicrotask(() => ac.abort(new Error("user cancelled")));
             const start = Date.now();
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
                 const elapsed = Date.now() - start;
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `err=${e instanceof Error} msg=${e.message} fast=${elapsed < 1000}`,
                 }));
             }
@@ -5185,16 +5185,16 @@ mod tests {
             r#"
             import { Timer } from "frances:v1/io";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const ac = new AbortController();
             const reason = { kind: "signal-reason", id: 7 };
             const t = new Timer({ delay: 60_000, signal: ac.signal });
             queueMicrotask(() => ac.abort(reason));
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `same=${e === reason} kind=${e.kind} id=${e.id}`,
                 }));
             }
@@ -5224,7 +5224,7 @@ mod tests {
             r#"
             import { Timer, TimerError } from "frances:v1/io";
             import { AbortController } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const ac = new AbortController();
             const t = new Timer({ delay: 60_000, signal: ac.signal });
             t.reject(new Error("manual"));
@@ -5233,11 +5233,11 @@ mod tests {
             ac.abort("late");
             try {
                 await t;
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
                 // We rejected with our own Error before abort fired —
                 // the late abort must not have replaced the reason.
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `msg=${e.message} aborted=${ac.signal.aborted}`,
                 }));
             }
@@ -5296,9 +5296,9 @@ mod tests {
             "js",
             r#"
             import { DOMException } from "whatwg:dom";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const e = new DOMException("nope", "AbortError");
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `err=${e instanceof Error} name=${e.name} msg=${e.message}`,
             }));
             "#,
@@ -5327,13 +5327,13 @@ mod tests {
                 WritableStream,
                 TransformStream,
             } from "whatwg:web-streams";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const shape = [
                 typeof ReadableStream,
                 typeof WritableStream,
                 typeof TransformStream,
             ].join(",");
-            transcript.push(new MarkdownFrame({ content: shape }));
+            transcript.push(new MarkdownSection({ content: shape }));
             "#,
         );
         let mut handle = rt
@@ -5356,7 +5356,7 @@ mod tests {
             "js",
             r#"
             import { AbortController, AbortSignal } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const ac = new AbortController();
             const before = ac.signal.aborted;
             let fired = false;
@@ -5365,7 +5365,7 @@ mod tests {
             const after = ac.signal.aborted;
             const reason = ac.signal.reason;
             const isSignal = ac.signal instanceof AbortSignal;
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `before=${before} after=${after} fired=${fired} reason=${reason} sig=${isSignal}`,
             }));
             "#,
@@ -5395,13 +5395,13 @@ mod tests {
             import { AbortSignal } from "whatwg:abortcontroller";
             import { DOMException } from "whatwg:dom";
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const start = Date.now();
             const s = AbortSignal.timeout(15);
             // Wait long enough for the timeout to fire.
             await new Timer(60);
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `aborted=${s.aborted} name=${s.reason && s.reason.name} dom=${s.reason instanceof DOMException} fast=${elapsed < 200}`,
             }));
             "#,
@@ -5432,14 +5432,14 @@ mod tests {
             r#"
             import { AbortSignal } from "whatwg:abortcontroller";
             import { Timer } from "frances:v1/io";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const start = Date.now();
             try {
                 await new Timer({ delay: 60_000, signal: AbortSignal.timeout(15) });
-                transcript.push(new MarkdownFrame({ content: "BUG: resolved" }));
+                transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
             } catch (e) {
                 const elapsed = Date.now() - start;
-                transcript.push(new MarkdownFrame({
+                transcript.push(new MarkdownSection({
                     content: `name=${e.name} msg=${e.message} fast=${elapsed < 1000}`,
                 }));
             }
@@ -5468,13 +5468,13 @@ mod tests {
             "js",
             r#"
             import { AbortSignal } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const cases = ["nope", -5, NaN, undefined, {}];
             const threw = cases.map((c) => {
                 try { AbortSignal.timeout(c); return "no-throw"; }
                 catch (_) { return "threw"; }
             });
-            transcript.push(new MarkdownFrame({ content: threw.join(",") }));
+            transcript.push(new MarkdownSection({ content: threw.join(",") }));
             "#,
         );
         let mut handle = rt
@@ -5500,7 +5500,7 @@ mod tests {
             "js",
             r#"
             import { AbortController, AbortSignal } from "whatwg:abortcontroller";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const a = new AbortController();
             const b = new AbortController();
             const out = AbortSignal.any([a.signal, b.signal]);
@@ -5511,7 +5511,7 @@ mod tests {
             // aborted, but it would still re-fire the listener walk).
             // The observable signal: out.reason must stay "first".
             b.abort("second");
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `first=${reasonAfterFirst} after=${out.reason} aborted=${out.aborted}`,
             }));
             "#,
@@ -5541,9 +5541,9 @@ mod tests {
             "js",
             r#"
             import { approve } from "frances:v1/approval";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const choice = await approve({ prompt: "delete /tmp/foo?" });
-            transcript.push(new MarkdownFrame({
+            transcript.push(new MarkdownSection({
                 content: `${choice.type}:${choice.details ?? ""}`,
             }));
             "#,
@@ -5592,12 +5592,12 @@ mod tests {
             .iter()
             .rev()
             .find_map(|d| match d {
-                TranscriptDelta::Set { frame, .. } => Some(frame),
+                SectionTranscript::Set { section, .. } => Some(section),
                 _ => None,
             })
             .expect("expected a markdown set after approval");
         assert!(
-            matches!(&last.kind, FrameKind::Markdown { .. })
+            matches!(&last.kind, SectionKind::Markdown { .. })
                 && last.seed.as_deref() == Some("yes:scoped to /tmp"),
             "got {last:?}",
         );
@@ -5660,12 +5660,12 @@ mod tests {
             "js",
             r#"
             import { complete } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const r = await complete({
                 intents: ["default"],
                 input: [{ role: "user", content: "hi" }],
             });
-            transcript.push(new MarkdownFrame({ content: r.text }));
+            transcript.push(new MarkdownSection({ content: r.text }));
             "#,
         );
         let mut handle = rt
@@ -5690,14 +5690,14 @@ mod tests {
             "js",
             r#"
             import { complete } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const r = await complete({
                 intents: ["default"],
                 input: [{ role: "user", content: "decide please" }],
                 tools: [{ name: "decide", description: "d", parameters: { type: "object" } }],
                 requireToolCall: true,
             });
-            transcript.push(new MarkdownFrame({ content: r.tool_calls.map((c) => c.name).join(",") }));
+            transcript.push(new MarkdownSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
             "#,
         );
         let mut handle = rt
@@ -5724,13 +5724,13 @@ mod tests {
             "js",
             r#"
             import { complete } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const r = await complete({
                 intents: ["default"],
                 input: [{ role: "user", content: "decide" }],
                 toolChoice: "decide",
             });
-            transcript.push(new MarkdownFrame({ content: r.tool_calls.map((c) => c.name).join(",") }));
+            transcript.push(new MarkdownSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
             "#,
         );
         let mut handle = rt
@@ -5757,16 +5757,16 @@ mod tests {
             "js",
             r#"
             import { complete } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             try {
                 await complete({
                     intents: ["default"],
                     input: [{ role: "user", content: "decide" }],
                     requireToolCall: true,
                 });
-                transcript.push(new MarkdownFrame({ content: "NO THROW" }));
+                transcript.push(new MarkdownSection({ content: "NO THROW" }));
             } catch (e) {
-                transcript.push(new MarkdownFrame({ content: "threw:" + String((e && e.message) || e) }));
+                transcript.push(new MarkdownSection({ content: "threw:" + String((e && e.message) || e) }));
             }
             "#,
         );
@@ -5798,7 +5798,7 @@ mod tests {
             "js",
             r#"
             import { complete } from "frances:v1/chat";
-            import { transcript, MarkdownFrame } from "frances:v1/frames";
+            import { transcript, MarkdownSection } from "frances:v1/sections";
             const r = await complete({
                 intents: ["default"],
                 input: [{ role: "user", content: "decide" }],
@@ -5811,7 +5811,7 @@ mod tests {
             });
             const c = r.tool_calls[0];
             const ok = c.error && c.expectedSchema && c.expectedSchema.required.includes("reason");
-            transcript.push(new MarkdownFrame({ content: ok ? "flagged:" + c.name : "clean" }));
+            transcript.push(new MarkdownSection({ content: ok ? "flagged:" + c.name : "clean" }));
             "#,
         );
         let mut handle = rt

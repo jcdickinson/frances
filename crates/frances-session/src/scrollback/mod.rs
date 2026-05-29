@@ -5,7 +5,7 @@
 //!
 //! ## Writes
 //!
-//! - **Clean close** (`BlockStop` on the wire): [`persist_block`] with
+//! - **Clean close** (a `BlockStop` event): [`persist_block`] with
 //!   `truncated = false`. Called from the `EmitState`'s normal close
 //!   path inside `workflows::emit`.
 //! - **Dehydrate-interrupted close**: same call with `truncated = true`.
@@ -100,8 +100,9 @@ pub enum StoredRow {
 }
 
 /// On-disk JSON shape for `kind` = 'text' rows. `source` mirrors the
-/// wire-level `BlockKind::Text { source }`. Serializes as the
-/// snake-case strings `"user"` / `"assistant"` / `"internal"`.
+/// runtime [`crate::events::BlockKind::Text`] variant's `source`.
+/// Serializes as the snake-case strings `"user"` / `"assistant"` /
+/// `"internal"`.
 #[derive(Serialize, Deserialize)]
 struct TextPayload {
     source: Source,

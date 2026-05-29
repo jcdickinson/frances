@@ -31,8 +31,8 @@
 //!
 //! - `frances:v1/workflow`       — `exit` lifecycle function.
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
-//! - `frances:v1/frames`         — `transcript`, `MarkdownFrame`, `ErrorFrame`,
-//!   `JsonFrame` (frame-objects-with-history API).
+//! - `frances:v1/sections`         — `transcript`, `MarkdownSection`, `ErrorSection`,
+//!   `JsonSection` (frame-objects-with-history API).
 //! - `frances:v1/chat`           — `ChatSession` (LLM access).
 //! - `frances:v1/io`             — `Timer` + `TimerError`. The user-facing
 //!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
@@ -79,12 +79,12 @@ use crate::runtime::{InboxItem, OutputSenders, caught};
 pub mod chat;
 pub mod file;
 pub mod file_find_or_grep;
-pub mod frames;
 pub mod inbox;
 pub mod io;
 pub mod jaq;
 pub mod lifecycle;
 pub mod permission;
+pub mod sections;
 pub mod shell;
 pub mod storage;
 pub mod workflow;
@@ -181,15 +181,15 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         thought_ctor,
         tool_use_ctor,
         diff_ctor,
-    ) = frames::build_frames(ctx, senders.transcript.clone())?;
+    ) = sections::build_sections(ctx, senders.transcript.clone())?;
     stash.set("transcript", transcript_proxy)?;
-    stash.set("MarkdownFrame", md_ctor)?;
-    stash.set("ErrorFrame", err_ctor)?;
-    stash.set("JsonFrame", json_ctor)?;
-    stash.set("ShellOutputFrame", shell_output_ctor)?;
-    stash.set("ThoughtFrame", thought_ctor)?;
-    stash.set("ToolUseFrame", tool_use_ctor)?;
-    stash.set("DiffFrame", diff_ctor)?;
+    stash.set("MarkdownSection", md_ctor)?;
+    stash.set("ErrorSection", err_ctor)?;
+    stash.set("JsonSection", json_ctor)?;
+    stash.set("ShellOutputSection", shell_output_ctor)?;
+    stash.set("ReasoningSection", thought_ctor)?;
+    stash.set("ToolUseSection", tool_use_ctor)?;
+    stash.set("DiffSection", diff_ctor)?;
 
     let (chat_ctor, chat_inner_stream) =
         chat::build_chat_session_ctor(ctx, deps.clone(), senders.usage.clone())?;
@@ -265,7 +265,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/workflow", WORKFLOW_SRC)?;
     declare_and_eval(ctx, "frances:v1/lifecycle", LIFECYCLE_SRC)?;
     declare_and_eval(ctx, "frances:v1/inbox", INBOX_SRC)?;
-    declare_and_eval(ctx, "frances:v1/frames", FRAMES_SRC)?;
+    declare_and_eval(ctx, "frances:v1/sections", SECTIONS_SRC)?;
     declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
     declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
@@ -359,7 +359,7 @@ fn declare_and_eval<'js>(
 const WORKFLOW_SRC: &str = include_str!("js/workflow.js");
 const LIFECYCLE_SRC: &str = include_str!("js/lifecycle.js");
 const INBOX_SRC: &str = include_str!("js/inbox.js");
-const FRAMES_SRC: &str = include_str!("js/frames.js");
+const SECTIONS_SRC: &str = include_str!("js/sections.js");
 const CHAT_SRC: &str = include_str!("js/chat.js");
 const IO_SRC: &str = include_str!("js/io.js");
 const APPROVAL_SRC: &str = include_str!("js/approval.js");

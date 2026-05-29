@@ -52,8 +52,8 @@ use crate::store::Database;
 
 use frances_storage::{EntitySchema, Migration};
 use frances_workflow::{
-    FrameId, FrameKind, FrameSpec, InboxItem, Invocation, PermissionRequest, SurfaceCmd,
-    TranscriptDelta, UserInput, WorkflowHandle, parse_slash_command,
+    InboxItem, Invocation, PermissionRequest, SectionId, SectionKind, SectionSpec,
+    SectionTranscript, SurfaceCmd, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
@@ -182,7 +182,7 @@ pub(crate) enum DriverCmd {
     Push { name: String, args: Vec<String> },
 }
 
-/// The currently-hydrated workflow plus the wire-state needed across
+/// The currently-hydrated workflow plus the emit-state needed across
 /// multiple `drive()` invocations (block id allocator, currently-open
 /// block) and a copy of its `config_key` for diagnostics. The runtime
 /// `WorkflowHandle` already carries the `instance_id`.
@@ -198,15 +198,15 @@ pub(crate) struct WorkflowInstance {
 
 /// Block-tracking state for a single hydrated workflow's lifetime.
 ///
-/// Workflow frames map to wire blocks like this:
+/// Workflow frames map to event blocks like this:
 ///
-/// - `MarkdownFrame` push: open a new `Text { source }` block, write
+/// - `MarkdownSection` push: open a new `Text { source }` block, write
 ///   initial content; the block stays open so subsequent `append`s
 ///   stream into it. The JS side sends `Close` for the prior active
 ///   markdown before pushing a new one — multiple blocks can be open
 ///   concurrently (e.g. a shell-output block running while the LLM
 ///   streams text into a markdown block above it).
-/// - `MarkdownFrame.append`: `Append` carries the [`FrameId`]; the
+/// - `MarkdownSection.append`: `Append` carries the [`SectionId`]; the
 ///   emit state looks up the matching open block and writes a
 ///   `BlockDelta` against it.
 /// - `Close { id }`: emit `BlockStop` for the block, persist a clean
@@ -214,10 +214,10 @@ pub(crate) struct WorkflowInstance {
 /// - `UpdateKind { id, kind }`: emit a no-text `BlockDelta` carrying
 ///   the new kind. Used for in-place metadata transitions (ShellOutput
 ///   Running → Success/Exit(N)).
-/// - `ErrorFrame` push: emit a one-shot `StreamFrame::Error` and
+/// - `ErrorSection` push: emit a one-shot `StreamFrame::Error` and
 ///   persist a scrollback row of kind 'error'. Does NOT touch any
 ///   open block — error frames are side-channel.
-/// - `JsonFrame` push: open + immediately close a one-shot
+/// - `JsonSection` push: open + immediately close a one-shot
 ///   `Text { source: Source::Internal }` block rendering `[tag] body`.
 ///
 /// On workflow termination every remaining open block is closed so the
@@ -227,10 +227,10 @@ pub(crate) struct WorkflowInstance {
 /// while a block was in flight).
 struct EmitState {
     next_block: u64,
-    /// Open blocks keyed by the workflow-side [`FrameId`]. Emit is
+    /// Open blocks keyed by the workflow-side [`SectionId`]. Emit is
     /// single-threaded (one task per workflow instance) so a plain
     /// `HashMap` is enough.
-    open: HashMap<FrameId, OpenBlock>,
+    open: HashMap<SectionId, OpenBlock>,
     /// Shared per-session [`Database`] used for scrollback writes. Cheap
     /// clone; the underlying connection lock serialises overlapping
     /// writes.
@@ -275,7 +275,7 @@ impl EmitState {
     /// Clean close for a single block: emit `BlockStop`, persist a
     /// finished row (if the block ever received body content), drop
     /// the entry. Idempotent on unknown ids.
-    async fn close_one(&mut self, events: &EventsChannel, frame_id: FrameId) -> Result<()> {
+    async fn close_one(&mut self, events: &EventsChannel, frame_id: SectionId) -> Result<()> {
         let Some(open) = self.open.remove(&frame_id) else {
             return Ok(());
         };
@@ -312,7 +312,7 @@ impl EmitState {
 
     /// Dehydrate close-all: the workflow is going away while blocks are
     /// in flight. Persist each row marked truncated and drop the
-    /// entries. No wire frames are emitted — the TUI is about to be
+    /// entries. No `StreamFrame`s are emitted — the TUI is about to be
     /// told to clear and replay via `ScrollbackFrame::Reset`, and the replay
     /// will surface these rows as `BlockTruncated`. Unmaterialised
     /// blocks (never wrote anything) are dropped silently.
@@ -556,7 +556,7 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
     initial: Option<WorkflowInstance>,
 ) {
     enum Step {
-        Transcript(TranscriptDelta),
+        Transcript(SectionTranscript),
         Surface(SurfaceCmd),
         Permission(PermissionRequest),
         Usage(frances_models_llm::Usage),
@@ -760,7 +760,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                     emit_transcript(runtime, &mut instance.emit, delta).await?;
                 }
                 // Body exited cleanly: every remaining open block gets
-                // a clean BlockStop on the wire and a non-truncated row.
+                // a clean `BlockStop` event and a non-truncated row.
                 instance.emit.close_all_stop(&runtime.events).await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow shutdown: {error}");
@@ -775,7 +775,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                     "workflow shutdown timed out; force-dropping handle"
                 );
                 // Body never settled. Mark every in-flight block
-                // truncated. No wire BlockStop — the TUI is about to
+                // truncated. No `BlockStop` event — the TUI is about to
                 // be told to clear via `ScrollbackFrame::Reset` by the caller's push path.
                 instance.emit.close_all_truncate().await?;
                 return Ok(());
@@ -784,23 +784,23 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
     }
 }
 
-/// Project a transcript delta onto the wire `StreamFrame` protocol and
+/// Project a transcript delta onto the `StreamFrame` event stream and
 /// persist closed blocks to scrollback.
 async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     state: &mut EmitState,
-    delta: TranscriptDelta,
+    delta: SectionTranscript,
 ) -> Result<()> {
     match delta {
-        TranscriptDelta::Set {
+        SectionTranscript::Set {
             id: frame_id,
-            frame: FrameSpec { kind, seed },
+            section: SectionSpec { kind, seed },
         } => match kind {
-            FrameKind::Markdown { source } => {
+            SectionKind::Markdown { source } => {
                 let block_kind = BlockKind::Text { source };
                 set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
-            FrameKind::ShellOutput {
+            SectionKind::ShellOutput {
                 state: shell_state,
                 cmd,
             } => {
@@ -812,7 +812,7 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 };
                 set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
-            FrameKind::Reasoning {
+            SectionKind::Reasoning {
                 state: reasoning_state,
             } => {
                 let block_kind = BlockKind::Tailed {
@@ -822,12 +822,12 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 };
                 set_streaming_block(runtime, state, frame_id, block_kind, seed);
             }
-            FrameKind::Error => {
+            SectionKind::Error => {
                 let content = seed.unwrap_or_default();
                 state.persist_error(&content).await?;
                 runtime.events.send(StreamFrame::Error(content));
             }
-            FrameKind::ToolUse { name, detail } => {
+            SectionKind::ToolUse { name, detail } => {
                 let kind = BlockKind::ToolUse {
                     name: Arc::from(name),
                     detail: detail.map(Arc::from),
@@ -837,7 +837,7 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 // prefix on the TUI side.
                 emit_one_shot(runtime, state, kind, "").await?;
             }
-            FrameKind::Json { tag, value } => {
+            SectionKind::Json { tag, value } => {
                 let body =
                     serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
                 let text = format!("[{tag}] {body}");
@@ -851,13 +851,13 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 )
                 .await?;
             }
-            FrameKind::Diff { lines } => {
-                let wire_lines: Vec<crate::events::DiffLine> =
+            SectionKind::Diff { lines } => {
+                let event_lines: Vec<crate::events::DiffLine> =
                     lines.into_iter().map(diff_op_to_protocol).collect();
-                emit_one_shot(runtime, state, BlockKind::Diff { lines: wire_lines }, "").await?;
+                emit_one_shot(runtime, state, BlockKind::Diff { lines: event_lines }, "").await?;
             }
         },
-        TranscriptDelta::Append {
+        SectionTranscript::Append {
             id: frame_id,
             delta,
         } => {
@@ -875,7 +875,7 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 });
             }
         }
-        TranscriptDelta::Close { id: frame_id } => {
+        SectionTranscript::Close { id: frame_id } => {
             state.close_one(&runtime.events, frame_id).await?;
         }
     }
@@ -889,7 +889,7 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
 fn set_streaming_block<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     state: &mut EmitState,
-    frame_id: FrameId,
+    frame_id: SectionId,
     block_kind: BlockKind,
     seed: Option<String>,
 ) {

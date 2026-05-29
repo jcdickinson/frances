@@ -1,6 +1,6 @@
 # Recall surface
 
-Frances's per-session libsql DB already persists every turn — the cold storage substrate exists. The recall surface is the agent-facing API for pulling cold content back into hot context on demand.
+Frances's per-session turso DB already persists every turn — the cold storage substrate exists. The recall surface is the agent-facing API for pulling cold content back into hot context on demand.
 
 ## Hot vs cold
 
@@ -87,7 +87,7 @@ At step completion, FTS5 indexes are populated for:
 - Transcript turns (model output text, tool call args, tool results)
 - Tool output payloads
 
-All indexed as virtual table content in the session DB. Cheap to index, cheap to query. SQLite FTS5 ships with libsql; no new infrastructure.
+All indexed as virtual table content in the session DB. Cheap to index, cheap to query. SQLite FTS5 ships with turso; no new infrastructure.
 
 ## Why FTS5, not vectors
 

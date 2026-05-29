@@ -22,11 +22,11 @@ import { inbox, INTERRUPT } from "frances:v1/inbox";
 import { AbortController } from "whatwg:abortcontroller";
 import {
   transcript,
-  MarkdownFrame,
-  ErrorFrame,
-  ThoughtFrame,
-  ToolUseFrame,
-} from "frances:v1/frames";
+  MarkdownSection,
+  ErrorSection,
+  ReasoningSection,
+  ToolUseSection,
+} from "frances:v1/sections";
 import { ChatSession, complete } from "frances:v1/chat";
 import {
   Shell,
@@ -269,7 +269,7 @@ function resetStepTranscript(): void {
 
 async function pipeAssistantTextToFrame(
   text: ReadableStream<string>,
-  out: MarkdownFrame,
+  out: MarkdownSection,
 ): Promise<string> {
   const reader = text.getReader();
   const writer = out.writable.getWriter();
@@ -297,7 +297,7 @@ async function pipeAssistantTextToFrame(
   return textOut;
 }
 
-// Reasoning channel: pipe straight to a ThoughtFrame.
+// Reasoning channel: pipe straight to a ReasoningSection.
 //
 // Two different model-feedback loops to keep straight:
 //   1. Provider history round-trip — reasoning still rides back to the
@@ -310,7 +310,7 @@ async function pipeAssistantTextToFrame(
 //      would dilute the summary and burn tokens for no real benefit.
 async function pipeReasoningToFrame(
   reasoning: ReadableStream<string>,
-  out: ThoughtFrame,
+  out: ReasoningSection,
 ): Promise<void> {
   const reader = reasoning.getReader();
   const writer = out.writable.getWriter();
@@ -484,7 +484,7 @@ class PlanUpdate {
       if (args.current_step !== undefined) activateStep(args.current_step);
       normalizePlan();
       transcript.push(
-        new MarkdownFrame({
+        new MarkdownSection({
           content: `Plan updated.\n\n\`\`\`\n${renderPlanForPrompt()}\n\`\`\``,
           source: "assistant",
           closed: true,
@@ -677,7 +677,7 @@ const tools = [
 for (const tool of tools) {
   const original = tool.handler.bind(tool);
   tool.handler = async ({ call, scope }: any) => {
-    transcript.push(new ToolUseFrame({ call, tool }));
+    transcript.push(new ToolUseSection({ call, tool }));
     recordStepTranscript(
       `Tool call: ${call.name}`,
       `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,
@@ -710,7 +710,7 @@ async function handlePendingCompletion(): Promise<boolean> {
   const judgement = await referee(signal);
   if (judgement.type === "decline") {
     const msg = `Referee declined task completion: ${judgement.message}`;
-    transcript.push(new MarkdownFrame({ content: msg, closed: true }));
+    transcript.push(new MarkdownSection({ content: msg, closed: true }));
     chat.push({
       role: "user",
       content:
@@ -734,7 +734,7 @@ async function handlePendingCompletion(): Promise<boolean> {
     return false;
   }
   transcript.push(
-    new MarkdownFrame({
+    new MarkdownSection({
       content:
         `Step ${stepNumber(completed)} completed: **${completed.title}**\n\n` +
         `Outcome: ${completed.outcome}\n\n` +
@@ -778,8 +778,8 @@ async function turn(): Promise<TurnEnd> {
     // persistence, until the first text delta materialises the block.
     // The `thought` frame sits alongside it for the reasoning channel;
     // for non-thinking models it stays empty and closes immediately.
-    const out = new MarkdownFrame({ source: "assistant" });
-    const thought = new ThoughtFrame();
+    const out = new MarkdownSection({ source: "assistant" });
+    const thought = new ReasoningSection();
     transcript.push(thought);
     transcript.push(out);
 
@@ -818,7 +818,7 @@ async function turn(): Promise<TurnEnd> {
         resetCount += 1;
         if (resetCount > 50) {
           transcript.push(
-            new ErrorFrame({
+            new ErrorSection({
               content:
                 "agentic loop stopped after 50 automatic step transitions",
             }),
@@ -839,7 +839,7 @@ async function turn(): Promise<TurnEnd> {
 }
 
 transcript.push(
-  new MarkdownFrame({
+  new MarkdownSection({
     content: "frances ready. Type `quit` to exit.",
     closed: true,
   }),
@@ -864,12 +864,12 @@ async function ourLoop(): Promise<void> {
 
     const msg = value.content.trim();
     transcript.push(
-      new MarkdownFrame({ content: msg, source: "user", closed: true }),
+      new MarkdownSection({ content: msg, source: "user", closed: true }),
     );
     recordStepTranscript("User", msg);
     if (msg === "quit") {
       transcript.push(
-        new MarkdownFrame({ content: "bye", source: "assistant", closed: true }),
+        new MarkdownSection({ content: "bye", source: "assistant", closed: true }),
       );
       exit();
       break;
@@ -879,7 +879,7 @@ async function ourLoop(): Promise<void> {
     try {
       await turn();
     } catch (e) {
-      transcript.push(new ErrorFrame({ content: `chat failed: \`${e}\`` }));
+      transcript.push(new ErrorSection({ content: `chat failed: \`${e}\`` }));
     }
   }
 }

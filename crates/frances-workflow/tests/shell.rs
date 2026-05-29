@@ -7,7 +7,7 @@
 use std::io::Write;
 
 use frances_workflow::{
-    FrameKind, Invocation, PermissionRequest, PermissionResponse, Runtime, TranscriptDelta,
+    Invocation, PermissionRequest, PermissionResponse, Runtime, SectionKind, SectionTranscript,
     WorkflowHandle,
     test_deps::StubDepsRealShell,
     test_drive::{CYCLE_TIMEOUT, drive_one_cycle},
@@ -22,46 +22,48 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn text_of(frame: &TranscriptDelta) -> String {
+fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
-            FrameKind::ToolUse { name, detail } => match detail {
+        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+            SectionKind::Markdown { .. } | SectionKind::Error => {
+                spec.seed.clone().unwrap_or_default()
+            }
+            SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
-            FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput { state, cmd } => format!(
+            SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
+            SectionKind::ShellOutput { state, cmd } => format!(
                 "[shell:{state:?}] $ {cmd}
 {}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Reasoning { state } => format!(
+            SectionKind::Reasoning { state } => format!(
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+            SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        TranscriptDelta::Append { delta, .. } => delta.clone(),
-        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Append { delta, .. } => delta.clone(),
+        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
     }
 }
 
-/// Collect content from every `MarkdownFrame` push in order. Most
-/// shell tests use `transcript.push(new MarkdownFrame({ content }))`
+/// Collect content from every `MarkdownSection` push in order. Most
+/// shell tests use `transcript.push(new MarkdownSection({ content }))`
 /// to surface tool_result text and then index into the resulting
-/// frames — but `Run.handler` now also pushes a `ShellOutputFrame`
+/// frames — but `Run.handler` now also pushes a `ShellOutputSection`
 /// (plus its Append/UpdateKind/Close trail), which would otherwise
 /// shift those indices around. Filtering by kind keeps the tests
 /// focused on the markdown frames they care about. Empty-content
 /// pushes (the `None` case) collapse to "" since the tests work in
 /// terms of body text.
-fn markdown_pushes(frames: &[TranscriptDelta]) -> Vec<String> {
+fn markdown_pushes(frames: &[SectionTranscript]) -> Vec<String> {
     frames
         .iter()
         .filter_map(|f| match f {
-            TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-                FrameKind::Markdown { .. } => Some(spec.seed.clone().unwrap_or_default()),
+            SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+                SectionKind::Markdown { .. } => Some(spec.seed.clone().unwrap_or_default()),
                 _ => None,
             },
             _ => None,
@@ -76,7 +78,7 @@ async fn shell_set_set_form_is_not_exported() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -97,7 +99,7 @@ async fn shell_set_set_form_is_not_exported() {
             call: { id: "r1", name: "shell_run", arguments: { cmd: "echo \"[$FOO]\"" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: seen.content }));
+        transcript.push(new MarkdownSection({ content: seen.content }));
 
         // But subprocesses don't inherit a non-exported var.
         const sub = await run.handler({
@@ -105,7 +107,7 @@ async fn shell_set_set_form_is_not_exported() {
                     arguments: { cmd: "bash -c 'echo \"[${FOO:-unset}]\"'" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: sub.content }));
+        transcript.push(new MarkdownSection({ content: sub.content }));
 
         await sh.close();
         "#,
@@ -141,7 +143,7 @@ async fn shell_set_export_form_visible_to_subprocesses() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -164,7 +166,7 @@ async fn shell_set_export_form_visible_to_subprocesses() {
                     arguments: { cmd: "bash -c 'echo \"$PAYLOAD\"'" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: out.content }));
+        transcript.push(new MarkdownSection({ content: out.content }));
 
         await sh.close();
         "#,
@@ -192,7 +194,7 @@ async fn shell_set_object_value_is_json_encoded() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -212,7 +214,7 @@ async fn shell_set_object_value_is_json_encoded() {
             call: { id: "r1", name: "shell_run", arguments: { cmd: "echo \"$OBJ\"" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: out.content }));
+        transcript.push(new MarkdownSection({ content: out.content }));
 
         await sh.close();
         "#,
@@ -240,7 +242,7 @@ async fn shell_set_validates_xor_and_missing_from() {
         r#"
         import { Shell, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const vars = new Variables();
@@ -268,10 +270,10 @@ async fn shell_set_validates_xor_and_missing_from() {
             scope: null,
         });
 
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(both) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(neither) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(missing) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(bad) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(both) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(neither) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(bad) }));
 
         await sh.close();
         "#,
@@ -306,7 +308,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
         r#"
         import { Shell, Run, Wait, Kill, Capture as ShellCapture } from "frances:v1/tools/shell";
         import { Variables, Assign as VarAssign } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -326,7 +328,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
                     arguments: { name: "snapshot", from: "OUT" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: vars.get("snapshot") }));
+        transcript.push(new MarkdownSection({ content: vars.get("snapshot") }));
 
         // Parse via variable_assign + fromjson. The captured value is
         // always a string, so we route it through $snapshot rather
@@ -337,7 +339,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
                                  inputs: ["snapshot"] } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(vars.get("parsed")) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(vars.get("parsed")) }));
 
         await sh.close();
         "#,
@@ -365,7 +367,7 @@ async fn shell_capture_unset_var_errors() {
         r#"
         import { Shell, Capture as ShellCapture } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const vars = new Variables();
@@ -376,7 +378,7 @@ async fn shell_capture_unset_var_errors() {
                     arguments: { name: "x", from: "DEFINITELY_UNSET_VAR_NAME" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
 
         await sh.close();
         "#,
@@ -420,7 +422,7 @@ async fn shell_run_approve_yes_executes_command() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -432,7 +434,7 @@ async fn shell_run_approve_yes_executes_command() {
                     arguments: { cmd: "echo approved-and-ran" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: out.content }));
+        transcript.push(new MarkdownSection({ content: out.content }));
         await sh.close();
         "#,
     );
@@ -488,7 +490,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -500,7 +502,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
                     arguments: { cmd: "rm -rf /" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(out) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(out) }));
         await sh.close();
         "#,
     );
@@ -530,7 +532,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let out = frames
         .iter()
         .find_map(|f| match f {
-            set @ TranscriptDelta::Set { .. } => Some(text_of(set)),
+            set @ SectionTranscript::Set { .. } => Some(text_of(set)),
             _ => None,
         })
         .expect("expected a tool result transcript push");
@@ -545,7 +547,7 @@ async fn shell_run_approve_false_skips_gate() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -557,7 +559,7 @@ async fn shell_run_approve_false_skips_gate() {
                     arguments: { cmd: "echo no-gate" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: out.content }));
+        transcript.push(new MarkdownSection({ content: out.content }));
         await sh.close();
         "#,
     );
@@ -596,7 +598,7 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
     let file = write_source(
         r#"
         import { Shell, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const kill = new Kill(sh);
@@ -617,7 +619,7 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
         const stillRunning = await sh.isRunning();
 
         await sh.close();
-        transcript.push(new MarkdownFrame({
+        transcript.push(new MarkdownSection({
             content: `r1Kind=${r1.kind} isErr=${result.is_error} hasStillRunning=${result.content.includes("Still running")} running=${stillRunning} content=${JSON.stringify(result.content)}`,
         }));
         "#,

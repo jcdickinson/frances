@@ -2,7 +2,7 @@
 //!
 //! Reads from a `session_config` table on the per-session turso DB and
 //! emits one [`ConfigEvent`] per row. Lives in `frances` (not in
-//! `frances-config`) so the config crate stays independent of libsql.
+//! `frances-config`) so the config crate stays independent of turso.
 //!
 //! Writes go through [`SessionConfigWriter`], obtained from
 //! [`SessionConfigProvider::writer`] after the provider has been driven

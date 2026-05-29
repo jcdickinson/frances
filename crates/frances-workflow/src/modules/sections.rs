@@ -1,17 +1,17 @@
-//! `frances:v1/frames` — transcript + frame classes.
+//! `frances:v1/sections` — transcript + frame classes.
 //!
 //! The transcript is an append-only sequence of frames. The user holds
 //! a frame object after `transcript.push(frame)` and may call
 //! `frame.write(text)` to extend its content. Frames stay writeable
 //! until they're explicitly closed; the host supports many open blocks
-//! at once, so a long-running [`ShellOutputFrame`] can keep streaming
-//! while later [`MarkdownFrame`]s are pushed alongside it.
+//! at once, so a long-running [`ShellOutputSection`] can keep streaming
+//! while later [`MarkdownSection`]s are pushed alongside it.
 //!
 //! Each writeable frame exposes:
 //!   - `frame.write(text)` — append, throws if `closed`.
 //!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
-//!   - `frame.close()` — emit [`TranscriptDelta::Close`], flip `closed`,
-//!     return `this` so `new MarkdownFrame(...).close()` chains.
+//!   - `frame.close()` — emit [`SectionTranscript::Close`], flip `closed`,
+//!     return `this` so `new MarkdownSection(...).close()` chains.
 //!   - `frame.autoclose` (default `true`) — when truthy, the writable's
 //!     `close`/`abort` hook calls `frame.close()` so a finished pipe
 //!     seals the frame automatically.
@@ -25,10 +25,10 @@
 //! `transcript` import). The `Transcript` class is exported as a type
 //! for future rotation work; users can't construct one in v1.
 //!
-//! Wire contract: the host receives a [`TranscriptDelta::Set`] for each
+//! Wire contract: the host receives a [`SectionTranscript::Set`] for each
 //! frame (the first creates it; a later one re-upserts kind + metadata,
-//! e.g. shell state going terminal), [`TranscriptDelta::Append`] for each
-//! text delta, and [`TranscriptDelta::Close`] when a frame is sealed.
+//! e.g. shell state going terminal), [`SectionTranscript::Append`] for each
+//! text delta, and [`SectionTranscript::Close`] when a frame is sealed.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -41,18 +41,18 @@ use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as Js
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{FrameId, FrameKind, FrameSpec, Source, TranscriptDelta};
+use crate::runtime::{SectionId, SectionKind, SectionSpec, SectionTranscript, Source};
 
 /// Shared state for the v1 frames surface. One per workflow invocation.
-pub(crate) struct FramesState {
+pub(crate) struct SectionsState {
     /// Monotonically-increasing frame id. Bumped by `transcript.push`.
     next_id: AtomicU64,
     /// Where push/append events go.
-    tx: UnboundedSender<TranscriptDelta>,
+    tx: UnboundedSender<SectionTranscript>,
 }
 
-impl FramesState {
-    fn new(tx: UnboundedSender<TranscriptDelta>) -> Arc<Self> {
+impl SectionsState {
+    fn new(tx: UnboundedSender<SectionTranscript>) -> Arc<Self> {
         Arc::new(Self {
             next_id: AtomicU64::new(0),
             tx,
@@ -65,22 +65,22 @@ impl FramesState {
     }
 }
 
-pub(crate) type BuiltFrames<'js> = (
+pub(crate) type BuiltSections<'js> = (
     Class<'js, TranscriptHandle>,
-    Ctor<'js>, // MarkdownFrame
-    Ctor<'js>, // ErrorFrame
-    Ctor<'js>, // JsonFrame
-    Ctor<'js>, // ShellOutputFrame
-    Ctor<'js>, // ThoughtFrame
-    Ctor<'js>, // ToolUseFrame
-    Ctor<'js>, // DiffFrame
+    Ctor<'js>, // MarkdownSection
+    Ctor<'js>, // ErrorSection
+    Ctor<'js>, // JsonSection
+    Ctor<'js>, // ShellOutputSection
+    Ctor<'js>, // ReasoningSection
+    Ctor<'js>, // ToolUseSection
+    Ctor<'js>, // DiffSection
 );
 
-pub(crate) fn build_frames<'js>(
+pub(crate) fn build_sections<'js>(
     ctx: &Ctx<'js>,
-    tx: UnboundedSender<TranscriptDelta>,
-) -> JsResult<BuiltFrames<'js>> {
-    let state = FramesState::new(tx);
+    tx: UnboundedSender<SectionTranscript>,
+) -> JsResult<BuiltSections<'js>> {
+    let state = SectionsState::new(tx);
 
     let transcript = Class::instance(
         ctx.clone(),
@@ -116,7 +116,7 @@ pub(crate) fn build_frames<'js>(
 /// `Transcript` — for v1 just `push(frame)`. Users get a singleton via
 /// the `transcript` export; the constructor is intentionally absent.
 pub struct TranscriptHandle {
-    state: Arc<FramesState>,
+    state: Arc<SectionsState>,
 }
 
 impl<'js> Trace<'js> for TranscriptHandle {
@@ -137,8 +137,8 @@ impl<'js> JsClass<'js> for TranscriptHandle {
             "push",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, TranscriptHandle>>, frame: Value<'js>| {
-                    push_frame(&ctx, &this.0, frame)
+                |ctx: Ctx<'js>, this: This<Class<'js, TranscriptHandle>>, section: Value<'js>| {
+                    push_section(&ctx, &this.0, section)
                 },
             )?,
         )?;
@@ -150,26 +150,26 @@ impl<'js> JsClass<'js> for TranscriptHandle {
     }
 }
 
-fn push_frame<'js>(
+fn push_section<'js>(
     ctx: &Ctx<'js>,
     handle: &Class<'js, TranscriptHandle>,
-    frame: Value<'js>,
+    section: Value<'js>,
 ) -> JsResult<()> {
     let state = handle.borrow().state.clone();
 
-    if let Some(md) = as_frame::<MarkdownFrame>(&frame) {
+    if let Some(md) = as_section::<MarkdownSection>(&section) {
         let new_id = state.assign_id();
         let borrow = md.borrow();
         borrow.id.store(new_id, Ordering::Release);
-        let frame = FrameSpec {
-            kind: FrameKind::Markdown {
+        let section = SectionSpec {
+            kind: SectionKind::Markdown {
                 source: borrow.source,
             },
             seed: borrow.content.clone(),
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         // Pre-closed frame (either `{ ..., closed: true }` at
         // construction or `frame.close()` called before push) — seal
@@ -177,104 +177,104 @@ fn push_frame<'js>(
         // Close in the same batch and never paints the spinner over
         // it.
         if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(TranscriptDelta::Close {
-                id: FrameId(new_id),
+            let _ = state.tx.send(SectionTranscript::Close {
+                id: SectionId(new_id),
             });
         }
         return Ok(());
     }
-    if let Some(err) = as_frame::<ErrorFrame>(&frame) {
+    if let Some(err) = as_section::<ErrorSection>(&section) {
         let new_id = state.assign_id();
         err.borrow().id.store(new_id, Ordering::Release);
-        let frame = FrameSpec {
-            kind: FrameKind::Error,
+        let section = SectionSpec {
+            kind: SectionKind::Error,
             seed: Some(err.borrow().content.clone()),
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         return Ok(());
     }
-    if let Some(tu) = as_frame::<ToolUseFrame>(&frame) {
+    if let Some(tu) = as_section::<ToolUseSection>(&section) {
         let borrow = tu.borrow();
         if borrow.hidden {
             return Ok(());
         }
         let new_id = state.assign_id();
         borrow.id.store(new_id, Ordering::Release);
-        let frame = FrameSpec {
-            kind: FrameKind::ToolUse {
+        let section = SectionSpec {
+            kind: SectionKind::ToolUse {
                 name: borrow.name.clone(),
                 detail: borrow.detail.clone(),
             },
             seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         // One-shot: the runtime closes + persists this frame on its end
-        // (see emit() for FrameKind::ToolUse). No TranscriptDelta::Close from
+        // (see emit() for SectionKind::ToolUse). No SectionTranscript::Close from
         // the workflow side — keeps the JS API simple.
         return Ok(());
     }
-    if let Some(df) = as_frame::<DiffFrame>(&frame) {
+    if let Some(df) = as_section::<DiffSection>(&section) {
         let mut borrow = df.borrow_mut();
         let new_id = state.assign_id();
         borrow.id.store(new_id, Ordering::Release);
         let ops = std::mem::take(&mut borrow.ops);
-        let frame = FrameSpec {
-            kind: FrameKind::Diff { lines: ops },
+        let section = SectionSpec {
+            kind: SectionKind::Diff { lines: ops },
             seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
-        // One-shot — runtime seals on its side. Same shape as ToolUseFrame.
+        // One-shot — runtime seals on its side. Same shape as ToolUseSection.
         return Ok(());
     }
-    if let Some(json) = as_frame::<JsonFrame>(&frame) {
+    if let Some(json) = as_section::<JsonSection>(&section) {
         let new_id = state.assign_id();
         json.borrow().id.store(new_id, Ordering::Release);
         let borrow = json.borrow();
-        let frame = FrameSpec {
-            kind: FrameKind::Json {
+        let section = SectionSpec {
+            kind: SectionKind::Json {
                 tag: borrow.tag.clone(),
                 value: borrow.value.clone(),
             },
             seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         return Ok(());
     }
-    if let Some(sh) = as_frame::<ShellOutputFrame>(&frame) {
+    if let Some(sh) = as_section::<ShellOutputSection>(&section) {
         let new_id = state.assign_id();
         let borrow = sh.borrow();
         borrow.id.store(new_id, Ordering::Release);
-        let frame = FrameSpec {
-            kind: FrameKind::ShellOutput {
+        let section = SectionSpec {
+            kind: SectionKind::ShellOutput {
                 state: load_shell_state(&borrow.state_atom),
                 cmd: borrow.cmd.clone(),
             },
             seed: Some(borrow.content.clone()),
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(TranscriptDelta::Close {
-                id: FrameId(new_id),
+            let _ = state.tx.send(SectionTranscript::Close {
+                id: SectionId(new_id),
             });
         }
         return Ok(());
     }
-    if let Some(th) = as_frame::<ThoughtFrame>(&frame) {
+    if let Some(th) = as_section::<ReasoningSection>(&section) {
         let new_id = state.assign_id();
         let borrow = th.borrow();
         borrow.id.store(new_id, Ordering::Release);
@@ -286,39 +286,39 @@ fn push_frame<'js>(
         } else {
             crate::runtime::ReasoningState::Streaming
         };
-        let frame = FrameSpec {
-            kind: FrameKind::Reasoning {
+        let section = SectionSpec {
+            kind: SectionKind::Reasoning {
                 state: reasoning_state,
             },
             seed: Some(borrow.content.clone()),
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(new_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
         });
         if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(TranscriptDelta::Close {
-                id: FrameId(new_id),
+            let _ = state.tx.send(SectionTranscript::Close {
+                id: SectionId(new_id),
             });
         }
         return Ok(());
     }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownFrame, ErrorFrame, JsonFrame, ShellOutputFrame, ThoughtFrame, or ToolUseFrame",
+        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ShellOutputSection, ReasoningSection, or ToolUseSection",
     )
 }
 
-fn as_frame<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
+fn as_section<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
     v.as_object().and_then(Class::<C>::from_object)
 }
 
 // ---------------------------------------------------------------------
-// MarkdownFrame / ErrorFrame — writeable text frames
+// MarkdownSection / ErrorSection — writeable text frames
 // ---------------------------------------------------------------------
 
-pub struct MarkdownFrame {
-    state: Arc<FramesState>,
+pub struct MarkdownSection {
+    state: Arc<SectionsState>,
     /// Set by `transcript.push`; 0 means "not yet pushed".
     id: AtomicU64,
     /// Initial content captured at construction. `None` when the
@@ -332,22 +332,22 @@ pub struct MarkdownFrame {
     /// [`Source::Internal`] when the workflow omits `source` — that's the
     /// "no prefix" / chrome case (greetings, plan dumps, tag bodies).
     source: Source,
-    /// Flipped by [`close_frame`] (either explicit `.close()` or the
+    /// Flipped by [`close_section`] (either explicit `.close()` or the
     /// writable's auto-close hook on the JS side). Subsequent writes
     /// throw; subsequent closes are no-ops.
     closed: AtomicBool,
 }
 
-impl<'js> Trace<'js> for MarkdownFrame {
+impl<'js> Trace<'js> for MarkdownSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for MarkdownFrame {
-    type Changed<'to> = MarkdownFrame;
+unsafe impl<'js> JsLifetime<'js> for MarkdownSection {
+    type Changed<'to> = MarkdownSection;
 }
 
-impl<'js> JsClass<'js> for MarkdownFrame {
-    const NAME: &'static str = "MarkdownFrame";
+impl<'js> JsClass<'js> for MarkdownSection {
+    const NAME: &'static str = "MarkdownSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -356,7 +356,7 @@ impl<'js> JsClass<'js> for MarkdownFrame {
             "write",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, MarkdownFrame>>, delta: String| {
+                |ctx: Ctx<'js>, this: This<Class<'js, MarkdownSection>>, delta: String| {
                     let b = this.0.borrow();
                     append_text(&ctx, &b.state, &b.id, &b.closed, delta)
                 },
@@ -367,11 +367,11 @@ impl<'js> JsClass<'js> for MarkdownFrame {
             Function::new(
                 ctx.clone(),
                 |ctx: Ctx<'js>,
-                 this: This<Class<'js, MarkdownFrame>>|
-                 -> JsResult<Class<'js, MarkdownFrame>> {
+                 this: This<Class<'js, MarkdownSection>>|
+                 -> JsResult<Class<'js, MarkdownSection>> {
                     {
                         let b = this.0.borrow();
-                        close_frame(&ctx, &b.state, &b.id, &b.closed)?;
+                        close_section(&ctx, &b.state, &b.id, &b.closed)?;
                     }
                     Ok(this.0.clone())
                 },
@@ -385,29 +385,29 @@ impl<'js> JsClass<'js> for MarkdownFrame {
     }
 }
 
-/// `ErrorFrame` — one-shot error message. No `write` in v1; rendering
+/// `ErrorSection` — one-shot error message. No `write` in v1; rendering
 /// goes through `StreamFrame::Error` (a non-block message) on the host
 /// side, so streaming-write semantics don't apply.
-pub struct ErrorFrame {
+pub struct ErrorSection {
     #[expect(
         dead_code,
-        reason = "kept on the type for parity with MarkdownFrame; write support is a follow-up"
+        reason = "kept on the type for parity with MarkdownSection; write support is a follow-up"
     )]
-    state: Arc<FramesState>,
+    state: Arc<SectionsState>,
     id: AtomicU64,
     content: String,
 }
 
-impl<'js> Trace<'js> for ErrorFrame {
+impl<'js> Trace<'js> for ErrorSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for ErrorFrame {
-    type Changed<'to> = ErrorFrame;
+unsafe impl<'js> JsLifetime<'js> for ErrorSection {
+    type Changed<'to> = ErrorSection;
 }
 
-impl<'js> JsClass<'js> for ErrorFrame {
-    const NAME: &'static str = "ErrorFrame";
+impl<'js> JsClass<'js> for ErrorSection {
+    const NAME: &'static str = "ErrorSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -423,7 +423,7 @@ impl<'js> JsClass<'js> for ErrorFrame {
 
 fn append_text<'js>(
     ctx: &Ctx<'js>,
-    state: &Arc<FramesState>,
+    state: &Arc<SectionsState>,
     id: &AtomicU64,
     closed: &AtomicBool,
     delta: String,
@@ -438,23 +438,23 @@ fn append_text<'js>(
     if closed.load(Ordering::Acquire) {
         return throw_type(ctx, "frame.write: frame is closed");
     }
-    let _ = state.tx.send(TranscriptDelta::Append {
-        id: FrameId(frame_id),
+    let _ = state.tx.send(SectionTranscript::Append {
+        id: SectionId(frame_id),
         delta,
     });
     Ok(())
 }
 
 /// Mark the frame closed and (if it has been pushed) emit
-/// [`TranscriptDelta::Close`] exactly once. Idempotent: a second call is a
+/// [`SectionTranscript::Close`] exactly once. Idempotent: a second call is a
 /// silent no-op. When called before `transcript.push`, just records
 /// the intent — `transcript.push` notices the pre-set flag and emits
-/// the close right after the push so `new MarkdownFrame(...).close()`
-/// chains the same way `new MarkdownFrame({ ..., closed: true })`
+/// the close right after the push so `new MarkdownSection(...).close()`
+/// chains the same way `new MarkdownSection({ ..., closed: true })`
 /// does.
-fn close_frame<'js>(
+fn close_section<'js>(
     _ctx: &Ctx<'js>,
-    state: &Arc<FramesState>,
+    state: &Arc<SectionsState>,
     id: &AtomicU64,
     closed: &AtomicBool,
 ) -> JsResult<()> {
@@ -464,42 +464,42 @@ fn close_frame<'js>(
         return Ok(());
     }
     if !closed.swap(true, Ordering::AcqRel) {
-        let _ = state.tx.send(TranscriptDelta::Close {
-            id: FrameId(frame_id),
+        let _ = state.tx.send(SectionTranscript::Close {
+            id: SectionId(frame_id),
         });
     }
     Ok(())
 }
 
 // ---------------------------------------------------------------------
-// JsonFrame — single tagged value, no write
+// JsonSection — single tagged value, no write
 // ---------------------------------------------------------------------
 
-pub struct JsonFrame {
+pub struct JsonSection {
     #[expect(
         dead_code,
         reason = "kept for future API parity with text frames; not read after construction"
     )]
-    state: Arc<FramesState>,
+    state: Arc<SectionsState>,
     id: AtomicU64,
     tag: String,
     value: serde_json::Value,
 }
 
-impl<'js> Trace<'js> for JsonFrame {
+impl<'js> Trace<'js> for JsonSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for JsonFrame {
-    type Changed<'to> = JsonFrame;
+unsafe impl<'js> JsLifetime<'js> for JsonSection {
+    type Changed<'to> = JsonSection;
 }
 
-impl<'js> JsClass<'js> for JsonFrame {
-    const NAME: &'static str = "JsonFrame";
+impl<'js> JsClass<'js> for JsonSection {
+    const NAME: &'static str = "JsonSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // Intentionally empty — no `write` here; JsonFrame is set at
+        // Intentionally empty — no `write` here; JsonSection is set at
         // construction.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
@@ -511,7 +511,7 @@ impl<'js> JsClass<'js> for JsonFrame {
 }
 
 // ---------------------------------------------------------------------
-// ToolUseFrame — one-shot "→ tool_name" marker
+// ToolUseSection — one-shot "→ tool_name" marker
 // ---------------------------------------------------------------------
 
 /// Hard cap on the length of the `detail` string returned by a tool's
@@ -521,12 +521,12 @@ impl<'js> JsClass<'js> for JsonFrame {
 /// cap is truncated with a trailing `…`.
 const TOOL_DETAIL_MAX: usize = 160;
 
-pub struct ToolUseFrame {
+pub struct ToolUseSection {
     #[expect(
         dead_code,
-        reason = "kept for symmetry with the other frame types; never read after construction since ToolUseFrame is one-shot"
+        reason = "kept for symmetry with the other frame types; never read after construction since ToolUseSection is one-shot"
     )]
-    state: Arc<FramesState>,
+    state: Arc<SectionsState>,
     id: AtomicU64,
     name: String,
     /// When `true`, `transcript.push` skips the frame entirely — no
@@ -540,16 +540,16 @@ pub struct ToolUseFrame {
     detail: Option<String>,
 }
 
-impl<'js> Trace<'js> for ToolUseFrame {
+impl<'js> Trace<'js> for ToolUseSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for ToolUseFrame {
-    type Changed<'to> = ToolUseFrame;
+unsafe impl<'js> JsLifetime<'js> for ToolUseSection {
+    type Changed<'to> = ToolUseSection;
 }
 
-impl<'js> JsClass<'js> for ToolUseFrame {
-    const NAME: &'static str = "ToolUseFrame";
+impl<'js> JsClass<'js> for ToolUseSection {
+    const NAME: &'static str = "ToolUseSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -598,22 +598,25 @@ fn normalise_detail(raw: String) -> Option<String> {
     Some(out)
 }
 
-fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ToolUseFrame, _, _>(
+fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ToolUseSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let Some(obj) = arg.as_object() else {
                 return throw_type(
                     &ctx,
-                    "new ToolUseFrame: expected { call: { name: string }, tool? }",
+                    "new ToolUseSection: expected { call: { name: string }, tool? }",
                 );
             };
             let call: Object<'js> = obj
                 .get("call")
-                .map_err(|_| throw_err(&ctx, "new ToolUseFrame: missing object `call`"))?;
+                .map_err(|_| throw_err(&ctx, "new ToolUseSection: missing object `call`"))?;
             let name: String = call.get("name").map_err(|_| {
-                throw_err(&ctx, "new ToolUseFrame: missing or non-string `call.name`")
+                throw_err(
+                    &ctx,
+                    "new ToolUseSection: missing or non-string `call.name`",
+                )
             })?;
             let tool: Option<Object<'js>> = match obj.get::<_, Value<'js>>("tool") {
                 Ok(v) if v.is_object() => v.into_object(),
@@ -629,7 +632,7 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
                 .and_then(normalise_detail);
             Class::instance(
                 ctx.clone(),
-                ToolUseFrame {
+                ToolUseSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     name,
@@ -642,37 +645,37 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
 }
 
 // ---------------------------------------------------------------------
-// DiffFrame — one-shot structured diff produced by a file-edit tool
+// DiffSection — one-shot structured diff produced by a file-edit tool
 // ---------------------------------------------------------------------
 
 /// One-shot frame carrying a unified-diff payload. Constructed by the
 /// JS file tools after a successful mutation; the runtime translates each
 /// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff`
-/// block. Like `ToolUseFrame`, the runtime seals and persists the block
+/// block. Like `ToolUseSection`, the runtime seals and persists the block
 /// — there is no `write` / `close` on the JS side.
-pub struct DiffFrame {
+pub struct DiffSection {
     #[expect(
         dead_code,
-        reason = "kept for symmetry with the other frame types; never read after construction since DiffFrame is one-shot"
+        reason = "kept for symmetry with the other frame types; never read after construction since DiffSection is one-shot"
     )]
-    state: Arc<FramesState>,
+    state: Arc<SectionsState>,
     id: AtomicU64,
     /// Drained on push — the runtime moves the ops into the wire
-    /// `FrameKind::Diff` rather than cloning, since a `DiffFrame` is
+    /// `SectionKind::Diff` rather than cloning, since a `DiffSection` is
     /// pushed exactly once.
     ops: Vec<DiffOp>,
 }
 
-impl<'js> Trace<'js> for DiffFrame {
+impl<'js> Trace<'js> for DiffSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for DiffFrame {
-    type Changed<'to> = DiffFrame;
+unsafe impl<'js> JsLifetime<'js> for DiffSection {
+    type Changed<'to> = DiffSection;
 }
 
-impl<'js> JsClass<'js> for DiffFrame {
-    const NAME: &'static str = "DiffFrame";
+impl<'js> JsClass<'js> for DiffSection {
+    const NAME: &'static str = "DiffSection";
     type Mutable = rquickjs::class::Writable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -688,7 +691,7 @@ impl<'js> JsClass<'js> for DiffFrame {
 
 fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp>> {
     let Some(arr) = lines.as_array() else {
-        return throw_type(ctx, "new DiffFrame: `lines` must be an array");
+        return throw_type(ctx, "new DiffSection: `lines` must be an array");
     };
     let mut ops = Vec::with_capacity(arr.len());
     for entry in arr.iter::<Value<'js>>() {
@@ -696,19 +699,22 @@ fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp
         let Some(obj) = entry.as_object() else {
             return throw_type(
                 ctx,
-                "new DiffFrame: each `lines` entry must be { kind, text, line? }",
+                "new DiffSection: each `lines` entry must be { kind, text, line? }",
             );
         };
         let kind: String = obj
             .get("kind")
-            .map_err(|_| throw_err(ctx, "new DiffFrame: missing or non-string `kind`"))?;
+            .map_err(|_| throw_err(ctx, "new DiffSection: missing or non-string `kind`"))?;
         let text: String = obj
             .get("text")
-            .map_err(|_| throw_err(ctx, "new DiffFrame: missing or non-string `text`"))?;
+            .map_err(|_| throw_err(ctx, "new DiffSection: missing or non-string `text`"))?;
         let op = match kind.as_str() {
             "context" => {
                 let line: u32 = obj.get("line").map_err(|_| {
-                    throw_err(ctx, "new DiffFrame: context entries require `line: number`")
+                    throw_err(
+                        ctx,
+                        "new DiffSection: context entries require `line: number`",
+                    )
                 })?;
                 DiffOp::Context { text, line }
             }
@@ -718,7 +724,7 @@ fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp
                 return throw_type(
                     ctx,
                     &format!(
-                        "new DiffFrame: unknown `kind` {other:?}; expected \"context\", \"added\", or \"removed\""
+                        "new DiffSection: unknown `kind` {other:?}; expected \"context\", \"added\", or \"removed\""
                     ),
                 );
             }
@@ -728,21 +734,21 @@ fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp
     Ok(ops)
 }
 
-fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<DiffFrame, _, _>(
+fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<DiffSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let Some(obj) = arg.as_object() else {
-                return throw_type(&ctx, "new DiffFrame: expected { lines: Array }");
+                return throw_type(&ctx, "new DiffSection: expected { lines: Array }");
             };
             let lines: Value<'js> = obj
                 .get("lines")
-                .map_err(|_| throw_err(&ctx, "new DiffFrame: missing `lines`"))?;
+                .map_err(|_| throw_err(&ctx, "new DiffSection: missing `lines`"))?;
             let ops = parse_diff_ops(&ctx, lines)?;
             Class::instance(
                 ctx.clone(),
-                DiffFrame {
+                DiffSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     ops,
@@ -753,7 +759,7 @@ fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Cto
 }
 
 // ---------------------------------------------------------------------
-// ShellOutputFrame — streaming shell-command output with mutable state
+// ShellOutputSection — streaming shell-command output with mutable state
 // ---------------------------------------------------------------------
 
 /// Compact wire encoding for [`crate::runtime::ShellState`] so we can
@@ -786,32 +792,32 @@ fn load_shell_state(atom: &AtomicU64) -> crate::runtime::ShellState {
     }
 }
 
-pub struct ShellOutputFrame {
-    state: Arc<FramesState>,
+pub struct ShellOutputSection {
+    state: Arc<SectionsState>,
     id: AtomicU64,
     /// Bash source that produced this output. Pinned on every wire
     /// frame so the TUI can render it as a header even when the body
     /// has been truncated.
     cmd: String,
-    /// Initial body captured at construction. Mirrors `MarkdownFrame.content`.
+    /// Initial body captured at construction. Mirrors `MarkdownSection.content`.
     content: String,
     /// Encoded [`crate::runtime::ShellState`]. Mutated by
     /// `.setState()` / `.success()` / `.exit()`.
     state_atom: AtomicU64,
-    /// Same close lifecycle as `MarkdownFrame`.
+    /// Same close lifecycle as `MarkdownSection`.
     closed: AtomicBool,
 }
 
-impl<'js> Trace<'js> for ShellOutputFrame {
+impl<'js> Trace<'js> for ShellOutputSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for ShellOutputFrame {
-    type Changed<'to> = ShellOutputFrame;
+unsafe impl<'js> JsLifetime<'js> for ShellOutputSection {
+    type Changed<'to> = ShellOutputSection;
 }
 
-impl<'js> JsClass<'js> for ShellOutputFrame {
-    const NAME: &'static str = "ShellOutputFrame";
+impl<'js> JsClass<'js> for ShellOutputSection {
+    const NAME: &'static str = "ShellOutputSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -820,7 +826,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             "write",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>, delta: String| {
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>, delta: String| {
                     let b = this.0.borrow();
                     append_text(&ctx, &b.state, &b.id, &b.closed, delta)
                 },
@@ -831,18 +837,18 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             Function::new(
                 ctx.clone(),
                 |ctx: Ctx<'js>,
-                 this: This<Class<'js, ShellOutputFrame>>|
-                 -> JsResult<Class<'js, ShellOutputFrame>> {
+                 this: This<Class<'js, ShellOutputSection>>|
+                 -> JsResult<Class<'js, ShellOutputSection>> {
                     {
                         let b = this.0.borrow();
-                        close_frame(&ctx, &b.state, &b.id, &b.closed)?;
+                        close_section(&ctx, &b.state, &b.id, &b.closed)?;
                     }
                     Ok(this.0.clone())
                 },
             )?,
         )?;
         // `frame.success()` and `frame.exit(code)` set the new state
-        // on the wire via a metadata-only `TranscriptDelta::Set`. They do NOT close
+        // on the wire via a metadata-only `SectionTranscript::Set`. They do NOT close
         // the frame — JS-side auto-close (writable's close hook) or
         // an explicit `frame.close()` is still required to seal the
         // block. Keeping these orthogonal lets the workflow stream a
@@ -851,7 +857,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             "success",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>| {
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>| {
                     let b = this.0.borrow();
                     set_shell_state(
                         &ctx,
@@ -868,7 +874,7 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
             "exit",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputFrame>>, code: i32| {
+                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>, code: i32| {
                     let b = this.0.borrow();
                     set_shell_state(
                         &ctx,
@@ -890,35 +896,35 @@ impl<'js> JsClass<'js> for ShellOutputFrame {
 }
 
 // ---------------------------------------------------------------------
-// ThoughtFrame — streaming model reasoning
+// ReasoningSection — streaming model reasoning
 // ---------------------------------------------------------------------
 
-/// `ThoughtFrame` — mirrors [`ShellOutputFrame`] but for the model's
+/// `ReasoningSection` — mirrors [`ShellOutputSection`] but for the model's
 /// reasoning channel. `state` transitions `Streaming → Done` on close;
 /// there is no body-after-state phase, so `.close()` performs both the
 /// state transition and the seal in one call.
-pub struct ThoughtFrame {
-    state: Arc<FramesState>,
+pub struct ReasoningSection {
+    state: Arc<SectionsState>,
     id: AtomicU64,
-    /// Initial body captured at construction. Mirrors `MarkdownFrame.content`.
+    /// Initial body captured at construction. Mirrors `MarkdownSection.content`.
     content: String,
     /// Encoded [`crate::runtime::ReasoningState`]. `false` ⇒ Streaming,
     /// `true` ⇒ Done. Flipped by `.close()`.
     done: AtomicBool,
-    /// Same close lifecycle as `MarkdownFrame`.
+    /// Same close lifecycle as `MarkdownSection`.
     closed: AtomicBool,
 }
 
-impl<'js> Trace<'js> for ThoughtFrame {
+impl<'js> Trace<'js> for ReasoningSection {
     fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
 }
 
-unsafe impl<'js> JsLifetime<'js> for ThoughtFrame {
-    type Changed<'to> = ThoughtFrame;
+unsafe impl<'js> JsLifetime<'js> for ReasoningSection {
+    type Changed<'to> = ReasoningSection;
 }
 
-impl<'js> JsClass<'js> for ThoughtFrame {
-    const NAME: &'static str = "ThoughtFrame";
+impl<'js> JsClass<'js> for ReasoningSection {
+    const NAME: &'static str = "ReasoningSection";
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
@@ -927,7 +933,7 @@ impl<'js> JsClass<'js> for ThoughtFrame {
             "write",
             Function::new(
                 ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ThoughtFrame>>, delta: String| {
+                |ctx: Ctx<'js>, this: This<Class<'js, ReasoningSection>>, delta: String| {
                     let b = this.0.borrow();
                     append_text(&ctx, &b.state, &b.id, &b.closed, delta)
                 },
@@ -940,8 +946,8 @@ impl<'js> JsClass<'js> for ThoughtFrame {
             Function::new(
                 ctx.clone(),
                 |ctx: Ctx<'js>,
-                 this: This<Class<'js, ThoughtFrame>>|
-                 -> JsResult<Class<'js, ThoughtFrame>> {
+                 this: This<Class<'js, ReasoningSection>>|
+                 -> JsResult<Class<'js, ReasoningSection>> {
                     {
                         let b = this.0.borrow();
                         finish_thought(&ctx, &b.state, &b.id, &b.done, &b.closed)?;
@@ -962,7 +968,7 @@ impl<'js> JsClass<'js> for ThoughtFrame {
 /// (`Close`) in one call. Idempotent on repeated invocation.
 fn finish_thought<'js>(
     _ctx: &Ctx<'js>,
-    state: &Arc<FramesState>,
+    state: &Arc<SectionsState>,
     id: &AtomicU64,
     done: &AtomicBool,
     closed: &AtomicBool,
@@ -976,30 +982,30 @@ fn finish_thought<'js>(
     }
     if !done.swap(true, Ordering::AcqRel) {
         // Metadata-only re-`Set` carrying the new state.
-        let frame = FrameSpec {
-            kind: FrameKind::Reasoning {
+        let section = SectionSpec {
+            kind: SectionKind::Reasoning {
                 state: crate::runtime::ReasoningState::Done,
             },
             seed: None,
         };
-        let _ = state.tx.send(TranscriptDelta::Set {
-            id: FrameId(frame_id),
-            frame,
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(frame_id),
+            section,
         });
     }
     if !closed.swap(true, Ordering::AcqRel) {
-        let _ = state.tx.send(TranscriptDelta::Close {
-            id: FrameId(frame_id),
+        let _ = state.tx.send(SectionTranscript::Close {
+            id: SectionId(frame_id),
         });
     }
     Ok(())
 }
 
-/// Update the frame's state and emit a metadata-only [`TranscriptDelta::Set`].
+/// Update the frame's state and emit a metadata-only [`SectionTranscript::Set`].
 /// Throws if the frame hasn't been pushed yet.
 fn set_shell_state<'js>(
     ctx: &Ctx<'js>,
-    state: &Arc<FramesState>,
+    state: &Arc<SectionsState>,
     id: &AtomicU64,
     state_atom: &AtomicU64,
     cmd: &str,
@@ -1017,16 +1023,16 @@ fn set_shell_state<'js>(
     // emits a no-text BlockDelta carrying just the new kind. `cmd` rides
     // along because the wire `BlockKind::ShellOutput` carries it on
     // every delta.
-    let frame = FrameSpec {
-        kind: FrameKind::ShellOutput {
+    let section = SectionSpec {
+        kind: SectionKind::ShellOutput {
             state: new_state,
             cmd: cmd.to_owned(),
         },
         seed: None,
     };
-    let _ = state.tx.send(TranscriptDelta::Set {
-        id: FrameId(frame_id),
-        frame,
+    let _ = state.tx.send(SectionTranscript::Set {
+        id: SectionId(frame_id),
+        section,
     });
     Ok(())
 }
@@ -1036,19 +1042,19 @@ fn set_shell_state<'js>(
 // ---------------------------------------------------------------------
 //
 // We define our own constructor `Function`s so each one can close over
-// the per-invocation `FramesState`. The frame classes' own `JsClass`
+// the per-invocation `SectionsState`. The frame classes' own `JsClass`
 // impls return `None` from `constructor()` so user code can't do
 // `new (constructor)()` without going through these.
 
-fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<MarkdownFrame, _, _>(
+fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<MarkdownSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let (content, source, closed) = parse_markdown_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
-                MarkdownFrame {
+                MarkdownSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     content,
@@ -1060,15 +1066,15 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult
     )
 }
 
-fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ErrorFrame, _, _>(
+fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ErrorSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-            let content = parse_content_arg(&ctx, &arg, "ErrorFrame")?;
+            let content = parse_content_arg(&ctx, &arg, "ErrorSection")?;
             Class::instance(
                 ctx.clone(),
-                ErrorFrame {
+                ErrorSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     content,
@@ -1078,20 +1084,20 @@ fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ct
     )
 }
 
-fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<JsonFrame, _, _>(
+fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<JsonSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let Some(obj) = arg.as_object() else {
-                return throw_type(&ctx, "new JsonFrame: expected { tag, value }");
+                return throw_type(&ctx, "new JsonSection: expected { tag, value }");
             };
             let tag: String = obj
                 .get("tag")
-                .map_err(|_| throw_err(&ctx, "new JsonFrame: missing or non-string `tag`"))?;
+                .map_err(|_| throw_err(&ctx, "new JsonSection: missing or non-string `tag`"))?;
             let value: Value<'js> = obj
                 .get("value")
-                .map_err(|_| throw_err(&ctx, "new JsonFrame: missing `value`"))?;
+                .map_err(|_| throw_err(&ctx, "new JsonSection: missing `value`"))?;
 
             // Round-trip the JS value through JSON to get a serde_json::Value.
             // Mirrors the old `workflow.frame.json` behaviour: silently drop
@@ -1105,7 +1111,7 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Cto
 
             Class::instance(
                 ctx.clone(),
-                JsonFrame {
+                JsonSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     tag,
@@ -1116,15 +1122,15 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Cto
     )
 }
 
-fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ShellOutputFrame, _, _>(
+fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ShellOutputSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let (cmd, content, closed) = parse_shell_output_arg(&ctx, &arg)?;
             Class::instance(
                 ctx.clone(),
-                ShellOutputFrame {
+                ShellOutputSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     cmd,
@@ -1137,16 +1143,16 @@ fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsRe
     )
 }
 
-/// `new ThoughtFrame()` — no constructor arguments. Reasoning frames
+/// `new ReasoningSection()` — no constructor arguments. Reasoning frames
 /// start empty in `Streaming` state and are filled via `.write()` from
 /// the chat session's `r.reasoning` channel.
-fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ThoughtFrame, _, _>(
+fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<ReasoningSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| {
             Class::instance(
                 ctx.clone(),
-                ThoughtFrame {
+                ReasoningSection {
                     state: state.clone(),
                     id: AtomicU64::new(0),
                     content: String::new(),
@@ -1158,12 +1164,12 @@ fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<FramesState>) -> JsResult<
     )
 }
 
-/// Parse `new ShellOutputFrame({ cmd, content?, closed? })`. `cmd` is
+/// Parse `new ShellOutputSection({ cmd, content?, closed? })`. `cmd` is
 /// required — it's the bash source that produced this output and the
 /// TUI renders it as a header. `content` is optional; if absent it
 /// defaults to an empty string (workflows usually push the frame first,
 /// then stream output via `.writable`). `closed` mirrors the
-/// MarkdownFrame option: setting it to `true` pre-seals the frame so
+/// MarkdownSection option: setting it to `true` pre-seals the frame so
 /// `transcript.push` emits a `Close` right after the `Push`.
 fn parse_shell_output_arg<'js>(
     ctx: &Ctx<'js>,
@@ -1172,7 +1178,7 @@ fn parse_shell_output_arg<'js>(
     let Some(obj) = arg.as_object() else {
         return throw_type(
             ctx,
-            "new ShellOutputFrame: expected { cmd: string, content?: string, closed?: bool }",
+            "new ShellOutputSection: expected { cmd: string, content?: string, closed?: bool }",
         );
     };
     let cmd_val: Value<'js> = obj
@@ -1180,11 +1186,11 @@ fn parse_shell_output_arg<'js>(
         .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
     let cmd = if let Some(s) = cmd_val.as_string() {
         s.to_string()
-            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `cmd` must be UTF-8"))?
+            .map_err(|_| throw_err(ctx, "new ShellOutputSection: `cmd` must be UTF-8"))?
     } else {
         return Err(throw_err(
             ctx,
-            "new ShellOutputFrame: `cmd` is required and must be a string",
+            "new ShellOutputSection: `cmd` is required and must be a string",
         ));
     };
     let content_val: Value<'js> = obj
@@ -1194,14 +1200,14 @@ fn parse_shell_output_arg<'js>(
         String::new()
     } else if let Some(s) = content_val.as_string() {
         s.to_string()
-            .map_err(|_| throw_err(ctx, "new ShellOutputFrame: `content` must be UTF-8"))?
+            .map_err(|_| throw_err(ctx, "new ShellOutputSection: `content` must be UTF-8"))?
     } else {
         return Err(throw_err(
             ctx,
-            "new ShellOutputFrame: `content` must be a string when present",
+            "new ShellOutputSection: `content` must be a string when present",
         ));
     };
-    let closed = parse_optional_bool(ctx, obj, "closed", "new ShellOutputFrame: `closed`")?;
+    let closed = parse_optional_bool(ctx, obj, "closed", "new ShellOutputSection: `closed`")?;
     Ok((cmd, content, closed))
 }
 
@@ -1216,7 +1222,7 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
 }
 
-/// Parse `new MarkdownFrame({ content?, source?, closed? })`. `content`
+/// Parse `new MarkdownSection({ content?, source?, closed? })`. `content`
 /// is optional; absent / `undefined` / `null` map to `None`. `source`
 /// is one of `"user"`, `"assistant"`, `"internal"`; absent → `Internal`.
 /// `closed` is an optional bool defaulting to `false`; when `true` the
@@ -1233,7 +1239,7 @@ fn parse_markdown_arg<'js>(
     let Some(obj) = arg.as_object() else {
         return Err(throw_err(
             ctx,
-            "new MarkdownFrame: expected { content?: string, source?: \"user\"|\"assistant\"|\"internal\" } or no argument",
+            "new MarkdownSection: expected { content?: string, source?: \"user\"|\"assistant\"|\"internal\" } or no argument",
         ));
     };
     let content_val: Value<'js> = obj
@@ -1244,12 +1250,12 @@ fn parse_markdown_arg<'js>(
     } else if let Some(s) = content_val.as_string() {
         Some(
             s.to_string()
-                .map_err(|_| throw_err(ctx, "new MarkdownFrame: `content` must be UTF-8"))?,
+                .map_err(|_| throw_err(ctx, "new MarkdownSection: `content` must be UTF-8"))?,
         )
     } else {
         return Err(throw_err(
             ctx,
-            "new MarkdownFrame: `content` must be a string when present",
+            "new MarkdownSection: `content` must be a string when present",
         ));
     };
     let source_val: Value<'js> = obj
@@ -1260,7 +1266,7 @@ fn parse_markdown_arg<'js>(
     } else if let Some(s) = source_val.as_string() {
         let s = s
             .to_string()
-            .map_err(|_| throw_err(ctx, "new MarkdownFrame: `source` must be UTF-8"))?;
+            .map_err(|_| throw_err(ctx, "new MarkdownSection: `source` must be UTF-8"))?;
         match s.as_str() {
             "user" => Source::User,
             "assistant" => Source::Assistant,
@@ -1269,7 +1275,7 @@ fn parse_markdown_arg<'js>(
                 return Err(throw_err(
                     ctx,
                     &format!(
-                        "new MarkdownFrame: `source` must be \"user\", \"assistant\", or \"internal\" (got {other:?})"
+                        "new MarkdownSection: `source` must be \"user\", \"assistant\", or \"internal\" (got {other:?})"
                     ),
                 ));
             }
@@ -1277,10 +1283,10 @@ fn parse_markdown_arg<'js>(
     } else {
         return Err(throw_err(
             ctx,
-            "new MarkdownFrame: `source` must be a string when present",
+            "new MarkdownSection: `source` must be a string when present",
         ));
     };
-    let closed = parse_optional_bool(ctx, obj, "closed", "new MarkdownFrame: `closed`")?;
+    let closed = parse_optional_bool(ctx, obj, "closed", "new MarkdownSection: `closed`")?;
     Ok((content, source, closed))
 }
 

@@ -11,7 +11,7 @@ The default agentic loop most tools ship — single rolling transcript, time- or
 - **The plan becomes gospel.** Once the original reasoning is compacted away, the agent can no longer judge whether the plan is still right — it just executes.
 - **Knowledge dies at session end.** Anything learned about the codebase is gone next time you run the tool.
 
-Frances has substrate that fixes most of this — a per-session libsql DB that already persists every turn, an in-process session runtime that owns the lifecycle, an existing word-anchor system. The design here leans on that substrate to build something better than the default.
+Frances has substrate that fixes most of this — a per-session turso DB that already persists every turn, an in-process session runtime that owns the lifecycle, an existing word-anchor system. The design here leans on that substrate to build something better than the default.
 
 ## Shape, end to end
 

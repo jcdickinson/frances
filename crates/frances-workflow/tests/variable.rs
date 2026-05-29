@@ -5,7 +5,7 @@
 use std::io::Write;
 
 use frances_workflow::{
-    FrameKind, Invocation, Runtime, TranscriptDelta, test_deps::StubDeps,
+    Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 
@@ -18,28 +18,30 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
     f
 }
 
-fn text_of(frame: &TranscriptDelta) -> String {
+fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        TranscriptDelta::Set { frame: spec, .. } => match &spec.kind {
-            FrameKind::Markdown { .. } | FrameKind::Error => spec.seed.clone().unwrap_or_default(),
-            FrameKind::ToolUse { name, detail } => match detail {
+        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
+            SectionKind::Markdown { .. } | SectionKind::Error => {
+                spec.seed.clone().unwrap_or_default()
+            }
+            SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
             },
-            FrameKind::Json { tag, value } => format!("[{tag}] {value}"),
-            FrameKind::ShellOutput { state, cmd } => format!(
+            SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
+            SectionKind::ShellOutput { state, cmd } => format!(
                 "[shell:{state:?}] $ {cmd}
 {}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Reasoning { state } => format!(
+            SectionKind::Reasoning { state } => format!(
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            FrameKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+            SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
         },
-        TranscriptDelta::Append { delta, .. } => delta.clone(),
-        TranscriptDelta::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Append { delta, .. } => delta.clone(),
+        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
     }
 }
 
@@ -49,13 +51,13 @@ async fn variables_round_trip_from_js() {
     let file = write_source(
         r#"
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
         const vars = new Variables();
         vars.set("plan", { steps: ["a", "b"], done: false });
         const back = vars.get("plan");
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(back) }));
-        transcript.push(new MarkdownFrame({ content: String(vars.has("plan")) }));
-        transcript.push(new MarkdownFrame({ content: String(vars.has("missing")) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(back) }));
+        transcript.push(new MarkdownSection({ content: String(vars.has("plan")) }));
+        transcript.push(new MarkdownSection({ content: String(vars.has("missing")) }));
         "#,
     );
     let mut handle = rt
@@ -79,7 +81,7 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
     let file = write_source(
         r#"
         import { Variables, Set, Assign } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
@@ -114,9 +116,9 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
             scope: null,
         });
 
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(vars.get("plan")) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(vars.get("summary")) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(r) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(vars.get("plan")) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(vars.get("summary")) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
         "#,
     );
     let mut handle = rt
@@ -149,7 +151,7 @@ async fn set_and_assign_responses_report_type_summary() {
     let file = write_source(
         r#"
         import { Variables, Set, Assign } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
@@ -160,7 +162,7 @@ async fn set_and_assign_responses_report_type_summary() {
                 call: { id: "c", name: "variable_set", arguments: { name, value } },
                 scope: null,
             });
-            transcript.push(new MarkdownFrame({ content: r.content }));
+            transcript.push(new MarkdownSection({ content: r.content }));
         }
         await run("a", { x: 1, y: 2, z: 3 });
         await run("b", [1, 2, 3, 4, 5]);
@@ -180,7 +182,7 @@ async fn set_and_assign_responses_report_type_summary() {
                     arguments: { name: "encoded", filter: "fromjson" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: recovered.content }));
+        transcript.push(new MarkdownSection({ content: recovered.content }));
         "#,
     );
     let mut handle = rt
@@ -210,7 +212,7 @@ async fn variable_assign_introspection_and_errors() {
     let file = write_source(
         r#"
         import { Variables, Set, Assign } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
@@ -246,9 +248,9 @@ async fn variable_assign_introspection_and_errors() {
             scope: null,
         });
 
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(vars.get("obj_keys")) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(multi) }));
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(missing) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(vars.get("obj_keys")) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(multi) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
         "#,
     );
     let mut handle = rt
@@ -279,7 +281,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
     let file = write_source(
         r#"
         import { Variables, Get, Set } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const get = new Get(vars);
@@ -302,7 +304,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
                     arguments: { name: "plan", filter: ".steps" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(objLens) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(objLens) }));
 
         // String-slice lens — split + range + join.
         const textLens = await get.handler({
@@ -311,7 +313,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
                                  filter: "split(\"\n\") | .[1:4] | join(\"\n\")" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(textLens) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(textLens) }));
 
         // Bad jq surfaces as is_error.
         const broken = await get.handler({
@@ -319,7 +321,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
                     arguments: { name: "plan", filter: "this is not jq" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(broken) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(broken) }));
 
         // Filter on missing variable still reports unknown-variable, not a jq error.
         const missing = await get.handler({
@@ -327,7 +329,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
                     arguments: { name: "nope", filter: "." } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(missing) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
         "#,
     );
     let mut handle = rt
@@ -367,7 +369,7 @@ async fn variable_get_and_set_tool_handlers_work() {
     let file = write_source(
         r#"
         import { Variables, Get, Set } from "frances:v1/tools/variable";
-        import { transcript, MarkdownFrame } from "frances:v1/frames";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const get = new Get(vars);
@@ -377,19 +379,19 @@ async fn variable_get_and_set_tool_handlers_work() {
             call: { id: "c1", name: "variable_set", arguments: { name: "x", value: { n: 42 } } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(setResult) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(setResult) }));
 
         const getResult = await get.handler({
             call: { id: "c2", name: "variable_get", arguments: { name: "x" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(getResult) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(getResult) }));
 
         const missing = await get.handler({
             call: { id: "c3", name: "variable_get", arguments: { name: "nope" } },
             scope: null,
         });
-        transcript.push(new MarkdownFrame({ content: JSON.stringify(missing) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
         "#,
     );
     let mut handle = rt

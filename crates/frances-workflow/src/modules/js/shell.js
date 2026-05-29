@@ -46,9 +46,9 @@
 
 import {
   transcript,
-  MarkdownFrame,
-  ShellOutputFrame,
-} from "frances:v1/frames";
+  MarkdownSection,
+  ShellOutputSection,
+} from "frances:v1/sections";
 import { approve } from "frances:v1/approval";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
@@ -148,7 +148,7 @@ async function _streamUntilSettled(shell, op) {
 // pushes it, Wait/Kill append to it. A Shell instance only runs one
 // command at a time so a single slot is enough.
 //
-// `frame` is a `ShellOutputFrame`; `writer` is its writable's locked
+// `frame` is a `ShellOutputSection`; `writer` is its writable's locked
 // writer (acquired once per frame so we don't fight reacquisition).
 function _openShellFrame(shell, cmd) {
   // Defensive: a previous frame should have been finalized by Done/
@@ -157,7 +157,7 @@ function _openShellFrame(shell, cmd) {
   if (shell._frame) {
     _closeShellFrame(shell);
   }
-  const frame = new ShellOutputFrame({ cmd });
+  const frame = new ShellOutputSection({ cmd });
   transcript.push(frame);
   const writer = frame.writable.getWriter();
   shell._frame = frame;
@@ -342,7 +342,7 @@ class Run {
       let scoldsRemaining = maxScolds;
       while (await shell.isRunning()) {
         // Render the inner round's LLM text into a frame.
-        const out = new MarkdownFrame();
+        const out = new MarkdownSection();
         transcript.push(out);
         const r = await scope.stream();
         await r.text.pipeTo(out.writable);
@@ -382,7 +382,7 @@ class Run {
             `Killed the shell command from ${call.id} — model did not call ` +
             `${waitName} or ${killName} after ${maxScolds} scold(s).`;
           transcript.push(
-            new MarkdownFrame({ content: killMsg, closed: true }),
+            new MarkdownSection({ content: killMsg, closed: true }),
           );
           scope.push({ role: "user", content: killMsg });
           break;
@@ -392,7 +392,7 @@ class Run {
           `Shell from ${call.id} is still running. ` +
           `You MUST call ${waitName} or ${killName} now.`;
         transcript.push(
-          new MarkdownFrame({ content: scoldMsg, closed: true }),
+          new MarkdownSection({ content: scoldMsg, closed: true }),
         );
         scope.push({ role: "user", content: scoldMsg });
       }
