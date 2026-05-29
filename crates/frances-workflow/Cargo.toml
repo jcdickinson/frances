@@ -12,6 +12,7 @@ deno_ast.workspace = true
 frances-core.workspace = true
 frances-edit.workspace = true
 frances-models-llm.workspace = true
+frances-models-tui.workspace = true
 frances-shell.workspace = true
 frances-storage.workspace = true
 globset.workspace = true

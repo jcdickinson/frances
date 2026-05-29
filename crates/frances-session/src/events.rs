@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use uuid::Uuid;
 
-pub use frances_workflow::{Source, SurfaceCmd};
+pub use frances_models_tui::Source;
+pub use frances_workflow::SurfaceCmd;
 
 use crate::llm::Usage;
 

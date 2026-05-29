@@ -112,100 +112,18 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
-/// Frame identity, scoped to one invocation. Monotonically assigned by
-/// `transcript.push`. Useful for the host to map back to its own block
-/// ids.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
-pub struct SectionId(pub u64);
+pub use frances_models_tui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
 
-/// What a [`SectionTranscript::Set`] carries: the frame's kind + bounded
-/// metadata, plus an optional `seed` — the initial body chunk for
-/// text-bodied kinds (Markdown / ShellOutput / Error). One-shot data
-/// kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave it
-/// `None`. The streaming body never lives here; it grows via
+/// What a [`SectionTranscript::Set`] carries: the section's kind +
+/// bounded metadata, plus an optional `seed` — the initial body chunk
+/// for text-bodied kinds (Markdown / ShellOutput / Error). One-shot
+/// data kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave
+/// it `None`. The streaming body never lives here; it grows via
 /// [`SectionTranscript::Append`].
 #[derive(Debug, Clone)]
 pub struct SectionSpec {
     pub kind: SectionKind,
     pub seed: Option<String>,
-}
-
-/// Who produced a text frame. Chooses the rendered sigil host-side
-/// (`User` → `>`, `Assistant` → `◆`, `Internal` → none). Closed set on
-/// purpose — adding a fourth speaker is a deliberate vocabulary change,
-/// not a free-form label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Source {
-    User,
-    Assistant,
-    Internal,
-}
-
-#[derive(Debug, Clone)]
-pub enum SectionKind {
-    /// `MarkdownSection` — text body extended with `append`. `source`
-    /// names the speaker; the host renders the matching sigil. The
-    /// initial body, if any, rides as `SectionSpec::seed`; `None` seed ⇒
-    /// the client tracks the id but doesn't measure/render until the
-    /// first `append`.
-    Markdown { source: Source },
-    /// `ErrorSection` — one-shot text (rendered as an error). The message
-    /// rides as `SectionSpec::seed`.
-    Error,
-    /// `ToolUseSection` — one-shot marker that names a tool the workflow
-    /// is about to invoke. The host renders this as a small "→ name"
-    /// row so the user can see the tool being called even when the
-    /// tool itself emits no other frames. `detail` is an optional
-    /// human-readable suffix produced by the tool's `describe(call)`
-    /// method (e.g. the file path + ranges for `file_read`).
-    ToolUse {
-        name: String,
-        detail: Option<String>,
-    },
-    /// `JsonSection` — single tagged JSON value. Immutable after push.
-    Json {
-        tag: String,
-        value: serde_json::Value,
-    },
-    /// `ShellOutputSection` — streaming output from one shell command.
-    /// `cmd` is the bash source that produced the output; it rides on
-    /// every `Set` so the host can keep it pinned even after the body
-    /// has been truncated for display. The initial body (output captured
-    /// before the first `Set`, if any) rides as `SectionSpec::seed`.
-    /// `state` transitions `Running → Success`/`Exit(N)` via a metadata
-    /// re-`Set` as the command completes.
-    ShellOutput { state: ShellState, cmd: String },
-    /// `ReasoningSection` — streaming model reasoning. Mirrors the
-    /// shell-output shape: body extends via append, `state` transitions
-    /// `Streaming → Done` via a metadata re-`Set` when the channel closes.
-    /// Rendered host-side as a `BlockKind::Tailed` block sibling to
-    /// shell output.
-    Reasoning { state: ReasoningState },
-    /// `DiffSection` — one-shot structured diff produced by a file-edit
-    /// tool. `lines` is the unified-diff content with line numbers for
-    /// context rows only; the session runtime translates each op to
-    /// `events::DiffLine` and emits a `BlockKind::Diff` block.
-    Diff { lines: Vec<frances_edit::DiffOp> },
-}
-
-/// Terminal status for [`SectionKind::ShellOutput`]. Mirrors
-/// `frances_session::events::ShellState`; the session runtime translates
-/// one to the other when it emits the matching `BlockKind`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ShellState {
-    Running,
-    Success,
-    Exit(i32),
-}
-
-/// Terminal status for [`SectionKind::Reasoning`]. Mirrors
-/// `frances_session::events::ReasoningState`; the session runtime
-/// translates one to the other when it emits the matching `BlockKind`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ReasoningState {
-    Streaming,
-    Done,
 }
 
 /// A single user input event delivered to `inbox`.

@@ -1568,6 +1568,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "frances-models-tui"
+version = "0.1.0"
+dependencies = [
+ "frances-edit",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "frances-session"
 version = "0.1.0"
 dependencies = [
@@ -1581,6 +1590,7 @@ dependencies = [
  "frances-edit",
  "frances-llm",
  "frances-models-llm",
+ "frances-models-tui",
  "frances-shell",
  "frances-storage",
  "frances-workflow",
@@ -1661,6 +1671,7 @@ dependencies = [
  "frances-core",
  "frances-edit",
  "frances-models-llm",
+ "frances-models-tui",
  "frances-shell",
  "frances-storage",
  "frances-workflow",
