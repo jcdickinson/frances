@@ -3,6 +3,17 @@
 Living document. Terms are resolved as they come up; do not treat this
 file as a spec.
 
+## Status note (sections PoC, batch 1 landed)
+
+Steps 0–6 of `docs/plan/section-and-markdown.md` have shipped. The
+container restructure (step 3's storage-level move to
+`VecDeque<ActiveSection>` / `VecDeque<SafeSection>`) is deferred —
+sections live in the `LiveBlocks` dispatcher above the container and
+feed the existing block-level API. Section identity is preserved
+during live operations but diffuses into per-block `committed`
+entries at scroll-off. `InactiveBlock` is defined and ready for a
+future PR that moves sections into the container.
+
 ## Crate layout (sections-related)
 
 - **`frances-models-tui`** (new) — shared TUI-side wire vocabulary.
