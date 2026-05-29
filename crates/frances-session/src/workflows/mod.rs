@@ -46,7 +46,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
+use crate::events::{ScrollbackFrame, StreamFrame};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
@@ -275,11 +275,10 @@ impl EmitState {
         };
         events.send(StreamFrame::SectionClose { id });
         if open.materialised {
-            let block_kind = section_kind_to_block_kind(&open.kind);
-            crate::scrollback::persist_block(
+            crate::scrollback::persist_section(
                 &self.db,
                 self.instance_id,
-                &block_kind,
+                &open.kind,
                 &open.text,
                 false,
             )
@@ -295,11 +294,10 @@ impl EmitState {
         for (id, open) in drained {
             events.send(StreamFrame::SectionClose { id });
             if open.materialised {
-                let block_kind = section_kind_to_block_kind(&open.kind);
-                crate::scrollback::persist_block(
+                crate::scrollback::persist_section(
                     &self.db,
                     self.instance_id,
-                    &block_kind,
+                    &open.kind,
                     &open.text,
                     false,
                 )
@@ -318,11 +316,10 @@ impl EmitState {
         let drained: Vec<OpenSection> = self.open.drain().map(|(_, v)| v).collect();
         for open in drained {
             if open.materialised {
-                let block_kind = section_kind_to_block_kind(&open.kind);
-                crate::scrollback::persist_block(
+                crate::scrollback::persist_section(
                     &self.db,
                     self.instance_id,
-                    &block_kind,
+                    &open.kind,
                     &open.text,
                     true,
                 )
@@ -818,11 +815,10 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                     delta: delta.clone(),
                 });
                 runtime.events.send(StreamFrame::SectionClose { id });
-                let block_kind = section_kind_to_block_kind(&kind);
-                crate::scrollback::persist_block(
+                crate::scrollback::persist_section(
                     &state.db,
                     state.instance_id,
-                    &block_kind,
+                    &kind,
                     &delta,
                     false,
                 )
@@ -883,39 +879,6 @@ fn is_one_shot(kind: &SectionKind) -> bool {
     )
 }
 
-/// Translate a workflow-side [`SectionKind`] into the persistence-side
-/// [`BlockKind`]. Step 5 of the section migration replaces this with a
-/// section-shaped schema and removes the translation entirely.
-fn section_kind_to_block_kind(kind: &SectionKind) -> BlockKind {
-    match kind {
-        SectionKind::Markdown { source } => BlockKind::Text { source: *source },
-        SectionKind::Error => BlockKind::Text {
-            source: Source::Internal,
-        },
-        SectionKind::ToolUse { name, detail } => BlockKind::ToolUse {
-            name: Arc::from(name.as_str()),
-            detail: detail.as_deref().map(Arc::from),
-        },
-        SectionKind::Json { .. } => BlockKind::Text {
-            source: Source::Internal,
-        },
-        SectionKind::ShellOutput { state, cmd } => BlockKind::Tailed {
-            header: TailedHeader::Shell {
-                state: state.clone(),
-                cmd: Arc::from(cmd.as_str()),
-            },
-        },
-        SectionKind::Reasoning { state } => BlockKind::Tailed {
-            header: TailedHeader::Reasoning {
-                state: state.clone(),
-            },
-        },
-        SectionKind::Diff { lines } => BlockKind::Diff {
-            lines: lines.iter().cloned().map(diff_op_to_protocol).collect(),
-        },
-    }
-}
-
 /// Workflow-declared chrome (the footer busy indicator). Ephemeral —
 /// never persisted; forwarded to the TUI as-is.
 fn emit_surface<Io: frances_workflow::WorkflowIo>(
@@ -962,18 +925,6 @@ async fn emit_permission<Io: frances_workflow::WorkflowIo>(
         }
     } else {
         runtime.events.send(StreamFrame::Permission(request));
-    }
-}
-
-fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::events::DiffLine {
-    use frances_edit::DiffOp;
-    match op {
-        DiffOp::Context { text, line } => crate::events::DiffLine::Context {
-            text: Arc::from(text),
-            line,
-        },
-        DiffOp::Added(t) => crate::events::DiffLine::Added(Arc::from(t)),
-        DiffOp::Removed(t) => crate::events::DiffLine::Removed(Arc::from(t)),
     }
 }
 

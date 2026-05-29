@@ -49,7 +49,7 @@ pub enum Source {
 /// What kind of section, and any bounded metadata that rides with it.
 /// One variant per concrete `Section` impl in the TUI. The dispatcher
 /// matches on this to pick the impl when a new section id is seen.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum SectionKind {
     /// `MarkdownSection` — streaming text. `source` names the speaker;
     /// the inline parser runs for `source != User`. The container

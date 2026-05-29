@@ -23,7 +23,7 @@ pub fn render_file(state: &FileAnchorState, lines: &[String]) -> String {
 /// number (1-based); `Added` / `Removed` carry only the raw line content
 /// because the wire-level `DiffLine` shape doesn't model line numbers for
 /// the changed sides.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffOp {
     Context { text: String, line: u32 },
     Added(String),
