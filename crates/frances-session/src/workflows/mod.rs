@@ -46,7 +46,7 @@ use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
+use crate::events::{BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::store::Database;
 
@@ -226,82 +226,81 @@ pub(crate) struct WorkflowInstance {
 /// — either clean (a `BlockStop`) or truncated (workflow was dehydrated
 /// while a block was in flight).
 struct EmitState {
-    next_block: u64,
-    /// Open blocks keyed by the workflow-side [`SectionId`]. Emit is
+    /// Open sections keyed by the workflow-side [`SectionId`]. Emit is
     /// single-threaded (one task per workflow instance) so a plain
     /// `HashMap` is enough.
-    open: HashMap<SectionId, OpenBlock>,
+    open: HashMap<SectionId, OpenSection>,
     /// Shared per-session [`Database`] used for scrollback writes. Cheap
     /// clone; the underlying connection lock serialises overlapping
     /// writes.
     db: Database,
-    /// Identifies the workflow whose blocks we're emitting. Every
+    /// Identifies the workflow whose sections we're emitting. Every
     /// scrollback row written from this state is tagged with it so
     /// replay can scope by workflow.
     instance_id: Uuid,
 }
 
-/// A block whose first `BlockDelta` has been emitted but whose
-/// `BlockStop` has not. We buffer the delta text here so that on close
-/// we can write one scrollback row with the full body.
+/// A section whose first `SectionAppend` has been emitted but whose
+/// `SectionClose` has not. We buffer the delta text here so that on
+/// close we can write one scrollback row with the full body.
 ///
-/// `text` is `None` for a block that was pushed without initial content
-/// and has never received an `Append` — the client has only seen the
-/// opener with `text: None` and is still deferring measure / render. On
-/// `Close` we skip persistence for these so the transcript doesn't
-/// gain empty ghost rows for never-written frames.
-struct OpenBlock {
-    id: BlockId,
-    kind: BlockKind,
-    text: Option<String>,
+/// `text` accumulates from successive Appends; an Append with empty
+/// `delta` is a metadata-only update (kind changed, e.g. shell state
+/// `Running` → `Success`). On `Close` we persist the accumulated text
+/// against the most recent kind.
+struct OpenSection {
+    kind: SectionKind,
+    text: String,
+    /// `true` when the section has received any non-empty body delta.
+    /// Sections that only ever saw metadata-only updates aren't
+    /// persisted on close — they're empty placeholders by construction.
+    materialised: bool,
 }
 
 impl EmitState {
     fn new(db: Database, instance_id: Uuid) -> Self {
         Self {
-            next_block: 1,
             open: HashMap::new(),
             db,
             instance_id,
         }
     }
 
-    fn alloc(&mut self) -> BlockId {
-        let id = BlockId(self.next_block);
-        self.next_block += 1;
-        id
-    }
-
-    /// Clean close for a single block: emit `BlockStop`, persist a
-    /// finished row (if the block ever received body content), drop
-    /// the entry. Idempotent on unknown ids.
-    async fn close_one(&mut self, events: &EventsChannel, frame_id: SectionId) -> Result<()> {
-        let Some(open) = self.open.remove(&frame_id) else {
+    /// Clean close for a single section: emit `SectionClose`, persist
+    /// a finished row (if the section ever received body content),
+    /// drop the entry. Idempotent on unknown ids.
+    async fn close_one(&mut self, events: &EventsChannel, id: SectionId) -> Result<()> {
+        let Some(open) = self.open.remove(&id) else {
             return Ok(());
         };
-        events.send(StreamFrame::BlockStop { id: open.id });
-        if let Some(text) = open.text {
-            crate::scrollback::persist_block(&self.db, self.instance_id, &open.kind, &text, false)
-                .await?;
+        events.send(StreamFrame::SectionClose { id });
+        if open.materialised {
+            let block_kind = section_kind_to_block_kind(&open.kind);
+            crate::scrollback::persist_block(
+                &self.db,
+                self.instance_id,
+                &block_kind,
+                &open.text,
+                false,
+            )
+            .await?;
         }
         Ok(())
     }
 
-    /// Clean close for every remaining open block. Called when the
-    /// workflow body exits and we're about to send `Done` — leftover
-    /// opens get a real `BlockStop` so the TUI's per-id active state
-    /// drains. Blocks that never received any text are dropped without
-    /// being persisted (the client never materialised them either).
+    /// Clean close for every remaining open section. Called when the
+    /// workflow body exits and we're about to send `Done`.
     async fn close_all_stop(&mut self, events: &EventsChannel) -> Result<()> {
-        let drained: Vec<OpenBlock> = self.open.drain().map(|(_, v)| v).collect();
-        for open in drained {
-            events.send(StreamFrame::BlockStop { id: open.id });
-            if let Some(text) = open.text {
+        let drained: Vec<(SectionId, OpenSection)> = self.open.drain().collect();
+        for (id, open) in drained {
+            events.send(StreamFrame::SectionClose { id });
+            if open.materialised {
+                let block_kind = section_kind_to_block_kind(&open.kind);
                 crate::scrollback::persist_block(
                     &self.db,
                     self.instance_id,
-                    &open.kind,
-                    &text,
+                    &block_kind,
+                    &open.text,
                     false,
                 )
                 .await?;
@@ -310,21 +309,21 @@ impl EmitState {
         Ok(())
     }
 
-    /// Dehydrate close-all: the workflow is going away while blocks are
-    /// in flight. Persist each row marked truncated and drop the
-    /// entries. No `StreamFrame`s are emitted — the TUI is about to be
-    /// told to clear and replay via `ScrollbackFrame::Reset`, and the replay
-    /// will surface these rows as `BlockTruncated`. Unmaterialised
-    /// blocks (never wrote anything) are dropped silently.
+    /// Dehydrate close-all: the workflow is going away while sections
+    /// are in flight. Persist each row marked truncated and drop the
+    /// entries. No `StreamFrame`s are emitted — the TUI is about to
+    /// be told to clear and replay via `ScrollbackFrame::Reset`, and
+    /// the replay will surface these rows as `SectionTruncated`.
     async fn close_all_truncate(&mut self) -> Result<()> {
-        let drained: Vec<OpenBlock> = self.open.drain().map(|(_, v)| v).collect();
+        let drained: Vec<OpenSection> = self.open.drain().map(|(_, v)| v).collect();
         for open in drained {
-            if let Some(text) = open.text {
+            if open.materialised {
+                let block_kind = section_kind_to_block_kind(&open.kind);
                 crate::scrollback::persist_block(
                     &self.db,
                     self.instance_id,
-                    &open.kind,
-                    &text,
+                    &block_kind,
+                    &open.text,
                     true,
                 )
                 .await?;
@@ -793,148 +792,128 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
 ) -> Result<()> {
     match delta {
         SectionTranscript::Set {
-            id: frame_id,
+            id,
             section: SectionSpec { kind, seed },
-        } => match kind {
-            SectionKind::Markdown { source } => {
-                let block_kind = BlockKind::Text { source };
-                set_streaming_block(runtime, state, frame_id, block_kind, seed);
-            }
-            SectionKind::ShellOutput {
-                state: shell_state,
-                cmd,
-            } => {
-                let block_kind = BlockKind::Tailed {
-                    header: TailedHeader::Shell {
-                        state: shell_state_to_protocol(&shell_state),
-                        cmd: Arc::from(cmd),
-                    },
-                };
-                set_streaming_block(runtime, state, frame_id, block_kind, seed);
-            }
-            SectionKind::Reasoning {
-                state: reasoning_state,
-            } => {
-                let block_kind = BlockKind::Tailed {
-                    header: TailedHeader::Reasoning {
-                        state: reasoning_state_to_protocol(&reasoning_state),
-                    },
-                };
-                set_streaming_block(runtime, state, frame_id, block_kind, seed);
-            }
-            SectionKind::Error => {
+        } => {
+            // Error is side-channel (not a streaming section).
+            if matches!(kind, SectionKind::Error) {
                 let content = seed.unwrap_or_default();
                 state.persist_error(&content).await?;
                 runtime.events.send(StreamFrame::Error(content));
+                return Ok(());
             }
-            SectionKind::ToolUse { name, detail } => {
-                let kind = BlockKind::ToolUse {
-                    name: Arc::from(name),
-                    detail: detail.map(Arc::from),
+            // One-shot kinds: emit Append + Close + persist immediately.
+            if is_one_shot(&kind) {
+                let delta = match &kind {
+                    SectionKind::Json { tag, value } => {
+                        let body = serde_json::to_string(value)
+                            .unwrap_or_else(|_| "<unserializable>".into());
+                        format!("[{tag}] {body}")
+                    }
+                    _ => String::new(),
                 };
-                // One-shot: open + stop + persist immediately, no entry
-                // in `state.open`. Text is empty — the name lives in the
-                // prefix on the TUI side.
-                emit_one_shot(runtime, state, kind, "").await?;
-            }
-            SectionKind::Json { tag, value } => {
-                let body =
-                    serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
-                let text = format!("[{tag}] {body}");
-                emit_one_shot(
-                    runtime,
-                    state,
-                    BlockKind::Text {
-                        source: Source::Internal,
-                    },
-                    &text,
+                runtime.events.send(StreamFrame::SectionAppend {
+                    id,
+                    kind: kind.clone(),
+                    delta: delta.clone(),
+                });
+                runtime.events.send(StreamFrame::SectionClose { id });
+                let block_kind = section_kind_to_block_kind(&kind);
+                crate::scrollback::persist_block(
+                    &state.db,
+                    state.instance_id,
+                    &block_kind,
+                    &delta,
+                    false,
                 )
                 .await?;
+                return Ok(());
             }
-            SectionKind::Diff { lines } => {
-                let event_lines: Vec<crate::events::DiffLine> =
-                    lines.into_iter().map(diff_op_to_protocol).collect();
-                emit_one_shot(runtime, state, BlockKind::Diff { lines: event_lines }, "").await?;
-            }
-        },
-        SectionTranscript::Append {
-            id: frame_id,
-            delta,
-        } => {
-            if let Some(open) = state.open.get_mut(&frame_id) {
-                match &mut open.text {
-                    Some(buf) => buf.push_str(&delta),
-                    slot @ None => *slot = Some(delta.clone()),
-                }
-                let block = open.id;
-                let kind = open.kind.clone();
-                runtime.events.send(StreamFrame::BlockDelta {
-                    id: block,
+            // Streaming kinds: Set is either an opener or a metadata update.
+            let initial = seed.unwrap_or_default();
+            let materialised = !initial.is_empty();
+            if let Some(open) = state.open.get_mut(&id) {
+                open.kind = kind.clone();
+                runtime.events.send(StreamFrame::SectionAppend {
+                    id,
                     kind,
-                    text: Some(delta),
+                    delta: String::new(),
                 });
+            } else {
+                runtime.events.send(StreamFrame::SectionAppend {
+                    id,
+                    kind: kind.clone(),
+                    delta: initial.clone(),
+                });
+                state.open.insert(
+                    id,
+                    OpenSection {
+                        kind,
+                        text: initial,
+                        materialised,
+                    },
+                );
             }
         }
-        SectionTranscript::Close { id: frame_id } => {
-            state.close_one(&runtime.events, frame_id).await?;
+        SectionTranscript::Append { id, delta } => {
+            if let Some(open) = state.open.get_mut(&id) {
+                if !delta.is_empty() {
+                    open.text.push_str(&delta);
+                    open.materialised = true;
+                }
+                let kind = open.kind.clone();
+                runtime
+                    .events
+                    .send(StreamFrame::SectionAppend { id, kind, delta });
+            }
+        }
+        SectionTranscript::Close { id } => {
+            state.close_one(&runtime.events, id).await?;
         }
     }
     Ok(())
 }
 
-/// Apply a `Set` for a streaming kind (Markdown / ShellOutput). The first
-/// `Set` for an id creates the block, seeding its body from `seed`; a
-/// later `Set` is a metadata-only re-render — it replaces the kind and
-/// emits a no-text delta, leaving the accumulated body untouched.
-fn set_streaming_block<Io: frances_workflow::WorkflowIo>(
-    runtime: &Arc<SessionRuntime<Io>>,
-    state: &mut EmitState,
-    frame_id: SectionId,
-    block_kind: BlockKind,
-    seed: Option<String>,
-) {
-    if let Some(open) = state.open.get_mut(&frame_id) {
-        open.kind = block_kind.clone();
-        runtime.events.send(StreamFrame::BlockDelta {
-            id: open.id,
-            kind: block_kind,
-            text: None,
-        });
-    } else {
-        let block = state.alloc();
-        runtime.events.send(StreamFrame::BlockDelta {
-            id: block,
-            kind: block_kind.clone(),
-            text: seed.clone(),
-        });
-        state.open.insert(
-            frame_id,
-            OpenBlock {
-                id: block,
-                kind: block_kind,
-                text: seed,
-            },
-        );
-    }
+/// True for [`SectionKind`] variants that don't stream — the workflow
+/// pushes them once and they're sealed in the same batch.
+fn is_one_shot(kind: &SectionKind) -> bool {
+    matches!(
+        kind,
+        SectionKind::ToolUse { .. } | SectionKind::Json { .. } | SectionKind::Diff { .. }
+    )
 }
 
-/// Open, stop, and persist a one-shot block (ToolUse / Json / Diff) in a
-/// single batch. Never enters `state.open` — there's no body to grow.
-async fn emit_one_shot<Io: frances_workflow::WorkflowIo>(
-    runtime: &Arc<SessionRuntime<Io>>,
-    state: &mut EmitState,
-    kind: BlockKind,
-    text: &str,
-) -> Result<()> {
-    let block = state.alloc();
-    runtime.events.send(StreamFrame::BlockDelta {
-        id: block,
-        kind: kind.clone(),
-        text: Some(text.to_owned()),
-    });
-    runtime.events.send(StreamFrame::BlockStop { id: block });
-    crate::scrollback::persist_block(&state.db, state.instance_id, &kind, text, false).await?;
-    Ok(())
+/// Translate a workflow-side [`SectionKind`] into the persistence-side
+/// [`BlockKind`]. Step 5 of the section migration replaces this with a
+/// section-shaped schema and removes the translation entirely.
+fn section_kind_to_block_kind(kind: &SectionKind) -> BlockKind {
+    match kind {
+        SectionKind::Markdown { source } => BlockKind::Text { source: *source },
+        SectionKind::Error => BlockKind::Text {
+            source: Source::Internal,
+        },
+        SectionKind::ToolUse { name, detail } => BlockKind::ToolUse {
+            name: Arc::from(name.as_str()),
+            detail: detail.as_deref().map(Arc::from),
+        },
+        SectionKind::Json { .. } => BlockKind::Text {
+            source: Source::Internal,
+        },
+        SectionKind::ShellOutput { state, cmd } => BlockKind::Tailed {
+            header: TailedHeader::Shell {
+                state: state.clone(),
+                cmd: Arc::from(cmd.as_str()),
+            },
+        },
+        SectionKind::Reasoning { state } => BlockKind::Tailed {
+            header: TailedHeader::Reasoning {
+                state: state.clone(),
+            },
+        },
+        SectionKind::Diff { lines } => BlockKind::Diff {
+            lines: lines.iter().cloned().map(diff_op_to_protocol).collect(),
+        },
+    }
 }
 
 /// Workflow-declared chrome (the footer busy indicator). Ephemeral —
@@ -995,25 +974,6 @@ fn diff_op_to_protocol(op: frances_edit::DiffOp) -> crate::events::DiffLine {
         },
         DiffOp::Added(t) => crate::events::DiffLine::Added(Arc::from(t)),
         DiffOp::Removed(t) => crate::events::DiffLine::Removed(Arc::from(t)),
-    }
-}
-
-fn shell_state_to_protocol(state: &frances_workflow::ShellState) -> crate::events::ShellState {
-    use frances_workflow::ShellState as W;
-    match state {
-        W::Running => crate::events::ShellState::Running,
-        W::Success => crate::events::ShellState::Success,
-        W::Exit(n) => crate::events::ShellState::Exit(*n),
-    }
-}
-
-fn reasoning_state_to_protocol(
-    state: &frances_workflow::ReasoningState,
-) -> crate::events::ReasoningState {
-    use frances_workflow::ReasoningState as W;
-    match state {
-        W::Streaming => crate::events::ReasoningState::Streaming,
-        W::Done => crate::events::ReasoningState::Done,
     }
 }
 

@@ -19,29 +19,36 @@ use crate::block::{Block, BlockMeasureContext, BlockRenderContext, Sigil};
 
 pub use frances_models_tui::SectionApply;
 
-/// A live section — owns its own list of inner [`Block`]s plus the
-/// section's sigil (gutter glyph) and gap policy. The container
-/// interacts with sections only through this trait; concrete impls
-/// (Markdown, ShellOutput, Reasoning, ToolUse, Diff, Json, Error)
-/// live in `frances-markdown` and the binary's `tui::sections`
-/// module.
+/// A live section — a state machine that consumes section events and
+/// emits a fresh list of inner [`Block`]s on each `apply`. The
+/// dispatcher (in `frances/src/ui.rs`) diffs the new list against the
+/// previous and routes changes into the container's existing
+/// block-level API. Concrete impls live in `frances-markdown`
+/// (`MarkdownSection`) and the binary's `tui::sections` module
+/// (`SingleBlockSection`).
+///
+/// Returning a fresh `Vec<Box<dyn Block>>` per apply is the
+/// load-bearing choice: `Box<dyn Block>` isn't `Clone`, so the
+/// section can't store blocks AND expose them by reference for the
+/// container to render — the container would need owning copies.
+/// Instead the section holds whatever state is needed to materialise
+/// blocks on demand (accumulated text, paragraph offsets, etc.) and
+/// rebuilds them each apply. For typical PoC payloads the cost is
+/// negligible.
 pub trait Section: 'static {
-    /// Apply a post-construction event. Construction is handled by
-    /// the dispatcher's `make_section` factory; the first
-    /// `SectionAppend` with a new id triggers construction, and the
-    /// same Append is dispatched to `apply` so the section absorbs
-    /// the initial delta uniformly.
-    fn apply(&mut self, event: SectionApply<'_>);
-
-    /// Inner blocks in display order. Borrowed; lifetime tied to
-    /// `&self`. Most impls return a single-element slice; the
-    /// MarkdownSection returns one element per paragraph.
-    fn blocks(&self) -> &[Box<dyn Block>];
+    /// Apply an event and return the section's full block list AFTER
+    /// the event. The first call (right after construction) processes
+    /// the initial `SectionApply::Append` so the section absorbs its
+    /// seed delta uniformly. Returning `Vec::new()` means the section
+    /// has no renderable blocks yet — the dispatcher tracks the id
+    /// but pushes nothing.
+    fn apply(&mut self, event: SectionApply<'_>) -> Vec<Box<dyn Block>>;
 
     /// Glyph painted by the container in the left gutter at this
-    /// section's first on-screen row. Inner blocks inherit the
-    /// section's sigil — their own `Block::render` sigil return is
-    /// ignored when they're rendered as part of a section.
+    /// section's first on-screen row. Today the gutter sigil is
+    /// painted per-block by the container; the section-level sigil
+    /// is consulted only at commit time when sections snapshot into
+    /// an [`InactiveBlock`] (a refinement on the post-PoC backlog).
     fn sigil(&self) -> Sigil;
 }
 

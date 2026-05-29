@@ -84,7 +84,7 @@ pub enum SectionKind {
 }
 
 /// Terminal status for [`SectionKind::ShellOutput`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ShellState {
     Running,
     Success,
@@ -92,7 +92,7 @@ pub enum ShellState {
 }
 
 /// Terminal status for [`SectionKind::Reasoning`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ReasoningState {
     Streaming,
     Done,

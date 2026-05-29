@@ -1,7 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "step 2 skeleton — consumers wired in step 3 (container restructure) and step 4 (event vocabulary swap)"
-)]
 //! Section impls for the TUI's section dispatcher.
 //!
 //! Each variant of [`frances_models_tui::SectionKind`] resolves to a
@@ -31,45 +27,40 @@ use frances_tui::section::Section;
 
 use crate::tui::blocks::{block_for_kind, sigil_for};
 
-/// One inner block per section; rebuilt on every Append from the
-/// accumulated text + current kind. Used for every section type except
+/// State machine: holds accumulated text + current kind, produces a
+/// single inner block per apply. Used for every section type except
 /// Markdown (which has its own multi-block impl in `frances-markdown`).
 pub struct SingleBlockSection {
     kind: SectionKind,
     text: String,
-    blocks: Vec<Box<dyn Block>>,
     sealed: bool,
     truncated: bool,
 }
 
 impl SingleBlockSection {
     pub fn new(kind: SectionKind) -> Self {
-        let mut s = Self {
+        Self {
             kind,
             text: String::new(),
-            blocks: Vec::new(),
             sealed: false,
             truncated: false,
-        };
-        s.rebuild();
-        s
+        }
     }
 
-    fn rebuild(&mut self) {
+    fn build(&self) -> Vec<Box<dyn Block>> {
         let wire = wire_kind_for(&self.kind);
-        self.blocks = vec![block_for_kind(wire, self.text.clone())];
+        vec![block_for_kind(wire, self.text.clone())]
     }
 }
 
 impl Section for SingleBlockSection {
-    fn apply(&mut self, event: SectionApply<'_>) {
+    fn apply(&mut self, event: SectionApply<'_>) -> Vec<Box<dyn Block>> {
         match event {
             SectionApply::Append { kind, delta } => {
                 self.kind = kind.clone();
                 if !delta.is_empty() {
                     self.text.push_str(delta);
                 }
-                self.rebuild();
             }
             SectionApply::Close => {
                 self.sealed = true;
@@ -79,10 +70,7 @@ impl Section for SingleBlockSection {
                 self.truncated = true;
             }
         }
-    }
-
-    fn blocks(&self) -> &[Box<dyn Block>] {
-        &self.blocks
+        self.build()
     }
 
     fn sigil(&self) -> Sigil {

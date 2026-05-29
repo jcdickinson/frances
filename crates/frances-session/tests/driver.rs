@@ -19,7 +19,7 @@ use frances_config::{ConfigProvider, InMemoryProvider, Value as ConfigValue};
 use frances_llm::test_util::{StubProvider, StubScript};
 use frances_models_llm::{CompletionOutcome, StreamEvent};
 use frances_session::context::{InvocationContext, ProcessContext};
-use frances_session::events::{BlockKind, StreamFrame};
+use frances_session::events::{SectionKind, StreamFrame};
 use frances_session::runtime::{SessionRuntime, StartOverrides};
 use frances_session::session::{Paths, Session, SessionMeta};
 use frances_session::store;
@@ -231,15 +231,15 @@ async fn smoke_workflow_starts_and_pushes_frame() {
     .await;
 
     let frames = h
-        .recv_until(|f| matches!(f, StreamFrame::BlockStop { .. }))
+        .recv_until(|f| matches!(f, StreamFrame::SectionClose { .. }))
         .await;
     assert!(
         frames.iter().any(|f| matches!(
             f,
-            StreamFrame::BlockDelta {
-                text: Some(s),
+            StreamFrame::SectionAppend {
+                delta,
                 ..
-            } if s == "hello from harness"
+            } if delta == "hello from harness"
         )),
         "expected hello-from-harness text frame; got: {frames:?}"
     );
@@ -274,7 +274,7 @@ async fn text_streaming_renders_block_delta_sequence() {
 
     // Drive until the assistant block closes.
     let frames = h
-        .recv_until(|f| matches!(f, StreamFrame::BlockStop { .. }))
+        .recv_until(|f| matches!(f, StreamFrame::SectionClose { .. }))
         .await;
 
     // Find the Text deltas. Expect: 1 open (text=None or empty) + 3
@@ -282,11 +282,11 @@ async fn text_streaming_renders_block_delta_sequence() {
     let texts: Vec<String> = frames
         .iter()
         .filter_map(|f| match f {
-            StreamFrame::BlockDelta {
-                kind: BlockKind::Text { .. },
-                text,
+            StreamFrame::SectionAppend {
+                kind: SectionKind::Markdown { .. },
+                delta,
                 ..
-            } => text.clone(),
+            } => Some(delta.clone()),
             _ => None,
         })
         .collect();

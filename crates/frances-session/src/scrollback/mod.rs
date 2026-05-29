@@ -53,7 +53,9 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{BlockId, BlockKind, ScrollbackFrame, Source, StreamFrame, TailedHeader};
+use crate::events::{
+    BlockKind, DiffLine, ScrollbackFrame, SectionId, SectionKind, Source, StreamFrame, TailedHeader,
+};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_blocks` table. UUID is permanent;
@@ -262,22 +264,22 @@ pub async fn replay_to_channel(
                 text,
                 truncated,
             } => {
-                let id = BlockId(next_id);
+                let id = SectionId(next_id);
                 next_id += 1;
-                // Stored rows always have a body (unmaterialised blocks
-                // are never persisted), so we always send `text: Some(_)`
-                // and the block materialises on the client.
-                events.send(StreamFrame::Scrollback(ScrollbackFrame::Block {
+                let section_kind = block_kind_to_section_kind(kind);
+                events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
                     id,
-                    kind,
-                    text: Some(text),
+                    kind: section_kind,
+                    delta: text,
                 }));
                 if truncated {
-                    events.send(StreamFrame::Scrollback(ScrollbackFrame::BlockTruncated {
+                    events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionTruncated {
                         id,
                     }));
                 } else {
-                    events.send(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { id }));
+                    events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionClose {
+                        id,
+                    }));
                 }
             }
             StoredRow::Error { text } => {
@@ -288,6 +290,40 @@ pub async fn replay_to_channel(
 
     events.send(StreamFrame::Scrollback(ScrollbackFrame::End));
     Ok(())
+}
+
+/// Translate the persistence-side [`BlockKind`] read from a row back
+/// into a [`SectionKind`] for replay through the section dispatcher.
+/// Step 5 collapses this when the schema becomes section-shaped.
+fn block_kind_to_section_kind(kind: BlockKind) -> SectionKind {
+    match kind {
+        BlockKind::Text { source } => SectionKind::Markdown { source },
+        BlockKind::ToolUse { name, detail } => SectionKind::ToolUse {
+            name: name.as_ref().to_owned(),
+            detail: detail.map(|d| d.as_ref().to_owned()),
+        },
+        BlockKind::Tailed { header } => match header {
+            TailedHeader::Shell { state, cmd } => SectionKind::ShellOutput {
+                state,
+                cmd: cmd.as_ref().to_owned(),
+            },
+            TailedHeader::Reasoning { state } => SectionKind::Reasoning { state },
+        },
+        BlockKind::Diff { lines } => SectionKind::Diff {
+            lines: lines.iter().map(diff_line_to_op).collect(),
+        },
+    }
+}
+
+fn diff_line_to_op(line: &DiffLine) -> frances_edit::DiffOp {
+    match line {
+        DiffLine::Context { text, line } => frances_edit::DiffOp::Context {
+            text: text.as_ref().to_owned(),
+            line: *line,
+        },
+        DiffLine::Added(t) => frances_edit::DiffOp::Added(t.as_ref().to_owned()),
+        DiffLine::Removed(t) => frances_edit::DiffOp::Removed(t.as_ref().to_owned()),
+    }
 }
 
 fn encode_block(
@@ -701,8 +737,8 @@ mod tests {
         // truncated.
         assert!(matches!(
             frames.get(1),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::Block {
-                kind: BlockKind::Text {
+            Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
+                kind: SectionKind::Markdown {
                     source: Source::User,
                 },
                 ..
@@ -710,7 +746,9 @@ mod tests {
         ));
         assert!(matches!(
             frames.get(2),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::BlockStop { .. }))
+            Some(StreamFrame::Scrollback(
+                ScrollbackFrame::SectionClose { .. }
+            ))
         ));
         assert!(matches!(
             frames.get(3),
@@ -718,21 +756,21 @@ mod tests {
         ));
         assert!(matches!(
             frames.get(4),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::Block {
-                kind: BlockKind::ToolUse { .. },
+            Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
+                kind: SectionKind::ToolUse { .. },
                 ..
             })),
         ));
         assert!(matches!(
             frames.get(5),
             Some(StreamFrame::Scrollback(
-                ScrollbackFrame::BlockTruncated { .. }
+                ScrollbackFrame::SectionTruncated { .. }
             )),
         ));
     }
 
-    /// A single stored block produces exactly:
-    /// `[Reset, Block { kind, text }, BlockStop, End]` (all wrapped in
+    /// A single stored block replays as exactly:
+    /// `[Reset, SectionAppend, SectionClose, End]` (all wrapped in
     /// `StreamFrame::Scrollback`). No extra frames slip in.
     #[tokio::test]
     async fn replay_frames_for_single_block_is_minimal() {
@@ -758,19 +796,19 @@ mod tests {
             other => panic!("expected Reset at [0], got {other:?}"),
         }
         match &frames[1] {
-            StreamFrame::Scrollback(ScrollbackFrame::Block {
-                kind: BlockKind::ToolUse { name, .. },
-                text,
+            StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
+                kind: SectionKind::ToolUse { name, .. },
+                delta,
                 ..
             }) => {
-                assert_eq!(&**name, "shell");
-                assert_eq!(text.as_deref(), Some("ls /"));
+                assert_eq!(name, "shell");
+                assert_eq!(delta, "ls /");
             }
-            other => panic!("expected Block with ToolUse kind at [1], got {other:?}"),
+            other => panic!("expected SectionAppend with ToolUse kind at [1], got {other:?}"),
         }
         match &frames[2] {
-            StreamFrame::Scrollback(ScrollbackFrame::BlockStop { .. }) => {}
-            other => panic!("expected BlockStop at [2], got {other:?}"),
+            StreamFrame::Scrollback(ScrollbackFrame::SectionClose { .. }) => {}
+            other => panic!("expected SectionClose at [2], got {other:?}"),
         }
         match &frames[3] {
             StreamFrame::Scrollback(ScrollbackFrame::End) => {}
