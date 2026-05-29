@@ -51,8 +51,8 @@ use frances_tui::block::Sigil;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::{
-    AnimationGate, Block, BlockId, BlockKind, BlockMeasureContext, BlockRenderContext, Focus,
-    ParaWidget, ScrollbackBackend, ScrollbackContainer, Theme, WallClockFrameTime,
+    AnimationGate, Block, BlockId, BlockMeasureContext, BlockRenderContext, Focus, ParaWidget,
+    ScrollbackBackend, ScrollbackContainer, Theme, WallClockFrameTime,
 };
 
 const VARSIZE_MAX: u16 = 5;
@@ -359,13 +359,6 @@ impl Input for FakeShellBlock {
 }
 
 impl Block for FakeShellBlock {
-    fn kind(&self) -> BlockKind {
-        // Reuse the `Raw` tag — the playground block has no wire
-        // counterpart, and `kind()` is only consulted by serde
-        // dispatch (which this playground doesn't exercise).
-        BlockKind::Raw
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         let tail = fake_shell_tail(ctx.selected);
         1 + self.lines.min(tail)

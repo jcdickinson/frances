@@ -4495,9 +4495,6 @@ mod tests {
             }
         }
         impl Block for Counter {
-            fn kind(&self) -> crate::block::BlockKind {
-                crate::block::BlockKind::Raw
-            }
             fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
                 1
             }
@@ -4528,9 +4525,7 @@ mod tests {
         // newest's counter is 1, the older is 1 as well after the
         // second dispatch.
         let mut found = Vec::new();
-        for entry in c.container.safe.iter().rev() {
-            let counter = entry.block.as_ref().kind();
-            assert_eq!(counter, crate::block::BlockKind::Raw);
+        for _entry in c.container.safe.iter().rev() {
             found.push(());
         }
         assert_eq!(found.len(), 2, "both counters live in safe");

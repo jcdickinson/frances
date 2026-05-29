@@ -21,19 +21,16 @@
 //!
 //! ## Persistence
 //!
-//! [`BlockKind`] is a closed enum mirroring what concrete block types
-//! exist in the binary. Persistence is per-variant serde on the
-//! concrete blocks — `Box<dyn Block>` itself isn't `Serialize` because
-//! that would block dyn dispatch (Serialize is not object-safe). The
-//! binary's `block_for_kind` reconstructs concrete blocks from a wire
-//! `frances_session::events::BlockKind` + text payload; the same path
-//! is intended to drive scrollback restore. If we later need open-set
-//! extensibility, swap to `typetag`.
+//! Blocks are not persisted directly. The transcript is persisted at
+//! the section level (see [`crate::section`]); the TUI's section
+//! dispatcher reconstructs the inner blocks on replay by running each
+//! section's `apply` over the persisted append-stream. If a `Block`
+//! impl needs replay-stable state beyond what the section gives it,
+//! the section should hold that state itself.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
-use serde::{Deserialize, Serialize};
 
 use crate::widget::{Input, Theme};
 
@@ -68,18 +65,6 @@ impl Sigil {
             style,
         }
     }
-}
-
-/// Closed tag for the concrete block types this binary ships. Returned
-/// by [`Block::kind`] so persistence layers can route a `Box<dyn Block>`
-/// into a tagged-enum serde wrapper without touching the trait object.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum BlockKind {
-    Text,
-    ToolUse,
-    Tailed,
-    Diff,
-    Raw,
 }
 
 /// Inputs threaded through [`Block::measure`].
@@ -139,8 +124,6 @@ pub trait Block: Input + 'static {
         false
     }
 
-    fn kind(&self) -> BlockKind;
-
     /// Total rendered row count if wrapped at `ctx.width`. Note that
     /// `ctx.width` is already the *body* width — the container has
     /// deducted [`SIGIL_WIDTH`] for the left gutter, so blocks compute
@@ -175,10 +158,6 @@ impl Input for ratatui::widgets::Paragraph<'static> {
 }
 
 impl Block for ratatui::widgets::Paragraph<'static> {
-    fn kind(&self) -> BlockKind {
-        BlockKind::Raw
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         // line_count requires the `unstable-rendered-line-info` cargo
         // feature, which is enabled in our Cargo.toml.

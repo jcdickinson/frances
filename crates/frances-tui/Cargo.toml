@@ -11,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 crossterm = { workspace = true }
+frances-models-tui = { workspace = true }
 ratatui = { workspace = true }
 ratatui-textarea = { workspace = true }
 serde = { workspace = true }

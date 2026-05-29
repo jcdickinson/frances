@@ -1460,6 +1460,8 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "frances-edit",
+ "frances-models-tui",
  "frances-session",
  "frances-tui",
  "futures-util",
@@ -1650,6 +1652,7 @@ version = "0.1.0"
 dependencies = [
  "alacritty_terminal",
  "crossterm",
+ "frances-models-tui",
  "ratatui",
  "ratatui-textarea",
  "serde",

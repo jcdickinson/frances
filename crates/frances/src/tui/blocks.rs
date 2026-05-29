@@ -6,7 +6,7 @@ use frances_session::events::{
 };
 use frances_tui::block::Sigil;
 use frances_tui::widget::{EventContext, EventOutcome, Input};
-use frances_tui::{Block, BlockKind, BlockMeasureContext, BlockRenderContext};
+use frances_tui::{Block, BlockMeasureContext, BlockRenderContext};
 use ratatui::style::{Color, Modifier, Style};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthChar;
@@ -68,10 +68,6 @@ impl Input for DiffBlock {
 }
 
 impl Block for DiffBlock {
-    fn kind(&self) -> BlockKind {
-        BlockKind::Diff
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         let max = ctx.width.max(1) as usize;
         let mut count = 0;
@@ -162,15 +158,6 @@ impl Input for LabelledBlock {
 }
 
 impl Block for LabelledBlock {
-    fn kind(&self) -> BlockKind {
-        match self.kind {
-            WireBlockKind::Text { .. } => BlockKind::Text,
-            WireBlockKind::ToolUse { .. } => BlockKind::ToolUse,
-            WireBlockKind::Tailed { .. } => BlockKind::Tailed,
-            WireBlockKind::Diff { .. } => BlockKind::Diff,
-        }
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         wrapped_body_lines(self.body_text(), ctx.width).len() as u16
     }
@@ -367,10 +354,6 @@ impl Input for TailedBlock {
 }
 
 impl Block for TailedBlock {
-    fn kind(&self) -> BlockKind {
-        BlockKind::Tailed
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         if self.is_empty() {
             return 0;
@@ -505,10 +488,6 @@ impl Block for ToolUseBlock {
         true
     }
 
-    fn kind(&self) -> BlockKind {
-        BlockKind::ToolUse
-    }
-
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         self.wrapped_lines(ctx.width).len() as u16
     }
@@ -607,10 +586,6 @@ impl Block for RawBlock {
     /// formed; the container can promote them straight to `safe`.
     fn safe_on_push(&self) -> bool {
         true
-    }
-
-    fn kind(&self) -> BlockKind {
-        BlockKind::Raw
     }
 
     fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
