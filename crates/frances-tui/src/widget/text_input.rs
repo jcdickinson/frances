@@ -128,10 +128,12 @@ impl Widget for TextInput {
         }
         drop(lease_slot);
 
-        // Re-apply the border each frame so the status-title text
-        // can change between frames without redoing the textarea's
-        // internal state. The clone is cheap — TextArea owns Strings
-        // and styles; no internal handles or animations.
+        // Build the border (with the optional status-title inset)
+        // fresh each frame so the title text can change between
+        // frames. We paint it ourselves and render the textarea into
+        // the inner rect rather than handing it to the textarea via
+        // `set_block` — that would force a full clone of the textarea
+        // every frame, since `render` only has `&self`.
         let block = match self.status.as_ref().filter(|(s, _)| !s.is_empty()) {
             Some((s, color)) => {
                 let mut spans = vec![Span::raw("─ ")];
@@ -146,9 +148,9 @@ impl Widget for TextInput {
                 .borders(Borders::ALL)
                 .style(ctx.theme.border),
         };
-        let mut snapshot = self.textarea.clone();
-        snapshot.set_block(block);
-        ratatui::widgets::Widget::render(&snapshot, ctx.area, &mut *ctx.buf);
+        let inner = block.inner(ctx.area);
+        ratatui::widgets::Widget::render(block, ctx.area, &mut *ctx.buf);
+        ratatui::widgets::Widget::render(&self.textarea, inner, &mut *ctx.buf);
     }
 }
 

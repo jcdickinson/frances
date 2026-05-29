@@ -117,8 +117,8 @@ pub enum WireSectionEvent {
         id: SectionId,
     },
     /// Replay-only sibling of `SectionClose`: section was in flight
-    /// when its workflow was dehydrated. The eventual `InactiveBlock`
-    /// snapshot will be flagged truncated.
+    /// when its workflow was dehydrated. The committed section view
+    /// will be flagged truncated.
     SectionTruncated {
         id: SectionId,
     },

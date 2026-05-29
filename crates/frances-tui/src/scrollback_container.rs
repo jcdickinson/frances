@@ -258,23 +258,38 @@ pub struct ScrollbackContainer {
     /// pushes land at the bottom — they just bump the ordinal
     /// distance from the selected block, never invalidate it.
     selected_from_newest: Option<u16>,
-    /// When `true`, every entry in `active` gets a spinner glyph
-    /// painted over the rightmost non-blank cell of its last row, so
-    /// users can see at a glance which blocks haven't been committed
-    /// yet. The container picks the current glyph from
-    /// [`DrawContext::frame_time`] on each draw — no external bump.
-    /// Default `false` means the container behaves as if spinners
-    /// didn't exist, which is what most tests rely on.
-    spinner_enabled: bool,
-    /// Animation lease held while the spinner is on and there's at
-    /// least one entry to draw it over. Tells the host's redraw loop
-    /// to keep ticking; cleared when the spinner has nothing to show.
-    spinner_lease: Option<AnimationLease>,
+    /// Per-frame animation upkeep for the active stack. See [`Animation`].
+    animation: Animation,
 }
 
-/// Braille-dot frames cycled through by `bump_spinner`. Single-cell
-/// glyphs, width 1 — they overlay cleanly on top of any character.
-const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Whether the container drives per-frame animation, and — when it
+/// does — whether it's currently holding a lease. A live section paints
+/// its own streaming indicator clocked off [`DrawContext::frame_time`];
+/// the container's job is just to keep the host ticking and mark active
+/// entries damaged each frame so that glyph advances. The container
+/// paints no glyph itself — streaming is a section concept.
+///
+/// Tri-state because the lease is only meaningful while opted in: a
+/// `bool` + `Option<AnimationLease>` could spell the impossible
+/// "disabled but holding a lease."
+enum Animation {
+    /// Not opted in (default). No lease, no per-frame damage churn —
+    /// what most tests and `container_scratch` rely on.
+    Off,
+    /// Opted in, but `active` is empty so there's nothing to animate;
+    /// no lease held.
+    Idle,
+    /// Opted in and holding a lease while `active` is non-empty. The
+    /// lease is kept purely for its RAII `Drop` — replacing this variant
+    /// releases it — so the field is never read.
+    Live(
+        #[expect(
+            dead_code,
+            reason = "held for its Drop side effect (releases the lease)"
+        )]
+        AnimationLease,
+    ),
+}
 
 /// Blank rows the container reserves *below* every non-zero-height
 /// block — the visual gap between consecutive blocks (and between the
@@ -297,6 +312,47 @@ fn block_slot_height(block: &dyn Block, mctx: &BlockMeasureContext<'_>) -> u16 {
     }
 }
 
+/// Selectable, *rendered* leaves of one container entry at `body_width`,
+/// each as a child index. A leaf block is itself (child 0); a section
+/// view yields one per inner block. Zero-height blocks are skipped — the
+/// renderer doesn't paint them, so they aren't selectable either (same
+/// rule, no divergence). Measured unselected: selection only ever grows
+/// a block, never shrinks a non-empty one to zero.
+fn rendered_child_indices(block: &dyn Block, theme: &Theme, body_width: u16) -> Vec<usize> {
+    let mctx = BlockMeasureContext {
+        width: body_width,
+        selected: false,
+        selected_part: None,
+        theme,
+    };
+    let parts = block.parts();
+    if parts.is_empty() {
+        if block.measure(&mctx) > 0 {
+            vec![0]
+        } else {
+            vec![]
+        }
+    } else {
+        parts
+            .iter()
+            .enumerate()
+            .filter(|(_, child)| child.measure(&mctx) > 0)
+            .map(|(i, _)| i)
+            .collect()
+    }
+}
+
+/// Map a per-entry selected-child index to the `(selected, selected_part)`
+/// fields. A leaf block reads `selected`; a section view reads
+/// `selected_part` and pushes `selected` down to the matching child.
+fn selection_fields(block: &dyn Block, sel_child: Option<usize>) -> (bool, Option<usize>) {
+    if block.parts().is_empty() {
+        (sel_child.is_some(), None)
+    } else {
+        (false, sel_child)
+    }
+}
+
 impl ScrollbackContainer {
     pub fn new(initial_y: u16) -> Self {
         Self {
@@ -314,43 +370,38 @@ impl ScrollbackContainer {
             scrollback_active: false,
             scrollback_offset: 0,
             selected_from_newest: None,
-            spinner_enabled: false,
-            spinner_lease: None,
+            animation: Animation::Off,
         }
     }
 
-    /// Turn on the active-block spinner overlay. After this every
-    /// entry in `active` gets a single-cell braille glyph painted over
-    /// the rightmost non-blank cell of its last visible row, advancing
-    /// in lockstep with [`DrawContext::frame_time`].
-    pub fn enable_spinner(&mut self) {
-        self.spinner_enabled = true;
+    /// Opt into per-frame animation upkeep for active entries. After
+    /// this, while `active` is non-empty the container holds an
+    /// animation lease and marks active entries damaged each draw, so a
+    /// live section's self-painted streaming indicator advances against
+    /// [`DrawContext::frame_time`]. The container itself paints no glyph.
+    pub fn enable_animation(&mut self) {
+        if matches!(self.animation, Animation::Off) {
+            self.animation = Animation::Idle;
+        }
     }
 
-    /// Frame to paint inside the spinner overlay this draw, plus
-    /// whether the container wants to hold an animation lease.
-    /// `None` when the spinner is off or there's nothing to draw it
-    /// over.
-    fn current_spinner_frame(&self, frame_time: &dyn FrameTime) -> Option<u8> {
-        if !self.spinner_enabled || self.active.is_empty() {
-            return None;
+    /// Reconcile the animation lease and per-frame damage. Call at the
+    /// top of any draw path: takes a lease while there's live content to
+    /// animate, drops it otherwise, and marks every active entry damaged
+    /// so anything clocked off `frame_time` re-renders this frame.
+    fn reconcile_animation(&mut self, ctx: &DrawContext<'_>) {
+        if matches!(self.animation, Animation::Off) {
+            return;
         }
-        let idx = ((frame_time.get_frame() / 6.0).rem_euclid(SPINNER_FRAMES.len() as f64)) as u8;
-        Some(idx)
-    }
-
-    /// Reconcile the spinner's animation lease with the current state.
-    /// Call at the top of any draw path: takes a fresh lease when the
-    /// spinner first has something to show, drops it when it doesn't.
-    /// Also marks every active entry damaged when the spinner is on so
-    /// the glyph re-renders against this frame's `frame_time` value.
-    fn reconcile_spinner(&mut self, ctx: &DrawContext<'_>) {
-        let want = self.spinner_enabled && !self.active.is_empty();
-        match (want, self.spinner_lease.is_some()) {
-            (true, false) => self.spinner_lease = Some(ctx.animation.lease()),
-            (false, true) => self.spinner_lease = None,
-            _ => {}
-        }
+        let want = !self.active.is_empty();
+        self.animation = match (
+            want,
+            std::mem::replace(&mut self.animation, Animation::Idle),
+        ) {
+            (true, Animation::Idle) => Animation::Live(ctx.animation.lease()),
+            (false, Animation::Live(_)) => Animation::Idle,
+            (_, other) => other,
+        };
         if want {
             for (_, entry) in self.active.iter_mut() {
                 if let Some(state) = entry.render.as_mut() {
@@ -586,11 +637,51 @@ impl ScrollbackContainer {
         );
     }
 
-    /// Total block count across `committed` + `safe` + `active`.
-    /// Used by `set_scrollback` to decide whether to seed selection
-    /// and by [`select_older`] to clamp.
+    /// Body width to test "is this leaf rendered?" against, taken from
+    /// the last drawn terminal size. Selection navigation happens between
+    /// paints, so it can't see the live width directly; the terminal
+    /// barely changes width between a paint and the next keypress, and a
+    /// resize repaints anyway. Falls back to a sane default before the
+    /// first paint (when no selection exists yet).
+    fn selection_body_width(&self) -> u16 {
+        self.prev_term_size
+            .map_or(80, |s| s.width)
+            .saturating_sub(SIGIL_WIDTH)
+    }
+
+    /// Every selectable *rendered* leaf, in display order (oldest first),
+    /// as `(display entry index, child index within entry)`. Zero-height
+    /// blocks are omitted — selection tracks exactly what the renderer
+    /// paints. The display entry index counts `committed` then `safe`
+    /// then `active`, matching [`Self::iter_history`].
+    fn rendered_leaves(&self, body_width: u16) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        for (entry_idx, (block, _)) in self.iter_history().enumerate() {
+            for child in rendered_child_indices(block, &self.theme, body_width) {
+                out.push((entry_idx, child));
+            }
+        }
+        out
+    }
+
+    /// The `(display entry index, child index)` the current selection
+    /// points at, or `None`. `selected_from_newest` indexes the rendered
+    /// leaves from the newest end.
+    fn selected_leaf(&self, body_width: u16) -> Option<(usize, usize)> {
+        let leaves = self.rendered_leaves(body_width);
+        let sel = self.selected_from_newest? as usize;
+        let oldest = leaves.len().checked_sub(1)?.checked_sub(sel)?;
+        leaves.get(oldest).copied()
+    }
+
+    /// Total *selectable leaf blocks* — one per rendered inner block of
+    /// each entry. Sections contribute one unit per non-empty inner
+    /// block, so the inspector selects individual blocks (which behave
+    /// differently — e.g. shell-output scroll) rather than whole
+    /// sections. Used by `set_scrollback` to seed selection and by
+    /// [`select_older`] to clamp.
     fn history_count(&self) -> usize {
-        self.committed.len() + self.safe.len() + self.active_order.len()
+        self.rendered_leaves(self.selection_body_width()).len()
     }
 
     /// Move selection towards the newer end of history. No-op when
@@ -627,46 +718,36 @@ impl ScrollbackContainer {
     }
 
     /// Resolve an ordinal-from-newest index to a mutable block
-    /// reference. Walks `active` (newest first), then `safe`, then
-    /// `committed` to find the target's location, then takes a single
-    /// mutable borrow on the hit. Two-pass to keep the borrow checker
-    /// happy with the slotmap's `get_mut`.
+    /// reference, descending into a section's selected inner block.
+    /// Uses the same rendered-leaf enumeration as the rest of selection
+    /// so input lands on exactly the block the inspector highlights.
     fn entry_at_from_newest_mut(&mut self, n: u16) -> Option<&mut dyn Block> {
-        enum Target {
-            Active(BlockId),
-            Safe(usize),
-            Committed(usize),
-        }
-        let mut remaining = n as usize;
-        let target: Option<Target> = (|| {
-            for &id in self.active_order.iter().rev() {
-                if self.active.contains_key(id) {
-                    if remaining == 0 {
-                        return Some(Target::Active(id));
-                    }
-                    remaining -= 1;
-                }
-            }
-            let safe_len = self.safe.len();
-            for i in 0..safe_len {
-                if remaining == 0 {
-                    return Some(Target::Safe(safe_len - 1 - i));
-                }
-                remaining -= 1;
-            }
-            let committed_len = self.committed.len();
-            for i in 0..committed_len {
-                if remaining == 0 {
-                    return Some(Target::Committed(committed_len - 1 - i));
-                }
-                remaining -= 1;
-            }
-            None
-        })();
-        match target? {
-            Target::Active(id) => self.active.get_mut(id).map(|e| e.block.as_mut()),
-            Target::Safe(idx) => self.safe.get_mut(idx).map(|e| e.block.as_mut()),
-            Target::Committed(idx) => self.committed.get_mut(idx).map(|e| e.block.as_mut()),
+        let leaves = self.rendered_leaves(self.selection_body_width());
+        let oldest = leaves.len().checked_sub(1)?.checked_sub(n as usize)?;
+        let (entry_idx, child) = *leaves.get(oldest)?;
+
+        // `entry_idx` counts committed, then safe, then active — the
+        // display order of `iter_history`.
+        let n_committed = self.committed.len();
+        let n_safe = self.safe.len();
+        let block: &mut dyn Block = if entry_idx < n_committed {
+            self.committed
+                .get_mut(entry_idx)
+                .map(|e| e.block.as_mut())?
+        } else if entry_idx < n_committed + n_safe {
+            self.safe
+                .get_mut(entry_idx - n_committed)
+                .map(|e| e.block.as_mut())?
+        } else {
+            let id = *self.active_order.get(entry_idx - n_committed - n_safe)?;
+            self.active.get_mut(id).map(|e| e.block.as_mut())?
+        };
+        // A section view routes the event to its selected inner block;
+        // a leaf block handles it itself.
+        if block.parts_mut().is_empty() {
+            Some(block)
+        } else {
+            block.parts_mut().get_mut(child).map(|b| b.as_mut())
         }
     }
 
@@ -728,6 +809,7 @@ impl ScrollbackContainer {
         BlockMeasureContext {
             width: width.saturating_sub(SIGIL_WIDTH),
             selected: false,
+            selected_part: None,
             theme: &self.theme,
         }
     }
@@ -738,18 +820,16 @@ impl ScrollbackContainer {
     /// `selected = true` so the inspector's `max_offset` matches the
     /// height the block actually paints.
     pub fn measure_history(&self, width: u16) -> u16 {
-        let count = self.history_count();
         let body_width = width.saturating_sub(SIGIL_WIDTH);
+        let selected = self.selected_leaf(body_width);
         let mut total: u32 = 0;
-        for (i, (block, _)) in self.iter_history().enumerate() {
-            let is_selected = self.selected_from_newest.is_some_and(|sel| {
-                (count - 1)
-                    .checked_sub(i)
-                    .is_some_and(|fn_| sel as usize == fn_)
-            });
+        for (entry_idx, (block, _)) in self.iter_history().enumerate() {
+            let sel_child = selected.and_then(|(ei, c)| (ei == entry_idx).then_some(c));
+            let (selected, selected_part) = selection_fields(block, sel_child);
             let mctx = BlockMeasureContext {
                 width: body_width,
-                selected: is_selected,
+                selected,
+                selected_part,
                 theme: &self.theme,
             };
             total = total.saturating_add(u32::from(block_slot_height(block, &mctx)));
@@ -793,11 +873,11 @@ impl ScrollbackContainer {
             if let Some(entry) = self.active.remove(id) {
                 // Preserve the entry's render state so a previously-
                 // rendered active block doesn't get re-rendered just
-                // because it changed slot — but if the spinner was on,
-                // mark damaged so the next draw repaints the cell the
-                // spinner glyph overwrote with its real content.
+                // because it changed slot — but while animating, mark
+                // damaged so the next draw repaints cleanly after the
+                // slot move.
                 let mut render = entry.render;
-                if self.spinner_enabled
+                if !matches!(self.animation, Animation::Off)
                     && let Some(state) = render.as_mut()
                 {
                     state.damaged = true;
@@ -906,7 +986,7 @@ impl ScrollbackContainer {
     where
         B: Backend<Error = io::Error> + Write,
     {
-        self.reconcile_spinner(ctx);
+        self.reconcile_animation(ctx);
         let term_size = terminal.backend().terminal_size();
         let width = term_size.width;
         let terminal_h = term_size.height;
@@ -1006,27 +1086,18 @@ impl ScrollbackContainer {
                 &mut cursor,
                 self.cumulative_scrolls,
                 &mut force_cascade,
-                None,
+                ctx.frame_time,
             )?;
         }
 
-        // Render the active stack (display order). Each entry gets the
-        // spinner overlay (if enabled) so the user can see at a glance
-        // which blocks are still open — except entries already flagged
-        // `safe_to_commit`. Those are done; they're sitting in
-        // `active_order` only because an older entry hasn't drained yet,
-        // and painting the spinner over them would misrepresent them as
-        // still in flight.
-        let spinner_frame = self.current_spinner_frame(ctx.frame_time);
+        // Render the active stack (display order). Each entry renders
+        // itself; a live section paints its own streaming indicator
+        // using `ctx.frame_time`. The container no longer owns that
+        // glyph — streaming is a section concept.
         for &id in self.active_order.iter() {
             let entry = match self.active.get_mut(id) {
                 Some(e) => e,
                 None => continue,
-            };
-            let entry_spinner = if entry.safe_to_commit {
-                None
-            } else {
-                spinner_frame
             };
             render_or_skip_entry(
                 &mut entry.block,
@@ -1038,7 +1109,7 @@ impl ScrollbackContainer {
                 &mut cursor,
                 self.cumulative_scrolls,
                 &mut force_cascade,
-                entry_spinner,
+                ctx.frame_time,
             )?;
         }
 
@@ -1381,7 +1452,9 @@ impl ScrollbackContainer {
                 truncated: false,
                 alt_view: false,
                 selected: false,
+                selected_part: None,
                 theme: &self.theme,
+                frame_time: ctx.frame_time,
             };
             let sigil = safe_entry.block.render(&mut rctx);
             paint_sigil(&mut buf, 0, 0, &sigil);
@@ -1404,11 +1477,9 @@ impl ScrollbackContainer {
             backend.newline()?;
         }
 
-        // 3. Visible active blocks (oldest visible to newest). The
-        // spinner is suppressed on entries already flagged
-        // `safe_to_commit` (same reasoning as the natural-scroll path
-        // above).
-        let spinner_frame = self.current_spinner_frame(ctx.frame_time);
+        // 3. Visible active blocks (oldest visible to newest). Each
+        // entry renders itself; a live section paints its own streaming
+        // indicator via `ctx.frame_time`.
         for (i, id) in visible_active_ids.iter().enumerate() {
             let entry = match self.active.get(*id) {
                 Some(e) => e,
@@ -1429,18 +1500,12 @@ impl ScrollbackContainer {
                 truncated: false,
                 alt_view: false,
                 selected: false,
+                selected_part: None,
                 theme: &self.theme,
+                frame_time: ctx.frame_time,
             };
             let sigil = entry.block.render(&mut rctx);
             paint_sigil(&mut buf, 0, 0, &sigil);
-            let entry_spinner = if entry.safe_to_commit {
-                None
-            } else {
-                spinner_frame
-            };
-            if let Some(frame) = entry_spinner {
-                overlay_spinner(&mut buf, body_area, frame);
-            }
             let skip = if i == 0 { boundary_skip_rows } else { 0 };
             for row_idx in skip..slot_h {
                 let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
@@ -1569,7 +1634,7 @@ impl ScrollbackContainer {
     where
         B: Backend<Error = io::Error> + Write,
     {
-        self.reconcile_spinner(ctx);
+        self.reconcile_animation(ctx);
         let term_size = terminal.backend().terminal_size();
         let width = term_size.width;
         let height = term_size.height;
@@ -1704,7 +1769,6 @@ impl ScrollbackContainer {
         }
         let window_end = src_y_offset.saturating_add(area.height);
 
-        let total = self.history_count();
         let has_gutter = area.width > SIGIL_WIDTH;
         let block_x = if has_gutter {
             area.x + SIGIL_WIDTH
@@ -1716,20 +1780,20 @@ impl ScrollbackContainer {
         } else {
             area.width
         };
+        let selected = self.selected_leaf(block_w);
 
         let mut block_y: u16 = 0;
-        for (i, (block, truncated)) in self.iter_history().enumerate() {
-            let is_selected = self.selected_from_newest.is_some_and(|sel| {
-                (total - 1)
-                    .checked_sub(i)
-                    .is_some_and(|fn_| sel as usize == fn_)
-            });
+        for (entry_idx, (block, truncated)) in self.iter_history().enumerate() {
+            let sel_child = selected.and_then(|(ei, c)| (ei == entry_idx).then_some(c));
+            let entry_selected = sel_child.is_some();
+            let (selected, selected_part) = selection_fields(block, sel_child);
             // Block measurement is selection-aware so the inspector's
             // offset math stays consistent with what the block paints
             // (e.g. `ShellOutputBlock` grows its tail when focused).
             let mctx = BlockMeasureContext {
                 width: block_w,
-                selected: is_selected,
+                selected,
+                selected_part,
                 theme: &self.theme,
             };
             let content_h = block.measure(&mctx);
@@ -1767,8 +1831,12 @@ impl ScrollbackContainer {
                         src_y: src_start,
                         truncated,
                         alt_view: true,
-                        selected: is_selected,
+                        selected,
+                        selected_part,
                         theme: &self.theme,
+                        // The inspector is a frozen snapshot of sealed
+                        // sections; nothing animates, so a fixed clock.
+                        frame_time: &crate::widget::FixedFrameTime(0.0),
                     };
                     let sigil = block.render(&mut rctx);
 
@@ -1781,8 +1849,8 @@ impl ScrollbackContainer {
                         paint_sigil(frame_buf, area.x, area.y + dst_start, &sigil);
                     }
                     // Selection indicator overrides col 0 of the gutter
-                    // on the block's topmost on-screen row.
-                    if has_gutter && is_selected && src_start == 0 {
+                    // on the section's topmost on-screen row.
+                    if has_gutter && entry_selected && src_start == 0 {
                         let indicator = Style::default().fg(Color::Cyan);
                         frame_buf.set_string(area.x, area.y + dst_start, "▶", indicator);
                     }
@@ -1902,7 +1970,7 @@ fn render_or_skip_entry<B>(
     cursor: &mut CursorState,
     cumulative_scrolls: i32,
     force_cascade: &mut bool,
-    spinner_frame: Option<u8>,
+    frame_time: &dyn FrameTime,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
@@ -1910,6 +1978,7 @@ where
     let mctx = BlockMeasureContext {
         width,
         selected: false,
+        selected_part: None,
         theme,
     };
     let content_h = block.measure(&mctx);
@@ -1974,13 +2043,12 @@ where
                 truncated: false,
                 alt_view: false,
                 selected: false,
+                selected_part: None,
                 theme,
+                frame_time,
             };
             let sigil = block.render(&mut rctx);
             paint_sigil(&mut buf, 0, 0, &sigil);
-            if let Some(frame) = spinner_frame {
-                overlay_spinner(&mut buf, body_area, frame);
-            }
             for row_idx in 0..h {
                 write_row_at_cursor(backend, &buf, row_idx, width, true, cursor, terminal_h)?;
             }
@@ -2008,33 +2076,6 @@ where
         );
     }
     Ok(())
-}
-
-/// Paint the active-block spinner glyph just after the last non-blank
-/// cell of `area`'s last row. If the row's content already runs to the
-/// right edge there's no room for a trailing cell, so the glyph
-/// overwrites the final character instead. An entirely blank row puts
-/// the glyph at the leftmost column so an empty block is still visibly
-/// tagged as open.
-fn overlay_spinner(buf: &mut Buffer, area: Rect, frame: u8) {
-    if area.height == 0 || area.width == 0 {
-        return;
-    }
-    let last_y = area.y + area.height - 1;
-    let right_edge = area.x + area.width - 1;
-    let last_content_x = (area.x..=right_edge).rev().find(|&x| {
-        let sym = buf[(x, last_y)].symbol();
-        !sym.is_empty() && sym != " "
-    });
-    let glyph_x = match last_content_x {
-        None => area.x,
-        Some(x) if x < right_edge => x + 1,
-        Some(_) => right_edge,
-    };
-    let glyph = SPINNER_FRAMES[(frame as usize) % SPINNER_FRAMES.len()];
-    let cell = &mut buf[(glyph_x, last_y)];
-    cell.set_symbol(glyph);
-    cell.set_style(Style::default().fg(Color::Cyan));
 }
 
 fn write_row_at_cursor<B>(
@@ -3043,13 +3084,13 @@ mod tests {
     }
 
     /// Same as [`growing_active_block_does_not_leak_block_borders`]
-    /// but with the spinner enabled — every draw marks the active
-    /// entry damaged, so the active block goes through the redraw
-    /// path even when its measure hasn't changed, and a spinner glyph
-    /// is overlaid on its last row. The real streaming scenario
-    /// always has the spinner on.
+    /// but with animation enabled — every draw marks the active entry
+    /// damaged, so the active block goes through the redraw path even
+    /// when its measure hasn't changed. The real streaming scenario
+    /// always has animation on; this guards the per-frame-damage path
+    /// against leaking the footer's borders into the content area.
     #[test]
-    fn growing_active_block_with_spinner_does_not_leak_block_borders() {
+    fn growing_active_block_with_animation_does_not_leak_block_borders() {
         use ratatui::widgets::{Block as RatBlock, Borders};
 
         let footer = || {
@@ -3064,7 +3105,7 @@ mod tests {
 
         let mut terminal = mk_term_terminal(40, 12);
         let mut rig = Rig::new(footer(), 5);
-        rig.enable_spinner();
+        rig.enable_animation();
         rig.push(multi_text(&["banner"]));
 
         let active = rig.push_active(multi_text(&["A1"]));
@@ -3077,9 +3118,8 @@ mod tests {
             vec!["A1", "A2", "A3", "A4", "A5"],
         ];
         for (i, new_lines) in updates.iter().enumerate() {
-            // Advance the rig's frame clock past the next spinner-glyph
-            // boundary (one glyph step is 6 frames at 60fps) so each
-            // iteration paints the next braille frame.
+            // Advance the rig's frame clock each iteration so the
+            // per-frame-damage path actually re-renders.
             rig.frame_time.set(((i + 1) * 6) as f64);
             rig.update_active(active, multi_text(&new_lines.to_vec()));
             rig.draw(&mut terminal).unwrap();
@@ -3094,7 +3134,7 @@ mod tests {
                     && !row.contains('└')
                     && !row.contains('┘')
                     && !row.contains('│'),
-                "row {y} (active block, spinner on) has stranded border chars: {row:?}",
+                "row {y} (active block, animation on) has stranded border chars: {row:?}",
             );
         }
     }
@@ -4248,127 +4288,17 @@ mod tests {
         assert_eq!(b.scrollback_len(), 0);
     }
 
-    /// With the spinner enabled, every active block gets a single
-    /// braille glyph painted just after its last non-blank cell on its
-    /// last row. Once the block is marked safe and promoted out of
-    /// active, the next draw repaints the row without the glyph.
+    /// The container itself paints no streaming glyph — that's a section
+    /// concept now, owned by `SectionView`. A bare active block (not a
+    /// section) renders verbatim regardless of `enable_animation`.
     #[test]
-    fn enabled_spinner_overlays_active_block_and_clears_on_mark_safe() {
+    fn container_paints_no_glyph_over_active_blocks() {
         let mut terminal = mk_term_terminal(80, 5);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
-        container.enable_spinner();
-
-        let id = container.push_active(multi_text(&["hello"]));
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(
-            terminal.backend().inner().screen_row(0),
-            "  hello⠋",
-            "spinner glyph appears immediately after the content (cols 0..1 are the sigil gutter)",
-        );
-
-        container.mark_safe(id);
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(
-            terminal.backend().inner().screen_row(0),
-            "  hello",
-            "mark_safe promotes out of active; the spinner cell is repainted",
-        );
-    }
-
-    /// Advancing `frame_time` past the next spinner-glyph boundary
-    /// (one glyph = 6 frames at 60fps) flips the rendered glyph on
-    /// the next draw.
-    #[test]
-    fn frame_time_advance_flips_spinner_glyph_on_next_draw() {
-        let mut terminal = mk_term_terminal(80, 5);
-        let mut container = Rig::new(multi_text(&["footer"]), 0);
-        container.enable_spinner();
-        container.push_active(multi_text(&["hi"]));
-
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠋");
-
-        container.frame_time.set(6.0);
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "  hi⠙");
-    }
-
-    /// When the last row's content already fills the row to the right
-    /// edge there's no trailing slot to paint into — the spinner falls
-    /// back to overwriting the final character.
-    #[test]
-    fn spinner_overwrites_last_char_when_content_fills_row() {
-        // Width 7 = 2-col sigil gutter + 5-col body. "hello" fills the
-        // body exactly, leaving no trailing slot for the spinner.
-        let mut terminal = mk_term_terminal(7, 5);
-        let mut container = Rig::new(multi_text(&["foot."]), 0);
-        container.enable_spinner();
-
-        container.push_active(multi_text(&["hello"]));
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(
-            terminal.backend().inner().screen_row(0),
-            "  hell⠋",
-            "content reaches the right edge, so the spinner overwrites the last char",
-        );
-    }
-
-    /// Spinner stays off by default — existing callers and tests see
-    /// exactly the same rendering they did before the feature landed.
-    #[test]
-    fn spinner_off_by_default_leaves_active_blocks_untouched() {
-        let mut terminal = mk_term_terminal(80, 5);
-        let mut container = Rig::new(multi_text(&["footer"]), 0);
+        container.enable_animation();
         container.push_active(multi_text(&["hello"]));
         container.draw(&mut terminal).unwrap();
         assert_eq!(terminal.backend().inner().screen_row(0), "  hello");
-    }
-
-    /// An entry flagged `safe_to_commit` that's still pinned in
-    /// `active_order` behind an older, still-streaming entry must NOT
-    /// receive the spinner overlay — it's logically done, just waiting
-    /// for the contiguous prefix to drain.
-    #[test]
-    fn spinner_skips_safe_flagged_entry_pinned_behind_older_active() {
-        let mut terminal = mk_term_terminal(80, 5);
-        let mut container = Rig::new(multi_text(&["footer"]), 0);
-        container.enable_spinner();
-
-        let older = container.push_active(multi_text(&["older"]));
-        let newer = container.push_active(multi_text(&["newer"]));
-
-        // Mark only the newer entry safe. The older one is still
-        // streaming, so the contiguous-prefix rule keeps both in
-        // `active_order`.
-        container.mark_safe(newer);
-        container.draw(&mut terminal).unwrap();
-
-        // Layout: older at row 0, gap at row 1, newer at row 2, gap
-        // at row 3, footer at row 4. Each block content starts at
-        // col 2 (the sigil gutter occupies cols 0..1).
-        assert_eq!(
-            terminal.backend().inner().screen_row(0),
-            "  older⠋",
-            "older still-active entry keeps the spinner glyph",
-        );
-        assert_eq!(
-            terminal.backend().inner().screen_row(1),
-            "",
-            "gap row below older",
-        );
-        assert_eq!(
-            terminal.backend().inner().screen_row(2),
-            "  newer",
-            "newer safe-flagged entry renders verbatim — no spinner overlay",
-        );
-
-        // Promoting the older entry drains both into safe, both
-        // rendering as their real last char.
-        container.mark_safe(older);
-        container.draw(&mut terminal).unwrap();
-        assert_eq!(terminal.backend().inner().screen_row(0), "  older");
-        assert_eq!(terminal.backend().inner().screen_row(1), "");
-        assert_eq!(terminal.backend().inner().screen_row(2), "  newer");
     }
 
     // ------------------------------------------------------------------
@@ -4529,5 +4459,185 @@ mod tests {
             found.push(());
         }
         assert_eq!(found.len(), 2, "both counters live in safe");
+    }
+
+    /// A section is one container entry but holds several blocks, which
+    /// behave differently. Selection + input must reach the individual
+    /// inner block, not the section as a whole.
+    #[test]
+    fn handle_block_event_routes_into_section_inner_block() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(Arc<AtomicUsize>);
+        impl crate::widget::Input for Counter {
+            fn handle_event(
+                &mut self,
+                _ctx: &mut crate::widget::EventContext<'_>,
+                _event: &Event,
+            ) -> crate::widget::EventOutcome {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                crate::widget::EventOutcome::Consumed
+            }
+        }
+        impl Block for Counter {
+            fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
+                1
+            }
+            fn render(&self, _ctx: &mut BlockRenderContext<'_>) -> crate::block::Sigil {
+                crate::block::Sigil::blank()
+            }
+        }
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let section = crate::section::SectionView::new(
+            vec![
+                Box::new(Counter(Arc::clone(&first))) as Box<dyn Block>,
+                Box::new(Counter(Arc::clone(&second))) as Box<dyn Block>,
+            ],
+            crate::block::Sigil::blank(),
+            false,
+        );
+        let mut c = Rig::new(para("footer"), 0);
+        c.container.push(Box::new(section));
+        c.set_scrollback(true);
+
+        // One container entry, two selectable leaves (newest first).
+        assert_eq!(c.container.history_count(), 2);
+        assert_eq!(c.selected_from_newest(), Some(0));
+
+        let key = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let mut focus = Focus::new();
+
+        // Newest leaf = the section's last inner block.
+        c.container.handle_block_event(&mut focus, &key);
+        assert_eq!(
+            second.load(Ordering::Relaxed),
+            1,
+            "event routed to the last inner block",
+        );
+        assert_eq!(
+            first.load(Ordering::Relaxed),
+            0,
+            "first inner block untouched"
+        );
+
+        // Older leaf = the section's first inner block.
+        c.container.select_older();
+        assert_eq!(c.selected_from_newest(), Some(1));
+        c.container.handle_block_event(&mut focus, &key);
+        assert_eq!(
+            first.load(Ordering::Relaxed),
+            1,
+            "event now routed to the first inner block",
+        );
+        assert_eq!(
+            second.load(Ordering::Relaxed),
+            1,
+            "last inner block unchanged by the second dispatch",
+        );
+    }
+
+    /// Zero-height blocks paint nothing, so they must not be selectable
+    /// either — the inspector skips them exactly like the renderer does,
+    /// for both the selection count and input routing.
+    #[test]
+    fn selection_skips_zero_height_blocks() {
+        use crossterm::event::{
+            Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+        };
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counter(Arc<AtomicUsize>);
+        impl crate::widget::Input for Counter {
+            fn handle_event(
+                &mut self,
+                _ctx: &mut crate::widget::EventContext<'_>,
+                _event: &Event,
+            ) -> crate::widget::EventOutcome {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                crate::widget::EventOutcome::Consumed
+            }
+        }
+        impl Block for Counter {
+            fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
+                1
+            }
+            fn render(&self, _ctx: &mut BlockRenderContext<'_>) -> crate::block::Sigil {
+                crate::block::Sigil::blank()
+            }
+        }
+
+        // A block that measures zero — paints nothing, never selectable.
+        struct Empty;
+        impl crate::widget::Input for Empty {
+            fn handle_event(
+                &mut self,
+                _ctx: &mut crate::widget::EventContext<'_>,
+                _event: &Event,
+            ) -> crate::widget::EventOutcome {
+                crate::widget::EventOutcome::Pass
+            }
+        }
+        impl Block for Empty {
+            fn measure(&self, _ctx: &BlockMeasureContext<'_>) -> u16 {
+                0
+            }
+            fn render(&self, _ctx: &mut BlockRenderContext<'_>) -> crate::block::Sigil {
+                crate::block::Sigil::blank()
+            }
+        }
+
+        let first = Arc::new(AtomicUsize::new(0));
+        let last = Arc::new(AtomicUsize::new(0));
+        let section = crate::section::SectionView::new(
+            vec![
+                Box::new(Counter(Arc::clone(&first))) as Box<dyn Block>,
+                Box::new(Empty) as Box<dyn Block>,
+                Box::new(Counter(Arc::clone(&last))) as Box<dyn Block>,
+            ],
+            crate::block::Sigil::blank(),
+            false,
+        );
+        let mut c = Rig::new(para("footer"), 0);
+        c.container.push(Box::new(section));
+        c.set_scrollback(true);
+
+        // Three inner blocks, but the empty one is not selectable.
+        assert_eq!(c.container.history_count(), 2);
+        assert_eq!(c.selected_from_newest(), Some(0));
+
+        let key = Event::Key(KeyEvent {
+            code: KeyCode::Char('x'),
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        let mut focus = Focus::new();
+
+        // Newest selectable leaf = the last non-empty block.
+        c.container.handle_block_event(&mut focus, &key);
+        assert_eq!(last.load(Ordering::Relaxed), 1);
+
+        // Stepping older lands on the FIRST non-empty block, skipping the
+        // zero-height one between them.
+        c.container.select_older();
+        assert_eq!(c.selected_from_newest(), Some(1));
+        c.container.handle_block_event(&mut focus, &key);
+        assert_eq!(
+            first.load(Ordering::Relaxed),
+            1,
+            "selection skipped the zero-height block straight to the first",
+        );
     }
 }

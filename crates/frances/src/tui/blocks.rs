@@ -483,7 +483,7 @@ impl Input for ToolUseBlock {
 impl Block for ToolUseBlock {
     /// One-shot block — emitted as `BlockDelta` + `BlockStop`
     /// back-to-back by the runtime. The container promotes it straight
-    /// to `safe` so it never carries the in-flight spinner overlay.
+    /// to `safe`, so it never sits in `active` as a streaming section.
     fn safe_on_push(&self) -> bool {
         true
     }
@@ -1030,7 +1030,9 @@ mod tests {
                 truncated: false,
                 alt_view: false,
                 selected: false,
+                selected_part: None,
                 theme: &theme,
+                frame_time: &frances_tui::FixedFrameTime(0.0),
             };
             b.render(&mut ctx);
             // First body row = first row after the header (1 row).
@@ -1057,7 +1059,9 @@ mod tests {
                 truncated: false,
                 alt_view: true,
                 selected: false,
+                selected_part: None,
                 theme: &theme,
+                frame_time: &frances_tui::FixedFrameTime(0.0),
             };
             b.render(&mut ctx);
             let marker_row: String = (0..40)

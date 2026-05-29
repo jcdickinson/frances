@@ -25,7 +25,7 @@ pub mod widget;
 pub use block::{Block, BlockMeasureContext, BlockRenderContext};
 pub use scrollback_backend::{ScrollbackBackend, SyncGuard};
 pub use scrollback_container::{BlockId, ScrollbackContainer};
-pub use section::{InactiveBlock, Section, SectionApply};
+pub use section::{Section, SectionApply, SectionView};
 pub use widget::{
     AnimationGate, AnimationLease, AtomicFrameTime, Border, EventContext, EventOutcome,
     FixedFrameTime, Flex, FlexChild, FlexDirection, Focus, FocusId, FocusManager, FrameTime, Grid,

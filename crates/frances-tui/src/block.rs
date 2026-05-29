@@ -32,7 +32,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 
-use crate::widget::{Input, Theme};
+use crate::widget::{FrameTime, Input, Theme};
 
 /// Container-reserved left gutter width, in columns. Every block's
 /// rendered content lives at `area.x + SIGIL_WIDTH..area.x + area.width`;
@@ -74,9 +74,14 @@ impl Sigil {
 /// that state to reveal more content while focused — `ShellOutputBlock`
 /// uses this to expand its body tail when the user has chosen it.
 /// Outside the inspector, callers pass `false`.
+///
+/// `selected_part` is meaningful only to composite blocks (a section
+/// view, see [`Block::parts`]): the index of the selected inner block,
+/// or `None`. Leaf blocks ignore it and read `selected`.
 pub struct BlockMeasureContext<'a> {
     pub width: u16,
     pub selected: bool,
+    pub selected_part: Option<usize>,
     pub theme: &'a Theme,
 }
 
@@ -111,7 +116,18 @@ pub struct BlockRenderContext<'a> {
     /// taller measure when selected must render a body that fills
     /// those extra rows.
     pub selected: bool,
+    /// Index of the selected inner block, for composite blocks (a
+    /// section view, see [`Block::parts`]). `None` outside the inspector
+    /// or when the selection isn't inside this block. Leaf blocks ignore
+    /// it and read `selected`. Mirrored from
+    /// [`BlockMeasureContext::selected_part`].
+    pub selected_part: Option<usize>,
     pub theme: &'a Theme,
+    /// Animation clock for renderables that paint a moving glyph (e.g.
+    /// a live section's streaming indicator). Frame index at 60fps; the
+    /// epoch is arbitrary, only deltas matter. The container marks
+    /// animated entries damaged every frame so this advances.
+    pub frame_time: &'a dyn FrameTime,
 }
 
 pub trait Block: Input + 'static {
@@ -122,6 +138,24 @@ pub trait Block: Input + 'static {
     /// [`mark_safe`]: crate::ScrollbackContainer::mark_safe
     fn safe_on_push(&self) -> bool {
         false
+    }
+
+    /// The block's addressable inner blocks, for the inspector's
+    /// per-block selection and input routing. A composite block (a
+    /// section view) returns its children, in display order; a leaf
+    /// block returns an empty slice, meaning "I am my own selectable
+    /// unit." The container flattens these into the flat selection
+    /// ordinal so behaviours that differ per block — e.g.
+    /// `ShellOutputBlock`'s scroll — reach the right block.
+    fn parts(&self) -> &[Box<dyn Block>] {
+        &[]
+    }
+
+    /// Mutable sibling of [`Self::parts`] for input dispatch. Same
+    /// contract: composite blocks return their children, leaf blocks
+    /// return an empty slice.
+    fn parts_mut(&mut self) -> &mut [Box<dyn Block>] {
+        &mut []
     }
 
     /// Total rendered row count if wrapped at `ctx.width`. Note that

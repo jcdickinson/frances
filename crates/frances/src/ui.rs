@@ -28,11 +28,12 @@ use frances_session::events::{
 use frances_session::llm::Usage;
 use frances_session::runtime::SessionRuntime;
 use frances_session::session::Session;
+use frances_tui::block::Sigil;
 use frances_tui::scrollback_container::DrawContext;
 use frances_tui::{
     AnimationGate, Block, BlockId as ContainerBlockId, EventContext, Focus, FocusManager,
-    FrameTime, Input, ScrollbackBackend, ScrollbackContainer, Section, Theme, WallClockFrameTime,
-    Widget,
+    FrameTime, Input, ScrollbackBackend, ScrollbackContainer, Section, SectionView, Theme,
+    WallClockFrameTime, Widget,
 };
 
 use crate::tui::sections::make_section;
@@ -70,16 +71,18 @@ enum ScrollbackAction {
 
 struct LiveSection {
     section: Box<dyn Section>,
-    /// Container block ids for each inner block this section currently
-    /// owns. One slot per `section.blocks()` entry; sync'd against the
-    /// vector returned by `Section::apply` on every event.
-    block_ids: Vec<ContainerBlockId>,
+    /// Container id for this section's single [`SectionView`] entry.
+    /// `None` until the section's first apply produces renderable
+    /// content (empty sections push nothing).
+    block_id: Option<ContainerBlockId>,
 }
 
 /// Per-section-id tracker for the live sections currently in flight.
-/// Each section owns its inner blocks; the dispatcher diffs the
-/// returned block list against the existing container ids on every
-/// `apply` and routes pushes / updates accordingly.
+/// Each section renders as ONE container entry — a [`SectionView`] that
+/// owns the section's inner blocks and paints its own streaming
+/// indicator while open. On every event the dispatcher re-applies, wraps
+/// the section's fresh block list in a new `SectionView`, and replaces
+/// the entry.
 struct LiveBlocks {
     by_id: HashMap<SectionId, LiveSection>,
 }
@@ -93,7 +96,8 @@ impl LiveBlocks {
 
     /// Process one self-describing `SectionAppend`. The first time we
     /// see `id` we construct the section via [`make_section`]; subsequent
-    /// appends apply the event and reconcile the container.
+    /// appends apply the event and refresh the container entry. The
+    /// section is still open, so the view streams.
     fn append(
         &mut self,
         container: &mut ScrollbackContainer,
@@ -103,18 +107,19 @@ impl LiveBlocks {
     ) {
         let entry = self.by_id.entry(id).or_insert_with(|| LiveSection {
             section: make_section(&kind),
-            block_ids: Vec::new(),
+            block_id: None,
         });
         let blocks = entry.section.apply(SectionApply::Append {
             kind: &kind,
             delta: &delta,
         });
-        sync_blocks(container, &mut entry.block_ids, blocks);
+        let sigil = entry.section.sigil();
+        sync_view(container, &mut entry.block_id, blocks, sigil, true);
     }
 
-    /// Seal a section: run a `Close` apply, reconcile blocks, then
-    /// mark every inner block safe in the container. Returns `true`
-    /// when the section was known. A close for an unknown id is a
+    /// Seal a section: run a `Close` apply, refresh the entry with a
+    /// non-streaming view, then mark it safe in the container. Returns
+    /// `true` when the section was known. A close for an unknown id is a
     /// protocol bug — we warn and continue.
     fn close(
         &mut self,
@@ -122,20 +127,7 @@ impl LiveBlocks {
         id: SectionId,
         frame_label: &'static str,
     ) -> bool {
-        let Some(mut entry) = self.by_id.remove(&id) else {
-            warn!(
-                section_id = id.0,
-                frame = frame_label,
-                "SectionClose for unknown id; recovering",
-            );
-            return false;
-        };
-        let blocks = entry.section.apply(SectionApply::Close);
-        sync_blocks(container, &mut entry.block_ids, blocks);
-        for bid in entry.block_ids {
-            container.mark_safe(bid);
-        }
-        true
+        self.seal(container, id, SectionApply::Close, frame_label)
     }
 
     /// Truncate variant of [`Self::close`] — same flow with a
@@ -147,17 +139,30 @@ impl LiveBlocks {
         id: SectionId,
         frame_label: &'static str,
     ) -> bool {
+        self.seal(container, id, SectionApply::Truncate, frame_label)
+    }
+
+    /// Shared close/truncate path: apply the sealing event, rebuild the
+    /// view with `streaming = false`, and promote it out of `active`.
+    fn seal(
+        &mut self,
+        container: &mut ScrollbackContainer,
+        id: SectionId,
+        event: SectionApply<'_>,
+        frame_label: &'static str,
+    ) -> bool {
         let Some(mut entry) = self.by_id.remove(&id) else {
             warn!(
                 section_id = id.0,
                 frame = frame_label,
-                "SectionTruncated for unknown id; recovering",
+                "seal for unknown section id; recovering",
             );
             return false;
         };
-        let blocks = entry.section.apply(SectionApply::Truncate);
-        sync_blocks(container, &mut entry.block_ids, blocks);
-        for bid in entry.block_ids {
+        let blocks = entry.section.apply(event);
+        let sigil = entry.section.sigil();
+        sync_view(container, &mut entry.block_id, blocks, sigil, false);
+        if let Some(bid) = entry.block_id {
             container.mark_safe(bid);
         }
         true
@@ -172,27 +177,24 @@ impl LiveBlocks {
     }
 }
 
-/// Reconcile the container's stored block ids with the section's
-/// fresh block list. Existing slots get `update_active`; new blocks
-/// past the previous tail get `push_active` and their ids appended.
-/// A returned vec shorter than `block_ids` is treated as no-op for
-/// the missing tail entries — sections don't shrink today.
-fn sync_blocks(
+/// Refresh a section's single container entry. Wraps the section's
+/// current block list in a fresh [`SectionView`] and either updates the
+/// existing entry or pushes a new one. An empty block list pushes
+/// nothing — an unmaterialised section has no entry yet.
+fn sync_view(
     container: &mut ScrollbackContainer,
-    block_ids: &mut Vec<ContainerBlockId>,
-    new_blocks: Vec<Box<dyn Block>>,
+    block_id: &mut Option<ContainerBlockId>,
+    blocks: Vec<Box<dyn Block>>,
+    sigil: Sigil,
+    streaming: bool,
 ) {
-    let mut iter = new_blocks.into_iter();
-    for &bid in block_ids.iter() {
-        if let Some(block) = iter.next() {
-            container.update_active(bid, block);
-        } else {
-            break;
-        }
+    if blocks.is_empty() {
+        return;
     }
-    for block in iter {
-        let bid = container.push_active(block);
-        block_ids.push(bid);
+    let view = Box::new(SectionView::new(blocks, sigil, streaming));
+    match *block_id {
+        Some(bid) => container.update_active(bid, view),
+        None => *block_id = Some(container.push_active(view)),
     }
 }
 
@@ -234,7 +236,7 @@ impl App<'_> {
         let mut focus = Focus::new();
         let mut footer = Footer::new(&mut focus_manager, "type a message…");
         let mut container = ScrollbackContainer::new(cursor_row);
-        container.enable_spinner();
+        container.enable_animation();
         for (i, line) in self.banner_lines().into_iter().enumerate() {
             let style = if i == 0 {
                 Style::default()
@@ -588,16 +590,18 @@ fn handle_replay_frame(
         ScrollbackFrame::SectionClose { id } => {
             if let Some(mut s) = open.take_if(|s| s.id == id) {
                 let blocks = s.section.apply(SectionApply::Close);
-                for block in blocks {
-                    container.push_committed(block);
+                if !blocks.is_empty() {
+                    let view = Box::new(SectionView::new(blocks, s.section.sigil(), false));
+                    container.push_committed(view);
                 }
             }
         }
         ScrollbackFrame::SectionTruncated { id } => {
             if let Some(mut s) = open.take_if(|s| s.id == id) {
                 let blocks = s.section.apply(SectionApply::Truncate);
-                for block in blocks {
-                    container.push_committed_truncated(block);
+                if !blocks.is_empty() {
+                    let view = Box::new(SectionView::new(blocks, s.section.sigil(), false));
+                    container.push_committed_truncated(view);
                 }
             }
         }
