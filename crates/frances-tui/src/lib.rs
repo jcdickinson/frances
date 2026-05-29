@@ -29,6 +29,6 @@ pub use section::{Section, SectionApply, SectionView};
 pub use widget::{
     AnimationGate, AnimationLease, AtomicFrameTime, Border, EventContext, EventOutcome,
     FixedFrameTime, Flex, FlexChild, FlexDirection, Focus, FocusId, FocusManager, FrameTime, Grid,
-    HStack, Input, ParaWidget, RenderContext, TEXT_INPUT_HEIGHT, TextInput, TextLine, Theme,
-    VStack, WallClockFrameTime, Widget, WidgetState,
+    Input, ParaWidget, RenderContext, TEXT_INPUT_HEIGHT, TextInput, TextLine, Theme,
+    WallClockFrameTime, Widget, WidgetState,
 };

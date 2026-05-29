@@ -1046,10 +1046,12 @@ impl ScrollbackContainer {
                 terminal,
                 footer,
                 ctx,
-                width,
-                terminal_h,
-                available_h,
-                footer_h,
+                OverflowDims {
+                    width,
+                    terminal_h,
+                    available_h,
+                    footer_h,
+                },
             )?;
             self.prev_term_size = Some(term_size);
             self.prev_mode = Some(mode);
@@ -1074,19 +1076,21 @@ impl ScrollbackContainer {
         //     changed → MoveTo its known screen position and rewrite,
         //     setting `force_cascade` so everything below redraws.
         let mut force_cascade = false;
-        let theme = &self.theme;
+        let paint = EntryPaintCtx {
+            width,
+            terminal_h,
+            theme: &self.theme,
+            cumulative_scrolls: self.cumulative_scrolls,
+            frame_time: ctx.frame_time,
+        };
         for entry in self.safe.iter_mut() {
             render_or_skip_entry(
                 &mut entry.block,
                 &mut entry.render,
-                width,
-                terminal_h,
-                theme,
+                &paint,
                 terminal.backend_mut(),
                 &mut cursor,
-                self.cumulative_scrolls,
                 &mut force_cascade,
-                ctx.frame_time,
             )?;
         }
 
@@ -1102,14 +1106,10 @@ impl ScrollbackContainer {
             render_or_skip_entry(
                 &mut entry.block,
                 &mut entry.render,
-                width,
-                terminal_h,
-                theme,
+                &paint,
                 terminal.backend_mut(),
                 &mut cursor,
-                self.cumulative_scrolls,
                 &mut force_cascade,
-                ctx.frame_time,
             )?;
         }
 
@@ -1344,23 +1344,22 @@ impl ScrollbackContainer {
     /// "paint from row 0 every frame" model rather than the natural-
     /// scroll path's `absolute_y` model). The footer's diff cache is
     /// invalidated so the next frame re-evaluates from scratch.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "active-overflow path threads frame-state by-ref; bundling adds a borrow."
-    )]
     fn draw_active_overflow<B>(
         &mut self,
         terminal: &mut Terminal<ScrollbackBackend<B>>,
         footer: &mut dyn Widget,
         ctx: &DrawContext<'_>,
-        width: u16,
-        terminal_h: u16,
-        available_h: u16,
-        footer_h: u16,
+        dims: OverflowDims,
     ) -> io::Result<()>
     where
         B: Backend<Error = io::Error> + Write,
     {
+        let OverflowDims {
+            width,
+            terminal_h,
+            available_h,
+            footer_h,
+        } = dims;
         tracing::trace!(
             width,
             terminal_h,
@@ -1940,6 +1939,17 @@ fn build_ellipsis_buffer(width: u16) -> Buffer {
     buf
 }
 
+/// Frame geometry for the active-overflow draw path: terminal
+/// dimensions plus the footer split (`available_h = terminal_h -
+/// footer_h`). Bundled so the path's draw entry point stays a few
+/// arguments wide.
+struct OverflowDims {
+    width: u16,
+    terminal_h: u16,
+    available_h: u16,
+    footer_h: u16,
+}
+
 /// Mutable cursor tracking shared across the safe / active / footer
 /// render passes within a single frame. `cursor_y` is the terminal
 /// row the cursor currently sits on; `scrolls` is the count of
@@ -1949,6 +1959,18 @@ struct CursorState {
     scrolls: i32,
 }
 
+/// Frame-constant inputs shared by every entry in a single natural-
+/// scroll draw pass. Built once before the safe/active loops; the same
+/// values feed every `render_or_skip_entry` call that frame.
+#[derive(Clone, Copy)]
+struct EntryPaintCtx<'a> {
+    width: u16,
+    terminal_h: u16,
+    theme: &'a Theme,
+    cumulative_scrolls: i32,
+    frame_time: &'a dyn FrameTime,
+}
+
 /// Render path for a single safe / active entry. Picks between
 /// (a) fresh render at the cursor's current position (no prior
 /// `RenderState`), (b) skip — entry is on screen, unchanged, and
@@ -1956,25 +1978,24 @@ struct CursorState {
 /// rewrite at the entry's known screen position. A damaged rewrite
 /// sets `force_cascade` so subsequent entries redraw too (their
 /// screen positions may have shifted if the geometry changed).
-#[expect(
-    clippy::too_many_arguments,
-    reason = "draw-frame state threaded by-ref; bundling into a struct trades param count for an even longer borrow signature."
-)]
 fn render_or_skip_entry<B>(
     block: &mut Box<dyn Block>,
     render: &mut Option<RenderState>,
-    width: u16,
-    terminal_h: u16,
-    theme: &Theme,
+    paint: &EntryPaintCtx<'_>,
     backend: &mut ScrollbackBackend<B>,
     cursor: &mut CursorState,
-    cumulative_scrolls: i32,
     force_cascade: &mut bool,
-    frame_time: &dyn FrameTime,
 ) -> io::Result<()>
 where
     B: Backend<Error = io::Error> + Write,
 {
+    let &EntryPaintCtx {
+        width,
+        terminal_h,
+        theme,
+        cumulative_scrolls,
+        frame_time,
+    } = paint;
     let mctx = BlockMeasureContext {
         width,
         selected: false,

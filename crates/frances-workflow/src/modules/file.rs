@@ -258,8 +258,8 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
     sess.record_loop(key);
 
     if let Some(ranges) = args.ranges {
-        // filter out zero, wait 1-indexed so 0 is invalid anyway.
-        // wait, let's normalize, sort, and merge overlapping.
+        // Validate each 1-indexed range and clamp its end to the file
+        // length, then sort by start and merge overlapping/adjacent ones.
         let mut final_ranges = Vec::new();
         for [start, end] in ranges {
             if end < start {

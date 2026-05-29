@@ -34,14 +34,12 @@ pub mod flex;
 pub mod focus;
 pub mod frame_time;
 pub mod grid;
-pub mod hstack;
 pub mod input;
 pub mod para;
 pub mod taffy_util;
 pub mod text_input;
 pub mod text_line;
 pub mod theme;
-pub mod vstack;
 
 pub use animation::{AnimationGate, AnimationLease};
 pub use border::Border;
@@ -50,13 +48,11 @@ pub use flex::{Flex, FlexChild, FlexDirection};
 pub use focus::{Focus, FocusId, FocusManager};
 pub use frame_time::{AtomicFrameTime, FixedFrameTime, FrameTime, WallClockFrameTime};
 pub use grid::Grid;
-pub use hstack::HStack;
 pub use input::{EventOutcome, Input};
 pub use para::ParaWidget;
 pub use text_input::{TEXT_INPUT_HEIGHT, TextInput};
 pub use text_line::TextLine;
 pub use theme::Theme;
-pub use vstack::VStack;
 
 use ratatui::layout::Rect;
 

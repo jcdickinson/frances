@@ -184,16 +184,10 @@ pub(crate) enum DriverCmd {
 
 /// The currently-hydrated workflow plus the emit-state needed across
 /// multiple `drive()` invocations (block id allocator, currently-open
-/// block) and a copy of its `config_key` for diagnostics. The runtime
-/// `WorkflowHandle` already carries the `instance_id`.
+/// block). The runtime `WorkflowHandle` already carries the `instance_id`.
 pub(crate) struct WorkflowInstance {
     handle: WorkflowHandle,
     emit: EmitState,
-    #[expect(
-        dead_code,
-        reason = "useful in tracing/logging; not yet read at any call site"
-    )]
-    config_key: String,
 }
 
 /// Block-tracking state for a single hydrated workflow's lifetime.
@@ -448,7 +442,6 @@ async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
     Ok(Some(WorkflowInstance {
         handle,
         emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
-        config_key: name.to_owned(),
     }))
 }
 
@@ -533,7 +526,6 @@ async fn push<Io: frances_workflow::WorkflowIo>(
     Some(WorkflowInstance {
         handle,
         emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
-        config_key: name.to_owned(),
     })
 }
 
@@ -1020,7 +1012,6 @@ async fn hydrate<Io: frances_workflow::WorkflowIo>(
     Ok(WorkflowInstance {
         handle,
         emit: EmitState::new(runtime.workflow_stack.db.clone(), row.instance_id),
-        config_key: row.config_key.clone(),
     })
 }
 

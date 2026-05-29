@@ -90,12 +90,12 @@ pub(crate) fn build_sections<'js>(
     )?;
 
     let md_ctor = build_markdown_ctor(ctx, state.clone())?;
-    let err_ctor = build_error_ctor(ctx, state.clone())?;
-    let json_ctor = build_json_ctor(ctx, state.clone())?;
+    let err_ctor = build_error_ctor(ctx)?;
+    let json_ctor = build_json_ctor(ctx)?;
     let shell_output_ctor = build_shell_output_ctor(ctx, state.clone())?;
-    let thought_ctor = build_thought_ctor(ctx, state.clone())?;
-    let tool_use_ctor = build_tool_use_ctor(ctx, state.clone())?;
-    let diff_ctor = build_diff_ctor(ctx, state)?;
+    let thought_ctor = build_thought_ctor(ctx, state)?;
+    let tool_use_ctor = build_tool_use_ctor(ctx)?;
+    let diff_ctor = build_diff_ctor(ctx)?;
 
     Ok((
         transcript,
@@ -389,11 +389,6 @@ impl<'js> JsClass<'js> for MarkdownSection {
 /// goes through `StreamFrame::Error` (a non-block message) on the host
 /// side, so streaming-write semantics don't apply.
 pub struct ErrorSection {
-    #[expect(
-        dead_code,
-        reason = "kept on the type for parity with MarkdownSection; write support is a follow-up"
-    )]
-    state: Arc<SectionsState>,
     id: AtomicU64,
     content: String,
 }
@@ -476,11 +471,6 @@ fn close_section<'js>(
 // ---------------------------------------------------------------------
 
 pub struct JsonSection {
-    #[expect(
-        dead_code,
-        reason = "kept for future API parity with text frames; not read after construction"
-    )]
-    state: Arc<SectionsState>,
     id: AtomicU64,
     tag: String,
     value: serde_json::Value,
@@ -522,11 +512,6 @@ impl<'js> JsClass<'js> for JsonSection {
 const TOOL_DETAIL_MAX: usize = 160;
 
 pub struct ToolUseSection {
-    #[expect(
-        dead_code,
-        reason = "kept for symmetry with the other frame types; never read after construction since ToolUseSection is one-shot"
-    )]
-    state: Arc<SectionsState>,
     id: AtomicU64,
     name: String,
     /// When `true`, `transcript.push` skips the frame entirely — no
@@ -598,7 +583,7 @@ fn normalise_detail(raw: String) -> Option<String> {
     Some(out)
 }
 
-fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ToolUseSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
@@ -633,7 +618,6 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResu
             Class::instance(
                 ctx.clone(),
                 ToolUseSection {
-                    state: state.clone(),
                     id: AtomicU64::new(0),
                     name,
                     hidden,
@@ -654,11 +638,6 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResu
 /// block. Like `ToolUseSection`, the runtime seals and persists the block
 /// — there is no `write` / `close` on the JS side.
 pub struct DiffSection {
-    #[expect(
-        dead_code,
-        reason = "kept for symmetry with the other frame types; never read after construction since DiffSection is one-shot"
-    )]
-    state: Arc<SectionsState>,
     id: AtomicU64,
     /// Drained on push — the runtime moves the ops into the wire
     /// `SectionKind::Diff` rather than cloning, since a `DiffSection` is
@@ -734,7 +713,7 @@ fn parse_diff_ops<'js>(ctx: &Ctx<'js>, lines: Value<'js>) -> JsResult<Vec<DiffOp
     Ok(ops)
 }
 
-fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+fn build_diff_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<DiffSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
@@ -749,7 +728,6 @@ fn build_diff_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<C
             Class::instance(
                 ctx.clone(),
                 DiffSection {
-                    state: state.clone(),
                     id: AtomicU64::new(0),
                     ops,
                 },
@@ -1066,7 +1044,7 @@ fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResu
     )
 }
 
-fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+fn build_error_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ErrorSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
@@ -1075,7 +1053,6 @@ fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<
             Class::instance(
                 ctx.clone(),
                 ErrorSection {
-                    state: state.clone(),
                     id: AtomicU64::new(0),
                     content,
                 },
@@ -1084,7 +1061,7 @@ fn build_error_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<
     )
 }
 
-fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
+fn build_json_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<JsonSection, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
@@ -1112,7 +1089,6 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<C
             Class::instance(
                 ctx.clone(),
                 JsonSection {
-                    state: state.clone(),
                     id: AtomicU64::new(0),
                     tag,
                     value: parsed,

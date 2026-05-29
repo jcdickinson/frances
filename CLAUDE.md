@@ -13,6 +13,8 @@ wasn't created.
 
 Frances is an agentic coding tool. The `frances` binary is a single-process TUI: it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens a per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), constructs an in-process `SessionRuntime`, and runs the TUI directly against it. LLM completions stream via OpenRouter.
 
+**Frances has never shipped — there is no backward-compatibility burden.** No released version, no users with persisted state to preserve. DB schemas, on-disk serialization formats, wire shapes, and public APIs can change freely; do not write migrations, compatibility shims, or "old behaviour" fallbacks for the sake of existing data. When a refactor improves the type or format, just make the change.
+
 ## Workspace layout
 
 The interesting crates under `crates/`:
@@ -70,6 +72,7 @@ For Rust documentation lookups, use `rsdoc` (the ferrisfetch MCP CLI) — `rsdoc
 ### Rust rules
 
 - **Never `#[allow(...)]`, always `#[expect(...)]`.** `expect` fails the build if the lint stops firing, so dead suppressions don't accumulate. If you need to silence a lint, use `expect` with a reason.
+- **Never suppress `clippy::too_many_arguments`.** It never holds up — "threading state by-ref" is not a justification, it's the smell. Fix the signature: bundle the related params into a struct (or pass the struct that already owns them by-ref). If the borrow signature gets longer, that's the cost of the function doing too much; reduce what it touches.
 - **Make invalid states unrepresentable.** Push validity into the type system rather than runtime checks. If a field has only one legal value, it doesn't belong in the struct; if two fields are mutually exclusive, they belong in an enum.
 - **Don't code like it's Python.** Reach for Rust's discriminated unions, newtypes, and trait bounds before stringly-typed shapes. Tagged enums beat `kind: &'static str` + optional fields:
 
@@ -97,6 +100,8 @@ For Rust documentation lookups, use `rsdoc` (the ferrisfetch MCP CLI) — `rsdoc
 If things are kept around for functional reasons (e.g. temp dirs), don't `#[expect(unused..)] foo: ...`,
 the correct thing to do is `_foo: ...`.
 
+**Never suppress a dead-code warning with a "this will be used in the future" reason** — parity, symmetry, "write support is a follow-up", "useful for tracing later". What if it never is? The warning is the signal that the code has no purpose *right now*; silencing it removes the signal and the dead code accumulates. Delete it and let the warning stay hot. If the future use lands, add the field/fn back *then*, when it has a real reader. The only `#[expect(dead_code)]` that's legitimate is for something with a present-tense functional purpose that the compiler can't see — e.g. a field held purely for its `Drop` side effect (and only when `_foo:` can't express it, such as a positional tuple-variant field).
+
 ### Deps
 
 We bring in deps using Deps traits that go into a `deps.rs` in their crate. For example:
@@ -122,3 +127,15 @@ this should be considered an extremely rare scenario.
 - `dashmap` - avoid `Mutex<HashMap>` unless broad atomicity is needed for some reason.
 - `anyhow` - generally exclusive to `frances` crate.
 - `thiserror` - the mandatory mechanism for lib errors. Do not invent a shitty anyhow with this (e.g. `Msg(String)`). Errors don't have to be super precise, and don't have to carry the original error (`trace` it if is discarded), and obviously can still contain a message if they are more specific than `Msg`.
+
+### Stringly-typed errors
+
+Don't thread a bare `String` error (`Result<T, String>`, or an `Err(String)` arm) through Rust. "It only ends up as text in JS / a log / a tool result" is not a reason to demote early — that's what `Display` is for. Keep the typed error all the way to the boundary and let the sink call `.to_string()` / format it there. The typed error produces the exact same string, and until that final edge Rust can still match on the variant.
+
+If a value is genuinely terminal — produced only to be handed to a sink and never inspected in Rust — name that with a newtype so the contract is visible and the type system stops it leaking back into control flow:
+
+```rs
+// Contract: only ever rendered as a JS exception message. Never matched in Rust.
+// Built by Display-ing a typed error at the boundary, not by stringifying early.
+pub struct JsError(pub String);
+```

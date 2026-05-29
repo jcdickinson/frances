@@ -38,11 +38,8 @@ pub struct Shell {
     reader: Option<OutputReader<ChildStdout>>,
     bash_pid: u32,
     nonce: String,
-    #[expect(
-        dead_code,
-        reason = "held for RAII cleanup of the per-shell tmpdir on drop"
-    )]
-    tmpdir: TempDir,
+    // Held for RAII cleanup of the per-shell tmpdir on drop.
+    _tmpdir: TempDir,
     cmd_path: PathBuf,
     alive: bool,
     running: bool,
@@ -179,7 +176,7 @@ impl Shell {
             reader: Some(reader),
             bash_pid,
             nonce,
-            tmpdir,
+            _tmpdir: tmpdir,
             cmd_path,
             alive: true,
             running: false,
