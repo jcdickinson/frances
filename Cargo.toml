@@ -16,6 +16,7 @@ frances-core = { path = "crates/frances-core" }
 frances-session = { path = "crates/frances-session" }
 frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
+frances-markdown = { path = "crates/frances-markdown" }
 frances-models-llm = { path = "crates/frances-models-llm" }
 frances-models-tui = { path = "crates/frances-models-tui" }
 frances-shell = { path = "crates/frances-shell" }

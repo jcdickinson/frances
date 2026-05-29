@@ -132,10 +132,16 @@ fn diff_op_to_wire(op: &frances_edit::DiffOp) -> frances_session::events::DiffLi
     }
 }
 
-/// Construct the right [`Section`] impl for a given kind. Today every
-/// kind routes through [`SingleBlockSection`]; step 6 of the migration
-/// swaps in `frances_markdown::MarkdownSection` for
-/// [`SectionKind::Markdown`].
+/// Construct the right [`Section`] impl for a given kind. Markdown
+/// sections route through [`frances_markdown::MarkdownSection`]
+/// (paragraph splitter + inline parser); everything else goes through
+/// the generic [`SingleBlockSection`] wrapper around the existing
+/// block-level constructors.
 pub fn make_section(kind: &SectionKind) -> Box<dyn Section> {
-    Box::new(SingleBlockSection::new(kind.clone()))
+    match kind {
+        SectionKind::Markdown { source } => {
+            Box::new(frances_markdown::MarkdownSection::new(*source))
+        }
+        _ => Box::new(SingleBlockSection::new(kind.clone())),
+    }
 }

@@ -1461,6 +1461,7 @@ dependencies = [
  "clap",
  "crossterm",
  "frances-edit",
+ "frances-markdown",
  "frances-models-tui",
  "frances-session",
  "frances-tui",
@@ -1551,6 +1552,17 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "frances-markdown"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "frances-models-tui",
+ "frances-tui",
+ "ratatui",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]
