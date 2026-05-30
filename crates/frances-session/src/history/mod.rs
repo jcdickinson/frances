@@ -61,7 +61,12 @@ impl TursoHistoryStore {
             .iter()
             .map(OwnedHistoryInput::as_borrowed)
             .collect();
-        let payloads = provider.forge_history(&inputs);
+        let payloads = provider
+            .forge_history(&inputs)
+            .map_err(|source| HistoryError::Encode {
+                what: "forge_history",
+                source,
+            })?;
         <Self as HistoryStoreTrait>::append_history(
             self,
             session,

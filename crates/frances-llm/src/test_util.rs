@@ -126,8 +126,8 @@ impl Provider for StubProvider {
         Ok(Arc::new(Self::new()))
     }
 
-    fn forge_history(&self, _: &[HistoryInput<'_>]) -> Vec<Value> {
-        Vec::new()
+    fn forge_history(&self, _: &[HistoryInput<'_>]) -> Result<Vec<Value>, serde_json::Error> {
+        Ok(Vec::new())
     }
 
     async fn stream(

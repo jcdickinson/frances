@@ -48,7 +48,7 @@ libc = "0.2"
 genai = "0.6.0-beta.20"
 parking_lot = "0.12"
 ratatui = { version = "0.30", features = ["unstable-backend-writer", "unstable-rendered-line-info"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 regex = "1"
 rquickjs = { version = "0.11", features = ["futures", "loader", "macro"] }
 serde = { version = "1", features = ["derive"] }

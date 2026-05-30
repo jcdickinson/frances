@@ -77,8 +77,10 @@ pub trait Provider: Send + Sync {
     /// rebuilds the entire history cache from primitive rows under a new
     /// provider's tag. The output `Vec` may be a different length than
     /// `inputs` — a provider can map one primitive to several wire
-    /// messages or coalesce many into one. Order is preserved.
-    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value>;
+    /// messages or coalesce many into one. Order is preserved. Fails only if
+    /// a primitive can't be serialised to wire JSON — the caller must not skip
+    /// a row silently, or the request desyncs from what the model saw.
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Result<Vec<Value>, serde_json::Error>;
 
     /// Drive a single chat call. Typed `StreamEvent`s are delivered to
     /// `on_event` synchronously as they're parsed; the call's full result
@@ -113,7 +115,7 @@ pub struct ErasedProvider {
 trait ErasedInner: Send + Sync {
     fn kind(&self) -> &'static str;
 
-    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value>;
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Result<Vec<Value>, serde_json::Error>;
 
     fn stream<'a>(
         &'a self,
@@ -138,7 +140,7 @@ where
         Provider::kind(self)
     }
 
-    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Result<Vec<Value>, serde_json::Error> {
         Provider::forge_history(self, inputs)
     }
 
@@ -190,7 +192,10 @@ impl ErasedProvider {
         self.inner.kind()
     }
 
-    pub fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+    pub fn forge_history(
+        &self,
+        inputs: &[HistoryInput<'_>],
+    ) -> Result<Vec<Value>, serde_json::Error> {
         self.inner.forge_history(inputs)
     }
 

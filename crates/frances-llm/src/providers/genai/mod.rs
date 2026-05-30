@@ -31,7 +31,7 @@ use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use serde_json::Value;
 use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_core::Truncated;
@@ -61,6 +61,12 @@ pub struct Provider {
     /// populated when this provider's `kind` is `openrouter`. Other
     /// adapters that grow their own quirks would gain sibling fields here.
     openrouter: Option<ConfigBinding<OpenRouterConfig>>,
+    /// One shared `reqwest::Client` (internally `Arc`'d) reused across every
+    /// stream this provider runs, so sequential completions to the same
+    /// endpoint reuse the connection pool + warm keep-alive instead of paying
+    /// a fresh TCP+TLS handshake per request. The per-plan auth/target
+    /// resolvers still rebuild each call — only the pool survives.
+    http: reqwest::Client,
 }
 
 #[derive(Debug, ThisError)]
@@ -83,6 +89,8 @@ pub enum Error {
         #[source]
         source: serde_json::Error,
     },
+    #[error("failed to encode chat message for the request: {0}")]
+    EncodeHistory(#[source] serde_json::Error),
     #[error("on_event callback aborted: {0}")]
     OnEvent(ErasedError),
     #[error("cancelled")]
@@ -126,16 +134,17 @@ impl provider::Provider for Provider {
             kind,
             adapter,
             openrouter,
+            http: reqwest::Client::new(),
         }))
     }
 
-    fn forge_history(&self, inputs: &[HistoryInput<'_>]) -> Vec<Value> {
+    fn forge_history(
+        &self,
+        inputs: &[HistoryInput<'_>],
+    ) -> std::result::Result<Vec<Value>, serde_json::Error> {
         inputs
             .iter()
-            .filter_map(|input| {
-                let msg = forge_one(input)?;
-                serde_json::to_value(&msg).ok()
-            })
+            .map(|input| serde_json::to_value(forge_one(input)))
             .collect()
     }
 
@@ -181,7 +190,9 @@ impl provider::Provider for Provider {
             }
         }
 
-        let forged_new = self.forge_history(req.new_inputs);
+        let forged_new = self
+            .forge_history(req.new_inputs)
+            .map_err(Error::EncodeHistory)?;
         for payload in &forged_new {
             on_event(StreamEvent::History(payload.clone()))?;
         }
@@ -200,7 +211,7 @@ impl provider::Provider for Provider {
         let chat_options = build_chat_options(&plan, req.tool_choice);
         let model_id = plan.model.id.clone();
 
-        let client = build_client(self.adapter, &plan)?;
+        let client = build_client(self.adapter, &plan, &self.http)?;
 
         debug!(
             adapter = ?self.adapter,
@@ -210,10 +221,12 @@ impl provider::Provider for Provider {
             model = %plan.model.id,
             "calling genai chat stream"
         );
-        if let Ok(s) = serde_json::to_string(&chat_req) {
-            // Cap is large enough that a typical multi-turn body fits
-            // even with several tool messages — the previous 100-char
-            // tail was useless for tool-round-trip debugging.
+        // Serialising the whole request (full history) is not free, so only
+        // pay for it when TRACE is actually live. Cap is large enough that a
+        // typical multi-turn body fits even with several tool messages.
+        if tracing::enabled!(tracing::Level::TRACE)
+            && let Ok(s) = serde_json::to_string(&chat_req)
+        {
             trace!(body = %Truncated::<20000>::new(s), "chat request body");
         }
 
@@ -283,7 +296,8 @@ impl provider::Provider for Provider {
                             &tool_calls,
                             &reasoning_text,
                             &thought_signatures,
-                        );
+                        )
+                        .map_err(Error::EncodeHistory)?;
                         on_event(StreamEvent::History(assistant))?;
                         return Ok(CompletionOutcome { text, tool_calls });
                     }
@@ -309,7 +323,8 @@ impl provider::Provider for Provider {
         }
 
         let assistant =
-            build_assistant_payload(&text, &tool_calls, &reasoning_text, &thought_signatures);
+            build_assistant_payload(&text, &tool_calls, &reasoning_text, &thought_signatures)
+                .map_err(Error::EncodeHistory)?;
         on_event(StreamEvent::History(assistant))?;
 
         Ok(CompletionOutcome { text, tool_calls })
@@ -335,7 +350,11 @@ impl Provider {
     }
 }
 
-fn build_client(adapter: AdapterKind, plan: &RequestPlan) -> std::result::Result<Client, Error> {
+fn build_client(
+    adapter: AdapterKind,
+    plan: &RequestPlan,
+    http: &reqwest::Client,
+) -> std::result::Result<Client, Error> {
     let base_url: Arc<str> = Arc::from(plan.base_url.as_str());
     let api_key = plan.api_key.clone();
     let target_resolver = ServiceTargetResolver::from_resolver_fn(
@@ -350,6 +369,7 @@ fn build_client(adapter: AdapterKind, plan: &RequestPlan) -> std::result::Result
         },
     );
     let client = Client::builder()
+        .with_reqwest(http.clone())
         .with_adapter_kind(adapter)
         .with_auth_resolver(auth_resolver)
         .with_service_target_resolver(target_resolver)
@@ -448,15 +468,12 @@ fn map_usage(u: &genai::chat::Usage) -> Usage {
     }
 }
 
-/// Map one `HistoryInput` primitive to a `ChatMessage`. Returns `None`
-/// to skip the entry (currently always returns Some — kept as an
-/// Option so a future ChatMessage construction failure can degrade
-/// gracefully rather than panic).
-fn forge_one(input: &HistoryInput<'_>) -> Option<ChatMessage> {
+/// Map one `HistoryInput` primitive to a `ChatMessage`.
+fn forge_one(input: &HistoryInput<'_>) -> ChatMessage {
     match input {
-        HistoryInput::System { text } => Some(ChatMessage::system(text.to_string())),
-        HistoryInput::User { text } => Some(ChatMessage::user(text.to_string())),
-        HistoryInput::Assistant { text } => Some(ChatMessage::assistant(text.to_string())),
+        HistoryInput::System { text } => ChatMessage::system(text.to_string()),
+        HistoryInput::User { text } => ChatMessage::user(text.to_string()),
+        HistoryInput::Assistant { text } => ChatMessage::assistant(text.to_string()),
         HistoryInput::ToolCall {
             id,
             name,
@@ -468,10 +485,7 @@ fn forge_one(input: &HistoryInput<'_>) -> Option<ChatMessage> {
                 fn_arguments: (*arguments).clone(),
                 thought_signatures: None,
             };
-            Some(ChatMessage::assistant_tool_calls_with_thoughts(
-                vec![call],
-                Vec::new(),
-            ))
+            ChatMessage::assistant_tool_calls_with_thoughts(vec![call], Vec::new())
         }
         HistoryInput::ToolResult {
             call_id,
@@ -479,9 +493,9 @@ fn forge_one(input: &HistoryInput<'_>) -> Option<ChatMessage> {
             is_error: _,
         } => {
             let response = ToolResponse::new(call_id.to_string(), content.to_string());
-            Some(ChatMessage::tool(MessageContent::from_parts(vec![
-                ContentPart::ToolResponse(response),
-            ])))
+            ChatMessage::tool(MessageContent::from_parts(vec![ContentPart::ToolResponse(
+                response,
+            )]))
         }
     }
 }
@@ -494,7 +508,7 @@ fn build_assistant_payload(
     tool_calls: &[ToolCall],
     reasoning_text: &str,
     thought_signatures: &[String],
-) -> Value {
+) -> std::result::Result<Value, serde_json::Error> {
     let mut parts: Vec<ContentPart> = Vec::new();
     for sig in thought_signatures {
         parts.push(ContentPart::ThoughtSignature(sig.clone()));
@@ -523,10 +537,7 @@ fn build_assistant_payload(
         content,
         options: None,
     };
-    serde_json::to_value(&msg).unwrap_or_else(|err| {
-        warn!(?err, "assistant ChatMessage failed to serialise");
-        Value::Null
-    })
+    serde_json::to_value(&msg)
 }
 
 #[cfg(test)]
@@ -536,27 +547,22 @@ mod tests {
 
     #[test]
     fn forge_user_round_trips_through_chat_message() {
-        let v = forge_one(&HistoryInput::User { text: "hi" })
-            .map(|m| serde_json::to_value(m).unwrap())
-            .unwrap();
+        let v = serde_json::to_value(forge_one(&HistoryInput::User { text: "hi" })).unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::User));
     }
 
     #[test]
     fn forge_system_yields_system_role() {
-        let v = forge_one(&HistoryInput::System { text: "sys" })
-            .map(|m| serde_json::to_value(m).unwrap())
-            .unwrap();
+        let v = serde_json::to_value(forge_one(&HistoryInput::System { text: "sys" })).unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::System));
     }
 
     #[test]
     fn forge_assistant_yields_assistant_role() {
-        let v = forge_one(&HistoryInput::Assistant { text: "hello" })
-            .map(|m| serde_json::to_value(m).unwrap())
-            .unwrap();
+        let v =
+            serde_json::to_value(forge_one(&HistoryInput::Assistant { text: "hello" })).unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::Assistant));
     }
@@ -564,12 +570,11 @@ mod tests {
     #[test]
     fn forge_tool_call_round_trips_arguments() {
         let args = json!({"path": "a.txt"});
-        let v = forge_one(&HistoryInput::ToolCall {
+        let v = serde_json::to_value(forge_one(&HistoryInput::ToolCall {
             id: "call_1",
             name: "file_read",
             arguments: &args,
-        })
-        .map(|m| serde_json::to_value(m).unwrap())
+        }))
         .unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::Assistant));
@@ -577,12 +582,11 @@ mod tests {
 
     #[test]
     fn forge_tool_result_yields_tool_role() {
-        let v = forge_one(&HistoryInput::ToolResult {
+        let v = serde_json::to_value(forge_one(&HistoryInput::ToolResult {
             call_id: "call_1",
             content: "ok",
             is_error: false,
-        })
-        .map(|m| serde_json::to_value(m).unwrap())
+        }))
         .unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::Tool));
@@ -598,7 +602,8 @@ mod tests {
             name: "edit".into(),
             arguments: json!({"path": "a.txt"}),
         }];
-        let payload = build_assistant_payload("answer", &calls, "thought", &[]);
+        let payload = build_assistant_payload("answer", &calls, "thought", &[])
+            .expect("assistant payload must serialise");
         let msg: ChatMessage = serde_json::from_value(payload)
             .expect("History payload must deserialise as ChatMessage");
         assert!(matches!(msg.role, ChatRole::Assistant));
