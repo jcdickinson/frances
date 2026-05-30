@@ -23,13 +23,6 @@ pub enum HistoryError {
     },
     #[error("chat_session {0} not found")]
     ChatSessionNotFound(ChatSessionId),
-    #[error("primitive of type {kind:?} missing field {field:?}")]
-    PrimitiveMissingField {
-        kind: &'static str,
-        field: &'static str,
-    },
-    #[error("unknown primitive type {0:?}")]
-    UnknownPrimitiveType(String),
     #[error("backend: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }

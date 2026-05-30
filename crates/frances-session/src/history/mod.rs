@@ -104,16 +104,3 @@ pub(super) async fn next_seq(
         .expect("COALESCE(MAX(seq), -1) + 1 always returns one row");
     row.get::<i64>(0).map_err(turso_err)
 }
-
-pub(super) async fn last_insert_rowid(conn: &turso::Connection) -> Result<i64, HistoryError> {
-    let mut rows = conn
-        .query("SELECT last_insert_rowid()", ())
-        .await
-        .map_err(turso_err)?;
-    let row = rows
-        .next()
-        .await
-        .map_err(turso_err)?
-        .expect("last_insert_rowid() always returns one row");
-    row.get::<i64>(0).map_err(turso_err)
-}

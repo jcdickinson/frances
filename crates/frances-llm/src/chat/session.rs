@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use frances_models_llm::chat::{
-    ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryError,
-    ModelIntents, OwnedHistoryInput,
+    ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryBatch,
+    HistoryError, ModelIntents, OwnedHistoryInput,
 };
 use frances_models_llm::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
 use parking_lot::Mutex;
@@ -171,9 +171,11 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         // store is consistent before the network call. Skipped for
         // ephemeral sessions.
         if let Some(id) = id {
+            let mut batch = HistoryBatch::default();
             for input in &drained {
-                store.append_primitive(id, input).await?;
+                batch.primitive(input)?;
             }
+            store.flush(id, batch).await?;
         }
 
         let model_name = self.inner.manager.resolve_name(&self.inner.model_intents);
@@ -224,20 +226,23 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         frances_models_llm::tool_args::annotate(&mut completion.tool_calls, &tools);
 
         if let Some(id) = id {
-            store
-                .append_history(id, provider_kind, &provider_id, &emitted_payloads)
-                .await?;
-
+            let mut batch = HistoryBatch::default();
+            for payload in &emitted_payloads {
+                batch.history(payload, provider_kind, &provider_id)?;
+            }
             if !completion.text.is_empty() {
-                store
-                    .append_primitive_assistant(id, &completion.text)
-                    .await?;
+                batch.primitive(&OwnedHistoryInput::Assistant {
+                    text: completion.text.clone(),
+                })?;
             }
             for call in &completion.tool_calls {
-                store
-                    .append_primitive_tool_call(id, &call.id, &call.name, &call.arguments)
-                    .await?;
+                batch.primitive(&OwnedHistoryInput::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    arguments: call.arguments.clone(),
+                })?;
             }
+            store.flush(id, batch).await?;
         }
 
         Ok(completion)
@@ -293,9 +298,9 @@ mod tests {
     use async_trait::async_trait;
     use frances_config::{ConfigHandle, ConfigProvider, InMemoryProvider};
     use frances_models_llm::chat::{
-        ChatSession as ChatSessionTrait, ChatSessionBuilder, ChatSessionId,
-        ChatSessionManager as ChatSessionManagerTrait, ChatSessionRow, HistoryError,
-        OwnedHistoryInput, RowId,
+        BatchRow, ChatSession as ChatSessionTrait, ChatSessionBuilder, ChatSessionId,
+        ChatSessionManager as ChatSessionManagerTrait, ChatSessionRow, HistoryBatch, HistoryError,
+        OwnedHistoryInput,
     };
     use frances_models_llm::config::ModelConfig;
     use frances_models_llm::{CompletionOutcome, HistoryInput, StreamEvent, ToolCall};
@@ -314,7 +319,6 @@ mod tests {
     #[derive(Clone, Default)]
     struct CountingStore {
         next_id: Arc<AtomicI64>,
-        next_seq: Arc<AtomicI64>,
         create_chat_session: Arc<AtomicUsize>,
         loaded_history: Arc<AtomicUsize>,
         append_history: Arc<AtomicUsize>,
@@ -323,12 +327,6 @@ mod tests {
         append_primitive_assistant: Arc<AtomicUsize>,
         append_primitive_tool_call: Arc<AtomicUsize>,
         append_primitive_tool_result: Arc<AtomicUsize>,
-    }
-
-    impl CountingStore {
-        fn next_row(&self) -> RowId {
-            RowId(self.next_seq.fetch_add(1, Ordering::Relaxed))
-        }
     }
 
     #[async_trait]
@@ -368,56 +366,27 @@ mod tests {
             Ok(())
         }
 
-        async fn append_primitive_system(
+        async fn flush(
             &self,
             _session: ChatSessionId,
-            _text: &str,
-        ) -> Result<RowId, HistoryError> {
-            self.append_primitive_system.fetch_add(1, Ordering::Relaxed);
-            Ok(self.next_row())
-        }
-
-        async fn append_primitive_user(
-            &self,
-            _session: ChatSessionId,
-            _text: &str,
-        ) -> Result<RowId, HistoryError> {
-            self.append_primitive_user.fetch_add(1, Ordering::Relaxed);
-            Ok(self.next_row())
-        }
-
-        async fn append_primitive_assistant(
-            &self,
-            _session: ChatSessionId,
-            _text: &str,
-        ) -> Result<RowId, HistoryError> {
-            self.append_primitive_assistant
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(self.next_row())
-        }
-
-        async fn append_primitive_tool_call(
-            &self,
-            _session: ChatSessionId,
-            _id: &str,
-            _name: &str,
-            _arguments: &Value,
-        ) -> Result<RowId, HistoryError> {
-            self.append_primitive_tool_call
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(self.next_row())
-        }
-
-        async fn append_primitive_tool_result(
-            &self,
-            _session: ChatSessionId,
-            _call_id: &str,
-            _content: &str,
-            _is_error: bool,
-        ) -> Result<RowId, HistoryError> {
-            self.append_primitive_tool_result
-                .fetch_add(1, Ordering::Relaxed);
-            Ok(self.next_row())
+            batch: HistoryBatch,
+        ) -> Result<(), HistoryError> {
+            for row in &batch.rows {
+                let counter = match row {
+                    BatchRow::History { .. } => &self.append_history,
+                    BatchRow::Primitive { ty: "system", .. } => &self.append_primitive_system,
+                    BatchRow::Primitive { ty: "user", .. } => &self.append_primitive_user,
+                    BatchRow::Primitive {
+                        ty: "assistant", ..
+                    } => &self.append_primitive_assistant,
+                    BatchRow::Primitive {
+                        ty: "tool_call", ..
+                    } => &self.append_primitive_tool_call,
+                    BatchRow::Primitive { .. } => &self.append_primitive_tool_result,
+                };
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
         }
     }
 
@@ -472,6 +441,21 @@ mod tests {
     fn assistant_script(text: &str) -> StubScript {
         StubScript {
             events: vec![StreamEvent::TextDelta(text.to_owned())],
+            outcome: CompletionOutcome {
+                text: text.to_owned(),
+                tool_calls: Vec::new(),
+            },
+        }
+    }
+
+    /// Like [`assistant_script`] but also emits one forged-history payload,
+    /// so the flush writes a `history` row (exercising that path).
+    fn assistant_script_with_history(text: &str) -> StubScript {
+        StubScript {
+            events: vec![
+                StreamEvent::History(json!({ "role": "assistant", "content": text })),
+                StreamEvent::TextDelta(text.to_owned()),
+            ],
             outcome: CompletionOutcome {
                 text: text.to_owned(),
                 tool_calls: Vec::new(),
@@ -574,8 +558,8 @@ mod tests {
     #[tokio::test]
     async fn persisted_session_writes_each_primitive() {
         let (manager, store, stub) = build_manager().await;
-        stub.push_script(assistant_script("hello"));
-        stub.push_script(assistant_script("again"));
+        stub.push_script(assistant_script_with_history("hello"));
+        stub.push_script(assistant_script_with_history("again"));
 
         let session = manager.create(ChatSessionBuilder::new());
         assert!(!session.is_ephemeral());

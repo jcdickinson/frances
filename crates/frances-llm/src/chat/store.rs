@@ -3,9 +3,7 @@ use std::borrow::Cow;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use frances_models_llm::chat::{
-    ChatSessionId, ChatSessionRow, HistoryError, OwnedHistoryInput, RowId,
-};
+use frances_models_llm::chat::{ChatSessionId, ChatSessionRow, HistoryBatch, HistoryError, RowId};
 
 /// Persistence boundary for chat sessions. The session-runtime impls this on its
 /// turso-backed store; tests can mock it.
@@ -29,39 +27,10 @@ pub trait HistoryStore: Send + Sync + 'static {
         payloads: &[Value],
     ) -> Result<(), HistoryError>;
 
-    async fn append_primitive_system(
-        &self,
-        session: ChatSessionId,
-        text: &str,
-    ) -> Result<RowId, HistoryError>;
-
-    async fn append_primitive_user(
-        &self,
-        session: ChatSessionId,
-        text: &str,
-    ) -> Result<RowId, HistoryError>;
-
-    async fn append_primitive_assistant(
-        &self,
-        session: ChatSessionId,
-        text: &str,
-    ) -> Result<RowId, HistoryError>;
-
-    async fn append_primitive_tool_call(
-        &self,
-        session: ChatSessionId,
-        id: &str,
-        name: &str,
-        arguments: &Value,
-    ) -> Result<RowId, HistoryError>;
-
-    async fn append_primitive_tool_result(
-        &self,
-        session: ChatSessionId,
-        call_id: &str,
-        content: &str,
-        is_error: bool,
-    ) -> Result<RowId, HistoryError>;
+    /// Persist a whole turn's worth of primitive and forged-history rows
+    /// in one transaction: a single sequence read, then one insert per
+    /// [`BatchRow`]. No-op on an empty batch.
+    async fn flush(&self, session: ChatSessionId, batch: HistoryBatch) -> Result<(), HistoryError>;
 
     /// Highest persisted row id for `session` (`RowId(0)` when empty).
     /// Used as a rollback marker: rows appended after this id can be
@@ -77,35 +46,5 @@ pub trait HistoryStore: Send + Sync + 'static {
     /// Default is a no-op for stores that don't support truncation.
     async fn rollback(&self, _session: ChatSessionId, _to: RowId) -> Result<(), HistoryError> {
         Ok(())
-    }
-
-    async fn append_primitive(
-        &self,
-        session: ChatSessionId,
-        input: &OwnedHistoryInput,
-    ) -> Result<RowId, HistoryError> {
-        match input {
-            OwnedHistoryInput::System { text } => self.append_primitive_system(session, text).await,
-            OwnedHistoryInput::User { text } => self.append_primitive_user(session, text).await,
-            OwnedHistoryInput::Assistant { text } => {
-                self.append_primitive_assistant(session, text).await
-            }
-            OwnedHistoryInput::ToolCall {
-                id,
-                name,
-                arguments,
-            } => {
-                self.append_primitive_tool_call(session, id, name, arguments)
-                    .await
-            }
-            OwnedHistoryInput::ToolResult {
-                call_id,
-                content,
-                is_error,
-            } => {
-                self.append_primitive_tool_result(session, call_id, content, *is_error)
-                    .await
-            }
-        }
     }
 }

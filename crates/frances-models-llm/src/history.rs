@@ -3,7 +3,10 @@
 //! and the owned [`OwnedHistoryInput`] mirror used to carry persisted rows
 //! across `.await` points and storage boundaries.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::chat::HistoryError;
 
 /// Primitive content the provider may need to forge into wire shape — both
 /// inline during `stream` (for the just-arrived turn delta) and in batch
@@ -36,7 +39,13 @@ pub enum HistoryInput<'a> {
 /// SQL row buffer or sit in a queue across `.await`. Round-trips with the
 /// borrowed form via [`as_borrowed`](Self::as_borrowed) /
 /// [`from_borrowed`](Self::from_borrowed).
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The `#[serde(tag = "kind")]` shape is the on-disk primitive payload:
+/// one `to_value`/`from_value` round-trips every variant, and
+/// [`kind`](Self::kind) yields the same tag for the indexable `type`
+/// column.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum OwnedHistoryInput {
     System {
         text: String,
@@ -120,5 +129,81 @@ impl OwnedHistoryInput {
                 is_error: *is_error,
             },
         }
+    }
+
+    /// The serde tag for this variant, mirrored into the indexable
+    /// `type` column. Stays in lockstep with `#[serde(rename_all =
+    /// "snake_case")]` by construction.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::System { .. } => "system",
+            Self::User { .. } => "user",
+            Self::Assistant { .. } => "assistant",
+            Self::ToolCall { .. } => "tool_call",
+            Self::ToolResult { .. } => "tool_result",
+        }
+    }
+}
+
+/// One row queued for a [`HistoryBatch`] flush. Primitive and forged-history
+/// rows share the `chat_messages` table and one `seq` sequence, so they
+/// buffer together and flush in a single transaction.
+pub enum BatchRow {
+    /// A conversation primitive. `ty` is [`OwnedHistoryInput::kind`];
+    /// `json` is the serialized `OwnedHistoryInput`.
+    Primitive { ty: &'static str, json: String },
+    /// A provider-forged wire payload, tagged with the provider kind and
+    /// id that produced it.
+    History {
+        json: String,
+        kind: String,
+        provider_id: String,
+    },
+}
+
+/// In-memory accumulator for a turn's history writes. Each `primitive` /
+/// `history` call serializes eagerly (so encode errors surface at build
+/// time) and appends a [`BatchRow`]; the store flushes the whole batch
+/// under one transaction with a single sequence read.
+#[derive(Default)]
+pub struct HistoryBatch {
+    pub rows: Vec<BatchRow>,
+}
+
+impl HistoryBatch {
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Queue a conversation primitive.
+    pub fn primitive(&mut self, input: &OwnedHistoryInput) -> Result<(), HistoryError> {
+        let json = serde_json::to_string(input).map_err(|source| HistoryError::Encode {
+            what: "primitive",
+            source,
+        })?;
+        self.rows.push(BatchRow::Primitive {
+            ty: input.kind(),
+            json,
+        });
+        Ok(())
+    }
+
+    /// Queue a provider-forged history payload.
+    pub fn history(
+        &mut self,
+        payload: &Value,
+        kind: &str,
+        provider_id: &str,
+    ) -> Result<(), HistoryError> {
+        let json = serde_json::to_string(payload).map_err(|source| HistoryError::Encode {
+            what: "history payload",
+            source,
+        })?;
+        self.rows.push(BatchRow::History {
+            json,
+            kind: kind.to_owned(),
+            provider_id: provider_id.to_owned(),
+        });
+        Ok(())
     }
 }

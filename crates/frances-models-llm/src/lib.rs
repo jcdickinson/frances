@@ -22,5 +22,5 @@ pub use config::{
     AuthCommand, AuthMethod, ModelConfig, OpenRouterConfig, OpenRouterModelConfig, ProviderConfig,
 };
 pub use erased::{ChunkAbort, ErasedError, ErasedResult};
-pub use history::{HistoryInput, OwnedHistoryInput};
+pub use history::{BatchRow, HistoryBatch, HistoryInput, OwnedHistoryInput};
 pub use tool::{ToolChoice, ToolDef, ToolFunction};
