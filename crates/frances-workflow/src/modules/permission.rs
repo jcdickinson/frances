@@ -28,11 +28,12 @@ use std::sync::atomic::Ordering;
 
 use frances_models_llm::ToolCall;
 use rquickjs::promise::Promised;
-use rquickjs::{Ctx, Exception, Function, IntoJs, Object, Result as JsResult, Value};
+use rquickjs::{Ctx, Function, IntoJs, Object, Result as JsResult, Value};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
+use super::throw_js as throw;
 use crate::permission::{PermissionRequest, PermissionResponse};
 
 /// Build the `_approve` primitive that `frances:v1/approval` re-wraps.
@@ -207,11 +208,4 @@ fn set_optional_string<'js>(
         None => obj.set(key, Value::new_null(ctx.clone()))?,
     }
     Ok(())
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
-    }
 }

@@ -17,8 +17,9 @@
 //! Compilation is a per-call cost (no caching). jq filters are tiny and
 //! jaq's compiler is fast, so this hasn't been worth the complexity yet.
 
-use rquickjs::{Ctx, Exception, Function, Result as JsResult};
+use rquickjs::{Ctx, Function, Result as JsResult};
 
+use super::throw_js as throw;
 use jaq_core::load::{Arena, File, Loader};
 use jaq_core::{Compiler, Ctx as JaqCtx, Vars, data, unwrap_valr};
 use jaq_json::Val;
@@ -115,13 +116,6 @@ fn parse_bindings(bindings_json: &str) -> Result<Vec<(String, Val)>, String> {
         out.push((name, val));
     }
     Ok(out)
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
-    }
 }
 
 #[cfg(test)]

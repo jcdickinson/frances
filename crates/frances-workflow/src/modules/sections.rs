@@ -33,10 +33,11 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::{get_or_undefined, throw_js as throw_err, throw_js_type as throw_type};
 use frances_edit::DiffOp;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, Opt, This};
-use rquickjs::{Class, Ctx, Exception, Function, JsLifetime, Object, Result as JsResult, Value};
+use rquickjs::{Class, Ctx, Function, JsLifetime, Object, Result as JsResult, Value};
 
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
@@ -1157,9 +1158,7 @@ fn parse_shell_output_arg<'js>(
             "new ShellOutputSection: expected { cmd: string, content?: string, closed?: bool }",
         );
     };
-    let cmd_val: Value<'js> = obj
-        .get("cmd")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let cmd_val: Value<'js> = get_or_undefined(ctx, obj, "cmd");
     let cmd = if let Some(s) = cmd_val.as_string() {
         s.to_string()
             .map_err(|_| throw_err(ctx, "new ShellOutputSection: `cmd` must be UTF-8"))?
@@ -1169,9 +1168,7 @@ fn parse_shell_output_arg<'js>(
             "new ShellOutputSection: `cmd` is required and must be a string",
         ));
     };
-    let content_val: Value<'js> = obj
-        .get("content")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let content_val: Value<'js> = get_or_undefined(ctx, obj, "content");
     let content = if content_val.is_undefined() || content_val.is_null() {
         String::new()
     } else if let Some(s) = content_val.as_string() {
@@ -1218,9 +1215,7 @@ fn parse_markdown_arg<'js>(
             "new MarkdownSection: expected { content?: string, source?: \"user\"|\"assistant\"|\"internal\" } or no argument",
         ));
     };
-    let content_val: Value<'js> = obj
-        .get("content")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let content_val: Value<'js> = get_or_undefined(ctx, obj, "content");
     let content = if content_val.is_undefined() || content_val.is_null() {
         None
     } else if let Some(s) = content_val.as_string() {
@@ -1234,9 +1229,7 @@ fn parse_markdown_arg<'js>(
             "new MarkdownSection: `content` must be a string when present",
         ));
     };
-    let source_val: Value<'js> = obj
-        .get("source")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let source_val: Value<'js> = get_or_undefined(ctx, obj, "source");
     let source = if source_val.is_undefined() || source_val.is_null() {
         Source::Internal
     } else if let Some(s) = source_val.as_string() {
@@ -1274,9 +1267,7 @@ fn parse_optional_bool<'js>(
     key: &str,
     field_label: &str,
 ) -> JsResult<bool> {
-    let val: Value<'js> = obj
-        .get(key)
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let val: Value<'js> = get_or_undefined(ctx, obj, key);
     if val.is_undefined() || val.is_null() {
         return Ok(false);
     }
@@ -1286,17 +1277,4 @@ fn parse_optional_bool<'js>(
             &format!("{field_label} must be a boolean when present"),
         )
     })
-}
-
-fn throw_type<'js, T>(ctx: &Ctx<'js>, message: &str) -> JsResult<T> {
-    Err(throw_err(ctx, message))
-}
-
-fn throw_err<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    // Build a JS Error and throw it via rquickjs::Error::Exception.
-    // `Exception::from_message` wraps the string with the right prototype.
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
-    }
 }

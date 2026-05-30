@@ -32,12 +32,11 @@ use ignore::overrides::OverrideBuilder;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
-use rquickjs::{
-    Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
-};
+use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
 
+use super::throw_js as throw;
 use crate::deps::{EditorFactory, WorkflowDeps};
 
 /// Hard cap on result entries. Workers atomically reserve a slot before
@@ -520,13 +519,6 @@ impl<'js> IntoJs<'js> for SearchStringResult {
             Ok(s) => s.into_js(ctx),
             Err(msg) => Err(throw(ctx, &msg)),
         }
-    }
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
     }
 }
 

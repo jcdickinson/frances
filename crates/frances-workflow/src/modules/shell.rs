@@ -37,20 +37,21 @@
 //! layer a Timer + Promise.race on top.
 
 use std::fs;
-use std::io::Write;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
-use rquickjs::{
-    Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
-};
+use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use frances_shell::{QuietReason, ReadEvent, RunOutcome, Shell, ShellOptions, WaitOpts};
+use frances_shell::{
+    QuietReason, ReadEvent, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts,
+};
 
+use super::throw_js as throw;
 use crate::deps::WorkflowDeps;
 use crate::io::{WorkflowIo, WorkflowShell};
 
@@ -242,19 +243,68 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
     }
 }
 
+/// Failures from the shell bridge's `*_inner` ops. Typed to the `IntoJs`
+/// boundary, where it renders via `Display` into a JS exception.
+#[derive(Debug, thiserror::Error)]
+enum ShellToolError {
+    #[error("shell is closed")]
+    Closed,
+    #[error("shell is busy; call keepWaiting or kill before issuing a new command")]
+    Busy,
+    #[error("no command in flight; call runOnce first")]
+    NoCommandInFlight,
+    #[error("shell handle gone")]
+    HandleGone,
+    #[error("spawn bash: {0}")]
+    Spawn(#[source] ShellError),
+    #[error("run: {0}")]
+    Run(#[source] ShellError),
+    #[error("keep_waiting: {0}")]
+    KeepWaiting(#[source] ShellError),
+    #[error("kill: {0}")]
+    Kill(#[source] ShellError),
+    #[error("tempfile: {0}")]
+    Tempfile(#[source] io::Error),
+    #[error("write tempfile: {0}")]
+    WriteTempfile(#[source] io::Error),
+    #[error("flush tempfile: {0}")]
+    FlushTempfile(#[source] io::Error),
+    #[error("read captured tempfile: {0}")]
+    ReadCaptured(#[source] io::Error),
+    #[error("{action} {name}: exit {exit}\n{output}")]
+    SetVarFailed {
+        action: &'static str,
+        name: String,
+        exit: i32,
+        output: String,
+    },
+    #[error("capture {name}: unset or expansion failed (exit {exit})\n{output}")]
+    CaptureFailed {
+        name: String,
+        exit: i32,
+        output: String,
+    },
+    #[error("command went quiet (export/capture expect immediate Done):\n{output}")]
+    WentQuiet { output: String },
+    #[error("shell died:\n{output}")]
+    Died { output: String },
+    #[error("empty bash name")]
+    EmptyBashName,
+    #[error("invalid bash name: {0:?}")]
+    InvalidBashName(String),
+}
+
 async fn run_once_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: String,
-) -> Result<Outcome, String> {
+) -> Result<Outcome, ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
-        return Err("shell is closed".to_owned());
+        return Err(ShellToolError::Closed);
     }
     if guard.running {
-        return Err(
-            "shell is busy; call keepWaiting or kill before issuing a new command".to_owned(),
-        );
+        return Err(ShellToolError::Busy);
     }
     ensure_shell(&mut guard, factory).await?;
     let outcome = {
@@ -262,7 +312,7 @@ async fn run_once_inner<F: WorkflowShell>(
         shell
             .run(&cmd, WaitOpts::default())
             .await
-            .map_err(|e| format!("run: {e}"))?
+            .map_err(ShellToolError::Run)?
     };
     Ok(absorb_outcome(&mut guard, outcome))
 }
@@ -273,14 +323,14 @@ async fn run_once_inner<F: WorkflowShell>(
 async fn ensure_shell<F: WorkflowShell>(
     guard: &mut tokio::sync::MutexGuard<'_, ShellState>,
     factory: &F,
-) -> Result<(), String> {
+) -> Result<(), ShellToolError> {
     if guard.shell.is_some() {
         return Ok(());
     }
     let mut shell = factory
         .spawn(ShellOptions::default())
         .await
-        .map_err(|e| format!("spawn bash: {e}"))?;
+        .map_err(ShellToolError::Spawn)?;
     if let Some(tx) = guard.event_tx.as_ref() {
         shell.set_output_sink(Some(tx.clone()));
     }
@@ -288,40 +338,36 @@ async fn ensure_shell<F: WorkflowShell>(
     Ok(())
 }
 
-async fn keep_waiting_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<Outcome, String> {
+async fn keep_waiting_inner(
+    state: &Arc<AsyncMutex<ShellState>>,
+) -> Result<Outcome, ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
-        return Err("shell is closed".to_owned());
+        return Err(ShellToolError::Closed);
     }
     if !guard.running {
-        return Err("no command in flight; call runOnce first".to_owned());
+        return Err(ShellToolError::NoCommandInFlight);
     }
     let outcome = {
-        let shell = guard
-            .shell
-            .as_mut()
-            .ok_or_else(|| "shell handle gone".to_owned())?;
+        let shell = guard.shell.as_mut().ok_or(ShellToolError::HandleGone)?;
         shell
             .keep_waiting(WaitOpts::default())
             .await
-            .map_err(|e| format!("keep_waiting: {e}"))?
+            .map_err(ShellToolError::KeepWaiting)?
     };
     Ok(absorb_outcome(&mut guard, outcome))
 }
 
-async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), String> {
+async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
-        return Err("shell is closed".to_owned());
+        return Err(ShellToolError::Closed);
     }
     if !guard.running {
         return Ok(());
     }
-    let shell = guard
-        .shell
-        .as_mut()
-        .ok_or_else(|| "shell handle gone".to_owned())?;
-    shell.kill_running().await.map_err(|e| format!("kill: {e}"))
+    let shell = guard.shell.as_mut().ok_or(ShellToolError::HandleGone)?;
+    shell.kill_running().await.map_err(ShellToolError::Kill)
 }
 
 /// Bridge a Frances variable into bash via the `name=$(cat tmpfile)`
@@ -337,12 +383,12 @@ async fn set_var_inner<F: WorkflowShell>(
     name: String,
     value: String,
     exported: bool,
-) -> Result<(), String> {
+) -> Result<(), ShellToolError> {
     validate_bash_name(&name)?;
-    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    let mut tmp = tempfile::NamedTempFile::new().map_err(ShellToolError::Tempfile)?;
     tmp.write_all(value.as_bytes())
-        .map_err(|e| format!("write tempfile: {e}"))?;
-    tmp.flush().map_err(|e| format!("flush tempfile: {e}"))?;
+        .map_err(ShellToolError::WriteTempfile)?;
+    tmp.flush().map_err(ShellToolError::FlushTempfile)?;
     let prefix = if exported { "export " } else { "" };
     let cmd = format!(
         "{prefix}{name}=$(cat {})",
@@ -351,7 +397,12 @@ async fn set_var_inner<F: WorkflowShell>(
     let (exit, output) = run_to_done(factory, state, &cmd).await?;
     if exit != 0 {
         let action = if exported { "export" } else { "set" };
-        return Err(format!("{action} {name}: exit {exit}\n{output}"));
+        return Err(ShellToolError::SetVarFailed {
+            action,
+            name,
+            exit,
+            output,
+        });
     }
     // `tmp` drops here — file is removed.
     drop(tmp);
@@ -369,21 +420,18 @@ async fn capture_var_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     name: String,
-) -> Result<String, String> {
+) -> Result<String, ShellToolError> {
     validate_bash_name(&name)?;
-    let tmp = tempfile::NamedTempFile::new().map_err(|e| format!("tempfile: {e}"))?;
+    let tmp = tempfile::NamedTempFile::new().map_err(ShellToolError::Tempfile)?;
     let cmd = format!(
         "( set -u; printf '%s' \"${name}\" > {} )",
         shell_quote(tmp.path().to_string_lossy().as_ref()),
     );
     let (exit, output) = run_to_done(factory, state, &cmd).await?;
     if exit != 0 {
-        return Err(format!(
-            "capture {name}: unset or expansion failed (exit {exit})\n{output}"
-        ));
+        return Err(ShellToolError::CaptureFailed { name, exit, output });
     }
-    let captured =
-        fs::read_to_string(tmp.path()).map_err(|e| format!("read captured tempfile: {e}"))?;
+    let captured = fs::read_to_string(tmp.path()).map_err(ShellToolError::ReadCaptured)?;
     drop(tmp);
     Ok(captured)
 }
@@ -397,15 +445,13 @@ async fn run_to_done<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: &str,
-) -> Result<(i32, String), String> {
+) -> Result<(i32, String), ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
-        return Err("shell is closed".to_owned());
+        return Err(ShellToolError::Closed);
     }
     if guard.running {
-        return Err(
-            "shell is busy; call keepWaiting or kill before issuing a new command".to_owned(),
-        );
+        return Err(ShellToolError::Busy);
     }
     ensure_shell(&mut guard, factory).await?;
     let outcome = {
@@ -413,30 +459,28 @@ async fn run_to_done<F: WorkflowShell>(
         shell
             .run(cmd, WaitOpts::default())
             .await
-            .map_err(|e| format!("run: {e}"))?
+            .map_err(ShellToolError::Run)?
     };
     let absorbed = absorb_outcome(&mut guard, outcome);
     match absorbed {
         Outcome::Done { exit_code, output } => Ok((exit_code, output)),
-        Outcome::Quiet { output, .. } => Err(format!(
-            "command went quiet (export/capture expect immediate Done):\n{output}"
-        )),
-        Outcome::Dead { output } => Err(format!("shell died:\n{output}")),
+        Outcome::Quiet { output, .. } => Err(ShellToolError::WentQuiet { output }),
+        Outcome::Dead { output } => Err(ShellToolError::Died { output }),
     }
 }
 
 /// Reject anything that isn't a plain bash identifier. The name lands
 /// inside `export <name>=…` and `"$<name>"` unquoted, so this is the
 /// single trust boundary against shell injection.
-fn validate_bash_name(name: &str) -> Result<(), String> {
+fn validate_bash_name(name: &str) -> Result<(), ShellToolError> {
     let mut chars = name.chars();
-    let first = chars.next().ok_or_else(|| "empty bash name".to_owned())?;
+    let first = chars.next().ok_or(ShellToolError::EmptyBashName)?;
     if !(first.is_ascii_alphabetic() || first == '_') {
-        return Err(format!("invalid bash name: {name:?}"));
+        return Err(ShellToolError::InvalidBashName(name.to_owned()));
     }
     for c in chars {
         if !(c.is_ascii_alphanumeric() || c == '_') {
-            return Err(format!("invalid bash name: {name:?}"));
+            return Err(ShellToolError::InvalidBashName(name.to_owned()));
         }
     }
     Ok(())
@@ -520,35 +564,35 @@ impl<'js> IntoJs<'js> for Outcome {
 
 /// Promise-payload that resolves to the outcome or rejects with the
 /// error string.
-struct ShellOpResult(Result<Outcome, String>);
+struct ShellOpResult(Result<Outcome, ShellToolError>);
 
 impl<'js> IntoJs<'js> for ShellOpResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(outcome) => outcome.into_js(ctx),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
 
-struct ShellUnitResult(Result<(), String>);
+struct ShellUnitResult(Result<(), ShellToolError>);
 
 impl<'js> IntoJs<'js> for ShellUnitResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(()) => Ok(Value::new_undefined(ctx.clone())),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
 
-struct ShellStringResult(Result<String, String>);
+struct ShellStringResult(Result<String, ShellToolError>);
 
 impl<'js> IntoJs<'js> for ShellStringResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(s) => s.into_js(ctx),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
@@ -593,12 +637,5 @@ impl<'js> IntoJs<'js> for NextEventResult {
             }
         }
         Ok(obj.into_value())
-    }
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
     }
 }

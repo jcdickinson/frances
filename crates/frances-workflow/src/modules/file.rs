@@ -26,20 +26,20 @@
 
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
-use rquickjs::{
-    Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
-};
+use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
 use twox_hash::XxHash3_64;
 
-use frances_edit::{DiffOp, DiffRender, LlmEdit, LoopKey};
+use frances_core::resolve_relative;
+use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey};
 
+use super::throw_js as throw;
 use crate::deps::{EditorFactory, WorkflowDeps};
 use crate::io::WorkflowFs;
 
@@ -123,11 +123,13 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                                         )
                                         .await
                                     } else {
-                                        Err("parse readFile args: invalid arg shape".to_owned())
+                                        Err(FileToolError::DecodeArgs(
+                                            "parse readFile args: invalid arg shape".to_owned(),
+                                        ))
                                     }
                                 }
                             },
-                            Err(msg) => Err(msg),
+                            Err(msg) => Err(FileToolError::DecodeArgs(msg)),
                         };
                         EditorStringResult(result)
                     }))
@@ -158,7 +160,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
                             Ok(v) => edit_inner(&deps, v).await,
-                            Err(msg) => Err(msg),
+                            Err(msg) => Err(FileToolError::DecodeArgs(msg)),
                         };
                         EditorEditResult(result)
                     }))
@@ -194,12 +196,45 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
 /// in tool-result text. Still consults the session's loop guard so a
 /// `readRaw` immediately following an identical `readRaw` on an
 /// unchanged file trips the same guard as `file_read`.
-async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, String> {
-    let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&path));
+/// Failures from the editor bridge's `*_inner` ops. Kept typed all the way to
+/// the `IntoJs` boundary, which renders it via `Display` into a JS exception.
+#[derive(Debug, thiserror::Error)]
+enum FileToolError {
+    /// Arg-shape decode failure — carries the message produced upstream
+    /// (`rquickjs_to_json`, or a bad readFile arg shape).
+    #[error("{0}")]
+    DecodeArgs(String),
+    #[error("parse edit: {0}")]
+    ParseEdit(#[source] serde_json::Error),
+    #[error("{path}: {source}")]
+    Io {
+        path: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error(transparent)]
+    Edit(#[from] EditError),
+    #[error(
+        "loop guard: this exact read was just performed and {path} has not \
+         changed since. you already have the result. do something different \
+         — change the path, the ranges, or the tool, or move on."
+    )]
+    Loop { path: String },
+    #[error("reverse range [{start}, {end}]")]
+    ReverseRange { start: usize, end: usize },
+    #[error("ranges are 1-indexed, got start=0")]
+    RangeStartZero,
+}
+
+async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, FileToolError> {
+    let resolved = resolve_relative(Path::new(&path), deps.current_cwd().as_deref());
     let fs = deps.fs();
     let (mtime_ns, size) = stat_file(fs, &resolved)
         .await
-        .map_err(|e| format!("{}: {e}", resolved.display()))?;
+        .map_err(|source| FileToolError::Io {
+            path: resolved.display().to_string(),
+            source,
+        })?;
     let key = LoopKey::Read {
         args_hash: hash_read_raw_args(&path),
         mtime_ns,
@@ -209,13 +244,16 @@ async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<Strin
     let session = deps.editor_factory().session();
     let mut sess = session.lock().await;
     if sess.is_loop(&key) {
-        return Err(loop_error_read(&path));
+        return Err(FileToolError::Loop { path });
     }
 
     let content = fs
         .read_to_string(&resolved)
         .await
-        .map_err(|e| format!("{}: {e}", resolved.display()))?;
+        .map_err(|source| FileToolError::Io {
+            path: resolved.display().to_string(),
+            source,
+        })?;
     sess.record_loop(key);
     Ok(content)
 }
@@ -228,12 +266,18 @@ struct ReadFileArgs {
     ranges: Option<Vec<[usize; 2]>>,
 }
 
-async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Result<String, String> {
-    let resolved = resolve_path(deps.current_cwd().as_deref(), Path::new(&args.path));
+async fn read_file_inner<D: WorkflowDeps>(
+    deps: &D,
+    args: ReadFileArgs,
+) -> Result<String, FileToolError> {
+    let resolved = resolve_relative(Path::new(&args.path), deps.current_cwd().as_deref());
     let fs = deps.fs();
     let (mtime_ns, size) = stat_file(fs, &resolved)
         .await
-        .map_err(|e| format!("{}: {e}", resolved.display()))?;
+        .map_err(|source| FileToolError::Io {
+            path: resolved.display().to_string(),
+            source,
+        })?;
     let key = LoopKey::Read {
         args_hash: hash_read_file_args(&args),
         mtime_ns,
@@ -243,18 +287,18 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
     let session: Arc<_> = deps.editor_factory().session();
     let mut sess = session.lock().await;
     if sess.is_loop(&key) {
-        return Err(loop_error_read(&args.path));
+        return Err(FileToolError::Loop { path: args.path });
     }
 
     let lines = read_file_lines(fs, &resolved)
         .await
-        .map_err(|e| format!("{}: {e}", resolved.display()))?;
+        .map_err(|source| FileToolError::Io {
+            path: resolved.display().to_string(),
+            source,
+        })?;
     let total_lines = lines.len();
 
-    let full_rendered = sess
-        .read_file(resolved, lines, mtime_ns, size)
-        .await
-        .map_err(|e| e.to_string())?;
+    let full_rendered = sess.read_file(resolved, lines, mtime_ns, size).await?;
     sess.record_loop(key);
 
     if let Some(ranges) = args.ranges {
@@ -263,10 +307,10 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
         let mut final_ranges = Vec::new();
         for [start, end] in ranges {
             if end < start {
-                return Err(format!("reverse range [{}, {}]", start, end));
+                return Err(FileToolError::ReverseRange { start, end });
             }
             if start == 0 {
-                return Err("ranges are 1-indexed, got start=0".to_owned());
+                return Err(FileToolError::RangeStartZero);
             }
             let actual_end = std::cmp::min(end, total_lines);
             if start > total_lines {
@@ -311,14 +355,12 @@ async fn read_file_inner<D: WorkflowDeps>(deps: &D, args: ReadFileArgs) -> Resul
 async fn edit_inner<D: WorkflowDeps>(
     deps: &D,
     raw: serde_json::Value,
-) -> Result<DiffRender, String> {
-    let mut edit: LlmEdit = serde_json::from_value(raw).map_err(|e| format!("parse edit: {e}"))?;
+) -> Result<DiffRender, FileToolError> {
+    let mut edit: LlmEdit = serde_json::from_value(raw).map_err(FileToolError::ParseEdit)?;
     resolve_edit_path(&mut edit, deps.current_cwd().as_deref());
     let session = deps.editor_factory().session();
     let mut sess = session.lock().await;
-    sess.edit(edit, write_draft)
-        .await
-        .map_err(|e| e.to_string())
+    Ok(sess.edit(edit, write_draft).await?)
 }
 
 fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
@@ -330,7 +372,7 @@ fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
         | LlmEdit::New { path, .. }
         | LlmEdit::Overwrite { path, .. } => path,
     };
-    *path = resolve_path(cwd, path);
+    *path = resolve_relative(path, cwd);
 }
 
 /// Stat without reading content — cheap, used by the loop guard so it
@@ -371,14 +413,6 @@ fn hash_read_raw_args(path: &str) -> u64 {
     XxHash3_64::oneshot(&buf)
 }
 
-fn loop_error_read(path: &str) -> String {
-    format!(
-        "loop guard: this exact read was just performed and {path} has not \
-         changed since. you already have the result. do something different \
-         — change the path, the ranges, or the tool, or move on."
-    )
-}
-
 fn write_draft(path: &Path, draft: &[String]) -> io::Result<(Vec<String>, i64, u64)> {
     // file_new can target a path whose parent doesn't exist yet; other
     // ops already required a prior successful read so the parent is
@@ -398,16 +432,6 @@ fn write_draft(path: &Path, draft: &[String]) -> io::Result<(Vec<String>, i64, u
     Ok((split_lines(&post), mtime_ns, size))
 }
 
-fn resolve_path(cwd: Option<&Path>, path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else if let Some(cwd) = cwd {
-        cwd.join(path)
-    } else {
-        path.to_path_buf()
-    }
-}
-
 fn split_lines(s: &str) -> Vec<String> {
     let mut lines: Vec<String> = s.split('\n').map(str::to_owned).collect();
     if lines.last().map(String::is_empty).unwrap_or(false) {
@@ -425,21 +449,21 @@ fn mtime_ns_from(meta: &fs::Metadata) -> io::Result<i64> {
 }
 
 /// Run the session-scoped edit commit (clears anchor tombstones).
-async fn commit_inner<D: WorkflowDeps>(deps: &D) -> Result<(), String> {
+async fn commit_inner<D: WorkflowDeps>(deps: &D) -> Result<(), FileToolError> {
     let session = deps.editor_factory().session();
     let mut sess = session.lock().await;
-    sess.commit_edits().await.map_err(|e| e.to_string())
+    Ok(sess.commit_edits().await?)
 }
 
 /// Promise payload that resolves to `undefined` or rejects with an
 /// error message. Used by `editor.commit()`.
-struct EditorUnitResult(Result<(), String>);
+struct EditorUnitResult(Result<(), FileToolError>);
 
 impl<'js> IntoJs<'js> for EditorUnitResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(()) => Ok(Value::new_undefined(ctx.clone())),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
@@ -447,13 +471,13 @@ impl<'js> IntoJs<'js> for EditorUnitResult {
 /// Promise payload that resolves to a string or rejects with an error
 /// message — matches `ShellOpResult`'s shape so the JS surface feels
 /// the same.
-struct EditorStringResult(Result<String, String>);
+struct EditorStringResult(Result<String, FileToolError>);
 
 impl<'js> IntoJs<'js> for EditorStringResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
             Ok(s) => s.into_js(ctx),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
@@ -462,7 +486,7 @@ impl<'js> IntoJs<'js> for EditorStringResult {
 /// `{ text: string, diff: Array<{ kind, text, line? }> }` so the JS
 /// caller can both return the LLM-facing string AND push a
 /// `DiffSection` for the TUI. Rejects with an error message on failure.
-struct EditorEditResult(Result<DiffRender, String>);
+struct EditorEditResult(Result<DiffRender, FileToolError>);
 
 impl<'js> IntoJs<'js> for EditorEditResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
@@ -473,7 +497,7 @@ impl<'js> IntoJs<'js> for EditorEditResult {
                 obj.set("diff", diff_ops_to_js(ctx, &render.ops)?)?;
                 Ok(obj.into_value())
             }
-            Err(msg) => Err(throw(ctx, &msg)),
+            Err(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
@@ -502,22 +526,17 @@ fn diff_ops_to_js<'js>(ctx: &Ctx<'js>, ops: &[DiffOp]) -> JsResult<Value<'js>> {
     Ok(arr.into_value())
 }
 
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
 
     #[test]
     fn resolve_path_uses_cwd_for_relative() {
         let cwd = PathBuf::from("/tmp");
         assert_eq!(
-            resolve_path(Some(&cwd), Path::new("foo.txt")),
+            resolve_relative(Path::new("foo.txt"), Some(&cwd)),
             PathBuf::from("/tmp/foo.txt")
         );
     }
@@ -526,7 +545,7 @@ mod tests {
     fn resolve_path_keeps_absolute_paths_intact() {
         let cwd = PathBuf::from("/tmp");
         assert_eq!(
-            resolve_path(Some(&cwd), Path::new("/etc/passwd")),
+            resolve_relative(Path::new("/etc/passwd"), Some(&cwd)),
             PathBuf::from("/etc/passwd"),
         );
     }

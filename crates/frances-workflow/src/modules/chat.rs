@@ -57,11 +57,12 @@ use tokio_util::sync::CancellationToken;
 use frances_core::Truncated;
 use frances_models_llm::chat::{
     ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
-    ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, ModelIntents,
-    OwnedHistoryInput, RowId,
+    ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, EnforceError,
+    ModelIntents, OwnedHistoryInput, RowId,
 };
 use frances_models_llm::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
 
+use super::{get_or_undefined, throw_js as throw};
 use crate::deps::WorkflowDeps;
 
 type Session<D> = <<D as WorkflowDeps>::ChatSessionManager as ChatSessionManagerTrait>::Session;
@@ -163,11 +164,10 @@ pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
                     max_tool_calls,
                 };
                 let result = match demand {
-                    Some(demand) => manager
-                        .complete_enforced(req, demand, retries)
-                        .await
-                        .map_err(|e| e.to_string()),
-                    None => manager.complete(req).await.map_err(|e| e.to_string()),
+                    Some(demand) => manager.complete_enforced(req, demand, retries).await,
+                    // `complete` fails with `ChatError`; lift it into the
+                    // shared `EnforceError` (it has `#[from] ChatError`).
+                    None => manager.complete(req).await.map_err(EnforceError::from),
                 };
                 match result {
                     Ok(outcome) => CompletionResult::Completed(CompletedJs {
@@ -175,7 +175,7 @@ pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
                         tool_calls: outcome.tool_calls,
                         usage: None,
                     }),
-                    Err(msg) => CompletionResult::Failed(msg),
+                    Err(e) => CompletionResult::Failed(e),
                 }
             });
             promised.into_js(&ctx)
@@ -239,9 +239,7 @@ fn parse_complete_opts<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Comple
     }
 
     // tools?: [...]
-    let tools_val: Value<'js> = obj
-        .get("tools")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let tools_val: Value<'js> = get_or_undefined(ctx, obj, "tools");
     let tools = if tools_val.is_undefined() || tools_val.is_null() {
         Vec::new()
     } else {
@@ -337,9 +335,7 @@ fn parse_message_obj<'js>(
 }
 
 fn get_optional_bool<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> JsResult<Option<bool>> {
-    let v: Value<'js> = obj
-        .get(key)
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let v: Value<'js> = get_or_undefined(ctx, obj, key);
     if v.is_undefined() || v.is_null() {
         return Ok(None);
     }
@@ -353,9 +349,7 @@ fn get_optional_string<'js>(
     obj: &Object<'js>,
     key: &str,
 ) -> JsResult<Option<String>> {
-    let v: Value<'js> = obj
-        .get(key)
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let v: Value<'js> = get_or_undefined(ctx, obj, key);
     if v.is_undefined() || v.is_null() {
         return Ok(None);
     }
@@ -368,9 +362,7 @@ fn get_optional_string<'js>(
 }
 
 fn get_optional_u32<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> JsResult<Option<u32>> {
-    let v: Value<'js> = obj
-        .get(key)
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let v: Value<'js> = get_or_undefined(ctx, obj, key);
     if v.is_undefined() || v.is_null() {
         return Ok(None);
     }
@@ -500,9 +492,7 @@ fn parse_chat_options<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<ChatOpt
     // `ephemeral` is optional. Missing and `undefined` both mean
     // `false`; anything else (`0`, `"true"`, etc.) is rejected so the
     // caller doesn't get silent truthiness.
-    let ephemeral_val: Value<'js> = obj
-        .get("ephemeral")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let ephemeral_val: Value<'js> = get_or_undefined(ctx, obj, "ephemeral");
     let ephemeral = if ephemeral_val.is_undefined() || ephemeral_val.is_null() {
         false
     } else {
@@ -532,9 +522,7 @@ fn parse_stream_opts<'js>(ctx: &Ctx<'js>, opts: Option<&Value<'js>>) -> JsResult
             "chat.stream: expected an options object or `undefined`",
         ));
     };
-    let val: Value<'js> = obj
-        .get("maxToolCalls")
-        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()));
+    let val: Value<'js> = get_or_undefined(ctx, obj, "maxToolCalls");
     if val.is_undefined() || val.is_null() {
         return Ok(None);
     }
@@ -694,7 +682,7 @@ fn parse_tool_defs<'js>(ctx: &Ctx<'js>, arr: &Array<'js>, label: &str) -> JsResu
                 &format!("{label}[{i}]: `parameters` must be an object"),
             ));
         }
-        let parameters: JsonValue = from_json_value(&parameters_val).map_err(|e| {
+        let parameters: JsonValue = super::rquickjs_to_json(&parameters_val).map_err(|e| {
             throw(
                 ctx,
                 &format!("{label}[{i}]: `parameters` not JSON-serialisable: {e}"),
@@ -708,42 +696,6 @@ fn parse_tool_defs<'js>(ctx: &Ctx<'js>, arr: &Array<'js>, label: &str) -> JsResu
         }));
     }
     Ok(defs)
-}
-
-fn from_json_value<'js>(value: &Value<'js>) -> Result<JsonValue, String> {
-    // `rquickjs` doesn't ship a JS-value → serde_json bridge by default,
-    // so we walk the shape ourselves. JSON-shaped JS values only —
-    // functions / symbols / undefined collapse to null per JSON convention.
-    if let Some(s) = value.as_string() {
-        let raw = s.to_string().map_err(|e| e.to_string())?;
-        Ok(JsonValue::String(raw))
-    } else if let Some(b) = value.as_bool() {
-        Ok(JsonValue::Bool(b))
-    } else if let Some(n) = value.as_int() {
-        Ok(JsonValue::Number(n.into()))
-    } else if let Some(n) = value.as_float() {
-        serde_json::Number::from_f64(n)
-            .map(JsonValue::Number)
-            .ok_or_else(|| "non-finite number".to_owned())
-    } else if value.is_null() || value.is_undefined() {
-        Ok(JsonValue::Null)
-    } else if let Some(arr) = value.as_array() {
-        let mut out = Vec::with_capacity(arr.len());
-        for v in arr.iter::<Value<'js>>() {
-            let v = v.map_err(|e| e.to_string())?;
-            out.push(from_json_value(&v)?);
-        }
-        Ok(JsonValue::Array(out))
-    } else if let Some(obj) = value.as_object() {
-        let mut out = serde_json::Map::new();
-        for prop in obj.props::<String, Value<'js>>() {
-            let (k, v) = prop.map_err(|e| e.to_string())?;
-            out.insert(k, from_json_value(&v)?);
-        }
-        Ok(JsonValue::Object(out))
-    } else {
-        Ok(JsonValue::Null)
-    }
 }
 
 fn json_value_into_js<'js>(ctx: &Ctx<'js>, value: &JsonValue) -> JsResult<Value<'js>> {
@@ -870,8 +822,14 @@ fn start_stream<'js, D: WorkflowDeps>(
             // rejection and rethrows the user's abort reason, so all three
             // observables (`events`, `text`, `completed`) reject uniformly.
             Ok(Err(ChatError::Cancelled)) => CompletionResult::Cancelled,
-            Ok(Err(e)) => CompletionResult::Failed(format!("chat stream failed: {e}")),
-            Err(_) => CompletionResult::Failed("chat stream task aborted".to_owned()),
+            Ok(Err(e)) => CompletionResult::Failed(EnforceError::Provider(e)),
+            // The driver task dropped its sender without sending — it
+            // panicked or the runtime is shutting down. Synthesize a
+            // provider-shaped error so the JS side still rejects.
+            Err(_) => CompletionResult::Failed(EnforceError::Provider(ChatError::Provider {
+                provider_id: "chat".to_owned(),
+                source: "stream task aborted before completion".into(),
+            })),
         }
     });
 
@@ -1014,7 +972,7 @@ impl<'js> IntoJs<'js> for JsStreamEvent {
 enum CompletionResult {
     Completed(CompletedJs),
     Cancelled,
-    Failed(String),
+    Failed(EnforceError),
 }
 
 impl<'js> IntoJs<'js> for CompletionResult {
@@ -1022,7 +980,7 @@ impl<'js> IntoJs<'js> for CompletionResult {
         match self {
             CompletionResult::Completed(c) => c.into_js(ctx),
             CompletionResult::Cancelled => Err(throw_cancelled(ctx)),
-            CompletionResult::Failed(msg) => Err(throw(ctx, &msg)),
+            CompletionResult::Failed(e) => Err(throw(ctx, &e.to_string())),
         }
     }
 }
@@ -1182,13 +1140,6 @@ impl<'js> IntoJs<'js> for IterResult {
             obj.set("value", v)?;
         }
         Ok(obj.into_value())
-    }
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
     }
 }
 

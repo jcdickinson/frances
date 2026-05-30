@@ -25,13 +25,58 @@ use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
 use rquickjs::{
-    Array, Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult,
-    TypedArray, Value,
+    Array, Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, TypedArray, Value,
 };
 use tokio::sync::Mutex as AsyncMutex;
 use turso::Value as TursoValue;
 
+use super::throw_js as throw;
 use crate::storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};
+
+/// Stamp a JS async method that clones one field off `this`, runs an async DB
+/// call, and wraps the result in a typed `IntoJs` newtype. Collapses the
+/// otherwise byte-identical `_exec`/`_query`/… towers on `JsDb` and `JsTx`.
+/// Three shapes: `(sql, params)`, no JS args (`method()`), and one `bool` arg.
+macro_rules! db_method {
+    ($proto:expr, $ctx:expr, $name:literal, $class:ty, $field:ident.$method:ident => $wrap:ident) => {
+        $proto.set(
+            $name,
+            Function::new(
+                $ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, $class>>, sql: String, params: Value<'js>| {
+                    let params = parse_params(&ctx, &params)?;
+                    let conn = this.0.borrow().$field.clone();
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        $wrap(conn.$method(&sql, params).await)
+                    }))
+                },
+            )?,
+        )?;
+    };
+    ($proto:expr, $ctx:expr, $name:literal, $class:ty, $field:ident.$method:ident() => $wrap:ident) => {
+        $proto.set(
+            $name,
+            Function::new($ctx.clone(), |this: This<Class<'js, $class>>| {
+                let conn = this.0.borrow().$field.clone();
+                Ok::<_, rquickjs::Error>(Promised::from(async move { $wrap(conn.$method().await) }))
+            })?,
+        )?;
+    };
+    ($proto:expr, $ctx:expr, $name:literal, $class:ty, $field:ident.$method:ident(bool) => $wrap:ident) => {
+        $proto.set(
+            $name,
+            Function::new(
+                $ctx.clone(),
+                |this: This<Class<'js, $class>>, flag: bool| {
+                    let conn = this.0.borrow().$field.clone();
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        $wrap(conn.$method(flag).await)
+                    }))
+                },
+            )?,
+        )?;
+    };
+}
 
 /// Construct the singleton `Db` class instance + the private
 /// `_innerQueryStream` function for the stash.
@@ -60,59 +105,10 @@ impl<'js> JsClass<'js> for JsDb {
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
         let proto = Object::new(ctx.clone())?;
-
-        proto.set(
-            "_exec",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsDb>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let db = this.0.borrow().db.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbExec(db.exec(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_query",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsDb>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let db = this.0.borrow().db.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbQuery(db.query(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_innerQueryStream",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsDb>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let db = this.0.borrow().db.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbStream(db.query_stream(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_beginTransaction",
-            Function::new(ctx.clone(), |this: This<Class<'js, JsDb>>| {
-                let db = this.0.borrow().db.clone();
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    WorkflowDbBegin(db.begin().await)
-                }))
-            })?,
-        )?;
-
+        db_method!(proto, ctx, "_exec", JsDb, db.exec => WorkflowDbExec);
+        db_method!(proto, ctx, "_query", JsDb, db.query => WorkflowDbQuery);
+        db_method!(proto, ctx, "_innerQueryStream", JsDb, db.query_stream => WorkflowDbStream);
+        db_method!(proto, ctx, "_beginTransaction", JsDb, db.begin() => WorkflowDbBegin);
         Ok(Some(proto))
     }
 
@@ -139,82 +135,12 @@ impl<'js> JsClass<'js> for JsTx {
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
         let proto = Object::new(ctx.clone())?;
-
-        proto.set(
-            "_exec",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsTx>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let tx = this.0.borrow().tx.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbExec(tx.exec(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_query",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsTx>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let tx = this.0.borrow().tx.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbQuery(tx.query(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_innerQueryStream",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, JsTx>>, sql: String, params: Value<'js>| {
-                    let params = parse_params(&ctx, &params)?;
-                    let tx = this.0.borrow().tx.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowDbStream(tx.query_stream(&sql, params).await)
-                    }))
-                },
-            )?,
-        )?;
-
-        proto.set(
-            "_commit",
-            Function::new(ctx.clone(), |this: This<Class<'js, JsTx>>| {
-                let tx = this.0.borrow().tx.clone();
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    WorkflowTxUnit(tx.commit().await)
-                }))
-            })?,
-        )?;
-
-        proto.set(
-            "_rollback",
-            Function::new(ctx.clone(), |this: This<Class<'js, JsTx>>| {
-                let tx = this.0.borrow().tx.clone();
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    WorkflowTxUnit(tx.rollback().await)
-                }))
-            })?,
-        )?;
-
-        proto.set(
-            "_settleDefault",
-            Function::new(
-                ctx.clone(),
-                |this: This<Class<'js, JsTx>>, success: bool| {
-                    let tx = this.0.borrow().tx.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        WorkflowTxBool(tx.settle_default(success).await)
-                    }))
-                },
-            )?,
-        )?;
-
+        db_method!(proto, ctx, "_exec", JsTx, tx.exec => WorkflowDbExec);
+        db_method!(proto, ctx, "_query", JsTx, tx.query => WorkflowDbQuery);
+        db_method!(proto, ctx, "_innerQueryStream", JsTx, tx.query_stream => WorkflowDbStream);
+        db_method!(proto, ctx, "_commit", JsTx, tx.commit() => WorkflowTxUnit);
+        db_method!(proto, ctx, "_rollback", JsTx, tx.rollback() => WorkflowTxUnit);
+        db_method!(proto, ctx, "_settleDefault", JsTx, tx.settle_default(bool) => WorkflowTxBool);
         Ok(Some(proto))
     }
 
@@ -391,15 +317,23 @@ fn parse_params<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> JsResult<Vec<TursoVa
     let mut out = Vec::with_capacity(arr.len());
     for (i, item) in arr.iter::<Value<'js>>().enumerate() {
         let item = item?;
-        out.push(
-            js_to_turso_value(ctx, &item)
-                .map_err(|msg| throw(ctx, &format!("params[{i}]: {msg}")))?,
-        );
+        out.push(js_to_turso_value(&item).map_err(|e| throw(ctx, &format!("params[{i}]: {e}")))?);
     }
     Ok(out)
 }
 
-fn js_to_turso_value<'js>(_ctx: &Ctx<'js>, value: &Value<'js>) -> Result<TursoValue, String> {
+/// A JS param value that can't be bound to a turso statement.
+#[derive(Debug, thiserror::Error)]
+enum ParamError {
+    #[error("{0}")]
+    StringConv(String),
+    #[error(
+        "unsupported parameter type — only null, number, string, boolean, and Uint8Array are accepted"
+    )]
+    Unsupported,
+}
+
+fn js_to_turso_value<'js>(value: &Value<'js>) -> Result<TursoValue, ParamError> {
     if value.is_null() || value.is_undefined() {
         return Ok(TursoValue::Null);
     }
@@ -417,17 +351,16 @@ fn js_to_turso_value<'js>(_ctx: &Ctx<'js>, value: &Value<'js>) -> Result<TursoVa
         return Ok(TursoValue::Real(f));
     }
     if let Some(s) = value.as_string() {
-        let s = s.to_string().map_err(|e| e.to_string())?;
+        let s = s
+            .to_string()
+            .map_err(|e| ParamError::StringConv(e.to_string()))?;
         return Ok(TursoValue::Text(s));
     }
     if let Ok(bytes) = TypedArray::<u8>::from_value(value.clone()) {
         let slice: &[u8] = bytes.as_ref();
         return Ok(TursoValue::Blob(slice.to_vec()));
     }
-    Err(
-        "unsupported parameter type — only null, number, string, boolean, and Uint8Array are accepted"
-            .to_owned(),
-    )
+    Err(ParamError::Unsupported)
 }
 
 fn turso_value_into_js<'js>(ctx: &Ctx<'js>, value: &TursoValue) -> JsResult<Value<'js>> {
@@ -456,11 +389,4 @@ fn row_into_js<'js>(ctx: &Ctx<'js>, row: &Row) -> JsResult<Value<'js>> {
         obj.set(name.as_str(), v)?;
     }
     Ok(obj.into_value())
-}
-
-fn throw<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
-    }
 }

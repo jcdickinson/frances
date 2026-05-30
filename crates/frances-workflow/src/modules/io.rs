@@ -43,11 +43,10 @@ use parking_lot::Mutex;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Opt, This};
 use rquickjs::promise::Promised;
-use rquickjs::{
-    Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
-};
+use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
 use tokio::sync::Notify;
 
+use super::throw_js as throw_err;
 use crate::io::WorkflowTimer;
 
 /// Builds the two stash functions plus the (registered, but
@@ -243,12 +242,5 @@ struct ResultStr(&'static str);
 impl<'js> IntoJs<'js> for ResultStr {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         self.0.into_js(ctx)
-    }
-}
-
-fn throw_err<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
-    match Exception::from_message(ctx.clone(), message) {
-        Ok(exc) => exc.throw(),
-        Err(e) => e,
     }
 }

@@ -285,6 +285,28 @@ pub(crate) fn remove_stash<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
     Ok(())
 }
 
+/// Build a JS `Error` from `message` and return it as the thrown
+/// `rquickjs::Error`. `Exception::from_message` wraps the string with the
+/// right prototype; if even that fails we surface its error instead.
+pub(super) fn throw_js<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
+    match rquickjs::Exception::from_message(ctx.clone(), message) {
+        Ok(exc) => exc.throw(),
+        Err(e) => e,
+    }
+}
+
+/// `throw_js` pre-packaged as an `Err` for fns that return a JS `Result<T>`.
+pub(super) fn throw_js_type<'js, T>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Result<T> {
+    Err(throw_js(ctx, message))
+}
+
+/// Read a property, treating a missing/erroring lookup as `undefined`. The
+/// idiom every module's arg-parsing repeats verbatim.
+pub(super) fn get_or_undefined<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> Value<'js> {
+    obj.get(key)
+        .unwrap_or_else(|_| Value::new_undefined(ctx.clone()))
+}
+
 /// Recursively convert an `rquickjs::Value` into a `serde_json::Value`.
 /// Cheaper than going through the `Value -> String -> Value` round-trip,
 /// and means JS-side arg shapes map 1:1 to whatever struct the caller
