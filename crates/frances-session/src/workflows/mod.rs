@@ -35,8 +35,9 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+use frances_core::now_ns;
 use parking_lot::Mutex as PlMutex;
 use thiserror::Error;
 
@@ -1210,13 +1211,6 @@ async fn read_active_row(db: &Database) -> Result<Option<StackRow>, WorkflowStac
         instance_id,
         args,
     }))
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

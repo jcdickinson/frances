@@ -35,8 +35,8 @@
 //! nothing.
 
 use std::borrow::Cow;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use frances_core::now_ns;
 use frances_edit::DiffOp;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -125,13 +125,6 @@ enum RowPayload {
     Diff {
         lines: Vec<DiffOp>,
     },
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 /// Insert a finished or truncated section row. `truncated = false`

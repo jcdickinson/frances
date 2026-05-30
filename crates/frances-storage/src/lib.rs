@@ -38,8 +38,8 @@ use std::borrow::Cow;
 use std::hash::Hasher;
 use std::ops::Deref;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use frances_core::now_ns;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 use turso::{Builder, Connection, Value};
@@ -207,13 +207,6 @@ fn checksum(sql: &str) -> i64 {
     let mut h = XxHash3_64::new();
     h.write(sql.as_bytes());
     h.finish() as i64
-}
-
-fn now_ns() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
 }
 
 /// Create the tracking table if it doesn't already exist. Idempotent.

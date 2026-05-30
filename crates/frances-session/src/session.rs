@@ -4,6 +4,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use frances_core::now_unix_secs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -293,13 +294,6 @@ fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}-{:x}", nanos, std::process::id())
-}
-
-fn now_unix_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 fn current_uid() -> u32 {

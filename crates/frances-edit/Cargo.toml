@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 frances-anchors.workspace = true
+frances-core.workspace = true
 similar.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true

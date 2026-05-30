@@ -1517,6 +1517,7 @@ dependencies = [
  "async-trait",
  "bincode",
  "frances-anchors",
+ "frances-core",
  "parking_lot",
  "regex",
  "serde",
@@ -1593,6 +1594,7 @@ dependencies = [
  "bincode",
  "dashmap",
  "frances-config",
+ "frances-core",
  "frances-edit",
  "frances-llm",
  "frances-models-llm",
@@ -1630,6 +1632,7 @@ dependencies = [
 name = "frances-storage"
 version = "0.1.0"
 dependencies = [
+ "frances-core",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

@@ -8,7 +8,6 @@ mod render;
 mod session;
 mod state;
 mod store;
-mod truncated;
 
 pub use anchor::{Anchor, AnchorParseError};
 pub use edit::{EditOp, apply_ops};
@@ -20,7 +19,10 @@ pub use render::{DiffOp, DiffRender, render_diff_block, render_file};
 pub use session::{EditError, EditResult, EditSession, LlmEdit};
 pub use state::{FileAnchorState, LineEntry, content_digest};
 pub use store::{AnchorStore, StoreError, StoreResult};
-pub use truncated::Truncated;
+
+/// Content-mismatch errors keep the leading 80 chars of the offending content,
+/// appending an ellipsis. A `Cow<'static, str>` so it can live in `EditError`.
+pub type Truncated = frances_core::Truncated<'static, 80, true>;
 
 #[cfg(any(test, feature = "test-utils"))]
 pub use session::test_support;
