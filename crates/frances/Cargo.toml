@@ -23,7 +23,6 @@ frances-markdown.workspace = true
 frances-models-tui.workspace = true
 frances-session.workspace = true
 frances-tui.workspace = true
-ratatui-textarea.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 

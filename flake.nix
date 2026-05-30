@@ -54,6 +54,7 @@
             pkgs.jq
             pkgs.python3
             pkgs.cargo-nextest
+            pkgs.cargo-machete
           ];
         };
       });

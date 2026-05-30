@@ -1468,7 +1468,6 @@ dependencies = [
  "futures-util",
  "libc",
  "ratatui",
- "ratatui-textarea",
  "serde",
  "serde_json",
  "tokio",
@@ -1543,7 +1542,6 @@ dependencies = [
  "futures-util",
  "genai",
  "parking_lot",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1562,7 +1560,6 @@ dependencies = [
  "frances-models-tui",
  "frances-tui",
  "ratatui",
- "unicode-width 0.2.2",
 ]
 
 [[package]]
@@ -1571,13 +1568,11 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "frances-config",
- "futures",
  "jsonschema",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio-util",
- "tracing",
  "url",
 ]
 
@@ -1594,42 +1589,28 @@ dependencies = [
 name = "frances-session"
 version = "0.1.0"
 dependencies = [
- "arc-swap",
  "async-trait",
  "bincode",
  "dashmap",
- "frances-anchors",
  "frances-config",
- "frances-core",
  "frances-edit",
  "frances-llm",
  "frances-models-llm",
  "frances-models-tui",
- "frances-shell",
  "frances-storage",
  "frances-workflow",
- "futures",
- "futures-util",
- "getrandom 0.2.17",
  "libc",
  "parking_lot",
- "reqwest 0.12.28",
  "serde",
  "serde_json",
- "shell-words",
- "shellexpand",
- "similar",
- "smallvec",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tokio-stream",
  "tokio-util",
  "tracing",
  "tracing-subscriber",
  "turso",
  "twox-hash",
- "url",
  "uuid",
  "xdg",
 ]
@@ -1643,7 +1624,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
 ]
 
 [[package]]
@@ -1667,8 +1647,6 @@ dependencies = [
  "frances-models-tui",
  "ratatui",
  "ratatui-textarea",
- "serde",
- "serde_json",
  "slotmap",
  "taffy",
  "tracing",
@@ -1691,7 +1669,6 @@ dependencies = [
  "frances-storage",
  "frances-workflow",
  "globset",
- "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
@@ -1837,7 +1814,7 @@ dependencies = [
  "mime_guess",
  "paste",
  "regex",
- "reqwest 0.13.3",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_with",
@@ -2182,7 +2159,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots",
 ]
 
 [[package]]
@@ -3867,47 +3843,6 @@ dependencies = [
 
 [[package]]
 name = "reqwest"
-version = "0.12.28"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "eddd3ca559203180a307f12d114c268abf583f59b03cb906fd0b3ff8646c1147"
-dependencies = [
- "base64",
- "bytes",
- "futures-core",
- "futures-util",
- "http",
- "http-body",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "js-sys",
- "log",
- "percent-encoding",
- "pin-project-lite",
- "quinn",
- "rustls",
- "rustls-pki-types",
- "serde",
- "serde_json",
- "serde_urlencoded",
- "sync_wrapper",
- "tokio",
- "tokio-rustls",
- "tokio-util",
- "tower",
- "tower-http",
- "tower-service",
- "url",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "wasm-streams 0.4.2",
- "web-sys",
- "webpki-roots",
-]
-
-[[package]]
-name = "reqwest"
 version = "0.13.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62e0021ea2c22aed41653bc7e1419abb2c97e038ff2c33d0e1309e49a97deec0"
@@ -3945,7 +3880,7 @@ dependencies = [
  "url",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wasm-streams 0.5.0",
+ "wasm-streams",
  "web-sys",
 ]
 
@@ -4097,7 +4032,6 @@ checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
 dependencies = [
  "aws-lc-rs",
  "once_cell",
- "ring",
  "rustls-pki-types",
  "rustls-webpki",
  "subtle",
@@ -4327,18 +4261,6 @@ version = "0.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
 dependencies = [
- "serde",
-]
-
-[[package]]
-name = "serde_urlencoded"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d3491c14715ca2294c4d6a88f15e84739788c1d030eed8c110436aafdaa2f3fd"
-dependencies = [
- "form_urlencoded",
- "itoa",
- "ryu",
  "serde",
 ]
 
@@ -6190,19 +6112,6 @@ dependencies = [
 
 [[package]]
 name = "wasm-streams"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "15053d8d85c7eccdbefef60f06769760a563c7f0a9d6902a13d35c7800b0ad65"
-dependencies = [
- "futures-util",
- "js-sys",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
-name = "wasm-streams"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9d1ec4f6517c9e11ae630e200b2b65d193279042e28edd4a2cda233e46670bbb"
@@ -6251,15 +6160,6 @@ name = "webpki-root-certs"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31141ce3fc3e300ae89b78c0dd67f9708061d1d2eda54b8209346fd6be9a92c"
-dependencies = [
- "rustls-pki-types",
-]
-
-[[package]]
-name = "webpki-roots"
-version = "1.0.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52f5ee44c96cf55f1b349600768e3ece3a8f26010c05265ab73f945bb1a2eb9d"
 dependencies = [
  "rustls-pki-types",
 ]

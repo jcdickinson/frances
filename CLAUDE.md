@@ -53,8 +53,15 @@ cargo nextest -p frances-edit        # one crate
 cargo nextest -p frances-edit reconcile::tests::name_of_test  # one test
 cargo fmt --all
 cargo clippy --all-targets
+cargo machete                     # find unused crate dependencies (provided by the devShell)
 nix build                         # reproducible build via flake.nix
 ```
+
+`cargo machete` is the unused-dependency check. Prefer it over rustc's
+`unused_crate_dependencies` lint: that lint fires per compilation target, so
+shared dev-deps and `path = "."` self-deps show up as false positives.
+`cargo machete` reads each `Cargo.toml` against actual source references and
+doesn't have that problem.
 
 The user runs the dev shell via `nix develop` (provides toolchain + `rust-analyzer` + `jq` + `python3`).
 
