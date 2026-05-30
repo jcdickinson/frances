@@ -37,7 +37,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frances_core::now_ns;
+use frances_core::{now_ns, resolve_relative};
 use parking_lot::Mutex as PlMutex;
 use thiserror::Error;
 
@@ -252,6 +252,25 @@ struct OpenSection {
     materialised: bool,
 }
 
+/// Why a set of open sections is being closed. The two variants carry
+/// exactly what differs between a clean stop and a mid-stream dehydrate,
+/// so the nonsense combinations (truncated-but-emit-close, or
+/// clean-but-silent) can't be written.
+enum CloseMode<'a> {
+    /// The workflow body exited cleanly. Emit a `SectionClose` per
+    /// section; persist non-truncated rows.
+    Stop(&'a EventsChannel),
+    /// The workflow is dehydrating mid-stream. Emit nothing; persist
+    /// each row truncated.
+    Truncate,
+}
+
+impl CloseMode<'_> {
+    fn truncated(&self) -> bool {
+        matches!(self, CloseMode::Truncate)
+    }
+}
+
 impl EmitState {
     fn new(db: Database, instance_id: Uuid) -> Self {
         Self {
@@ -261,6 +280,32 @@ impl EmitState {
         }
     }
 
+    /// Persist one closing section's row (if it ever received body
+    /// content) and, for a clean stop, emit its `SectionClose`. The
+    /// `open` is consumed — its `kind`/`text` move straight into the
+    /// row, no clone.
+    async fn close_section(
+        &self,
+        mode: &CloseMode<'_>,
+        id: SectionId,
+        open: OpenSection,
+    ) -> Result<()> {
+        if let CloseMode::Stop(events) = mode {
+            events.send(StreamFrame::SectionClose { id });
+        }
+        if open.materialised {
+            crate::scrollback::persist_section(
+                &self.db,
+                self.instance_id,
+                open.kind,
+                open.text,
+                mode.truncated(),
+            )
+            .await?;
+        }
+        Ok(())
+    }
+
     /// Clean close for a single section: emit `SectionClose`, persist
     /// a finished row (if the section ever received body content),
     /// drop the entry. Idempotent on unknown ids.
@@ -268,58 +313,18 @@ impl EmitState {
         let Some(open) = self.open.remove(&id) else {
             return Ok(());
         };
-        events.send(StreamFrame::SectionClose { id });
-        if open.materialised {
-            crate::scrollback::persist_section(
-                &self.db,
-                self.instance_id,
-                &open.kind,
-                &open.text,
-                false,
-            )
-            .await?;
-        }
-        Ok(())
+        self.close_section(&CloseMode::Stop(events), id, open).await
     }
 
-    /// Clean close for every remaining open section. Called when the
-    /// workflow body exits and we're about to send `Done`.
-    async fn close_all_stop(&mut self, events: &EventsChannel) -> Result<()> {
+    /// Close every remaining open section. `Stop` emits a `SectionClose`
+    /// per section and persists clean rows; `Truncate` emits nothing
+    /// (the TUI is about to clear and replay via `ScrollbackFrame::Reset`,
+    /// which surfaces these rows as `SectionTruncated`) and marks each
+    /// row truncated.
+    async fn close_all(&mut self, mode: CloseMode<'_>) -> Result<()> {
         let drained: Vec<(SectionId, OpenSection)> = self.open.drain().collect();
         for (id, open) in drained {
-            events.send(StreamFrame::SectionClose { id });
-            if open.materialised {
-                crate::scrollback::persist_section(
-                    &self.db,
-                    self.instance_id,
-                    &open.kind,
-                    &open.text,
-                    false,
-                )
-                .await?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Dehydrate close-all: the workflow is going away while sections
-    /// are in flight. Persist each row marked truncated and drop the
-    /// entries. No `StreamFrame`s are emitted — the TUI is about to
-    /// be told to clear and replay via `ScrollbackFrame::Reset`, and
-    /// the replay will surface these rows as `SectionTruncated`.
-    async fn close_all_truncate(&mut self) -> Result<()> {
-        let drained: Vec<OpenSection> = self.open.drain().map(|(_, v)| v).collect();
-        for open in drained {
-            if open.materialised {
-                crate::scrollback::persist_section(
-                    &self.db,
-                    self.instance_id,
-                    &open.kind,
-                    &open.text,
-                    true,
-                )
-                .await?;
-            }
+            self.close_section(&mode, id, open).await?;
         }
         Ok(())
     }
@@ -403,9 +408,11 @@ pub(crate) async fn restore_or_seed<Io: frances_workflow::WorkflowIo>(
 /// Push the configured default workflow with empty args. Used by
 /// `restore_or_seed` when the table is empty (first-ever boot or a
 /// fresh session). Returns the started instance for the driver to seat;
-/// `None` when config is missing or migrations fail to read. Frames the
-/// workflow emits during top-level evaluation buffer in
-/// `WorkflowHandle::frames` and flush once the driver starts pumping.
+/// `Ok(None)` when no matching config entry exists. A boot failure
+/// (migration read or runtime start) propagates as `Err` — `restore_or_seed`
+/// logs it and leaves the stack empty. Frames the workflow emits during
+/// top-level evaluation buffer in `WorkflowHandle::frames` and flush once
+/// the driver starts pumping.
 async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     name: &str,
@@ -419,31 +426,10 @@ async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
         );
         return Ok(None);
     };
-    let migrations = match load_migrations(cfg).await {
-        Ok(m) => m,
-        Err(error) => {
-            warn!(
-                workflow = name,
-                %error,
-                "default_workflow migration read failed; leaving stack empty"
-            );
-            return Ok(None);
-        }
-    };
     let instance_id = Uuid::new_v4();
-    let invocation = Invocation {
-        source_path: cfg.file.clone(),
-        args: Vec::new(),
-        entity: cfg.id,
-        instance_id,
-        migrations,
-    };
-    let handle = runtime.workflow_runtime.start(invocation).await?;
+    let instance = boot_instance(runtime, cfg, instance_id, Vec::new()).await?;
     insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &[]).await?;
-    Ok(Some(WorkflowInstance {
-        handle,
-        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
-    }))
+    Ok(Some(instance))
 }
 
 /// Slash-command push: start the new workflow, then (only on success)
@@ -465,29 +451,13 @@ async fn push<Io: frances_workflow::WorkflowIo>(
         return old;
     };
 
-    let migrations = match load_migrations(cfg).await {
-        Ok(m) => m,
-        Err(error) => {
-            runtime
-                .events
-                .send(StreamFrame::Error(format!("workflow: {error}")));
-            return old;
-        }
-    };
-
     let instance_id = Uuid::new_v4();
-    let invocation = Invocation {
-        source_path: cfg.file.clone(),
-        args: args.clone(),
-        entity: cfg.id,
-        instance_id,
-        migrations,
-    };
 
-    // Start the new runtime BEFORE touching any state. If it fails, the
-    // previous workflow keeps running and the DB is unchanged.
-    let handle = match runtime.workflow_runtime.start(invocation).await {
-        Ok(handle) => handle,
+    // Boot the new instance BEFORE touching any state. If migrations or
+    // start fail, the previous workflow keeps running and the DB is
+    // unchanged.
+    let instance = match boot_instance(runtime, cfg, instance_id, args.clone()).await {
+        Ok(instance) => instance,
         Err(error) => {
             runtime
                 .events
@@ -524,10 +494,7 @@ async fn push<Io: frances_workflow::WorkflowIo>(
         warn!(%error, "scrollback replay on push failed");
     }
 
-    Some(WorkflowInstance {
-        handle,
-        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
-    })
+    Some(instance)
 }
 
 /// The long-lived workflow driver. Owns the active instance for its
@@ -662,6 +629,20 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
     }
 }
 
+/// Drain every transcript delta currently queued on `instance`, emitting
+/// each into the event stream. `try_recv` releases its borrow on the
+/// transcript channel before `emit_transcript` touches the disjoint
+/// `instance.emit`, so a single `&mut instance` works under NLL.
+async fn drain_transcript<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    instance: &mut WorkflowInstance,
+) -> Result<()> {
+    while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
+        emit_transcript(runtime, &mut instance.emit, delta).await?;
+    }
+    Ok(())
+}
+
 /// Genuine-termination handling for the active instance: drain any tail
 /// frames, emit a clean `BlockStop` for every still-open block, and
 /// surface a workflow error if the body settled with one.
@@ -670,16 +651,43 @@ async fn finish_done<Io: frances_workflow::WorkflowIo>(
     instance: &mut WorkflowInstance,
     reported: Option<WorkflowError>,
 ) -> Result<()> {
-    while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
-        emit_transcript(runtime, &mut instance.emit, delta).await?;
-    }
-    instance.emit.close_all_stop(&runtime.events).await?;
+    drain_transcript(runtime, instance).await?;
+    instance
+        .emit
+        .close_all(CloseMode::Stop(&runtime.events))
+        .await?;
     if let Some(error) = reported {
         let msg = format!("workflow: {error}");
         instance.emit.persist_error(&msg).await?;
         runtime.events.send(StreamFrame::Error(msg));
     }
     Ok(())
+}
+
+/// The side-effect-free core every boot path shares: read migrations,
+/// build the invocation, start the runtime, wrap it in a
+/// [`WorkflowInstance`]. Touches no stack table and emits no frames —
+/// the caller owns instance-id minting, row persistence, and error
+/// policy.
+async fn boot_instance<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    cfg: &WorkflowConfig,
+    instance_id: Uuid,
+    args: Vec<String>,
+) -> Result<WorkflowInstance, WorkflowError> {
+    let migrations = load_migrations(cfg).await?;
+    let invocation = Invocation {
+        source_path: cfg.file.clone(),
+        args,
+        entity: cfg.id,
+        instance_id,
+        migrations,
+    };
+    let handle = runtime.workflow_runtime.start(invocation).await?;
+    Ok(WorkflowInstance {
+        handle,
+        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
+    })
 }
 
 /// Read each declared migration file (resolved relative to the
@@ -692,11 +700,7 @@ async fn load_migrations(cfg: &WorkflowConfig) -> Result<Vec<Migration>, Workflo
         .unwrap_or_default();
     let mut out = Vec::with_capacity(cfg.migrations.len());
     for path in &cfg.migrations {
-        let resolved = if path.is_absolute() {
-            path.clone()
-        } else {
-            base.join(path)
-        };
+        let resolved = resolve_relative(path, Some(&base));
         let sql = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|source| WorkflowError::ReadMigration {
@@ -734,9 +738,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
         // persists, so it must reach scrollback before we suspend.
         // Surfaces/usage are ephemeral and a pending permission is
         // resolved by the body's own shutdown path (`closed_notify`).
-        while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
-            emit_transcript(runtime, &mut instance.emit, delta).await?;
-        }
+        drain_transcript(runtime, &mut instance).await?;
         tokio::select! {
             biased;
             Some(delta) = instance.handle.outputs.transcript.recv() => {
@@ -745,12 +747,13 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
             done = &mut instance.handle.done => {
                 // Drain any tail transcript the lifecycle hook pushed
                 // immediately before settling.
-                while let Ok(delta) = instance.handle.outputs.transcript.try_recv() {
-                    emit_transcript(runtime, &mut instance.emit, delta).await?;
-                }
+                drain_transcript(runtime, &mut instance).await?;
                 // Body exited cleanly: every remaining open block gets
                 // a clean `BlockStop` event and a non-truncated row.
-                instance.emit.close_all_stop(&runtime.events).await?;
+                instance
+                    .emit
+                    .close_all(CloseMode::Stop(&runtime.events))
+                    .await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow shutdown: {error}");
                     instance.emit.persist_error(&msg).await?;
@@ -766,7 +769,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                 // Body never settled. Mark every in-flight block
                 // truncated. No `BlockStop` event — the TUI is about to
                 // be told to clear via `ScrollbackFrame::Reset` by the caller's push path.
-                instance.emit.close_all_truncate().await?;
+                instance.emit.close_all(CloseMode::Truncate).await?;
                 return Ok(());
             }
         }
@@ -811,8 +814,8 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
                 crate::scrollback::persist_section(
                     &state.db,
                     state.instance_id,
-                    &kind,
-                    &delta,
+                    kind,
+                    delta,
                     false,
                 )
                 .await?;
@@ -1001,19 +1004,7 @@ async fn hydrate<Io: frances_workflow::WorkflowIo>(
             context: "restore".into(),
             detail: format!("no [workflows.{}] entry in config", row.config_key),
         })?;
-    let migrations = load_migrations(cfg).await?;
-    let invocation = Invocation {
-        source_path: cfg.file.clone(),
-        args: row.args.clone(),
-        entity: cfg.id,
-        instance_id: row.instance_id,
-        migrations,
-    };
-    let handle = runtime.workflow_runtime.start(invocation).await?;
-    Ok(WorkflowInstance {
-        handle,
-        emit: EmitState::new(runtime.workflow_stack.db.clone(), row.instance_id),
-    })
+    boot_instance(runtime, cfg, row.instance_id, row.args.clone()).await
 }
 
 /// Decoded `workflow_stack` row.

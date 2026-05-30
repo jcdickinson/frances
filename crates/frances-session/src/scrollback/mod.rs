@@ -133,8 +133,8 @@ enum RowPayload {
 pub async fn persist_section(
     db: &Database,
     instance: Uuid,
-    kind: &SectionKind,
-    text: &str,
+    kind: SectionKind,
+    text: String,
     truncated: bool,
 ) -> std::result::Result<(), ScrollbackError> {
     let payload = encode_payload(kind, text);
@@ -258,35 +258,15 @@ pub async fn replay_to_channel(
     Ok(())
 }
 
-fn encode_payload(kind: &SectionKind, text: &str) -> RowPayload {
+fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
     match kind {
-        SectionKind::Markdown { source } => RowPayload::Markdown {
-            source: *source,
-            text: text.to_owned(),
-        },
-        SectionKind::Error => RowPayload::Error {
-            text: text.to_owned(),
-        },
-        SectionKind::ToolUse { name, detail } => RowPayload::ToolUse {
-            name: name.clone(),
-            detail: detail.clone(),
-        },
-        SectionKind::Json { tag, value } => RowPayload::Json {
-            tag: tag.clone(),
-            value: value.clone(),
-        },
-        SectionKind::ShellOutput { state, cmd } => RowPayload::ShellOutput {
-            state: state.clone(),
-            cmd: cmd.clone(),
-            text: text.to_owned(),
-        },
-        SectionKind::Reasoning { state } => RowPayload::Reasoning {
-            state: state.clone(),
-            text: text.to_owned(),
-        },
-        SectionKind::Diff { lines } => RowPayload::Diff {
-            lines: lines.clone(),
-        },
+        SectionKind::Markdown { source } => RowPayload::Markdown { source, text },
+        SectionKind::Error => RowPayload::Error { text },
+        SectionKind::ToolUse { name, detail } => RowPayload::ToolUse { name, detail },
+        SectionKind::Json { tag, value } => RowPayload::Json { tag, value },
+        SectionKind::ShellOutput { state, cmd } => RowPayload::ShellOutput { state, cmd, text },
+        SectionKind::Reasoning { state } => RowPayload::Reasoning { state, text },
+        SectionKind::Diff { lines } => RowPayload::Diff { lines },
     }
 }
 
@@ -361,11 +341,11 @@ mod tests {
         persist_section(
             &db,
             instance,
-            &SectionKind::ToolUse {
+            SectionKind::ToolUse {
                 name: "shell".into(),
                 detail: None,
             },
-            "",
+            String::new(),
             false,
         )
         .await
@@ -405,10 +385,10 @@ mod tests {
         persist_section(
             &db,
             instance,
-            &SectionKind::Markdown {
+            SectionKind::Markdown {
                 source: Source::User,
             },
-            "hi",
+            "hi".into(),
             false,
         )
         .await
@@ -417,11 +397,11 @@ mod tests {
         persist_section(
             &db,
             instance,
-            &SectionKind::ToolUse {
+            SectionKind::ToolUse {
                 name: "shell".into(),
                 detail: None,
             },
-            "",
+            String::new(),
             false,
         )
         .await
@@ -429,10 +409,10 @@ mod tests {
         persist_section(
             &db,
             instance,
-            &SectionKind::Markdown {
+            SectionKind::Markdown {
                 source: Source::Assistant,
             },
-            "partial",
+            "partial".into(),
             true,
         )
         .await
