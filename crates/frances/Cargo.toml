@@ -18,6 +18,7 @@ tracing.workspace = true
 futures-util.workspace = true
 crossterm.workspace = true
 unicode-width.workspace = true
+frances-core.workspace = true
 frances-edit.workspace = true
 frances-markdown.workspace = true
 frances-models-tui.workspace = true

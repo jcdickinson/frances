@@ -1,4 +1,9 @@
+use std::borrow::Cow;
+use std::cell::{OnceCell, Ref, RefCell};
+use std::ops::Range;
 use std::sync::Arc;
+
+use frances_core::CountingSink;
 
 use crate::tui::status::{StatusTone, status_prefix};
 use frances_session::events::{
@@ -79,9 +84,9 @@ impl Block for DiffBlock {
                 frances_session::events::DiffLine::Added(a) => a.to_string(),
                 frances_session::events::DiffLine::Removed(r) => r.to_string(),
             };
-            let mut out = Vec::new();
-            wrap_into("", &content, max, &mut out);
-            count += out.len().max(1) as u16;
+            let mut sink = CountingSink(0);
+            wrap_rows(&content, 0, max, &mut sink);
+            count += sink.0 as u16;
         }
         count
     }
@@ -126,13 +131,27 @@ impl Block for DiffBlock {
 /// matching-width indent on continuation rows.
 #[derive(Serialize, Deserialize)]
 pub struct LabelledBlock {
-    pub kind: WireBlockKind,
-    pub text: String,
+    kind: WireBlockKind,
+    text: String,
+    /// Wrapped row-ranges into [`Self::body_text`], cached with the width
+    /// they were computed for. The body is wrapped on both `measure`
+    /// (3–4× per redraw) and `render`; caching keyed on width means a
+    /// resize recomputes but repeated draws at a stable width reuse the
+    /// ranges — and `render` slices the backing text rather than
+    /// allocating a `String` per row. The block is rebuilt from fresh
+    /// text on every streaming apply, so width is the only invalidation
+    /// axis left.
+    #[serde(skip)]
+    rows: RefCell<Option<(u16, Vec<Range<usize>>)>>,
 }
 
 impl LabelledBlock {
     pub fn new(kind: WireBlockKind, text: String) -> Self {
-        Self { kind, text }
+        Self {
+            kind,
+            text,
+            rows: RefCell::new(None),
+        }
     }
 
     /// Body content rendered into the block area. For plain `ToolUse`
@@ -144,6 +163,17 @@ impl LabelledBlock {
             WireBlockKind::ToolUse { name, .. } => name,
             _ => &self.text,
         }
+    }
+
+    /// Wrapped row-ranges for the body at `width`, recomputed only when
+    /// the cached width differs. Ranges index into [`Self::body_text`].
+    fn rows(&self, width: u16) -> Ref<'_, Vec<Range<usize>>> {
+        let stale = self.rows.borrow().as_ref().is_none_or(|(w, _)| *w != width);
+        if stale {
+            let rows = body_line_ranges(self.body_text(), width);
+            *self.rows.borrow_mut() = Some((width, rows));
+        }
+        Ref::map(self.rows.borrow(), |c| &c.as_ref().unwrap().1)
     }
 }
 
@@ -159,14 +189,15 @@ impl Input for LabelledBlock {
 
 impl Block for LabelledBlock {
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
-        wrapped_body_lines(self.body_text(), ctx.width).len() as u16
+        self.rows(ctx.width).len() as u16
     }
 
     fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
-        let lines = wrapped_body_lines(self.body_text(), ctx.area.width);
+        let body = self.body_text();
+        let rows = self.rows(ctx.area.width);
         let src_y = ctx.src_y;
         let area = ctx.area;
-        for (i, line) in lines.iter().enumerate() {
+        for (i, row) in rows.iter().enumerate() {
             let i = i as u16;
             if i < src_y {
                 continue;
@@ -175,8 +206,12 @@ impl Block for LabelledBlock {
             if dst_row >= area.height {
                 break;
             }
-            ctx.buf
-                .set_string(area.x, area.y + dst_row, line, Style::default());
+            ctx.buf.set_string(
+                area.x,
+                area.y + dst_row,
+                &body[row.clone()],
+                Style::default(),
+            );
         }
         paint_truncation_marker_if_set(ctx);
         sigil_for(&self.kind)
@@ -195,8 +230,8 @@ impl Block for LabelledBlock {
 /// keeps streaming.
 #[derive(Serialize, Deserialize)]
 pub struct TailedBlock {
-    pub header: TailedHeader,
-    pub text: String,
+    header: TailedHeader,
+    text: String,
     /// Alt-view-only scroll offset, measured in *source lines* from
     /// the tail. `0` = the window sits at the tail (the canonical
     /// live-view position). Live-view renders always force this to
@@ -204,7 +239,15 @@ pub struct TailedBlock {
     /// representation never carries scroll state — hence the
     /// `serde(default, skip)` annotation.
     #[serde(default, skip_serializing_if = "is_zero_u16")]
-    pub scroll_y: u16,
+    scroll_y: u16,
+    /// Cached source-line byte-ranges into [`Self::text`] (trailing
+    /// blanks stripped). The split is width-independent and the block is
+    /// rebuilt on every streaming apply, so it's computed once and reused
+    /// across the many `is_empty` / `max_scroll_for` / body calls a
+    /// single redraw makes — the original re-`split('\n')`'d the whole
+    /// (potentially large) body on each.
+    #[serde(skip)]
+    source: OnceCell<Vec<Range<usize>>>,
 }
 
 fn is_zero_u16(v: &u16) -> bool {
@@ -217,6 +260,7 @@ impl TailedBlock {
             header,
             text,
             scroll_y: 0,
+            source: OnceCell::new(),
         }
     }
 
@@ -248,7 +292,7 @@ impl TailedBlock {
     /// pill on its own is just noise. Shell blocks always show their
     /// header (the command line + status) even when the body is empty.
     fn is_empty(&self) -> bool {
-        matches!(self.header, TailedHeader::Reasoning { .. }) && self.source_lines().is_empty()
+        matches!(self.header, TailedHeader::Reasoning { .. }) && self.source_ranges().is_empty()
     }
 
     fn header_lines(&self, width: u16) -> Vec<String> {
@@ -258,60 +302,123 @@ impl TailedBlock {
         out
     }
 
-    /// Non-empty source lines, with trailing blanks from a closing
-    /// `\n` stripped. Shared between [`Self::max_scroll_for`] and the
-    /// windowing logic in [`Self::body_lines_at`].
-    fn source_lines(&self) -> Vec<&str> {
-        let mut source: Vec<&str> = self.text.split('\n').collect();
-        while matches!(source.last(), Some(&"")) {
-            source.pop();
-        }
-        source
+    /// Row count for [`Self::header_lines`] without materialising the rows.
+    fn header_row_count(&self, width: u16) -> usize {
+        let (prefix, _style) = self.header_prefix();
+        let mut sink = CountingSink(0);
+        wrap_rows(
+            self.header_body(),
+            display_width(&prefix),
+            width.max(1) as usize,
+            &mut sink,
+        );
+        sink.0
+    }
+
+    /// Source-line byte-ranges into [`Self::text`], with trailing blanks
+    /// from a closing `\n` stripped, computed once and cached. Shared
+    /// between [`Self::max_scroll_for`] and the windowing logic in
+    /// [`Self::body_rows`].
+    fn source_ranges(&self) -> &[Range<usize>] {
+        self.source.get_or_init(|| {
+            let mut ranges = line_ranges(&self.text);
+            while matches!(ranges.last(), Some(r) if r.is_empty()) {
+                ranges.pop();
+            }
+            ranges
+        })
     }
 
     /// Maximum legal `scroll_y` for a given tail height — beyond this
     /// the window would expose negative rows. Returns `0` when the
     /// source is shorter than the tail.
     fn max_scroll_for(&self, tail: usize) -> u16 {
-        let source_len = self.source_lines().len();
-        source_len.saturating_sub(tail) as u16
+        self.source_ranges().len().saturating_sub(tail) as u16
     }
 
     /// Body rows for a window of height `tail` whose right edge sits
     /// `window_start` source-lines *before* the natural tail. The row
     /// count is invariant in `window_start` (clamped via
     /// [`Self::max_scroll_for`]) so `measure` and `render` agree on height.
+    /// Source-line rows are borrowed slices of [`Self::text`]; only the
+    /// marker is owned.
     ///
     /// - When `source.len() > tail`: 1 marker row + `tail` body rows.
     ///   The marker reports how many source lines remain hidden above
     ///   the window (`0` when scrolled to the top).
     /// - When `source.len() <= tail`: marker suppressed, output is the
     ///   source verbatim.
-    fn body_lines_at(&self, width: u16, window_start: u16, tail: usize) -> Vec<String> {
-        let source = self.source_lines();
+    fn body_rows(&self, width: u16, window_start: u16, tail: usize) -> Vec<Cow<'_, str>> {
+        let source = self.source_ranges();
         if source.is_empty() {
             return Vec::new();
         }
         let max = width.max(1) as usize;
-        let mut out = Vec::new();
-        if source.len() > tail {
-            let start_offset = window_start.min(self.max_scroll_for(tail)) as usize;
-            let end = source.len() - start_offset;
-            let start = end - tail;
-            let marker = format!(
-                "… [{start} earlier line{}]",
-                if start == 1 { "" } else { "s" }
-            );
-            wrap_into("", &marker, max, &mut out);
-            for line in &source[start..end] {
-                wrap_into("", line, max, &mut out);
-            }
-        } else {
-            for line in &source {
-                wrap_into("", line, max, &mut out);
-            }
+        let (marker, start, end) = body_window(source.len(), window_start, tail);
+        let mut out: Vec<Cow<'_, str>> = Vec::new();
+        if let Some(marker) = marker {
+            let mut wrapped = Vec::new();
+            wrap_into("", &marker, max, &mut wrapped);
+            out.extend(wrapped.into_iter().map(Cow::Owned));
+        }
+        for r in &source[start..end] {
+            let line = &self.text[r.clone()];
+            let mut ranges = Vec::new();
+            wrap_rows(line, 0, max, &mut ranges);
+            out.extend(ranges.into_iter().map(|rr| Cow::Borrowed(&line[rr])));
         }
         out
+    }
+
+    /// Row count for [`Self::body_rows`] at the live-view window
+    /// (`window_start = 0`) without materialising the rows. The count is
+    /// invariant in `window_start`, so the live window is the right basis
+    /// for `measure`.
+    fn body_row_count(&self, width: u16, tail: usize) -> usize {
+        let source = self.source_ranges();
+        if source.is_empty() {
+            return 0;
+        }
+        let max = width.max(1) as usize;
+        let (marker, start, end) = body_window(source.len(), 0, tail);
+        let mut sink = CountingSink(0);
+        if let Some(marker) = &marker {
+            wrap_rows(marker, 0, max, &mut sink);
+        }
+        for r in &source[start..end] {
+            wrap_rows(&self.text[r.clone()], 0, max, &mut sink);
+        }
+        sink.0
+    }
+}
+
+/// The visible body window for a tailed block of height `tail` whose
+/// right edge sits `window_start` source-lines before the natural tail.
+/// Returns `(marker, start, end)` where `source[start..end]` are the
+/// visible source lines and `marker` is the `… [N earlier lines]` row
+/// shown above them (`None` when the source fits inside the tail, in
+/// which case the whole source is visible and no marker is shown).
+///
+/// `window_start` is clamped so the count of returned lines is invariant
+/// in it — `measure` (window_start 0) and a scrolled `render` agree on
+/// height.
+fn body_window(
+    source_len: usize,
+    window_start: u16,
+    tail: usize,
+) -> (Option<String>, usize, usize) {
+    if source_len > tail {
+        let max_scroll = source_len.saturating_sub(tail);
+        let start_offset = (window_start as usize).min(max_scroll);
+        let end = source_len - start_offset;
+        let start = end - tail;
+        let marker = format!(
+            "… [{start} earlier line{}]",
+            if start == 1 { "" } else { "s" }
+        );
+        (Some(marker), start, end)
+    } else {
+        (None, 0, source_len)
     }
 }
 
@@ -359,8 +466,7 @@ impl Block for TailedBlock {
             return 0;
         }
         let tail = tail_lines_for(ctx.selected);
-        let body_rows = self.body_lines_at(ctx.width, 0, tail).len();
-        (self.header_lines(ctx.width).len() + body_rows) as u16
+        (self.header_row_count(ctx.width) + self.body_row_count(ctx.width, tail)) as u16
     }
 
     fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
@@ -374,7 +480,7 @@ impl Block for TailedBlock {
         let window_start = if ctx.alt_view { self.scroll_y } else { 0 };
         let tail = tail_lines_for(ctx.selected);
         let header = self.header_lines(ctx.area.width);
-        let body = self.body_lines_at(ctx.area.width, window_start, tail);
+        let body = self.body_rows(ctx.area.width, window_start, tail);
         let (prefix, prefix_style) = self.header_prefix();
         let prefix_bytes = prefix.len();
         let prefix_cols = display_width(&prefix) as u16;
@@ -416,7 +522,7 @@ impl Block for TailedBlock {
                     return Sigil::blank();
                 }
                 ctx.buf
-                    .set_string(area.x, area.y + dst_row, line, body_style);
+                    .set_string(area.x, area.y + dst_row, line.as_ref(), body_style);
             }
             src_idx = src_idx.saturating_add(1);
         }
@@ -468,6 +574,19 @@ impl ToolUseBlock {
         }
         out
     }
+
+    /// Row count for [`Self::wrapped_lines`] without materialising the
+    /// rows. The prefix and continuation indent share a width, so both
+    /// pass `prefix_width` as the lead.
+    fn wrapped_line_count(&self, width: u16) -> u16 {
+        let max = width.max(1) as usize;
+        let prefix_width = display_width(&self.name_prefix());
+        let mut sink = CountingSink(0);
+        for source_line in self.detail.split('\n') {
+            wrap_rows(source_line, prefix_width, max, &mut sink);
+        }
+        sink.0 as u16
+    }
 }
 
 impl Input for ToolUseBlock {
@@ -489,7 +608,7 @@ impl Block for ToolUseBlock {
     }
 
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
-        self.wrapped_lines(ctx.width).len() as u16
+        self.wrapped_line_count(ctx.width)
     }
 
     fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {
@@ -702,41 +821,109 @@ pub fn sigil_for(kind: &WireBlockKind) -> Sigil {
     }
 }
 
-/// Wrap `text` to `width` columns, one row per wrapped line. The
-/// container is responsible for the left gutter; this function doesn't
-/// know about sigils.
-pub fn wrapped_body_lines(text: &str, width: u16) -> Vec<String> {
-    let max = width.max(1) as usize;
-    // LLM completions routinely end with one or more trailing `\n`s.
-    // Without stripping, `split('\n')` yields an empty trailing element
-    // that renders as a blank continuation row. Embedded blank lines
-    // (`\n\n` mid-text) are preserved as real paragraph breaks.
-    let text = text.trim_end_matches('\n');
-
-    let mut out = Vec::new();
-    for source_line in text.split('\n') {
-        wrap_into("", source_line, max, &mut out);
-    }
-    if out.is_empty() {
-        out.push(String::new());
-    }
-    out
+/// Wrap `text` into rows at `max_width` columns, emitting one
+/// byte-[`Range`] per row into `sink`. `lead_width` is the column cost
+/// of a prefix that occupies the start of the first row (the prefix
+/// bytes are *not* part of `text`, so they never appear in a range); it
+/// only shifts where the first break falls. Continuation rows start at
+/// column 0.
+///
+/// Always emits at least one range (`0..0` for empty `text`), matching
+/// the "one blank row" floor the string builders rely on. Splitting the
+/// row geometry out from materialisation lets [`Block::measure`] count
+/// rows with a [`CountingSink`] — no per-row `String` allocated — while
+/// `render` still slices the backing text.
+/// An [`Extend`] sink that shifts each row range by `base` before
+/// forwarding it to `out`. Lets [`wrap_rows`] (which emits ranges
+/// relative to the slice it was given) write ranges relative to a larger
+/// backing string — e.g. wrapping one `\n`-separated line but recording
+/// the rows as ranges into the whole body.
+struct OffsetSink<'a> {
+    out: &'a mut Vec<Range<usize>>,
+    base: usize,
 }
 
-fn wrap_into(lead: &str, text: &str, max_width: usize, out: &mut Vec<String>) {
-    let mut current = String::from(lead);
-    let mut current_width = display_width(lead);
+impl Extend<Range<usize>> for OffsetSink<'_> {
+    fn extend<I: IntoIterator<Item = Range<usize>>>(&mut self, iter: I) {
+        let base = self.base;
+        self.out
+            .extend(iter.into_iter().map(|r| base + r.start..base + r.end));
+    }
+}
 
-    for ch in text.chars() {
+/// Byte-ranges of `text` split on `\n`, the range analogue of
+/// `text.split('\n').collect()` (no trailing-empty stripping). Always
+/// yields at least one range.
+fn line_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    for (nl, _) in text.match_indices('\n') {
+        ranges.push(start..nl);
+        start = nl + 1;
+    }
+    ranges.push(start..text.len());
+    ranges
+}
+
+/// Wrapped row-ranges for a labelled-block body at `width`. The body is
+/// trimmed of trailing `\n` (a closing newline shouldn't paint a blank
+/// row), then each `\n`-separated line is wrapped; embedded blank lines
+/// survive as real paragraph breaks. Ranges index into `text`. Always
+/// non-empty — empty/blank input yields a single `0..0` row.
+fn body_line_ranges(text: &str, width: u16) -> Vec<Range<usize>> {
+    let max = width.max(1) as usize;
+    let text = text.trim_end_matches('\n');
+    let mut rows = Vec::new();
+    for line in line_ranges(text) {
+        let mut sink = OffsetSink {
+            out: &mut rows,
+            base: line.start,
+        };
+        wrap_rows(&text[line.clone()], 0, max, &mut sink);
+    }
+    rows
+}
+
+fn wrap_rows(
+    text: &str,
+    lead_width: usize,
+    max_width: usize,
+    sink: &mut impl Extend<Range<usize>>,
+) {
+    let mut start = 0;
+    // Width of the row so far, including `lead_width` on the first row.
+    // `current_width > 0` doubles as "this row has visible content": a
+    // break is only taken once the row holds something, so we never emit
+    // an empty row before consuming at least one character.
+    let mut current_width = lead_width;
+
+    for (idx, ch) in text.char_indices() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if current_width + w > max_width && !current.is_empty() && current_width > 0 {
-            out.push(std::mem::take(&mut current));
+        if current_width + w > max_width && current_width > 0 {
+            sink.extend(std::iter::once(start..idx));
+            start = idx;
             current_width = 0;
         }
-        current.push(ch);
         current_width += w;
     }
-    out.push(current);
+    sink.extend(std::iter::once(start..text.len()));
+}
+
+/// Wrap `text` to owned `String` rows, prepending `lead` to the first
+/// row. The render paths use this; `measure` uses [`wrap_rows`] with a
+/// [`CountingSink`] instead.
+fn wrap_into(lead: &str, text: &str, max_width: usize, out: &mut Vec<String>) {
+    let mut rows = Vec::new();
+    wrap_rows(text, display_width(lead), max_width, &mut rows);
+    for (i, row) in rows.iter().enumerate() {
+        let mut s = if i == 0 {
+            String::from(lead)
+        } else {
+            String::new()
+        };
+        s.push_str(&text[row.clone()]);
+        out.push(s);
+    }
 }
 
 fn display_width(s: &str) -> usize {
@@ -750,17 +937,24 @@ mod tests {
     use super::*;
     use frances_session::events::DiffLine;
 
+    /// Materialise [`body_line_ranges`] back to the rows it describes —
+    /// the labelled-block body the cache stores and `render` slices.
+    fn wrap_body(text: &str, width: u16) -> Vec<&str> {
+        body_line_ranges(text, width)
+            .iter()
+            .map(|r| &text[r.clone()])
+            .collect()
+    }
+
     #[test]
     fn no_trailing_newline_is_unchanged() {
-        let lines = wrapped_body_lines("Hello", 80);
-        assert_eq!(lines, vec!["Hello"]);
+        assert_eq!(wrap_body("Hello", 80), vec!["Hello"]);
     }
 
     #[test]
     fn single_trailing_newline_is_stripped() {
-        let lines = wrapped_body_lines("Hello\n", 80);
         assert_eq!(
-            lines,
+            wrap_body("Hello\n", 80),
             vec!["Hello"],
             "trailing `\\n` should not produce a blank continuation row"
         );
@@ -768,39 +962,31 @@ mod tests {
 
     #[test]
     fn multiple_trailing_newlines_are_stripped() {
-        let lines = wrapped_body_lines("Hello\n\n\n", 80);
-        assert_eq!(lines, vec!["Hello"]);
+        assert_eq!(wrap_body("Hello\n\n\n", 80), vec!["Hello"]);
     }
 
     #[test]
     fn mid_text_paragraph_break_is_preserved() {
-        let lines = wrapped_body_lines("One\n\nTwo", 80);
         assert_eq!(
-            lines,
-            vec!["One".to_string(), "".to_string(), "Two".to_string()],
+            wrap_body("One\n\nTwo", 80),
+            vec!["One", "", "Two"],
             "an internal `\\n\\n` is a real paragraph break and stays"
         );
     }
 
     #[test]
     fn mid_text_paragraph_break_with_trailing_newline_keeps_only_the_break() {
-        let lines = wrapped_body_lines("One\n\nTwo\n", 80);
-        assert_eq!(
-            lines,
-            vec!["One".to_string(), "".to_string(), "Two".to_string()]
-        );
+        assert_eq!(wrap_body("One\n\nTwo\n", 80), vec!["One", "", "Two"]);
     }
 
     #[test]
     fn newline_only_text_collapses_to_one_blank_row() {
-        let lines = wrapped_body_lines("\n", 80);
-        assert_eq!(lines, vec![""]);
+        assert_eq!(wrap_body("\n", 80), vec![""]);
     }
 
     #[test]
     fn empty_text_yields_one_blank_row() {
-        let lines = wrapped_body_lines("", 80);
-        assert_eq!(lines, vec![""]);
+        assert_eq!(wrap_body("", 80), vec![""]);
     }
 
     #[test]
@@ -1005,16 +1191,16 @@ mod tests {
             let b0 = block_with_lines(30);
             let mut b5 = block_with_lines(30);
             b5.scroll_y = 5;
-            let lines0 = b0.body_lines_at(80, 0, TAIL_LINES);
-            let lines5 = b5.body_lines_at(80, 5, TAIL_LINES);
+            let lines0 = b0.body_rows(80, 0, TAIL_LINES);
+            let lines5 = b5.body_rows(80, 5, TAIL_LINES);
             // Both runs have 1 marker + TAIL_LINES body rows.
             assert_eq!(lines0.len(), 1 + TAIL_LINES);
             assert_eq!(lines5.len(), 1 + TAIL_LINES);
-            assert_eq!(lines0[0], "… [20 earlier lines]");
-            assert_eq!(lines5[0], "… [15 earlier lines]");
+            assert_eq!(&*lines0[0], "… [20 earlier lines]");
+            assert_eq!(&*lines5[0], "… [15 earlier lines]");
             // Window shifts back by 5 source lines.
-            assert_eq!(lines0[1], "line21");
-            assert_eq!(lines5[1], "line16");
+            assert_eq!(&*lines0[1], "line21");
+            assert_eq!(&*lines5[1], "line16");
         }
 
         #[test]
@@ -1071,6 +1257,204 @@ mod tests {
                 marker_row.starts_with("… [13 earlier lines]"),
                 "alt view ignored scroll_y; got marker row: {marker_row:?}",
             );
+        }
+    }
+
+    /// `wrap_rows` (the allocation-free measure core) and `wrap_into`
+    /// (the render path) must agree: same row count, and the ranges must
+    /// reconstruct the materialised strings. If these drift, `measure`
+    /// and `render` disagree on height and the container's layout breaks.
+    mod wrap_equivalence {
+        use super::*;
+
+        const CASES: &[(&str, &str)] = &[
+            ("", ""),
+            ("", "short"),
+            ("", "a string that is definitely wider than the wrap width"),
+            ("", "exact"),
+            ("→ ", "tool detail that wraps across several rows for sure"),
+            (
+                "… ",
+                "wide  →  glyphs … and ✓ marks mixed in with ascii text here",
+            ),
+            ("prefix ", ""),
+            ("", "trailing space test "),
+        ];
+
+        fn rows(text: &str, lead_width: usize, max: usize) -> Vec<Range<usize>> {
+            let mut out = Vec::new();
+            wrap_rows(text, lead_width, max, &mut out);
+            out
+        }
+
+        #[test]
+        fn count_matches_wrap_into() {
+            for &(lead, text) in CASES {
+                for max in [1usize, 3, 8, 20, 200] {
+                    let lead_width = display_width(lead);
+                    let ranges = rows(text, lead_width, max);
+                    let mut materialised = Vec::new();
+                    wrap_into(lead, text, max, &mut materialised);
+                    assert_eq!(
+                        ranges.len(),
+                        materialised.len(),
+                        "row count diverged for lead={lead:?} text={text:?} max={max}",
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn ranges_reconstruct_wrap_into_strings() {
+            for &(lead, text) in CASES {
+                for max in [1usize, 3, 8, 20, 200] {
+                    let lead_width = display_width(lead);
+                    let ranges = rows(text, lead_width, max);
+                    let mut materialised = Vec::new();
+                    wrap_into(lead, text, max, &mut materialised);
+                    let rebuilt: Vec<String> = ranges
+                        .iter()
+                        .enumerate()
+                        .map(|(i, r)| {
+                            let mut s = if i == 0 {
+                                String::from(lead)
+                            } else {
+                                String::new()
+                            };
+                            s.push_str(&text[r.clone()]);
+                            s
+                        })
+                        .collect();
+                    assert_eq!(
+                        rebuilt, materialised,
+                        "ranges didn't reconstruct rows for lead={lead:?} text={text:?} max={max}",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Each block's `measure` (count helpers) must equal the length of
+    /// the rows its `render` path materialises, at the same width.
+    mod measure_matches_render {
+        use super::*;
+
+        fn mctx(width: u16) -> BlockMeasureContext<'static> {
+            // Theme is never read during measure today; leak one default
+            // so the context can borrow a `'static`.
+            let theme: &'static frances_tui::widget::Theme =
+                Box::leak(Box::new(frances_tui::widget::Theme::default()));
+            BlockMeasureContext {
+                width,
+                selected: false,
+                selected_part: None,
+                theme,
+            }
+        }
+
+        #[test]
+        fn labelled_block() {
+            let text = "a longish assistant reply\nwith two paragraphs that each wrap a bit";
+            let b = LabelledBlock::new(
+                WireBlockKind::Text {
+                    source: Source::Assistant,
+                },
+                text.into(),
+            );
+            for width in [4u16, 12, 30, 200] {
+                assert_eq!(
+                    b.measure(&mctx(width)) as usize,
+                    wrap_body(b.body_text(), width).len(),
+                    "width {width}",
+                );
+            }
+        }
+
+        #[test]
+        fn tool_use_block() {
+            let b = ToolUseBlock::new(
+                "shell".into(),
+                "a detail line\nand a second one that is long enough to wrap somewhere".into(),
+            );
+            for width in [4u16, 12, 30, 200] {
+                assert_eq!(
+                    b.measure(&mctx(width)) as usize,
+                    b.wrapped_lines(width).len(),
+                    "width {width}",
+                );
+            }
+        }
+
+        #[test]
+        fn tailed_block_short_and_long() {
+            for n in [3usize, 12, 40] {
+                let body: String = (0..n).map(|i| format!("output line {}\n", i + 1)).collect();
+                let b = TailedBlock::new(
+                    TailedHeader::Shell {
+                        state: ShellState::Success,
+                        cmd: "build with a fairly long command line that wraps".into(),
+                    },
+                    body,
+                );
+                for width in [6u16, 20, 200] {
+                    let tail = tail_lines_for(false);
+                    let rendered = b.header_lines(width).len() + b.body_rows(width, 0, tail).len();
+                    assert_eq!(
+                        b.measure(&mctx(width)) as usize,
+                        rendered,
+                        "n={n} width={width}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn diff_block() {
+            let b = DiffBlock::new(vec![
+                frances_session::events::DiffLine::Context {
+                    text: "a context line that is long enough to wrap at small widths".into(),
+                    line: 12,
+                },
+                frances_session::events::DiffLine::Added("added".into()),
+            ]);
+            for width in [6u16, 20, 200] {
+                // Mirror render's per-line wrap to count materialised rows.
+                let max = width.max(1) as usize;
+                let mut rendered = 0usize;
+                for line in &b.lines {
+                    let content = match line {
+                        frances_session::events::DiffLine::Context { text: c, line: l } => {
+                            format!("{:4} {}", l, c)
+                        }
+                        frances_session::events::DiffLine::Added(a) => a.to_string(),
+                        frances_session::events::DiffLine::Removed(r) => r.to_string(),
+                    };
+                    let mut out = Vec::new();
+                    wrap_into("", &content, max, &mut out);
+                    rendered += out.len();
+                }
+                assert_eq!(b.measure(&mctx(width)) as usize, rendered, "width {width}");
+            }
+        }
+
+        /// The labelled-block row cache is keyed on width: re-measuring at
+        /// a previously-seen width after a different one must recompute,
+        /// not return the stale narrow/wide layout.
+        #[test]
+        fn labelled_cache_recomputes_on_width_change() {
+            let text = "a reply long enough that the wrap width clearly changes the row count";
+            let b = LabelledBlock::new(
+                WireBlockKind::Text {
+                    source: Source::Assistant,
+                },
+                text.into(),
+            );
+            let wide = b.measure(&mctx(200));
+            let narrow = b.measure(&mctx(12));
+            assert!(narrow > wide, "narrower width should wrap to more rows");
+            // Re-visit each width; the cache must yield the same answers.
+            assert_eq!(b.measure(&mctx(200)), wide);
+            assert_eq!(b.measure(&mctx(12)), narrow);
         }
     }
 }

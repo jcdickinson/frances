@@ -1460,6 +1460,7 @@ dependencies = [
  "anyhow",
  "clap",
  "crossterm",
+ "frances-core",
  "frances-edit",
  "frances-markdown",
  "frances-models-tui",
