@@ -60,7 +60,7 @@ use std::io::{self, Write};
 
 use ratatui::Terminal;
 use ratatui::backend::Backend;
-use ratatui::buffer::{Buffer, Cell};
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Rect, Size};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -169,19 +169,17 @@ struct CommittedEntry {
 /// cells enter native scrollback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayoutMode {
-    /// Total content height (safe + active + footer) fits inside the
-    /// terminal.
-    Normal,
-    /// Content overflows, but every overflowing entry is `safe` —
-    /// natural scroll commits them to scrollback cleanly.
-    SafeOnly,
+    /// Content fits, or only `safe` entries overflow — both render via
+    /// the natural-scroll path (the distinction was never read).
+    Natural,
     /// Content overflows AND at least one active entry is partially
     /// or fully hidden above the visible window. We must NOT let
     /// active cells flow into native scrollback, so the render path
     /// reserves a top row for a `•••` ellipsis indicator, paints the
     /// visible blocks bottom-up, and explicitly emits any hidden safe
-    /// entries into scrollback at the top.
-    ActiveOverflow,
+    /// entries into scrollback at the top. Carries the dims
+    /// `classify_layout` already computed.
+    ActiveOverflow(OverflowDims),
 }
 
 pub struct ScrollbackContainer {
@@ -893,11 +891,11 @@ impl ScrollbackContainer {
     /// Classify the current frame's layout. The result decides which
     /// render path runs:
     ///
-    /// * [`LayoutMode::Normal`] / [`LayoutMode::SafeOnly`] — the
-    ///   natural-scroll path (terminal scrolls older rows into native
-    ///   scrollback itself). Used when content fits, or when the
-    ///   only overflowing entries are safe and may be evicted via
-    ///   natural scroll without losing recoverability.
+    /// * [`LayoutMode::Natural`] — the natural-scroll path (terminal
+    ///   scrolls older rows into native scrollback itself). Used when
+    ///   content fits, or when the only overflowing entries are safe
+    ///   and may be evicted via natural scroll without losing
+    ///   recoverability.
     /// * [`LayoutMode::ActiveOverflow`] — content overflows and at
     ///   least one row of *active* content would have to be hidden
     ///   above the visible window. We must not let active cells leak
@@ -918,9 +916,9 @@ impl ScrollbackContainer {
             // Footer alone fills (or overflows) the terminal. No room
             // for blocks; the natural-scroll path handles footer
             // overflow with its own pre-scroll logic.
-            return LayoutMode::Normal;
+            return LayoutMode::Natural;
         }
-        let available_h = (terminal_h - footer_h) as u32;
+        let available_h = terminal_h - footer_h;
         let mctx = self.measure_ctx(width);
         let safe_h: u32 = self
             .safe
@@ -934,12 +932,15 @@ impl ScrollbackContainer {
             .map(|e| block_slot_height(e.block.as_ref(), &mctx) as u32)
             .sum();
         let total = safe_h + active_h + footer_h as u32;
-        if total <= terminal_h as u32 {
-            LayoutMode::Normal
-        } else if active_h >= available_h {
-            LayoutMode::ActiveOverflow
+        if total > terminal_h as u32 && active_h >= available_h as u32 {
+            LayoutMode::ActiveOverflow(OverflowDims {
+                width,
+                terminal_h,
+                available_h,
+                footer_h,
+            })
         } else {
-            LayoutMode::SafeOnly
+            LayoutMode::Natural
         }
     }
 
@@ -993,8 +994,8 @@ impl ScrollbackContainer {
         let terminal_resized = self.prev_term_size.is_some_and(|prev| prev != term_size);
 
         let mode = self.classify_layout(footer, width, terminal_h);
-        let exiting_active_overflow = self.prev_mode == Some(LayoutMode::ActiveOverflow)
-            && mode != LayoutMode::ActiveOverflow;
+        let exiting_active_overflow = matches!(self.prev_mode, Some(LayoutMode::ActiveOverflow(_)))
+            && !matches!(mode, LayoutMode::ActiveOverflow(_));
 
         tracing::trace!(
             width,
@@ -1039,20 +1040,8 @@ impl ScrollbackContainer {
             self.prev_footer_height = None;
         }
 
-        if mode == LayoutMode::ActiveOverflow {
-            let footer_h = footer.measure(width);
-            let available_h = terminal_h.saturating_sub(footer_h);
-            self.draw_active_overflow(
-                terminal,
-                footer,
-                ctx,
-                OverflowDims {
-                    width,
-                    terminal_h,
-                    available_h,
-                    footer_h,
-                },
-            )?;
+        if let LayoutMode::ActiveOverflow(dims) = mode {
+            self.draw_active_overflow(terminal, footer, ctx, dims)?;
             self.prev_term_size = Some(term_size);
             self.prev_mode = Some(mode);
             return Ok(());
@@ -1434,43 +1423,26 @@ impl ScrollbackContainer {
 
         let mut emitted: u16 = 0;
 
+        let emit_ctx = EmitCtx {
+            mctx: &mctx,
+            frame_time: ctx.frame_time,
+            total_rows,
+        };
+
         // 1. Evict safe entries (oldest first).
         for safe_entry in self.safe.iter() {
-            let content_h = safe_entry.block.measure(&mctx);
-            if content_h == 0 {
-                continue;
-            }
-            let slot_h = content_h.saturating_add(BLOCK_GAP_ROWS);
-            let area = Rect::new(0, 0, width, slot_h);
-            let mut buf = Buffer::empty(area);
-            let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
-            let mut rctx = BlockRenderContext {
-                area: body_area,
-                buf: &mut buf,
-                src_y: 0,
-                truncated: false,
-                alt_view: false,
-                selected: false,
-                selected_part: None,
-                theme: &self.theme,
-                frame_time: ctx.frame_time,
-            };
-            let sigil = safe_entry.block.render(&mut rctx);
-            paint_sigil(&mut buf, 0, 0, &sigil);
-            for row_idx in 0..slot_h {
-                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-                backend.write_row(cells.into_iter())?;
-                emitted = emitted.saturating_add(1);
-                if emitted < total_rows {
-                    backend.newline()?;
-                }
-            }
+            emit_block(
+                backend,
+                &emit_ctx,
+                safe_entry.block.as_ref(),
+                0,
+                &mut emitted,
+            )?;
         }
 
         // 2. Ellipsis row.
         let ellipsis_buf = build_ellipsis_buffer(width);
-        let cells: Vec<&Cell> = (0..width).map(|x| &ellipsis_buf[(x, 0)]).collect();
-        backend.write_row(cells.into_iter())?;
+        backend.write_row((0..width).map(|x| &ellipsis_buf[(x, 0)]))?;
         emitted = emitted.saturating_add(1);
         if emitted < total_rows {
             backend.newline()?;
@@ -1484,36 +1456,8 @@ impl ScrollbackContainer {
                 Some(e) => e,
                 None => continue,
             };
-            let content_h = entry.block.measure(&mctx);
-            if content_h == 0 {
-                continue;
-            }
-            let slot_h = content_h.saturating_add(BLOCK_GAP_ROWS);
-            let area = Rect::new(0, 0, width, slot_h);
-            let mut buf = Buffer::empty(area);
-            let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
-            let mut rctx = BlockRenderContext {
-                area: body_area,
-                buf: &mut buf,
-                src_y: 0,
-                truncated: false,
-                alt_view: false,
-                selected: false,
-                selected_part: None,
-                theme: &self.theme,
-                frame_time: ctx.frame_time,
-            };
-            let sigil = entry.block.render(&mut rctx);
-            paint_sigil(&mut buf, 0, 0, &sigil);
             let skip = if i == 0 { boundary_skip_rows } else { 0 };
-            for row_idx in skip..slot_h {
-                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-                backend.write_row(cells.into_iter())?;
-                emitted = emitted.saturating_add(1);
-                if emitted < total_rows {
-                    backend.newline()?;
-                }
-            }
+            emit_block(backend, &emit_ctx, entry.block.as_ref(), skip, &mut emitted)?;
         }
 
         // 4. Footer rows. The content-rows loop above already emitted
@@ -1709,8 +1653,7 @@ impl ScrollbackContainer {
             let backend = terminal.backend_mut();
             for row_idx in 0..footer_y {
                 backend.move_cursor_abs(0, row_idx)?;
-                let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-                backend.write_row(cells.into_iter())?;
+                backend.write_row((0..width).map(|x| &buf[(x, row_idx)]))?;
             }
             Backend::flush(backend)?;
         }
@@ -1906,6 +1849,61 @@ fn paint_status_bar_bottom(buf: &mut Buffer, width: u16, y: u16, below: u16) {
     }
 }
 
+/// Frame-wide constants shared across the active-overflow emit passes.
+/// `mctx` already carries the width + theme; bundling these keeps
+/// [`emit_block`]'s signature small.
+struct EmitCtx<'a> {
+    mctx: &'a BlockMeasureContext<'a>,
+    frame_time: &'a dyn FrameTime,
+    total_rows: u16,
+}
+
+/// Render one block into a fresh buffer and write its rows (from `skip`
+/// to the bottom of the slot) into native scrollback, advancing
+/// `emitted` and emitting a newline after every row that isn't the
+/// frame's last. Shared by `draw_active_overflow`'s safe-eviction and
+/// visible-active passes. A zero-height block writes nothing.
+fn emit_block<B>(
+    backend: &mut ScrollbackBackend<B>,
+    ctx: &EmitCtx<'_>,
+    block: &dyn Block,
+    skip: u16,
+    emitted: &mut u16,
+) -> io::Result<()>
+where
+    B: Backend<Error = io::Error> + Write,
+{
+    let content_h = block.measure(ctx.mctx);
+    if content_h == 0 {
+        return Ok(());
+    }
+    let width = ctx.mctx.width;
+    let slot_h = content_h.saturating_add(BLOCK_GAP_ROWS);
+    let mut buf = Buffer::empty(Rect::new(0, 0, width, slot_h));
+    let body_area = Rect::new(SIGIL_WIDTH, 0, width.saturating_sub(SIGIL_WIDTH), content_h);
+    let mut rctx = BlockRenderContext {
+        area: body_area,
+        buf: &mut buf,
+        src_y: 0,
+        truncated: false,
+        alt_view: false,
+        selected: false,
+        selected_part: None,
+        theme: ctx.mctx.theme,
+        frame_time: ctx.frame_time,
+    };
+    let sigil = block.render(&mut rctx);
+    paint_sigil(&mut buf, 0, 0, &sigil);
+    for row_idx in skip..slot_h {
+        backend.write_row((0..width).map(|x| &buf[(x, row_idx)]))?;
+        *emitted = emitted.saturating_add(1);
+        if *emitted < ctx.total_rows {
+            backend.newline()?;
+        }
+    }
+    Ok(())
+}
+
 /// Paint `sigil` into the [`SIGIL_WIDTH`]-cell gutter at `(x, y)` of
 /// `buf`. The block declared the glyph; this is the only place the
 /// container actually puts ink in the gutter. Trailing cells inside
@@ -1943,6 +1941,7 @@ fn build_ellipsis_buffer(width: u16) -> Buffer {
 /// dimensions plus the footer split (`available_h = terminal_h -
 /// footer_h`). Bundled so the path's draw entry point stays a few
 /// arguments wide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct OverflowDims {
     width: u16,
     terminal_h: u16,
@@ -2111,8 +2110,7 @@ fn write_row_at_cursor<B>(
 where
     B: Backend<Error = io::Error> + Write,
 {
-    let cells: Vec<&Cell> = (0..width).map(|x| &buf[(x, row_idx)]).collect();
-    backend.write_row(cells.into_iter())?;
+    backend.write_row((0..width).map(|x| &buf[(x, row_idx)]))?;
     if with_newline {
         backend.newline()?;
         if cursor.cursor_y + 1 < terminal_h {
