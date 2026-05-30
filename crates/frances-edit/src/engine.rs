@@ -64,7 +64,7 @@ impl<S: AnchorStore> EditEngine<S> {
                     let mut new_state = r.state;
                     new_state.mtime_ns = mtime_ns;
                     new_state.size = size;
-                    self.persist_state(&path, &new_state).await?;
+                    self.store.replace_file_lines(&path, &new_state).await?;
                     if !r.tombstoned.is_empty() {
                         self.store.tombstone(&path, &r.tombstoned).await?;
                     }
@@ -89,7 +89,7 @@ impl<S: AnchorStore> EditEngine<S> {
                     content_digest: on_disk_digest,
                     lines: entries,
                 };
-                self.persist_state(&path, &new_state).await?;
+                self.store.replace_file_lines(&path, &new_state).await?;
                 new_state
             }
         };
@@ -115,7 +115,9 @@ impl<S: AnchorStore> EditEngine<S> {
         let mut state_with_meta = state.clone();
         state_with_meta.mtime_ns = mtime_ns;
         state_with_meta.size = size;
-        self.persist_state(path, &state_with_meta).await?;
+        self.store
+            .replace_file_lines(path, &state_with_meta)
+            .await?;
         if !tombstones.is_empty() {
             self.store.tombstone(path, tombstones).await?;
         }
@@ -126,23 +128,6 @@ impl<S: AnchorStore> EditEngine<S> {
     /// reconciliation boundary chosen by the workflow.
     pub async fn commit_edits(&self) -> StoreResult<()> {
         self.store.clear_tombstones().await
-    }
-
-    async fn persist_state(&self, path: &Path, state: &FileAnchorState) -> StoreResult<()> {
-        self.store.truncate_lines(path).await?;
-        let rows: Vec<(u32, u64, Anchor)> = state
-            .lines
-            .iter()
-            .enumerate()
-            .map(|(i, le)| (i as u32, le.hash, le.anchor.clone()))
-            .collect();
-        if !rows.is_empty() {
-            self.store.upsert_lines(path, &rows).await?;
-        }
-        self.store
-            .save_meta(path, state.mtime_ns, state.size, state.content_digest)
-            .await?;
-        Ok(())
     }
 }
 

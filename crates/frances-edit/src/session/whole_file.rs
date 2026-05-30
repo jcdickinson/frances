@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::render::{DiffRender, render_diff_block};
 use crate::{AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile};
 
-use super::types::{EditError, EditResult};
+use super::types::{EditError, EditResult, WriteMode};
 use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 impl<S: AnchorStore> EditSession<S> {
@@ -20,15 +20,19 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
-        if path.exists() {
-            return Err(EditError::NewFileExists {
-                path: path.to_path_buf(),
-            });
-        }
         let draft = split_text_to_lines(text);
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
+        // No `path.exists()` precheck — it can't be race-free. The drafter
+        // opens with `create_new`, so a file that appeared between then and
+        // now surfaces here as `AlreadyExists`; map it to the typed error.
+        let (post_lines, mtime_ns, size) =
+            on_draft(path, &draft, WriteMode::CreateNew).map_err(|e| match e.kind() {
+                io::ErrorKind::AlreadyExists => EditError::NewFileExists {
+                    path: path.to_path_buf(),
+                },
+                _ => EditError::Draft(e),
+            })?;
         let working = self
             .engine
             .open(path.to_path_buf(), post_lines, mtime_ns, size)
@@ -57,7 +61,7 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
@@ -70,7 +74,7 @@ impl<S: AnchorStore> EditSession<S> {
             })?
             .clone();
         let draft = split_text_to_lines(text);
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
+        let (post_lines, mtime_ns, size) = on_draft(path, &draft, WriteMode::Overwrite)?;
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
         let hints = EditHints {

@@ -13,10 +13,12 @@ mod anchored;
 mod types;
 mod whole_file;
 
+use anchored::PinPosition;
+
 #[cfg(any(test, feature = "test-utils"))]
 pub mod test_support;
 
-pub use types::{EditError, EditResult, LlmEdit};
+pub use types::{EditError, EditResult, LlmEdit, WriteMode};
 
 const DIFF_CONTEXT: usize = 2;
 
@@ -82,7 +84,7 @@ impl<S: AnchorStore> EditSession<S> {
     /// structured ops shipped to the TUI.
     pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         // Any edit mutates the workspace; previously-cached read/search
         // results are no longer the source of truth, so the loop-guard
@@ -131,8 +133,15 @@ impl<S: AnchorStore> EditSession<S> {
                 text,
                 bypass_anchor_guard,
             } => {
-                self.apply_insert_after(&path, &anchor, &text, bypass_anchor_guard, &mut on_draft)
-                    .await
+                self.apply_pin_insert(
+                    &path,
+                    &anchor,
+                    &text,
+                    PinPosition::After,
+                    bypass_anchor_guard,
+                    &mut on_draft,
+                )
+                .await
             }
             LlmEdit::InsertBefore {
                 path,
@@ -140,8 +149,15 @@ impl<S: AnchorStore> EditSession<S> {
                 text,
                 bypass_anchor_guard,
             } => {
-                self.apply_insert_before(&path, &anchor, &text, bypass_anchor_guard, &mut on_draft)
-                    .await
+                self.apply_pin_insert(
+                    &path,
+                    &anchor,
+                    &text,
+                    PinPosition::Before,
+                    bypass_anchor_guard,
+                    &mut on_draft,
+                )
+                .await
             }
         }
     }

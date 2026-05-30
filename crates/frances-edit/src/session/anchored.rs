@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io;
 use std::path::Path;
 use std::str::FromStr;
@@ -10,10 +11,19 @@ use crate::{
     apply_ops, reconcile,
 };
 
-use super::types::{EditError, EditResult};
+use super::types::{EditError, EditResult, WriteMode};
 use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 const ANCHOR_SEP: char = '§';
+
+/// Which side of the pinned anchor a `file_insert` lands on. Selects the
+/// `EditOp::Insert{After,Before}` variant in one match — the two insert
+/// paths are otherwise identical.
+#[derive(Clone, Copy)]
+pub(super) enum PinPosition {
+    Before,
+    After,
+}
 
 impl<S: AnchorStore> EditSession<S> {
     pub(super) async fn apply_replace<F>(
@@ -26,7 +36,7 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
@@ -63,73 +73,58 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let working = self.cached_working(path)?;
         let re = Regex::new(find)?;
         let content = working.lines.join("\n");
-        let actual = re.find_iter(&content).count();
-        if let Some(limit) = count
-            && actual > limit
-        {
-            return Err(EditError::ReplaceAllCountExceeded { actual, limit });
+
+        // The count cap (`ReplaceAllCountExceeded`) needs the match total up
+        // front to reject without writing. With no cap there's nothing to
+        // enforce, so we skip the scan entirely: `replace_all` returns
+        // `Cow::Borrowed` iff it made zero replacements, which is exactly the
+        // "No changes" signal — one pass instead of count-then-replace.
+        if let Some(limit) = count {
+            let actual = re.find_iter(&content).count();
+            if actual > limit {
+                return Err(EditError::ReplaceAllCountExceeded { actual, limit });
+            }
         }
-        if actual == 0 {
+
+        let replaced = re.replace_all(&content, replacement);
+        if matches!(replaced, Cow::Borrowed(_)) {
             return Ok(DiffRender {
                 text: format!("No changes: regex matched 0 times in {}", path.display()),
                 ops: Vec::new(),
             });
         }
 
-        let replaced = re.replace_all(&content, replacement).into_owned();
         let draft = split_text_to_lines(&replaced);
         self.apply_draft_edit(path, working, draft, None, on_draft)
             .await
     }
 
-    pub(super) async fn apply_insert_after<F>(
+    pub(super) async fn apply_pin_insert<F>(
         &mut self,
         path: &Path,
         anchor: &str,
         text: &str,
+        position: PinPosition,
         bypass_anchor_guard: bool,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
         }
         let working = self.cached_working(path)?;
         let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
-        let op = EditOp::InsertAfter {
-            pin,
-            lines: split_text_to_lines(text),
-        };
-        self.apply_line_edit(path, working, op, Vec::new(), on_draft)
-            .await
-    }
-
-    pub(super) async fn apply_insert_before<F>(
-        &mut self,
-        path: &Path,
-        anchor: &str,
-        text: &str,
-        bypass_anchor_guard: bool,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
-    {
-        if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
-            return Err(EditError::AnchorPastebackDetected { anchors });
-        }
-        let working = self.cached_working(path)?;
-        let (pin, _) = resolve_anchor(anchor, &working.state, &working.lines, path)?;
-        let op = EditOp::InsertBefore {
-            pin,
-            lines: split_text_to_lines(text),
+        let lines = split_text_to_lines(text);
+        let op = match position {
+            PinPosition::After => EditOp::InsertAfter { pin, lines },
+            PinPosition::Before => EditOp::InsertBefore { pin, lines },
         };
         self.apply_line_edit(path, working, op, Vec::new(), on_draft)
             .await
@@ -157,7 +152,7 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let ops = [op];
         let draft = apply_ops(&working.state, &working.lines, &ops);
@@ -176,9 +171,9 @@ impl<S: AnchorStore> EditSession<S> {
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String]) -> io::Result<(Vec<String>, i64, u64)>,
+        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft)?;
+        let (post_lines, mtime_ns, size) = on_draft(path, &draft, WriteMode::Overwrite)?;
 
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
@@ -807,9 +802,9 @@ mod tests {
                     replacement: "delta".into(),
                     count: None,
                 },
-                |_path, _draft| {
+                |path, draft, mode| {
                     wrote = true;
-                    no_format(_path, _draft)
+                    no_format(path, draft, mode)
                 },
             )
             .await
@@ -840,9 +835,9 @@ mod tests {
                     replacement: "b".into(),
                     count: Some(2),
                 },
-                |_path, _draft| {
+                |path, draft, mode| {
                     wrote = true;
-                    no_format(_path, _draft)
+                    no_format(path, draft, mode)
                 },
             )
             .await

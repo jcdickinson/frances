@@ -130,44 +130,46 @@ impl AnchorStore for AnchorStoreImpl {
         Ok(())
     }
 
-    async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()> {
+    async fn replace_file_lines(&self, path: &Path, state: &FileAnchorState) -> StoreResult<()> {
         let conn = self.db.connect().await;
         let p = path_str(path)?;
-        for (line_no, hash, anchor) in lines {
-            conn.execute(
-                "INSERT OR REPLACE INTO file_lines (path, line_no, hash, anchor) VALUES (?1, ?2, ?3, ?4)",
-                (
+
+        // Whole-file rewrite under one transaction: truncate, re-insert every
+        // line via a single prepared statement, then write meta — collapsing
+        // what used to be N+2 separately-committed statements into one commit.
+        let tx = conn
+            .unchecked_transaction()
+            .await
+            .map_err(StoreError::new)?;
+        tx.execute("DELETE FROM file_lines WHERE path = ?1", (p.clone(),))
+            .await
+            .map_err(StoreError::new)?;
+        if !state.lines.is_empty() {
+            let mut stmt = tx
+                .prepare(
+                    "INSERT INTO file_lines (path, line_no, hash, anchor) VALUES (?1, ?2, ?3, ?4)",
+                )
+                .await
+                .map_err(StoreError::new)?;
+            for (line_no, le) in state.lines.iter().enumerate() {
+                stmt.execute((
                     p.clone(),
-                    *line_no as i64,
-                    *hash as i64,
-                    anchor.to_bytes(),
-                ),
-            )
-            .await
-            .map_err(StoreError::new)?;
+                    line_no as i64,
+                    le.hash as i64,
+                    le.anchor.to_bytes(),
+                ))
+                .await
+                .map_err(StoreError::new)?;
+                stmt.reset().map_err(StoreError::new)?;
+            }
         }
-        Ok(())
-    }
-
-    async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()> {
-        let conn = self.db.connect().await;
-        let p = path_str(path)?;
-        for n in line_nos {
-            conn.execute(
-                "DELETE FROM file_lines WHERE path = ?1 AND line_no = ?2",
-                (p.clone(), *n as i64),
-            )
-            .await
-            .map_err(StoreError::new)?;
-        }
-        Ok(())
-    }
-
-    async fn truncate_lines(&self, path: &Path) -> StoreResult<()> {
-        let conn = self.db.connect().await;
-        conn.execute("DELETE FROM file_lines WHERE path = ?1", (path_str(path)?,))
-            .await
-            .map_err(StoreError::new)?;
+        tx.execute(
+            "INSERT OR REPLACE INTO file_meta (path, mtime_ns, size, content_digest) VALUES (?1, ?2, ?3, ?4)",
+            (p, state.mtime_ns, state.size as i64, state.content_digest as i64),
+        )
+        .await
+        .map_err(StoreError::new)?;
+        tx.commit().await.map_err(StoreError::new)?;
         Ok(())
     }
 
@@ -195,35 +197,27 @@ impl AnchorStore for AnchorStoreImpl {
     async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()> {
         let conn = self.db.connect().await;
         let p = path_str(path)?;
-        for anchor in anchors {
-            conn.execute(
-                "INSERT OR IGNORE INTO file_tombstones (path, anchor) VALUES (?1, ?2)",
-                (p.clone(), anchor.to_bytes()),
-            )
+        let tx = conn
+            .unchecked_transaction()
             .await
             .map_err(StoreError::new)?;
+        let mut stmt = tx
+            .prepare("INSERT OR IGNORE INTO file_tombstones (path, anchor) VALUES (?1, ?2)")
+            .await
+            .map_err(StoreError::new)?;
+        for anchor in anchors {
+            stmt.execute((p.clone(), anchor.to_bytes()))
+                .await
+                .map_err(StoreError::new)?;
+            stmt.reset().map_err(StoreError::new)?;
         }
+        tx.commit().await.map_err(StoreError::new)?;
         Ok(())
     }
 
     async fn clear_tombstones(&self) -> StoreResult<()> {
         let conn = self.db.connect().await;
         conn.execute("DELETE FROM file_tombstones", ())
-            .await
-            .map_err(StoreError::new)?;
-        Ok(())
-    }
-
-    async fn forget(&self, path: &Path) -> StoreResult<()> {
-        let conn = self.db.connect().await;
-        let p = path_str(path)?;
-        conn.execute("DELETE FROM file_meta WHERE path = ?1", (p.clone(),))
-            .await
-            .map_err(StoreError::new)?;
-        conn.execute("DELETE FROM file_lines WHERE path = ?1", (p.clone(),))
-            .await
-            .map_err(StoreError::new)?;
-        conn.execute("DELETE FROM file_tombstones WHERE path = ?1", (p,))
             .await
             .map_err(StoreError::new)?;
         Ok(())

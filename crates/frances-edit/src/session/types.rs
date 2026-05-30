@@ -65,6 +65,20 @@ pub enum LlmEdit {
     },
 }
 
+/// How the draft writer must open the target file. The check-and-create for
+/// a brand-new file has to be atomic, and frances-edit is filesystem-agnostic
+/// (the caller's `on_draft` owns the actual write), so the engine threads this
+/// signal through instead of doing a racy `path.exists()` itself.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteMode {
+    /// File must not already exist; open with `create_new(true)` so a
+    /// concurrent create fails atomically (surfaced as
+    /// `io::ErrorKind::AlreadyExists`) rather than silently clobbering.
+    CreateNew,
+    /// Replace the contents of a file that was already read this session.
+    Overwrite,
+}
+
 #[derive(Error, Debug)]
 pub enum EditError {
     #[error(

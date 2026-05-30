@@ -34,13 +34,14 @@ pub trait AnchorStore: Send + Sync {
         size: u64,
         content_digest: u64,
     ) -> StoreResult<()>;
-    async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()>;
-    async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()>;
-    async fn truncate_lines(&self, path: &Path) -> StoreResult<()>;
+    /// Replace all stored lines for `path` with `state.lines` and write
+    /// `state`'s meta, atomically. This is the whole-file persistence path
+    /// (the engine always rewrites the full line set, never patches lines
+    /// individually), so it subsumes a truncate + per-line upsert + meta save.
+    async fn replace_file_lines(&self, path: &Path, state: &FileAnchorState) -> StoreResult<()>;
     async fn used_anchors(&self, path: &Path) -> StoreResult<HashSet<Anchor>>;
     async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()>;
     async fn clear_tombstones(&self) -> StoreResult<()>;
-    async fn forget(&self, path: &Path) -> StoreResult<()>;
 }
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -125,28 +126,23 @@ mod fake {
             Ok(())
         }
 
-        async fn upsert_lines(&self, path: &Path, lines: &[(u32, u64, Anchor)]) -> StoreResult<()> {
-            let mut inner = self.inner.lock();
-            let entry = inner.lines.entry(path.to_path_buf()).or_default();
-            for (line_no, hash, anchor) in lines {
-                entry.insert(*line_no, (*hash, anchor.clone()));
-            }
-            Ok(())
-        }
-
-        async fn delete_lines(&self, path: &Path, line_nos: &[u32]) -> StoreResult<()> {
-            let mut inner = self.inner.lock();
-            if let Some(m) = inner.lines.get_mut(path) {
-                for n in line_nos {
-                    m.remove(n);
-                }
-            }
-            Ok(())
-        }
-
-        async fn truncate_lines(&self, path: &Path) -> StoreResult<()> {
+        async fn replace_file_lines(
+            &self,
+            path: &Path,
+            state: &FileAnchorState,
+        ) -> StoreResult<()> {
             let mut inner = self.inner.lock();
             inner.lines.remove(path);
+            if !state.lines.is_empty() {
+                let entry = inner.lines.entry(path.to_path_buf()).or_default();
+                for (line_no, le) in state.lines.iter().enumerate() {
+                    entry.insert(line_no as u32, (le.hash, le.anchor.clone()));
+                }
+            }
+            inner.meta.insert(
+                path.to_path_buf(),
+                (state.mtime_ns, state.size, state.content_digest),
+            );
             Ok(())
         }
 
@@ -174,14 +170,6 @@ mod fake {
         async fn clear_tombstones(&self) -> StoreResult<()> {
             let mut inner = self.inner.lock();
             inner.tombstones.clear();
-            Ok(())
-        }
-
-        async fn forget(&self, path: &Path) -> StoreResult<()> {
-            let mut inner = self.inner.lock();
-            inner.meta.remove(path);
-            inner.lines.remove(path);
-            inner.tombstones.remove(path);
             Ok(())
         }
     }

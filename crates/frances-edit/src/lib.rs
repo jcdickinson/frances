@@ -16,7 +16,7 @@ pub use loop_guard::LoopKey;
 pub use pool::Pool;
 pub use reconcile::{EditHints, ReconcileOutcome, reconcile};
 pub use render::{DiffOp, DiffRender, render_diff_block, render_file};
-pub use session::{EditError, EditResult, EditSession, LlmEdit};
+pub use session::{EditError, EditResult, EditSession, LlmEdit, WriteMode};
 pub use state::{FileAnchorState, LineEntry, content_digest};
 pub use store::{AnchorStore, StoreError, StoreResult};
 

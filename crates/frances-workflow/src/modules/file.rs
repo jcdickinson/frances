@@ -37,7 +37,7 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use twox_hash::XxHash3_64;
 
 use frances_core::resolve_relative;
-use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey};
+use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, WriteMode};
 
 use super::throw_js as throw;
 use crate::deps::{EditorFactory, WorkflowDeps};
@@ -413,7 +413,11 @@ fn hash_read_raw_args(path: &str) -> u64 {
     XxHash3_64::oneshot(&buf)
 }
 
-fn write_draft(path: &Path, draft: &[String]) -> io::Result<(Vec<String>, i64, u64)> {
+fn write_draft(
+    path: &Path,
+    draft: &[String],
+    mode: WriteMode,
+) -> io::Result<(Vec<String>, i64, u64)> {
     // file_new can target a path whose parent doesn't exist yet; other
     // ops already required a prior successful read so the parent is
     // there. create_dir_all is idempotent — safe in either case.
@@ -424,7 +428,20 @@ fn write_draft(path: &Path, draft: &[String]) -> io::Result<(Vec<String>, i64, u
     }
     let mut content = draft.join("\n");
     content.push('\n');
-    fs::write(path, &content)?;
+    match mode {
+        // create_new is the atomic check-and-create: if the file appeared
+        // since file_new's caller decided to create it, this fails with
+        // AlreadyExists rather than clobbering it.
+        WriteMode::CreateNew => {
+            use io::Write;
+            let mut f = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)?;
+            f.write_all(content.as_bytes())?;
+        }
+        WriteMode::Overwrite => fs::write(path, &content)?,
+    }
     let meta = fs::metadata(path)?;
     let mtime_ns = mtime_ns_from(&meta)?;
     let size = meta.len();
@@ -561,7 +578,7 @@ mod tests {
     fn write_draft_creates_missing_parent_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         let nested = tmp.path().join("a").join("b").join("c.txt");
-        let result = write_draft(&nested, &["hello".to_string()]).unwrap();
+        let result = write_draft(&nested, &["hello".to_string()], WriteMode::Overwrite).unwrap();
         let (post, _mtime, size) = result;
         assert_eq!(post, vec!["hello"]);
         assert!(size > 0);
