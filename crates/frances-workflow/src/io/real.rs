@@ -6,7 +6,6 @@ use std::io;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 use tokio::sync::Notify;
@@ -14,6 +13,7 @@ use tokio::sync::Notify;
 use frances_shell::{Shell, ShellError, ShellOptions};
 
 use super::{FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer};
+use crate::closed::WorkflowClosed;
 
 /// Production IO bundle. Unit-struct sub-impls, so cloning is free.
 #[derive(Clone, Copy, Default)]
@@ -50,33 +50,23 @@ impl WorkflowTimer for RealTimer {
         &self,
         duration: Duration,
         cancel: Arc<Notify>,
-        closed: Arc<AtomicBool>,
-        closed_notify: Arc<Notify>,
+        closed: Arc<WorkflowClosed>,
     ) -> Pin<Box<dyn Future<Output = SleepOutcome> + Send>> {
         Box::pin(async move {
             let cancel = cancel.notified();
-            let closed_n = closed_notify.notified();
             let sleep = tokio::time::sleep(duration);
             tokio::pin!(cancel);
-            tokio::pin!(closed_n);
             tokio::pin!(sleep);
 
-            // Register cancel + closed waiters before reading the
-            // closed flag, so any pulse that races against us is held
-            // as a permit and the select! sees it.
+            // Register the cancel waiter before the select so a pulse
+            // racing us is held as a permit; `closed.closed()` does its
+            // own register-before-check for the shutdown signal.
             cancel.as_mut().enable();
-            closed_n.as_mut().enable();
-
-            // If the workflow closed between caller-side construction
-            // and now, surface "closed" immediately.
-            if closed.load(Ordering::Acquire) {
-                return SleepOutcome::Closed;
-            }
 
             tokio::select! {
                 biased;
                 () = &mut cancel => SleepOutcome::Cancelled,
-                () = &mut closed_n => SleepOutcome::Closed,
+                () = closed.closed() => SleepOutcome::Closed,
                 () = &mut sleep => SleepOutcome::Fired,
             }
         })

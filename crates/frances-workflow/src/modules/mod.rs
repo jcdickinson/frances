@@ -65,7 +65,6 @@
 //!   (currently just `DOMException`).
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use rquickjs::module::Module;
 use rquickjs::{CatchResultExt, Ctx, Object, Value};
@@ -73,6 +72,7 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::WorkflowError;
+use crate::closed::WorkflowClosed;
 use crate::deps::WorkflowDeps;
 use crate::runtime::{InboxItem, OutputSenders, caught};
 
@@ -100,8 +100,7 @@ const STASH_KEY: &str = "__frances_v1_stash__";
 pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub senders: OutputSenders,
     pub input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
-    pub closed: Arc<AtomicBool>,
-    pub closed_notify: Arc<Notify>,
+    pub closed: Arc<WorkflowClosed>,
     /// Pulsed by `inbox.next()` when it suspends on an empty queue (the
     /// body is idle, waiting for input). Test-harness signal; production
     /// completion is driven by the event loop draining, not this — so it's
@@ -132,7 +131,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         senders,
         input_rx,
         closed,
-        closed_notify,
         shutdown_notify,
         deps,
         workflow_db,
@@ -165,7 +163,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         inbox::InboxArgs {
             rx: input_rx,
             closed: closed.clone(),
-            closed_notify: closed_notify.clone(),
             #[cfg(any(test, feature = "test-utils"))]
             on_idle,
         },
@@ -227,17 +224,12 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let jaq_eval = jaq::build_jaq_eval(ctx)?;
     stash.set("_jaqEval", jaq_eval)?;
 
-    let (set_sleep, clear_sleep) = io::build_sleep_primitives(
-        ctx,
-        deps.timer().clone(),
-        closed.clone(),
-        closed_notify.clone(),
-    )?;
+    let (set_sleep, clear_sleep) =
+        io::build_sleep_primitives(ctx, deps.timer().clone(), closed.clone())?;
     stash.set("_setSleep", set_sleep)?;
     stash.set("_clearSleep", clear_sleep)?;
 
-    let approve_fn =
-        permission::build_approve_primitive(ctx, approval_permissions_tx, closed, closed_notify)?;
+    let approve_fn = permission::build_approve_primitive(ctx, approval_permissions_tx, closed)?;
     stash.set("_approve", approve_fn)?;
 
     let db_instance = storage::build_storage(ctx, workflow_db)?;
@@ -358,16 +350,16 @@ pub(super) fn rquickjs_to_json(value: &Value<'_>) -> Result<serde_json::Value, S
 /// are valid as soon as `eval` returns.
 fn declare_and_eval<'js>(
     ctx: &Ctx<'js>,
-    name: &str,
+    name: &'static str,
     source: &str,
 ) -> Result<rquickjs::module::Module<'js, rquickjs::module::Evaluated>, WorkflowError> {
+    // `name` is the diagnostic tag; declare-vs-eval is evident from the
+    // caught JS error itself (a parse failure reads nothing like a
+    // runtime one), so the module name alone identifies the site.
     let module = Module::declare(ctx.clone(), name, source)
         .catch(ctx)
-        .map_err(caught(format!("declare {name}")))?;
-    let (evaluated, _promise) = module
-        .eval()
-        .catch(ctx)
-        .map_err(caught(format!("eval {name}")))?;
+        .map_err(caught(name))?;
+    let (evaluated, _promise) = module.eval().catch(ctx).map_err(caught(name))?;
     Ok(evaluated)
 }
 

@@ -23,6 +23,7 @@
 //! interleaving, no surprise turso errors.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use frances_storage::{ActiveDatabase, Database};
 use thiserror::Error;
@@ -112,7 +113,7 @@ impl WorkflowDb {
             rows,
             columns,
             entity: self.entity,
-            tx: None,
+            settled: None,
         })
     }
 
@@ -125,6 +126,7 @@ impl WorkflowDb {
         Ok(WorkflowTx {
             entity: self.entity,
             inner: Arc::new(AsyncMutex::new(WorkflowTxInner { conn: Some(conn) })),
+            settled: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -144,10 +146,16 @@ impl WorkflowDb {
 /// connection guard sits inside that slot, which means the underlying
 /// turso lock is released exactly once — when COMMIT/ROLLBACK takes
 /// `conn` out.
+///
+/// `settled` mirrors "`conn` has been taken out" as a lock-free flag so
+/// a [`RowStream`] iterating this tx can detect mid-iteration settlement
+/// with an atomic `load` per row instead of locking `inner` each time.
+/// Every clone shares the same flag.
 #[derive(Clone)]
 pub struct WorkflowTx {
     entity: Uuid,
     inner: Arc<AsyncMutex<WorkflowTxInner>>,
+    settled: Arc<AtomicBool>,
 }
 
 struct WorkflowTxInner {
@@ -192,7 +200,7 @@ impl WorkflowTx {
             rows,
             columns,
             entity: self.entity,
-            tx: Some(self.inner.clone()),
+            settled: Some(self.settled.clone()),
         })
     }
 
@@ -217,6 +225,7 @@ impl WorkflowTx {
         let sql = if success { "COMMIT" } else { "ROLLBACK" };
         conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
         inner.conn = None;
+        self.settled.store(true, Ordering::Release);
         Ok(true)
     }
 
@@ -228,6 +237,7 @@ impl WorkflowTx {
         let sql = if success { "COMMIT" } else { "ROLLBACK" };
         conn.execute(sql, ()).await.map_err(|e| self.wrap(e))?;
         inner.conn = None;
+        self.settled.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -241,12 +251,13 @@ impl WorkflowTx {
 
 /// Lazy result-set iterator. `next()` pulls one row from turso per call;
 /// when bound to a transaction, also rejects further reads after the
-/// tx settles.
+/// tx settles. The settled check is a lock-free atomic `load` so an
+/// N-row scan doesn't take the tx lock N times.
 pub struct RowStream {
     rows: turso::Rows,
     columns: Arc<[String]>,
     entity: Uuid,
-    tx: Option<Arc<AsyncMutex<WorkflowTxInner>>>,
+    settled: Option<Arc<AtomicBool>>,
 }
 
 impl RowStream {
@@ -255,8 +266,8 @@ impl RowStream {
     }
 
     pub async fn next(&mut self) -> Result<Option<Row>, WorkflowDbError> {
-        if let Some(tx) = &self.tx
-            && tx.lock().await.conn.is_none()
+        if let Some(settled) = &self.settled
+            && settled.load(Ordering::Acquire)
         {
             return Err(WorkflowDbError::TxSettled);
         }

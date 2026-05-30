@@ -35,7 +35,6 @@
 //! [`crate::io::mock::MockTimer`].
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -47,6 +46,7 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use tokio::sync::Notify;
 
 use super::throw_js as throw_err;
+use crate::closed::WorkflowClosed;
 use crate::io::WorkflowTimer;
 
 /// Builds the two stash functions plus the (registered, but
@@ -57,11 +57,9 @@ use crate::io::WorkflowTimer;
 pub(crate) fn build_sleep_primitives<'js, T: WorkflowTimer>(
     ctx: &Ctx<'js>,
     timer: T,
-    workflow_closed: Arc<AtomicBool>,
-    workflow_closed_notify: Arc<Notify>,
+    workflow_closed: Arc<WorkflowClosed>,
 ) -> JsResult<(Function<'js>, Function<'js>)> {
-    let closed = workflow_closed.clone();
-    let closed_notify = workflow_closed_notify.clone();
+    let closed = workflow_closed;
     let timer_for_setter = timer;
     let set_sleep = Function::new(
         ctx.clone(),
@@ -86,16 +84,10 @@ pub(crate) fn build_sleep_primitives<'js, T: WorkflowTimer>(
             // Fast-path: if the workflow has already closed by the time
             // we're constructing the token, settle as "closed" without
             // ever asking the timer to spawn a wait.
-            if closed.load(Ordering::Acquire) {
+            if closed.is_closed() {
                 *inner.result.lock() = Some("closed");
             } else {
-                spawn_sleep_task(
-                    &timer_for_setter,
-                    inner.clone(),
-                    duration,
-                    closed.clone(),
-                    closed_notify.clone(),
-                );
+                spawn_sleep_task(&timer_for_setter, inner.clone(), duration, closed.clone());
             }
 
             Class::instance(ctx, SleepToken { inner })
@@ -117,11 +109,10 @@ fn spawn_sleep_task<T: WorkflowTimer>(
     timer: &T,
     inner: Arc<SleepTokenInner>,
     duration: Duration,
-    workflow_closed: Arc<AtomicBool>,
-    workflow_closed_notify: Arc<Notify>,
+    workflow_closed: Arc<WorkflowClosed>,
 ) {
     let cancel = inner.cancel.clone();
-    let fut = timer.sleep(duration, cancel, workflow_closed, workflow_closed_notify);
+    let fut = timer.sleep(duration, cancel, workflow_closed);
     tokio::spawn(async move {
         let outcome = fut.await;
         settle(&inner, outcome.as_wire());

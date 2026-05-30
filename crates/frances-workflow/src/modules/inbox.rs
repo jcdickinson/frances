@@ -2,23 +2,24 @@
 //!
 //! `next()` pulls from the input mpsc; when the buffer is empty it pulses
 //! the test-harness `on_idle` signal (compiled only under test) before
-//! suspending. `return()` and `workflow.exit()` flip `closed`, breaking
-//! any in-flight `next()` with `{done: true}`.
+//! suspending. `return()` and `workflow.exit()` close the shared
+//! [`WorkflowClosed`], breaking any in-flight `next()` with `{done:
+//! true}`.
 //!
 //! Same wiring as the previous `workflow.user.input` class, with the
 //! message field renamed `message` → `content`.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use rquickjs::atom::PredefinedAtom;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
 use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+use crate::closed::WorkflowClosed;
 use crate::runtime::InboxItem;
 
 /// Args for [`build_inbox`], bundled so the call site isn't a long
@@ -26,12 +27,11 @@ use crate::runtime::InboxItem;
 /// cfg-gated as a field rather than a (non-cfg-able) positional param.
 pub(crate) struct InboxArgs {
     pub rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
-    pub closed: Arc<AtomicBool>,
-    pub closed_notify: Arc<Notify>,
+    pub closed: Arc<WorkflowClosed>,
     /// Test-harness "parked on input" pulse; see
     /// [`crate::runtime::WorkflowHandle`]. Compiled only under test.
     #[cfg(any(test, feature = "test-utils"))]
-    pub on_idle: Arc<Notify>,
+    pub on_idle: Arc<tokio::sync::Notify>,
 }
 
 pub(crate) fn build_inbox<'js>(ctx: &Ctx<'js>, args: InboxArgs) -> JsResult<Class<'js, Inbox>> {
@@ -40,7 +40,6 @@ pub(crate) fn build_inbox<'js>(ctx: &Ctx<'js>, args: InboxArgs) -> JsResult<Clas
         Inbox {
             rx: args.rx,
             closed: args.closed,
-            closed_notify: args.closed_notify,
             #[cfg(any(test, feature = "test-utils"))]
             on_idle: args.on_idle,
         },
@@ -49,10 +48,9 @@ pub(crate) fn build_inbox<'js>(ctx: &Ctx<'js>, args: InboxArgs) -> JsResult<Clas
 
 pub struct Inbox {
     rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
+    closed: Arc<WorkflowClosed>,
     #[cfg(any(test, feature = "test-utils"))]
-    on_idle: Arc<Notify>,
+    on_idle: Arc<tokio::sync::Notify>,
 }
 
 impl<'js> Trace<'js> for Inbox {
@@ -83,16 +81,15 @@ impl<'js> JsClass<'js> for Inbox {
                 let borrow = this.0.borrow();
                 let rx = borrow.rx.clone();
                 let closed = borrow.closed.clone();
-                let closed_notify = borrow.closed_notify.clone();
                 #[cfg(any(test, feature = "test-utils"))]
                 let on_idle = borrow.on_idle.clone();
                 drop(borrow);
                 Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    if closed.load(Ordering::Acquire) {
+                    if closed.is_closed() {
                         return IterResult::done();
                     }
                     let mut guard = rx.lock().await;
-                    if closed.load(Ordering::Acquire) {
+                    if closed.is_closed() {
                         return IterResult::done();
                     }
                     if let Ok(value) = guard.try_recv() {
@@ -105,7 +102,7 @@ impl<'js> JsClass<'js> for Inbox {
                             Some(input) => IterResult::value(input),
                             None => IterResult::done(),
                         },
-                        () = closed_notify.notified() => IterResult::done(),
+                        () = closed.closed() => IterResult::done(),
                     }
                 }))
             })?,
@@ -114,10 +111,7 @@ impl<'js> JsClass<'js> for Inbox {
         proto.set(
             PredefinedAtom::Return,
             Function::new(ctx.clone(), |this: This<Class<'js, Inbox>>| {
-                let borrow = this.0.borrow();
-                if !borrow.closed.swap(true, Ordering::AcqRel) {
-                    borrow.closed_notify.notify_waiters();
-                }
+                this.0.borrow().closed.close();
                 Ok::<_, rquickjs::Error>(IterResult::done())
             })?,
         )?;

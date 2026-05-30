@@ -15,7 +15,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use parking_lot::Mutex;
@@ -25,6 +25,7 @@ use frances_shell::{Shell, ShellError, ShellOptions};
 
 use super::real::{RealFs, RealTimer};
 use super::{FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer};
+use crate::closed::WorkflowClosed;
 
 /// Test IO bundle. Generic over the three sub-pieces so any one of
 /// them can be dragged in independently — picking a mock timer
@@ -183,13 +184,12 @@ impl WorkflowTimer for MockTimer {
         &self,
         duration: Duration,
         cancel: Arc<Notify>,
-        closed: Arc<AtomicBool>,
-        closed_notify: Arc<Notify>,
+        closed: Arc<WorkflowClosed>,
     ) -> Pin<Box<dyn Future<Output = SleepOutcome> + Send>> {
         let inner = self.inner.clone();
         Box::pin(async move {
             // Fast-path: workflow already closed.
-            if closed.load(Ordering::Acquire) {
+            if closed.is_closed() {
                 return SleepOutcome::Closed;
             }
 
@@ -220,27 +220,26 @@ impl WorkflowTimer for MockTimer {
             }
 
             let cancel_n = cancel.notified();
-            let closed_n = closed_notify.notified();
             let slot_n = slot.notify.notified();
             tokio::pin!(cancel_n);
-            tokio::pin!(closed_n);
             tokio::pin!(slot_n);
             cancel_n.as_mut().enable();
-            closed_n.as_mut().enable();
             slot_n.as_mut().enable();
 
             // If `advance` already settled us, skip the select.
             if let Some(outcome) = *slot.settled.lock() {
                 return outcome;
             }
-            if closed.load(Ordering::Acquire) {
+            if closed.is_closed() {
                 return SleepOutcome::Closed;
             }
 
+            // `closed.closed()` does its own register-before-check, so a
+            // close racing the line above is still observed here.
             let outcome = tokio::select! {
                 biased;
                 () = &mut cancel_n => SleepOutcome::Cancelled,
-                () = &mut closed_n => SleepOutcome::Closed,
+                () = closed.closed() => SleepOutcome::Closed,
                 () = &mut slot_n => {
                     slot.settled.lock().unwrap_or(SleepOutcome::Fired)
                 }
@@ -377,21 +376,10 @@ mod tests {
     async fn timer_advance_fires_due_sleeps_synchronously() {
         let timer = MockTimer::default();
         let cancel = Arc::new(Notify::new());
-        let closed = Arc::new(AtomicBool::new(false));
-        let closed_n = Arc::new(Notify::new());
+        let closed = Arc::new(WorkflowClosed::default());
 
-        let fut_100 = timer.sleep(
-            Duration::from_millis(100),
-            cancel.clone(),
-            closed.clone(),
-            closed_n.clone(),
-        );
-        let fut_250 = timer.sleep(
-            Duration::from_millis(250),
-            cancel.clone(),
-            closed.clone(),
-            closed_n.clone(),
-        );
+        let fut_100 = timer.sleep(Duration::from_millis(100), cancel.clone(), closed.clone());
+        let fut_250 = timer.sleep(Duration::from_millis(250), cancel.clone(), closed.clone());
         // Spawn waiters so they're registered before we advance.
         let h100 = tokio::spawn(fut_100);
         let h250 = tokio::spawn(fut_250);
@@ -411,15 +399,9 @@ mod tests {
     async fn timer_honours_cancel() {
         let timer = MockTimer::default();
         let cancel = Arc::new(Notify::new());
-        let closed = Arc::new(AtomicBool::new(false));
-        let closed_n = Arc::new(Notify::new());
+        let closed = Arc::new(WorkflowClosed::default());
 
-        let fut = timer.sleep(
-            Duration::from_secs(60),
-            cancel.clone(),
-            closed.clone(),
-            closed_n.clone(),
-        );
+        let fut = timer.sleep(Duration::from_secs(60), cancel.clone(), closed.clone());
         let h = tokio::spawn(fut);
         tokio::task::yield_now().await;
 
@@ -431,20 +413,13 @@ mod tests {
     async fn timer_honours_closed_flag() {
         let timer = MockTimer::default();
         let cancel = Arc::new(Notify::new());
-        let closed = Arc::new(AtomicBool::new(false));
-        let closed_n = Arc::new(Notify::new());
+        let closed = Arc::new(WorkflowClosed::default());
 
-        let fut = timer.sleep(
-            Duration::from_secs(60),
-            cancel.clone(),
-            closed.clone(),
-            closed_n.clone(),
-        );
+        let fut = timer.sleep(Duration::from_secs(60), cancel.clone(), closed.clone());
         let h = tokio::spawn(fut);
         tokio::task::yield_now().await;
 
-        closed.store(true, Ordering::Release);
-        closed_n.notify_waiters();
+        closed.close();
         assert_eq!(h.await.unwrap(), SleepOutcome::Closed);
     }
 

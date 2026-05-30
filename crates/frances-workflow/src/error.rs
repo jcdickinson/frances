@@ -32,7 +32,10 @@ pub enum WorkflowError {
     Script(#[from] rquickjs::Error),
 
     #[error("script ({context}): {detail}")]
-    ScriptCaught { context: String, detail: String },
+    ScriptCaught {
+        context: &'static str,
+        detail: String,
+    },
 
     #[error("build workflow JS thread runtime: {0}")]
     JsThreadRuntime(#[source] std::io::Error),

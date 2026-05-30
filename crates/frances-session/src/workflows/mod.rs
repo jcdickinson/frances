@@ -1001,7 +1001,7 @@ async fn hydrate<Io: frances_workflow::WorkflowIo>(
     let cfg = workflows
         .get(&row.config_key)
         .ok_or_else(|| WorkflowError::ScriptCaught {
-            context: "restore".into(),
+            context: "restore",
             detail: format!("no [workflows.{}] entry in config", row.config_key),
         })?;
     boot_instance(runtime, cfg, row.instance_id, row.args.clone()).await

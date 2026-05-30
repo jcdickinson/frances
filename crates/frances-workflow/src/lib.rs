@@ -14,6 +14,7 @@
 //! - [`Runtime`] — the script runtime that exposes the `frances:v1/*`
 //!   import surface to user scripts.
 
+mod closed;
 mod config;
 mod deps;
 mod error;
@@ -25,6 +26,7 @@ mod slash;
 mod storage;
 mod transpile;
 
+pub use closed::WorkflowClosed;
 pub use config::WorkflowConfig;
 pub use deps::{EditorFactory, WorkflowDeps};
 pub use io::{

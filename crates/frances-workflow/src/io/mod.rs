@@ -14,12 +14,13 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use frances_shell::{Shell, ShellError, ShellOptions};
+
+use crate::closed::WorkflowClosed;
 
 pub mod real;
 
@@ -77,7 +78,7 @@ pub trait WorkflowIo: Clone + Send + Sync + 'static {
 ///
 /// - `duration` elapsed → [`SleepOutcome::Fired`]
 /// - `cancel` notify → [`SleepOutcome::Cancelled`]
-/// - `closed` flag (or `closed_notify`) → [`SleepOutcome::Closed`]
+/// - `closed` → [`SleepOutcome::Closed`]
 ///
 /// The returned future is `Send` and `'static` so the JS-side primitive
 /// can spawn it onto the global runtime without dragging lifetimes
@@ -87,8 +88,7 @@ pub trait WorkflowTimer: Clone + Send + Sync + 'static {
         &self,
         duration: Duration,
         cancel: Arc<Notify>,
-        closed: Arc<AtomicBool>,
-        closed_notify: Arc<Notify>,
+        closed: Arc<WorkflowClosed>,
     ) -> Pin<Box<dyn Future<Output = SleepOutcome> + Send>>;
 }
 

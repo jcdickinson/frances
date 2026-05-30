@@ -23,17 +23,15 @@
 //! unwind cleanly without throwing.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::Ordering;
 
 use frances_models_llm::ToolCall;
 use rquickjs::promise::Promised;
 use rquickjs::{Ctx, Function, IntoJs, Object, Result as JsResult, Value};
-use tokio::sync::Notify;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 
 use super::throw_js as throw;
+use crate::closed::WorkflowClosed;
 use crate::permission::{PermissionRequest, PermissionResponse};
 
 /// Build the `_approve` primitive that `frances:v1/approval` re-wraps.
@@ -43,8 +41,7 @@ use crate::permission::{PermissionRequest, PermissionResponse};
 pub(crate) fn build_approve_primitive<'js>(
     ctx: &Ctx<'js>,
     permissions_tx: UnboundedSender<PermissionRequest>,
-    closed: Arc<AtomicBool>,
-    closed_notify: Arc<Notify>,
+    closed: Arc<WorkflowClosed>,
 ) -> JsResult<Function<'js>> {
     Function::new(
         ctx.clone(),
@@ -71,15 +68,12 @@ pub(crate) fn build_approve_primitive<'js>(
             });
 
             let closed = closed.clone();
-            let closed_notify = closed_notify.clone();
             let promised = Promised::from(async move {
-                // Fast path: workflow already shutting down.
-                if closed.load(Ordering::Acquire) {
-                    return ChoiceJs(default_shutdown_choice());
-                }
+                // `closed.closed()` fast-returns if shutdown already
+                // began, and is polled first under `biased`.
                 tokio::select! {
                     biased;
-                    () = closed_notify.notified() => ChoiceJs(default_shutdown_choice()),
+                    () = closed.closed() => ChoiceJs(default_shutdown_choice()),
                     res = rx => match res {
                         Ok(response) => ChoiceJs(response),
                         Err(_) => ChoiceJs(default_shutdown_choice()),
