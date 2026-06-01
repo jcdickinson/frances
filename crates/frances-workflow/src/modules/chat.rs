@@ -202,7 +202,6 @@ fn parse_complete_opts<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Comple
         ));
     };
 
-    // intents: string[]
     let intents_val: Value<'js> = obj
         .get("intents")
         .map_err(|_| throw(ctx, "complete: missing `intents`"))?;
@@ -222,7 +221,6 @@ fn parse_complete_opts<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Comple
         return Err(throw(ctx, "complete: `intents` must be non-empty"));
     }
 
-    // input: { role, content }[]
     let input_val: Value<'js> = obj
         .get("input")
         .map_err(|_| throw(ctx, "complete: missing `input`"))?;
@@ -238,7 +236,6 @@ fn parse_complete_opts<'js>(ctx: &Ctx<'js>, arg: &Value<'js>) -> JsResult<Comple
         messages.push(parse_message_obj(ctx, &item, i)?);
     }
 
-    // tools?: [...]
     let tools_val: Value<'js> = get_or_undefined(ctx, obj, "tools");
     let tools = if tools_val.is_undefined() || tools_val.is_null() {
         Vec::new()
@@ -624,9 +621,7 @@ fn push_message<'js, D: WorkflowDeps>(
 }
 
 /// Snapshot `chat.tools` into a `Vec<ToolDef>`. Validates each entry:
-/// `name` and `description` strings, `parameters` an object, and no
-/// duplicate names. The `handler` field is read by JS only; we don't
-/// inspect it here.
+/// `name` and `description` strings, `parameters` an object, and no duplicate names.
 fn snapshot_tools<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     session: &Class<'js, ChatSessionJs<D>>,
@@ -643,10 +638,8 @@ fn snapshot_tools<'js, D: WorkflowDeps>(
     parse_tool_defs(ctx, arr, "chat.tools")
 }
 
-/// Parse a JS array of `{ name, description, parameters }` tool entries
-/// into `Vec<ToolDef>`. `label` names the source for error messages
-/// (`chat.tools` for the streaming path, `complete: tools` for the
-/// one-shot export). The `handler` field is JS-only; not inspected here.
+/// Parse a JS array of `{ name, description, parameters }` tool entries into `Vec<ToolDef>`.
+/// `label` names the source for error messages.
 fn parse_tool_defs<'js>(ctx: &Ctx<'js>, arr: &Array<'js>, label: &str) -> JsResult<Vec<ToolDef>> {
     let mut defs: Vec<ToolDef> = Vec::with_capacity(arr.len());
     let mut seen: HashSet<String> = HashSet::with_capacity(arr.len());
@@ -842,9 +835,7 @@ fn start_stream<'js, D: WorkflowDeps>(
 
 /// JS-held handle that fires a `CancellationToken` either explicitly (via
 /// `fire()`) or implicitly on GC. The Rust task spawned by `start_stream`
-/// holds a clone of the same token; firing aborts its in-flight provider
-/// stream. Mirrors the `SleepToken` precedent in
-/// `crates/frances-workflow/src/modules/io.rs`.
+/// holds a clone of the same token; firing aborts its in-flight provider stream.
 pub struct CancelHandle {
     token: CancellationToken,
 }
@@ -885,8 +876,7 @@ impl<'js> JsClass<'js> for CancelHandle {
     }
 }
 
-/// Async-iterable wrapper around the stream-event receiver. Lifted from
-/// `Inbox`'s `Symbol.asyncIterator` pattern; yields `StreamEvent`s
+/// Async-iterable wrapper around the stream-event receiver. Yields `StreamEvent`s
 /// converted to discriminated-union JS objects.
 pub struct JsEventStream {
     rx: Arc<AsyncMutex<UnboundedReceiver<StreamEvent>>>,
@@ -1062,8 +1052,7 @@ impl<'js> IntoJs<'js> for CheckpointResult {
     }
 }
 
-/// Promise payload that resolves to `undefined` or rejects with the
-/// error message. Used by `chat.rollback()`.
+/// Promise payload that resolves to `undefined` or rejects with the error message.
 struct UnitResult(Result<(), ChatError>);
 
 impl<'js> IntoJs<'js> for UnitResult {

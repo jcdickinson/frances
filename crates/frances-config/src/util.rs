@@ -9,9 +9,8 @@ use serde::de::{Deserialize, Deserializer, IgnoredAny, MapAccess, Visitor};
 ///
 /// Bound via [`ConfigHandle::bind::<Keys>(path)`](crate::ConfigHandle::bind)
 /// to track which entries exist under a map (e.g. `models`,
-/// `model_providers`) without paying to deserialise the values. Refreshes
-/// flow through the normal binding pipeline, so subscribers see the new
-/// key-set as entries appear and disappear.
+/// `model_providers`). Refreshes flow through the normal binding pipeline,
+/// so subscribers see the new key-set as entries appear and disappear.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Keys(BTreeSet<String>);
 

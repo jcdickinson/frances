@@ -92,8 +92,7 @@ pub enum StoredRow {
 
 /// On-disk payload. The tag-internal serde derives mean the row's
 /// JSON column directly identifies its variant — no parallel `kind`
-/// column needed. Closing the `review-quality.md` "stringly `kind` +
-/// JSON payload columns instead of `#[serde(tag)]`" finding.
+/// column needed.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RowPayload {
@@ -332,8 +331,7 @@ mod tests {
         out
     }
 
-    /// Replay of one stored section is `[Reset, SectionAppend,
-    /// SectionClose, End]`. Same shape as before the schema swap.
+    /// Replay of one stored section is `[Reset, SectionAppend, SectionClose, End]`.
     #[tokio::test]
     async fn replay_frames_for_single_section_is_minimal() {
         let db = fresh_db().await;
@@ -376,8 +374,7 @@ mod tests {
         }
     }
 
-    /// Multi-row instance: text section + error + tool-use + truncated
-    /// section, all of which round-trip through the new schema.
+    /// Multi-row instance: text section + error + tool-use + truncated section.
     #[tokio::test]
     async fn replay_mixed_rows() {
         let db = fresh_db().await;

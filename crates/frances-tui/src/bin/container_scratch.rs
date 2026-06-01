@@ -3,9 +3,7 @@
 //! Mirrors `frances-tui-scratch` but exercises the new container path
 //! instead of calling `BottomBackend::emit_above` directly. The
 //! footer block reports its own height; the container measures it,
-//! decides which history rows fit above, and paints. Rows that fall
-//! off the top are flag-marked but (today) not yet emitted into
-//! native scrollback — that primitive lands in a follow-up.
+//! decides which history rows fit above, and paints.
 //!
 //! Controls (live view):
 //!   p          push a single-line history row (lands in `safe`, or
@@ -201,10 +199,9 @@ fn run() -> io::Result<()> {
                             container.push(Box::new(FakeShellBlock::new(pushed, 30)));
                         }
                         KeyCode::Char('a') => {
-                            // Tiny scripted active-block lifecycle: start an
-                            // empty block, replace its contents with growing
-                            // text across two draws, then mark safe. Useful
-                            // for eyeballing the active → safe promotion path.
+                            // Active-block lifecycle: start an empty block,
+                            // replace its contents with growing text across
+                            // two draws, then mark safe.
                             pushed += 1;
                             let id = container.push_active(Box::new(Paragraph::new(Line::raw(
                                 format!("[active #{pushed:>3}] starting…"),
@@ -277,12 +274,10 @@ fn footer_block(
     )
 }
 
-/// Phase D playground stand-in for `ShellOutputBlock`. Owns a fixed
-/// body of `lines` source rows plus an `scroll_y` offset (measured in
-/// source lines from the tail) so the alt-view selection + j/k/u/d
-/// dispatch can be exercised end-to-end without the binary's real
-/// `ShellOutputBlock` (which lives in `frances` and would require a
-/// reverse dependency).
+/// Playground stand-in for `ShellOutputBlock`. Owns a fixed body of
+/// `lines` source rows plus a `scroll_y` offset (measured in source
+/// lines from the tail) so the alt-view selection + j/k/u/d dispatch
+/// can be exercised end-to-end.
 ///
 /// Renders as `[fakeshell #N] line K of M` rows, with a `▶` gutter
 /// added by the container when the block is the alt-view selection.
@@ -381,7 +376,6 @@ impl Block for FakeShellBlock {
         let area = ctx.area;
         let src_y = ctx.src_y;
         let mut src_idx: u16 = 0;
-        // Header.
         if src_idx >= src_y {
             let dst = src_idx - src_y;
             if dst < area.height {
@@ -390,7 +384,6 @@ impl Block for FakeShellBlock {
             }
         }
         src_idx += 1;
-        // Body window.
         for line_no in window_start..window_end {
             if src_idx >= src_y {
                 let dst = src_idx - src_y;

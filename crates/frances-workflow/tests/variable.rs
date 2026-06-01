@@ -87,7 +87,6 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
         const set = new Set(vars);
         const assign = new Assign(vars);
 
-        // Construct a fresh value (no `.` reference).
         await assign.handler({
             call: { id: "a1", name: "variable_assign",
                     arguments: { name: "plan",
@@ -95,14 +94,12 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
             scope: null,
         });
 
-        // Mutate via `.` (the destination's current value).
         await assign.handler({
             call: { id: "a2", name: "variable_assign",
                     arguments: { name: "plan", filter: ".steps += [\"c\"]" } },
             scope: null,
         });
 
-        // Bind another variable as $name.
         await set.handler({
             call: { id: "s1", name: "variable_set",
                     arguments: { name: "extra", value: 7 } },
@@ -171,12 +168,8 @@ async fn set_and_assign_responses_report_type_summary() {
         await run("e", true);
         await run("f", null);
 
-        // qwen-style double-encoding: array passed as a JSON string.
-        // The set tool stores it verbatim — the type summary tells the
-        // model it landed as `string` so it can fromjson next round.
         await run("encoded", "[1,2,3]");
 
-        // Recover via assign+fromjson.
         const recovered = await assign.handler({
             call: { id: "a1", name: "variable_assign",
                     arguments: { name: "encoded", filter: "fromjson" } },
@@ -224,7 +217,6 @@ async fn variable_assign_introspection_and_errors() {
             scope: null,
         });
 
-        // `keys` introspection via $-binding.
         await assign.handler({
             call: { id: "a1", name: "variable_assign",
                     arguments: { name: "obj_keys",
@@ -233,14 +225,12 @@ async fn variable_assign_introspection_and_errors() {
             scope: null,
         });
 
-        // Multi-output filter errors.
         const multi = await assign.handler({
             call: { id: "a2", name: "variable_assign",
                     arguments: { name: "x", filter: "1, 2, 3" } },
             scope: null,
         });
 
-        // Unknown input binding errors.
         const missing = await assign.handler({
             call: { id: "a3", name: "variable_assign",
                     arguments: { name: "x", filter: ".",
@@ -298,7 +288,6 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
             scope: null,
         });
 
-        // Object-key lens.
         const objLens = await get.handler({
             call: { id: "g1", name: "variable_get",
                     arguments: { name: "plan", filter: ".steps" } },
@@ -306,7 +295,6 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
         });
         transcript.push(new MarkdownSection({ content: JSON.stringify(objLens) }));
 
-        // String-slice lens — split + range + join.
         const textLens = await get.handler({
             call: { id: "g2", name: "variable_get",
                     arguments: { name: "text",
@@ -315,7 +303,6 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
         });
         transcript.push(new MarkdownSection({ content: JSON.stringify(textLens) }));
 
-        // Bad jq surfaces as is_error.
         const broken = await get.handler({
             call: { id: "g3", name: "variable_get",
                     arguments: { name: "plan", filter: "this is not jq" } },
@@ -323,7 +310,6 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
         });
         transcript.push(new MarkdownSection({ content: JSON.stringify(broken) }));
 
-        // Filter on missing variable still reports unknown-variable, not a jq error.
         const missing = await get.handler({
             call: { id: "g4", name: "variable_get",
                     arguments: { name: "nope", filter: "." } },

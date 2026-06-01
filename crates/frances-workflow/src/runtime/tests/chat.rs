@@ -628,7 +628,6 @@ async fn chat_stream_surfaces_tool_calls_in_completed_and_events() {
         s.push({ role: "user", content: "hi" });
 
         const r = await s.stream();
-        // Drain events; collect any tool_call events seen on the wire.
         let toolCallSeen = "no";
         const reader = r.events.getReader();
         while (true) {
@@ -917,7 +916,6 @@ async fn tool_call_hook_intercepts_dispatch() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     assert_eq!(text_of(frames.last().expect("frame")), "pre=1 post=1");
 
-    // The hook wrapped the inner result before it was pushed.
     let sessions = deps.sessions();
     let pending = sessions[0].pending();
     let tool_content = pending.iter().find_map(|p| match p {

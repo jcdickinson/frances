@@ -196,7 +196,7 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     /// directly to score permission requests that opted into auto.
     pub chat: ChatSessionManager<ChatDepsImpl>,
     /// Writes session-config rows and emits the matching events on the
-    /// DB layer in one call. Held for future config writers.
+    /// DB layer in one call.
     pub session_config_writer: SessionConfigWriter,
     /// Cancelled by [`SessionRuntime::shutdown`]. Visible to any
     /// in-flight `prompt` task that wants to bail early.

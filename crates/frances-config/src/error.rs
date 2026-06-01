@@ -59,8 +59,7 @@ impl ConfigBindError {
         }
     }
 
-    /// Prepend `prefix` to this error's path. Used by the deserializer when
-    /// surfacing errors from nested fields.
+    /// Prepend `prefix` to this error's path.
     pub(crate) fn add_path(self, prefix: &str) -> Self {
         if prefix.is_empty() {
             return self;

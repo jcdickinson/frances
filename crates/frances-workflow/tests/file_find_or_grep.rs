@@ -110,9 +110,6 @@ async fn no_args_lists_files_with_gitignore_respected() {
 
 #[tokio::test]
 async fn depth_one_alone_lists_cwd_children_only() {
-    // `{ depth: 1 }` with no `paths` is the documented `ls` replacement.
-    // The "no empty" rule must let this through (paths is omitted, not
-    // `[]`), and the walker must keep results to immediate children.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("top.txt"), "").unwrap();
     std::fs::create_dir_all(dir.path().join("sub")).unwrap();
@@ -138,7 +135,6 @@ async fn depth_one_alone_lists_cwd_children_only() {
 async fn empty_paths_without_search_rejects() {
     let dir = tempfile::tempdir().unwrap();
     let deps = deps_with_cwd(dir.path().to_path_buf());
-    // Catch the thrown rejection and surface its message via transcript.
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { transcript, MarkdownSection } from "frances:v1/sections";
@@ -230,10 +226,6 @@ async fn binary_flag_set_when_no_search() {
 
 #[tokio::test]
 async fn json_repair_unwraps_double_encoded_paths() {
-    // Pin the qwen3-coder quirk: `paths` arrives as a JSON-encoded
-    // string of an array. Passing through the JS surface, JSON.stringify
-    // → JSON.parse round-trip preserves the string-shape, and Rust-side
-    // JsonRepair unwraps it before deserialising.
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "").unwrap();
     std::fs::write(dir.path().join("b.txt"), "").unwrap();
@@ -332,7 +324,6 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
         tool_result.contains("hits = 2 entries"),
         "tool result missing summary header: {tool_result}"
     );
-    // Inline preview should mention each path.
     assert!(tool_result.contains("a.txt"), "tool result: {tool_result}");
     assert!(tool_result.contains("b.txt"), "tool result: {tool_result}");
 
@@ -362,7 +353,6 @@ async fn search_tool_without_into_returns_compact_text() {
     let frames = run_script(deps, script).await;
     let tool_result = text_of(&frames[0]);
     assert!(tool_result.contains(r#""is_error":false"#));
-    // Inline format: `path:line:text  (N matches)`
     assert!(
         tool_result.contains("a.txt:1:hello"),
         "expected inline match line, got: {tool_result}"
@@ -411,7 +401,6 @@ async fn loop_guard_search_clears_after_edit() {
         const fs = new FileSearch();
         const editor = new Editor();
         await fs.search({ search: "hello" });
-        // Touch the workspace via an edit — should clear the search ring.
         const read = await editor.readFile("a.txt");
         const line_b = read.split("\n")[1];
         await editor.edit({
@@ -421,8 +410,6 @@ async fn loop_guard_search_clears_after_edit() {
             end_anchor: line_b,
             text: "WORLD",
         });
-        // Same search args as before — but the edit cleared the ring,
-        // so this should succeed.
         const second = await fs.search({ search: "hello" });
         transcript.push(new MarkdownSection({ content: second }));
     "#;
@@ -446,7 +433,6 @@ async fn loop_guard_search_distinguishes_query() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const fs = new FileSearch();
         await fs.search({ search: "hello" });
-        // Different query → different args hash → no collision.
         const second = await fs.search({ search: "world" });
         transcript.push(new MarkdownSection({ content: second }));
     "#;

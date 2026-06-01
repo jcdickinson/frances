@@ -12,9 +12,6 @@ use crate::event::{EventSender, InternalEvent, ProviderId};
 use crate::provider::ConfigProvider;
 use crate::value::Path;
 
-/// Default capacity for the internal event channel between providers and the
-/// processor task. Tuned generously — startup events from a few providers
-/// fit comfortably; runtime events are infrequent.
 const EVENT_BUFFER: usize = 1024;
 
 /// Registry of bindings driven by a [`ConfigHandle`].
@@ -41,9 +38,7 @@ impl BindingRegistry {
         g.push(w);
     }
 
-    /// Lock-free snapshot read. Used by `map_async` at construction time to
-    /// run the freshly-composed mapper chain against the current
-    /// configuration.
+    /// Lock-free snapshot read.
     pub(crate) fn snapshot(&self) -> Arc<Configuration> {
         self.snapshot.load_full()
     }
@@ -69,8 +64,6 @@ impl BindingRegistry {
 #[derive(Clone)]
 pub struct ConfigHandle {
     registry: Arc<BindingRegistry>,
-    /// Keeps providers alive for the lifetime of the handle so they can
-    /// continue publishing runtime events.
     _providers: Arc<Vec<Arc<dyn ConfigProvider>>>,
 }
 

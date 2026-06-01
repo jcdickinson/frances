@@ -3,9 +3,7 @@
 //! paragraph in its accumulated text.
 //!
 //! Rendering goes through `ratatui::widgets::Paragraph` so word-wrap +
-//! styled-span paint are out-of-the-box. Memoisation is deferred until
-//! profiling shows it bites (the original `frances/src/tui/blocks.rs`
-//! already pays the unmemoised wrap cost on its other blocks).
+//! styled-span paint are out-of-the-box.
 
 use ratatui::layout::Rect;
 use ratatui::style::Style;

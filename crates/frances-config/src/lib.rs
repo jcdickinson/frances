@@ -1,6 +1,6 @@
 //! Hierarchical, layered configuration for frances.
 //!
-//! Sources (env vars, TOML files, future watchers...) push [`ConfigEvent`]s
+//! Sources (env vars, TOML files) push [`ConfigEvent`]s
 //! into a [`ConfigHandle`]. The handle keeps an immutable [`Configuration`]
 //! snapshot, replaces it on each event, and refreshes typed [`ConfigBinding`]s
 //! that subscribers can poll via [`ConfigBinding::get`] or observe via

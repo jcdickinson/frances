@@ -42,7 +42,7 @@ impl FrameTime for WallClockFrameTime {
     }
 }
 
-/// Constant frame — for widget tests that don't exercise animation.
+/// Constant frame index — for tests that don't exercise animation.
 pub struct FixedFrameTime(pub f64);
 
 impl FrameTime for FixedFrameTime {
@@ -51,9 +51,9 @@ impl FrameTime for FixedFrameTime {
     }
 }
 
-/// Frame backed by an atomic, so a test can advance the clock between
-/// renders without holding a `&mut`. `f64` isn't atomic on its own;
-/// we round-trip through `to_bits` / `from_bits`.
+/// Frame backed by an atomic so a test can advance the clock between
+/// renders without holding a `&mut`. `f64` round-trips through
+/// `to_bits` / `from_bits`.
 pub struct AtomicFrameTime {
     bits: AtomicU64,
 }

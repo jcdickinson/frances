@@ -19,7 +19,6 @@ async fn unbalanced_quote_does_not_break_shell() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    // Shell still alive and usable.
     assert!(shell.is_alive());
     let next = shell.run("echo alive", WaitOpts::default()).await.unwrap();
     assert!(matches!(next, RunOutcome::Done { exit_code: 0, .. }));

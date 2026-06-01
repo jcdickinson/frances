@@ -26,21 +26,15 @@ use frances_session::store;
 
 /// Anything the harness keeps alive for the duration of one test.
 struct Harness {
-    /// Held so RAII shutdown runs on drop, and so future tests can
-    /// call `prompt` / `interrupt` / `respond_permission` against it.
-    /// Underscored because no test in this file dereferences it yet —
-    /// drop the prefix when adding a test that does.
     _runtime: Arc<SessionRuntime>,
     events: UnboundedReceiver<StreamFrame>,
     stub: Arc<StubProvider>,
-    // RAII handles — drop order: runtime first (shutdown), then sources.
     _src: NamedTempFile,
     _tempdir: TempDir,
 }
 
 impl Harness {
-    /// Pull one frame off the channel with a sanity timeout so a hung
-    /// scenario fails loudly instead of hanging the test runner.
+    /// Pull one frame off the channel, timing out after 5 seconds.
     async fn recv_one(&mut self) -> StreamFrame {
         match tokio::time::timeout(Duration::from_secs(5), self.events.recv()).await {
             Ok(Some(frame)) => frame,
@@ -73,9 +67,8 @@ impl Harness {
 async fn harness(workflow_src: &str) -> Harness {
     use std::io::Write;
     let tempdir = tempfile::tempdir().expect("tempdir");
-    // The session.dir + runtime_dir need to exist before start_with
-    // touches them. SessionRuntime::start_with calls create_dir_all on
-    // session.runtime_dir but not on session.dir itself.
+    // SessionRuntime::start_with calls create_dir_all on session.runtime_dir
+    // but not on session.dir itself.
     std::fs::create_dir_all(tempdir.path().join("session")).unwrap();
     std::fs::create_dir_all(tempdir.path().join("runtime")).unwrap();
 
@@ -138,13 +131,10 @@ async fn harness(workflow_src: &str) -> Harness {
     }
 }
 
-/// Seed every config key the runtime touches during start_with. Path
-/// values are scalars (Null/Bool/Int/Float/String) — nested structs
-/// are addressed component-wise.
+/// Seed every config key the runtime touches during start_with.
 fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) -> InMemoryProvider {
     let workflow_path = workflow_file.display().to_string();
     InMemoryProvider::new()
-        // Default model points at the "test" provider.
         .set(
             vec![
                 ConfigValue::String("models".into()),
@@ -161,9 +151,6 @@ fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) ->
             ],
             "test-model",
         )
-        // Provider config — `kind`, `base_url`, and `auth.token` are
-        // required for ProviderCache::new() to parse the table even
-        // though `insert_stub` bypasses the build path.
         .set(
             vec![
                 ConfigValue::String("model_providers".into()),
@@ -189,9 +176,6 @@ fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) ->
             ],
             "stub-token",
         )
-        // Workflow config — `id` (a Uuid) plus the .ts file path. We
-        // synthesize a deterministic per-test UUID so the workflow's
-        // own DB schema rows are reproducible.
         .set(
             vec![
                 ConfigValue::String("workflows".into()),
@@ -218,8 +202,7 @@ fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) ->
 // Tests
 // =========================================================================
 
-/// Sanity test: workflow starts, pushes a MarkdownSection, ends.
-/// Proves the harness wiring is correct independent of LLM scripting.
+/// Workflow starts, pushes a MarkdownSection, ends.
 #[tokio::test]
 async fn smoke_workflow_starts_and_pushes_frame() {
     let mut h = harness(
@@ -245,9 +228,7 @@ async fn smoke_workflow_starts_and_pushes_frame() {
     );
 }
 
-/// Scripts the stub with three TextDeltas. The driver should turn that
-/// into a Text BlockDelta open + three text-bearing BlockDeltas + a
-/// BlockStop on the events channel.
+/// Three scripted TextDeltas produce a BlockDelta sequence on the events channel.
 #[tokio::test]
 #[ignore = "frame plumbing for chat.stream() needs more wiring; left as a stub for the next session"]
 async fn text_streaming_renders_block_delta_sequence() {
@@ -272,13 +253,10 @@ async fn text_streaming_renders_block_delta_sequence() {
         },
     });
 
-    // Drive until the assistant block closes.
     let frames = h
         .recv_until(|f| matches!(f, StreamFrame::SectionClose { .. }))
         .await;
 
-    // Find the Text deltas. Expect: 1 open (text=None or empty) + 3
-    // appends matching the scripted deltas + a final BlockStop.
     let texts: Vec<String> = frames
         .iter()
         .filter_map(|f| match f {
@@ -306,7 +284,6 @@ async fn text_streaming_renders_block_delta_sequence() {
         frames
     );
 
-    // Sanity: one captured request to the stub.
     let captured = h.stub.captured();
     assert_eq!(captured.len(), 1, "expected exactly one provider call");
 }

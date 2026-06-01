@@ -36,10 +36,9 @@ impl TursoHistoryStore {
     }
 
     /// Drop the wire-tagged history rows for `session` and re-forge from
-    /// primitives under the supplied provider's wire shape. Currently
-    /// unused — swap detection is future work. Lives as an inherent
-    /// method rather than on the `HistoryStore` trait because it's
-    /// TUI-only and pulls in the `Provider` trait.
+    /// primitives under the supplied provider's wire shape. Lives as an
+    /// inherent method rather than on the `HistoryStore` trait because
+    /// it's TUI-only and pulls in the `Provider` trait.
     pub async fn purge_and_reforge<P: frances_llm::Provider + 'static>(
         &self,
         session: ChatSessionId,

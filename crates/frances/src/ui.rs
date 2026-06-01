@@ -251,8 +251,7 @@ impl App<'_> {
         let mut frame_rx = self.events;
         let mut events = EventStream::new();
         // Busy-indicator text, set by the workflow via `setStatus`.
-        // `Some(text)` → footer shows `{spinner} {text}`; `None` →
-        // hidden. The host no longer infers this from token flow.
+        // `Some(text)` → footer shows `{spinner} {text}`; `None` → hidden.
         let mut status: Option<String> = None;
         // Accumulator for the in-flight replayed block during a
         // scrollback burst (between `ScrollbackFrame::Reset` and `End`).
@@ -384,8 +383,7 @@ impl App<'_> {
                 }
                 Some(frame) = frame_rx.recv() => {
                     // The busy indicator is workflow-driven: a `Surface`
-                    // frame sets or clears the footer. (Scrollback frames
-                    // carry no chrome — they're their own variant now.)
+                    // frame sets or clears the footer.
                     if let StreamFrame::Surface(cmd) = &frame {
                         status = match cmd {
                             SurfaceCmd::SetFooter { text } => Some(text.clone()),
@@ -647,8 +645,7 @@ fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
     match key.code {
-        // Esc interrupts the running workflow (delivered to its inbox);
-        // it no longer quits. The app exits via Ctrl-C / Ctrl-D.
+        // Esc interrupts the running workflow (delivered to its inbox).
         KeyCode::Esc => KeyAction::Interrupt,
         KeyCode::Char('c' | 'd') if ctrl => KeyAction::Quit,
         KeyCode::Char('o' | 'O') if ctrl && !pending_approval => KeyAction::EnterScrollback,
@@ -751,8 +748,7 @@ mod tests {
         assert_eq!(container.safe_count(), 2);
     }
 
-    /// A close for an unknown section id warns and continues — same as
-    /// the original block-level `stop_or_recover` behaviour. The other
+    /// A close for an unknown section id warns and continues. Other
     /// open sections stay open.
     #[test]
     fn section_close_with_unknown_id_leaves_others_open() {

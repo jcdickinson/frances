@@ -21,15 +21,11 @@ use crate::provider_cache::ProviderCache;
 /// Live snapshot of the entire `models::*` table. Bound once on the
 /// manager; refreshes on any add/remove/change under that path. Sessions
 /// look up by intent on every resolve.
-///
-/// Key is `Arc<str>` so `resolve_name` can hand callers a cheap, owned
-/// reference to the resolved name without copying — it gets threaded
-/// through to providers for per-model config lookups.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct Models(pub(crate) HashMap<Arc<str>, ModelConfig>);
 
-/// Concrete chat-session manager. Clone-by-value handle; complex state
+/// Concrete chat-session manager. Clone-by-value handle; inner state
 /// lives in `Arc<Inner>`.
 pub struct ChatSessionManager<D: ChatManagerDeps> {
     pub(crate) inner: Arc<ChatSessionManagerInner<D>>,
@@ -107,10 +103,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
     }
 
     /// Same as the trait's `complete`, but the caller observes
-    /// every `StreamEvent` the provider emits. The callback is the
-    /// auto-judge's lever for cancelling after the 2nd
-    /// `StreamEvent::ToolCall`; see
-    /// `crates/frances-session/src/runtime/auto_judge.rs`.
+    /// every `StreamEvent` the provider emits.
     pub async fn complete_with_events(
         &self,
         req: CompleteRequest<'_>,
@@ -161,7 +154,7 @@ impl<D: ChatManagerDeps> ChatSessionManagerTrait for ChatSessionManager<D> {
     /// One-shot, non-persisted call. Resolves a model by walking
     /// `req.intents`, then calls the provider with `req.history` +
     /// `req.new_inputs` verbatim. Nothing is read from or written to
-    /// the history store. (`complete_enforced` is the trait default.)
+    /// the history store.
     async fn complete(&self, req: CompleteRequest<'_>) -> Result<CompletionOutcome, ChatError> {
         self.complete_with_events(req, &mut |_| {}).await
     }

@@ -5,20 +5,11 @@
 //! calls [`judge`] before forwarding the request to the TUI. The
 //! judge walks the model-intent fallback `["auto", "referee", "cheap"]`
 //! and forces a single `decide` tool whose `verdict` is the decision.
-//! Compliance is enforced by [`ChatSessionManager::complete_enforced`]
-//! (force the tool, distrust the provider, one bounded scold), so the
-//! caller no longer hand-rolls a retry loop.
+//! Compliance is enforced by [`ChatSessionManager::complete_enforced`].
 //!
-//! On `Approve` the runtime resolves the permission's oneshot
-//! directly and the TUI never sees the prompt. On `Reject` or
-//! `Indeterminate` the runtime falls through to the user — the
-//! judge is an opt-in fast path, not an authority on denial.
-//!
-//! The judge does not see history. It does not see the structured
-//! `tool_call`. It sees only the workflow-composed prompt, since
-//! that prompt is already the canonical rendering of "what's being
-//! requested". Feeding the structured call in too would
-//! double-render.
+//! On `Approve` the runtime resolves the permission's oneshot directly
+//! and the TUI never sees the prompt. On `Reject` or `Indeterminate`
+//! the runtime falls through to the user.
 
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -43,12 +34,8 @@ const INTENTS: &[&str] = &["auto", "referee", "cheap"];
 
 const SYSTEM_PROMPT: &str = include_str!("auto_judge/system_prompt.md");
 
-/// The single forced tool, held as the `[ToolDef; 1]` the request wants so
-/// each judge borrows `&*DECIDE_TOOLS` instead of deep-cloning the JSON
-/// schema per call. `verdict` carries the decision. The schema is kept
-/// strict-compatible (`additionalProperties: false`, both `required`) so the
-/// provider gets OpenAI strict mode automatically; host-side validation backs
-/// it up where the provider ignores strict.
+/// The single forced tool. Schema is strict-compatible; host-side validation
+/// backs it up where the provider ignores OpenAI strict mode.
 static DECIDE_TOOLS: LazyLock<[ToolDef; 1]> = LazyLock::new(|| {
     [ToolDef::Function(ToolFunction {
         name: "decide".into(),
@@ -91,8 +78,6 @@ pub(crate) enum JudgeOutcome {
 const DEFAULT_REASON: &str = "(no reason given)";
 
 /// Ask the configured judge model whether to auto-approve `request`.
-/// `complete_enforced` forces the `decide` tool and scolds once on a
-/// miss; if it still can't get a call, that's `Indeterminate`.
 pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     request: &PermissionRequest,
@@ -115,7 +100,6 @@ pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
         history: &[],
         new_inputs: &inputs,
         tools: &*DECIDE_TOOLS,
-        // `complete_enforced` drives tool_choice from the demand.
         tool_choice: None,
         cancel: CancellationToken::new(),
         max_tool_calls: Some(1),
@@ -136,8 +120,6 @@ pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
     }
 }
 
-/// Pure parser over the enforced `decide` call. `verdict` selects the
-/// outcome; `reason` is `arguments.reason` if present and a string.
 fn parse_decision(calls: &[ToolCall]) -> JudgeOutcome {
     let Some(call) = calls.iter().find(|c| c.name == "decide") else {
         // `complete_enforced` guarantees a `decide` call on `Ok`, so this

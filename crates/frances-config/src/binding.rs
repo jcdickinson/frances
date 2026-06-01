@@ -21,9 +21,7 @@ use crate::value::Path;
 /// `tracing::warn!`.
 pub(crate) type DeserializeFn<T> = Arc<dyn Fn(&Configuration) -> Option<T> + Send + Sync>;
 
-/// Composed mapper chain. At construction (initial `bind()`), this is the
-/// identity wrapped in `async`. Each `map_async` replaces it with a
-/// composition of the previous mapper and the new one.
+/// Composed mapper chain that transforms `T → U`.
 pub(crate) type MapperFn<T, U> =
     Arc<dyn Fn(T) -> BoxFuture<'static, Result<U, MapError>> + Send + Sync>;
 
@@ -282,8 +280,6 @@ where
     }
 
     /// Promote to a `Required` form, asserting the value is currently set.
-    /// Re-registers the new refresher with the handle so future refreshes
-    /// follow the sticky-on-absence policy.
     pub fn required(self) -> Result<RequiredConfigBinding<T, U>, ConfigBindError> {
         if self.inner.value.load().is_none() {
             return Err(ConfigBindError::RequiredSection {
@@ -337,8 +333,6 @@ where
     /// `f` is invoked once at construction on the current `U` (if any); if it
     /// errors, `map_async` returns `Err(MapError)`. After construction, `f`
     /// runs as the tail of the composed mapper chain on every refresh.
-    /// Concurrent invocations against the same binding are not possible
-    /// (the processor task serialises refreshes).
     ///
     /// Absence is a no-op: when deserialisation yields `None`, the mapper
     /// chain is not invoked and the mapped binding is `None`.

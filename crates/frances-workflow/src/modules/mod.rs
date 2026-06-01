@@ -94,9 +94,7 @@ pub mod workflow;
 /// so user scripts can't reach it via `globalThis`.
 const STASH_KEY: &str = "__frances_v1_stash__";
 
-/// Per-invocation host state that gets stashed for module bodies to
-/// capture. Bundled into a single struct so the install call site
-/// stays readable.
+/// Per-invocation host state that gets stashed for module bodies to capture.
 pub(crate) struct V1HostState<D: WorkflowDeps> {
     pub senders: OutputSenders,
     pub input_rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
@@ -277,9 +275,7 @@ pub(crate) fn remove_stash<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
     Ok(())
 }
 
-/// Build a JS `Error` from `message` and return it as the thrown
-/// `rquickjs::Error`. `Exception::from_message` wraps the string with the
-/// right prototype; if even that fails we surface its error instead.
+/// Build a JS `Error` from `message` and return it as the thrown `rquickjs::Error`.
 pub(super) fn throw_js<'js>(ctx: &Ctx<'js>, message: &str) -> rquickjs::Error {
     match rquickjs::Exception::from_message(ctx.clone(), message) {
         Ok(exc) => exc.throw(),
@@ -292,8 +288,7 @@ pub(super) fn throw_js_type<'js, T>(ctx: &Ctx<'js>, message: &str) -> rquickjs::
     Err(throw_js(ctx, message))
 }
 
-/// Read a property, treating a missing/erroring lookup as `undefined`. The
-/// idiom every module's arg-parsing repeats verbatim.
+/// Read a property, treating a missing/erroring lookup as `undefined`.
 pub(super) fn get_or_undefined<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> Value<'js> {
     obj.get(key)
         .unwrap_or_else(|_| Value::new_undefined(ctx.clone()))
@@ -353,9 +348,6 @@ fn declare_and_eval<'js>(
     name: &'static str,
     source: &str,
 ) -> Result<rquickjs::module::Module<'js, rquickjs::module::Evaluated>, WorkflowError> {
-    // `name` is the diagnostic tag; declare-vs-eval is evident from the
-    // caught JS error itself (a parse failure reads nothing like a
-    // runtime one), so the module name alone identifies the site.
     let module = Module::declare(ctx.clone(), name, source)
         .catch(ctx)
         .map_err(caught(name))?;
@@ -364,11 +356,6 @@ fn declare_and_eval<'js>(
 }
 
 // ---- Module source strings ------------------------------------------------
-//
-// Each module just re-exports its slot from the stash. The stash is
-// dropped from globalThis after all modules evaluate, but by then the
-// module bodies have already captured the values via the `const __s = …`
-// binding.
 
 const WORKFLOW_SRC: &str = include_str!("js/workflow.js");
 const LIFECYCLE_SRC: &str = include_str!("js/lifecycle.js");

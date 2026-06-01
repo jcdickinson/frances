@@ -17,13 +17,10 @@ pub enum EditOp {
     },
 }
 
-/// Pure replay: apply ops to `original_lines`, producing the new line array.
+/// Apply ops to `original_lines`, producing the new line array.
 /// Anchors in ops must reference lines in `original_lines`'s anchor space —
 /// the caller resolves anchor → original_index via the `FileAnchorState`
 /// they passed to `parse_patch`.
-///
-/// Implementation note: ops are applied in order, with offset tracking so
-/// that earlier splices shift the resolved positions of later ops.
 pub fn apply_ops(
     original_state: &crate::state::FileAnchorState,
     original_lines: &[String],

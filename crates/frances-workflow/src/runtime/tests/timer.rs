@@ -58,10 +58,6 @@ async fn timer_fire_resolves_pending_await() {
 
 #[tokio::test]
 async fn timer_disable_then_fire_wakes_await() {
-    // `disable()` pauses the timer (no auto-firing). `fire()`
-    // still works — that's the manual-trigger mode the user asked
-    // for. Without the fire(), the await would suspend forever
-    // (and `drive_one_cycle` would time out).
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -96,8 +92,6 @@ async fn timer_disable_then_fire_wakes_await() {
 
 #[tokio::test]
 async fn timer_reject_preserves_error_identity() {
-    // Rejection identity is now preserved verbatim — the caught
-    // value IS the original Error, not a wrapped copy.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -132,8 +126,7 @@ async fn timer_reject_preserves_error_identity() {
 
 #[tokio::test]
 async fn timer_rejected_is_terminal() {
-    // After reject(), every mutating method throws. Only the
-    // construction of a fresh Timer can escape it.
+    // After reject(), every mutating method throws.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -174,9 +167,6 @@ async fn timer_rejected_is_terminal() {
 
 #[tokio::test]
 async fn timer_reject_with_timer_error_is_instance() {
-    // When the caller explicitly rejects with a TimerError, the
-    // identity is preserved and `instanceof TimerError` holds. We
-    // no longer auto-wrap arbitrary rejections.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -246,8 +236,6 @@ async fn timer_reject_with_no_arg_rejects_with_default_timer_error() {
 
 #[tokio::test]
 async fn timer_disable_then_enable_revives() {
-    // `enable()` re-applies the schedule (clearing `fired_once`),
-    // so a disabled timer can be brought back without `set(...)`.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -299,7 +287,6 @@ async fn timer_getters_reflect_schedule_and_state() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    // Schedule survives disable() — the getters still report it.
     assert_eq!(
         text_of(&frames[0]),
         "enabled=true delay=100 interval=50 | enabled=false delay=100 interval=50"
@@ -416,8 +403,6 @@ async fn timer_object_delay_form() {
 
 #[tokio::test]
 async fn timer_delay_then_interval_combo() {
-    // `{ delay, interval }` should wait `delay` before the first
-    // fire, then `interval` between subsequent fires.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -452,7 +437,6 @@ async fn timer_delay_then_interval_combo() {
 
 #[tokio::test]
 async fn timer_object_needs_delay_or_interval() {
-    // Empty object is rejected — must carry at least one field.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -508,8 +492,6 @@ async fn timer_set_after_cancel_reuses_timer() {
 
 #[tokio::test]
 async fn timer_set_changes_schedule_and_resets_fired_once() {
-    // One-shot fires, then set() flips it to repeating; subsequent
-    // awaits must actually wait (proving fired_once was cleared).
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -596,8 +578,6 @@ async fn timer_exit_unblocks_pending_await() {
 
 #[tokio::test]
 async fn timer_reject_with_object_preserves_identity() {
-    // Non-Error rejection values are also preserved verbatim — no
-    // string coercion, no auto-wrapping.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -706,8 +686,6 @@ async fn timer_signal_aborts_mid_wait() {
 
 #[tokio::test]
 async fn timer_signal_reason_preserved_verbatim() {
-    // The rejection IS signal.reason, by identity — not a wrapped
-    // copy. Mirrors WHATWG fetch semantics.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",

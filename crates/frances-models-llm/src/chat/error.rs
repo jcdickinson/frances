@@ -41,9 +41,7 @@ pub enum ChatError {
         source: ErasedError,
     },
     /// The caller fired the `CancellationToken` passed to `run`/`complete`
-    /// before the provider stream finished. The in-flight HTTP request
-    /// has been dropped; nothing has been written to history past the
-    /// drained primitives.
+    /// before the provider stream finished.
     #[error("cancelled")]
     Cancelled,
 }

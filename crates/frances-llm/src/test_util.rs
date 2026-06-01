@@ -41,8 +41,7 @@ impl StubScript {
     }
 }
 
-/// What was passed to one `stream()` call. Owned so the test can keep
-/// the value past the original borrow's lifetime.
+/// What was passed to one `stream()` call.
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub session_id: String,
@@ -162,10 +161,9 @@ impl Provider for StubProvider {
         let cap = req.max_tool_calls;
         let mut emitted_calls: Vec<frances_models_llm::ToolCall> = Vec::new();
         for ev in script.events {
-            // Mirror the OpenAI provider's truncation: once we've
-            // emitted `cap` tool calls, drop everything further on the
-            // floor and return Ok with what we have. Lets tests
-            // exercise the cap path without standing up a real wire.
+            // Once we've emitted `cap` tool calls, stop: mirrors the
+            // real provider's truncation behaviour so tests exercise the
+            // cap path.
             if let Some(cap) = cap
                 && emitted_calls.len() >= cap
             {
@@ -179,8 +177,6 @@ impl Provider for StubProvider {
         if let Some(cap) = cap
             && script.outcome.tool_calls.len() > cap
         {
-            // Match the SSE-loop's contract: outcome.tool_calls
-            // reflects only what we actually emitted.
             let mut truncated = script.outcome;
             truncated.tool_calls.truncate(cap);
             return Ok(truncated);

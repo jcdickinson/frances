@@ -21,7 +21,6 @@ async fn set_status_emits_status_frames() {
         .unwrap();
     let (_frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))));
-    // setStatus lands on the surfaces channel, not the transcript.
     let mut surfaces = Vec::new();
     while let Ok(s) = handle.outputs.surfaces.try_recv() {
         surfaces.push(s);
@@ -66,8 +65,7 @@ async fn body_returns_terminates_workflow() {
 async fn dangling_promise_does_not_keep_workflow_alive() {
     // A bare `new Promise(() => {})` has no backing host IO, so the
     // event loop empties around it and the workflow reaps cleanly
-    // rather than hanging. (Under the old "await the body promise"
-    // model this hung until CYCLE_TIMEOUT.)
+    // rather than hanging.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -177,7 +175,6 @@ async fn lifecycle_shutdown_runs_on_request() {
         })
         .await
         .unwrap();
-    // Workflow parks on inbox.next() first.
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(frames.is_empty(), "got {frames:?}");
     assert!(done.is_none());
@@ -217,9 +214,6 @@ async fn lifecycle_shutdown_runs_on_exit() {
         })
         .await
         .unwrap();
-    // exit() is queued before the body parks, so the park and the
-    // shutdown-driven completion collapse into one logical cycle —
-    // drive to done rather than racing the transient park.
     let (frames, result) = drive_to_done(&mut handle).await;
     assert!(matches!(result, Ok(())), "result was {result:?}");
     assert_eq!(text_of(&frames[0]), "bye");

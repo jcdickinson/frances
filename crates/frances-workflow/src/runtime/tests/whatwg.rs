@@ -109,7 +109,6 @@ async fn abortsignal_timeout_fires_after_delay() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const start = Date.now();
         const s = AbortSignal.timeout(15);
-        // Wait long enough for the timeout to fire.
         await new Timer(60);
         const elapsed = Date.now() - start;
         transcript.push(new MarkdownSection({

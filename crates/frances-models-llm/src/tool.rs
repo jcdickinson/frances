@@ -7,8 +7,7 @@
 use serde_json::Value;
 
 /// A tool the model may call. Modelled on OpenAI's
-/// `{"type":"function","function":{...}}` shape; a single `Function` variant
-/// today, with room for new tool kinds if a provider ever ships them.
+/// `{"type":"function","function":{...}}` shape.
 #[derive(Clone, Debug)]
 pub enum ToolDef {
     Function(ToolFunction),

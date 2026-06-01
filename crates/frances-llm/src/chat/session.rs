@@ -91,8 +91,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         self.inner.ephemeral
     }
 
-    /// TUI-compat shim. Behaviour: enqueue a user input for the next
-    /// `run`. The primitive row is written by `run`, not here.
+    /// Enqueue a user input for the next `run`.
     pub async fn submit_user(&self, text: &str) -> Result<(), ChatError> {
         self.push_internal(OwnedHistoryInput::User {
             text: text.to_owned(),
@@ -100,7 +99,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         Ok(())
     }
 
-    /// TUI-compat shim. Same shape as `submit_user`.
+    /// Enqueue a tool result for the next `run`.
     pub async fn submit_tool_result(
         &self,
         call_id: &str,
@@ -160,7 +159,6 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError> {
         let mut on_event = on_event;
-        // `None` for ephemeral sessions; otherwise the row id for this chat.
         let id = self.ensure_row().await?;
         let store = self.inner.manager.deps().history_store().clone();
 

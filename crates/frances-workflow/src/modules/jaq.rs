@@ -14,8 +14,7 @@
 //! multi-output filters both error — the caller wraps with `[...]` if
 //! it wants an array.
 //!
-//! Compilation is a per-call cost (no caching). jq filters are tiny and
-//! jaq's compiler is fast, so this hasn't been worth the complexity yet.
+//! Compilation is a per-call cost (no caching).
 
 use rquickjs::{Ctx, Function, Result as JsResult};
 
@@ -99,9 +98,8 @@ fn eval_filter(filter: &str, input_json: &str, bindings_json: &str) -> Result<St
 }
 
 /// Parse the bindings JSON into an ordered list of (name, Val) pairs.
-/// Ordering doesn't matter for correctness — `with_global_vars` and
-/// `Vars::new` only need consistent order between them — but using a
-/// `Vec` keeps the iteration deterministic.
+/// `with_global_vars` and `Vars::new` must receive names and values in
+/// the same order; only consistency matters, not the order itself.
 fn parse_bindings(bindings_json: &str) -> Result<Vec<(String, Val)>, String> {
     let parsed: serde_json::Value =
         serde_json::from_str(bindings_json).map_err(|e| format!("parse bindings: {e}"))?;

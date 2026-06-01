@@ -1,19 +1,9 @@
 //! Section impls for the TUI's section dispatcher.
 //!
 //! Each variant of [`frances_models_tui::SectionKind`] resolves to a
-//! concrete [`Section`] impl via [`make_section`]. For round 1, every
-//! kind routes through [`SingleBlockSection`] — a thin wrapper that
-//! owns one inner [`Block`] (constructed via the existing
-//! [`block_for_kind`]) and rebuilds it on every Append. Markdown gets
-//! a dedicated multi-block impl in `frances-markdown` (landing in
-//! step 6 of the migration); when that lands, this dispatcher routes
-//! `SectionKind::Markdown` there instead.
-//!
-//! Step 2 status: skeleton. No consumers yet — the container and the
-//! event dispatcher start using these in step 3 and step 4
-//! respectively.
-//!
-//! See `docs/plan/section-and-markdown.md`.
+//! concrete [`Section`] impl via [`make_section`]. Every kind except
+//! `SectionKind::Markdown` routes through [`SingleBlockSection`]; Markdown
+//! uses the dedicated multi-block impl in `frances-markdown`.
 
 use std::sync::Arc;
 

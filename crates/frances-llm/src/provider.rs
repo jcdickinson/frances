@@ -217,9 +217,7 @@ impl ErasedProvider {
     }
 }
 
-/// Internal helper for the cache: wrap a concrete `Arc<P>` in an
-/// `Arc<ErasedProvider>` without leaking the `P::Error: Into<...>`
-/// bound to call sites.
+/// Internal helper for the cache: wrap a concrete `Arc<P>` in an `Arc<ErasedProvider>`.
 pub(crate) fn erase<P>(provider: Arc<P>) -> Arc<ErasedProvider>
 where
     P: Provider + 'static,

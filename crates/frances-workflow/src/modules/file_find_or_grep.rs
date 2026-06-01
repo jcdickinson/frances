@@ -363,7 +363,6 @@ fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String>
                 .unwrap_or_default();
             let binary = is_binary_quick(path);
 
-            // rg's default: skip binary files for content search.
             if want_search && binary {
                 return WalkState::Continue;
             }
@@ -383,8 +382,6 @@ fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String>
                 (None, None)
             };
 
-            // Reserve a slot before pushing. (cap+1)-th caller flips the
-            // sticky truncated flag and quits without contributing.
             let slot = reserved.fetch_add(1, Ordering::Relaxed);
             if slot >= RESULT_CAP {
                 truncated.fetch_add(1, Ordering::Relaxed);

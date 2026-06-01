@@ -9,8 +9,7 @@ use taffy::Layout;
 /// Convert a taffy [`Layout`] (its `location` is relative to its
 /// parent's content box) into an absolute cell-grid [`Rect`] within
 /// `parent`. Floats are truncated to integer cells (`floor` on
-/// `location` + `size`); fractional residuals are visually
-/// invisible at terminal resolution.
+/// `location` + `size`).
 ///
 /// The returned rect is clamped to `parent`'s extent so a child
 /// whose taffy layout rounded outside the parent won't paint into

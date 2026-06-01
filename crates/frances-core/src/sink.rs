@@ -1,10 +1,6 @@
 //! Lightweight [`Extend`] sinks.
 
 /// An [`Extend`] sink that counts items instead of storing them.
-///
-/// Lets a routine that normally fills a `Vec` run allocation-free when the
-/// caller only needs the count — e.g. measuring wrapped-line height without
-/// materialising the lines.
 pub struct CountingSink(pub usize);
 
 impl<T> Extend<T> for CountingSink {

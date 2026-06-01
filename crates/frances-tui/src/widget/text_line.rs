@@ -1,8 +1,6 @@
 //! [`TextLine`] — single styled line. Pads to width on render so
 //! the cell budget is fully consumed (avoids leftover cells from a
-//! previous frame bleeding through); truncates on overflow. Replaces
-//! the inline status-row painting that lived inside the old
-//! `FooterBlock`.
+//! previous frame bleeding through); truncates on overflow.
 
 use crossterm::event::Event;
 use ratatui::style::Style;

@@ -38,15 +38,11 @@ impl<S: AnchorStore> EditSession<S> {
     }
 
     /// True if `key` matches an entry recorded since the last write.
-    /// Read-style tools call this before doing work and bail with an
-    /// error when it returns `true`.
     pub fn is_loop(&self, key: &LoopKey) -> bool {
         self.loop_set.contains(key)
     }
 
-    /// Insert `key` into the loop-guard set. Read-style tools call
-    /// this after a successful execution so the next identical call
-    /// (with unchanged on-disk state, for `Read`) trips the guard.
+    /// Insert `key` into the loop-guard set.
     pub fn record_loop(&mut self, key: LoopKey) {
         self.loop_set.record(key);
     }
@@ -162,17 +158,15 @@ impl<S: AnchorStore> EditSession<S> {
         }
     }
 
-    /// Commit accumulated edits (clears anchor tombstones). The workflow
-    /// invokes this once a round's tool calls are fully processed.
+    /// Commit accumulated edits (clears anchor tombstones).
     pub async fn commit_edits(&mut self) -> EditResult<()> {
         self.engine.commit_edits().await?;
         Ok(())
     }
 }
 
-/// Split a model-supplied `text` payload into a draft line array. Mirrors
-/// `apply_ops`: callers split on `\n` exactly so the on-disk line count
-/// matches what the model wrote.
+/// Split a model-supplied `text` payload into a draft line array.
+/// Callers split on `\n` exactly so the on-disk line count matches what the model wrote.
 fn split_text_to_lines(text: &str) -> Vec<String> {
     text.split('\n').map(str::to_owned).collect()
 }

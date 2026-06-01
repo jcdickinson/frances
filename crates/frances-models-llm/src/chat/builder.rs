@@ -1,9 +1,7 @@
 use std::borrow::Cow;
 
 /// Ordered list of `models::<intent>` config keys the session walks
-/// when picking a model. Both layers are `Cow` so static callers can
-/// pass `&[Cow::Borrowed("chat")]` zero-alloc while JS / DB-load paths
-/// stay `Owned`.
+/// when picking a model.
 pub type ModelIntents = Cow<'static, [Cow<'static, str>]>;
 
 /// What a caller hands to `ChatSessionManager::create` to describe a new

@@ -31,8 +31,6 @@ async fn two_shells_have_independent_state() {
 
 #[tokio::test]
 async fn many_shells_in_parallel_dont_interfere() {
-    // Spawn N shells, set a unique tag in each, read it back. Done in
-    // parallel via tokio::spawn so they're contending for runtime time.
     const N: usize = 8;
 
     let mut handles = Vec::with_capacity(N);

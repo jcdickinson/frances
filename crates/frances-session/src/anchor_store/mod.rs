@@ -134,9 +134,6 @@ impl AnchorStore for AnchorStoreImpl {
         let conn = self.db.connect().await;
         let p = path_str(path)?;
 
-        // Whole-file rewrite under one transaction: truncate, re-insert every
-        // line via a single prepared statement, then write meta — collapsing
-        // what used to be N+2 separately-committed statements into one commit.
         let tx = conn
             .unchecked_transaction()
             .await

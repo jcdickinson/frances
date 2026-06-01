@@ -5,8 +5,7 @@
 //! inset.
 //!
 //! `TextArea` paints its own reversed-style cursor cell, so the
-//! terminal cursor stays hidden upstream — same model as the
-//! pre-Phase-B `FooterBlock`.
+//! terminal cursor stays hidden upstream.
 
 use std::cell::RefCell;
 
@@ -21,9 +20,7 @@ use super::{
     WidgetState,
 };
 
-/// Total rows occupied by a single-line `TextInput`: top + bottom
-/// border = 2 + 1 row of text. Mirrors the pre-Phase-B
-/// `INPUT_HEIGHT` const from `crates/frances/src/tui/textarea.rs`.
+/// Total rows occupied by a single-line `TextInput`: top + bottom border = 2 + 1 row of text.
 pub const TEXT_INPUT_HEIGHT: u16 = 3;
 
 pub struct TextInput {
@@ -89,10 +86,8 @@ impl Input for TextInput {
     fn handle_event(&mut self, _: &mut EventContext<'_>, event: &Event) -> EventOutcome {
         match event {
             Event::Key(k) => {
-                // ratatui-textarea 0.9 ships `From<crossterm::event::KeyEvent>`
-                // for its Input type behind the (default-on)
-                // `crossterm` feature. Drops the entire hand-translation
-                // table that lived in the pre-Phase-B `Textarea` wrapper.
+                // ratatui-textarea ships `From<crossterm::event::KeyEvent>`
+                // for its Input type behind the (default-on) `crossterm` feature.
                 let _ = self.textarea.input(*k);
                 EventOutcome::Consumed
             }
@@ -117,8 +112,6 @@ impl Widget for TextInput {
         if ctx.area.width == 0 || ctx.area.height == 0 {
             return;
         }
-        // Reconcile the animation lease with the current status:
-        // we hold one iff there's something to animate.
         let want_lease = self.status.as_ref().is_some_and(|(s, _)| !s.is_empty());
         let mut lease_slot = self.animation_lease.borrow_mut();
         match (want_lease, lease_slot.is_some()) {

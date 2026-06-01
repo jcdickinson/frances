@@ -34,8 +34,7 @@ use super::throw_js as throw;
 use crate::storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};
 
 /// Stamp a JS async method that clones one field off `this`, runs an async DB
-/// call, and wraps the result in a typed `IntoJs` newtype. Collapses the
-/// otherwise byte-identical `_exec`/`_query`/… towers on `JsDb` and `JsTx`.
+/// call, and wraps the result in a typed `IntoJs` newtype.
 /// Three shapes: `(sql, params)`, no JS args (`method()`), and one `bool` arg.
 macro_rules! db_method {
     ($proto:expr, $ctx:expr, $name:literal, $class:ty, $field:ident.$method:ident => $wrap:ident) => {
@@ -150,8 +149,7 @@ impl<'js> JsClass<'js> for JsTx {
 }
 
 /// Async-iterable wrapper around a [`RowStream`]. Yields rows as
-/// `{ done, value }` objects per the JS iterator protocol, lifted by
-/// `chat.js`-style stream wrapping in the JS module.
+/// `{ done, value }` objects per the JS iterator protocol.
 pub struct JsRowStream {
     inner: Arc<AsyncMutex<RowStream>>,
 }
@@ -344,7 +342,6 @@ fn js_to_turso_value<'js>(value: &Value<'js>) -> Result<TursoValue, ParamError> 
         return Ok(TursoValue::Integer(i.into()));
     }
     if let Some(f) = value.as_float() {
-        // JS Number — pass integers as Integer when they fit, else Real.
         if f.is_finite() && f.fract() == 0.0 && (i64::MIN as f64..=i64::MAX as f64).contains(&f) {
             return Ok(TursoValue::Integer(f as i64));
         }

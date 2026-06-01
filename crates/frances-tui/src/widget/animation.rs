@@ -23,14 +23,12 @@ impl AnimationGate {
         Self::default()
     }
 
-    /// Take a lease. Increments the active count; drop the returned
-    /// lease to release.
+    /// Take a lease. Drop the returned lease to release.
     pub fn lease(&self) -> AnimationLease {
         AnimationLease::new(Arc::clone(&self.count))
     }
 
-    /// Outstanding lease count. The host's wake-up loop checks this
-    /// to decide whether to keep ticking the animation timer.
+    /// Outstanding lease count.
     pub fn active(&self) -> usize {
         self.count.load(Ordering::Relaxed)
     }

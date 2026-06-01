@@ -31,8 +31,7 @@
 //!
 //! Modeled after sqlx's `_sqlx_migrations`, but multi-tenant via the
 //! `entity` column so independent subsystems can evolve their schemas
-//! without coordinating version numbers. (sqlx wasn't an option — it
-//! doesn't talk to turso directly.)
+//! without coordinating version numbers.
 
 use std::borrow::Cow;
 use std::hash::Hasher;
@@ -52,8 +51,7 @@ use uuid::Uuid;
 ///
 /// All access goes through [`Database::connect`], which yields an
 /// [`ActiveDatabase`] holding the lock for the duration of the
-/// operation. This is the only way to talk to turso from anywhere in
-/// the workspace; the raw `Connection` is private to this type.
+/// operation. The raw `Connection` is private to this type.
 #[derive(Clone)]
 pub struct Database {
     conn: Arc<AsyncMutex<Connection>>,
@@ -85,8 +83,7 @@ impl Database {
     /// Acquire the connection lock. The returned [`ActiveDatabase`]
     /// dereferences to `&Connection` and releases the lock (after a
     /// best-effort `cacheflush`) when dropped. Holding the guard across
-    /// `await` points is the supported pattern — that's how
-    /// multi-statement transactions stay atomic.
+    /// `await` points is the supported pattern.
     pub async fn connect(&self) -> ActiveDatabase {
         ActiveDatabase {
             guard: self.conn.clone().lock_owned().await,
@@ -103,9 +100,7 @@ impl std::fmt::Debug for Database {
 }
 
 /// RAII guard returned by [`Database::connect`]. Holds the connection
-/// mutex; drop releases it. Dereferences to `&Connection` so existing
-/// helper functions taking `&Connection` keep working unchanged — they
-/// just need to be called with `&*active`.
+/// mutex; drop releases it. Dereferences to `&Connection`.
 pub struct ActiveDatabase {
     guard: OwnedMutexGuard<Connection>,
 }
@@ -201,8 +196,7 @@ pub enum MigrationError {
 pub type Result<T> = std::result::Result<T, MigrationError>;
 
 /// xxh3-64 of the migration body, stored as a signed i64 in the
-/// `checksum` column. Chosen because it's already a workspace dep and
-/// stable across rust toolchains; this is integrity, not crypto.
+/// `checksum` column. Integrity check, not cryptographic.
 fn checksum(sql: &str) -> i64 {
     let mut h = XxHash3_64::new();
     h.write(sql.as_bytes());

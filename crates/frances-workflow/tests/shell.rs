@@ -49,15 +49,9 @@ fn text_of(frame: &SectionTranscript) -> String {
     }
 }
 
-/// Collect content from every `MarkdownSection` push in order. Most
-/// shell tests use `transcript.push(new MarkdownSection({ content }))`
-/// to surface tool_result text and then index into the resulting
-/// frames — but `Run.handler` now also pushes a `ShellOutputSection`
-/// (plus its Append/UpdateKind/Close trail), which would otherwise
-/// shift those indices around. Filtering by kind keeps the tests
-/// focused on the markdown frames they care about. Empty-content
-/// pushes (the `None` case) collapse to "" since the tests work in
-/// terms of body text.
+/// Collect content from every `MarkdownSection` push in order, filtering out
+/// non-markdown frames so indices remain stable regardless of other section
+/// types. Empty-content pushes collapse to "".
 fn markdown_pushes(frames: &[SectionTranscript]) -> Vec<String> {
     frames
         .iter()
@@ -586,14 +580,6 @@ async fn shell_run_approve_false_skips_gate() {
 
 #[tokio::test]
 async fn shell_kill_after_quiet_does_not_return_still_running() {
-    // Regression: when shell_kill was called on a Quiet command, the
-    // handler used to do one keepWaiting pass and, if that also went
-    // Quiet, return a "Still running … call shell_kill to stop" tool
-    // result. The model would then call shell_kill again, spin
-    // forever, and the frame would fill with `(killed)` lines. The
-    // fix loops kill+drain a few times so the post-source sentinel
-    // always lands, and as a last-resort closes the shell rather than
-    // returning a quiet outcome.
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"

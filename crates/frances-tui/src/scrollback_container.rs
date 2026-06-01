@@ -77,9 +77,7 @@ use crate::widget::{
 };
 
 /// Per-frame state the container threads through to the footer
-/// widget's [`Widget::render`]. Bundled so [`ScrollbackContainer::draw`]
-/// and [`ScrollbackContainer::paint_scrollback`] take a single
-/// reference instead of three positional args.
+/// widget's [`Widget::render`].
 pub struct DrawContext<'a> {
     pub theme: &'a Theme,
     pub focus: &'a Focus,
@@ -266,10 +264,6 @@ pub struct ScrollbackContainer {
 /// the container's job is just to keep the host ticking and mark active
 /// entries damaged each frame so that glyph advances. The container
 /// paints no glyph itself — streaming is a section concept.
-///
-/// Tri-state because the lease is only meaningful while opted in: a
-/// `bool` + `Option<AnimationLease>` could spell the impossible
-/// "disabled but holding a lease."
 enum Animation {
     /// Not opted in (default). No lease, no per-frame damage churn —
     /// what most tests and `container_scratch` rely on.
@@ -600,9 +594,6 @@ impl ScrollbackContainer {
         self.prev_footer_height = None;
         self.prev_mode = None;
         self.scrollback_offset = 0;
-        // `selected_from_newest` is also reset here (line above) so the
-        // inspector reopens at the newest of the freshly-replayed
-        // history rather than pointing into evicted content.
         self.prev_term_size = Some(term_size);
 
         Ok(())
@@ -1085,8 +1076,7 @@ impl ScrollbackContainer {
 
         // Render the active stack (display order). Each entry renders
         // itself; a live section paints its own streaming indicator
-        // using `ctx.frame_time`. The container no longer owns that
-        // glyph — streaming is a section concept.
+        // using `ctx.frame_time`.
         for &id in self.active_order.iter() {
             let entry = match self.active.get_mut(id) {
                 Some(e) => e,
@@ -2151,11 +2141,6 @@ mod tests {
     /// `safe_count`, etc.) work unchanged; inherent `draw` /
     /// `paint_scrollback` / `set_footer` / `clear` shadow the
     /// container's signatures to thread the footer in.
-    ///
-    /// Construction signature mirrors the old
-    /// `Rig::new(footer, initial_y)` so the test churn
-    /// stays minimal: every `Rig::new(...)` call site
-    /// becomes a `Rig::new(...)` call.
     struct Rig {
         container: ScrollbackContainer,
         footer: ParaWidget,
@@ -2502,10 +2487,6 @@ mod tests {
     /// off naturally. No row should ever be emitted twice — the same
     /// content rendered by an earlier frame must continue to live in
     /// the same screen cell until the terminal scrolls it away.
-    ///
-    /// Terminal expanded from 5 to 7 rows because each block now
-    /// carries a trailing gap row: multi(3) + gap + single(1) + gap +
-    /// footer(1) = 7 exactly.
     #[test]
     fn renders_block_by_block_letting_terminal_scroll_naturally() {
         let mut terminal = mk_term_terminal(80, 7);
@@ -2707,9 +2688,6 @@ mod tests {
     /// the rows stay blank.
     #[test]
     fn scroll_commits_oldest_and_remaining_visible_blocks_skip_repaint() {
-        // Terminal expanded from 5 to 9 rows because each block now
-        // takes 2 slot rows (content + gap): 4 blocks fit at rows
-        // 0..7 with the footer at row 8.
         let mut terminal = mk_term_terminal(80, 9);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -2785,9 +2763,6 @@ mod tests {
     /// external clear of the screen those rows stay blank.
     #[test]
     fn straddling_multi_row_block_commits_and_visible_remnant_is_orphaned() {
-        // Terminal expanded from 5 to 7 rows because each block now
-        // has a trailing gap row: multi(3) → slot 4, single → slot 2,
-        // footer = 1 → 7 rows exact fit before the extra push.
         let mut terminal = mk_term_terminal(80, 7);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3361,11 +3336,6 @@ mod tests {
     /// fill as new content arrives — a much steadier visual.
     #[test]
     fn content_shrink_pins_footer_and_pushes_consume_slack() {
-        // Terminal expanded from 5 to 9 rows because each block now
-        // carries a 1-row gap below it: an N-line block takes N+1
-        // slot rows, a 1-line block takes 2 slot rows. The initial
-        // multiline is now 5 lines so the shrink from 5→3→1 frees
-        // 4 slot rows of slack, enough to absorb two slot-2 pushes.
         let mut terminal = mk_term_terminal(80, 9);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3506,10 +3476,6 @@ mod tests {
     /// draw it renders below the active stack — not above it.
     #[test]
     fn push_with_older_active_queues_behind_them() {
-        // Terminal expanded from 5 to 6 rows because every block now
-        // has a trailing gap row: streaming(2)+gap + history(1)+gap +
-        // footer = 3+2+1 = 6, exactly fitting without tipping into
-        // active-overflow.
         let mut terminal = mk_term_terminal(80, 6);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3574,10 +3540,9 @@ mod tests {
         s
     }
 
-    /// 6-row terminal (was 5; +1 for the block's trailing gap row),
-    /// 1-row footer. Push one 10-row active block. Available
-    /// block-content area: 5 rows. The ellipsis row eats 1, so 4
-    /// slot rows of the block are visible — the bottom 3 content
+    /// 6-row terminal, 1-row footer. Push one 10-row active block.
+    /// Available block-content area: 5 rows. The ellipsis row eats 1,
+    /// so 4 slot rows of the block are visible — the bottom 3 content
     /// rows (L7..L9) plus the gap row, top-truncated. Crucially,
     /// scrollback must remain empty: an active block's cells can be
     /// replaced, so they cannot be allowed into native scrollback.
@@ -3615,9 +3580,6 @@ mod tests {
     /// cannot be allowed to evict its cells.
     #[test]
     fn oversize_active_block_update_does_not_leak_to_scrollback() {
-        // Terminal expanded from 5 to 6 rows to make room for the
-        // active block's trailing gap row alongside its visible
-        // bottom 3 content rows + ellipsis + footer.
         let mut terminal = mk_term_terminal(80, 6);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3651,14 +3613,8 @@ mod tests {
     /// safe-overflow path runs — natural scroll commits the overflow
     /// rows to scrollback; the bottom rows of the now-safe block stay
     /// on screen as an orphaned remnant per the existing model.
-    /// This is the "no additional logic, existing stuff covers it"
-    /// case: marking a previously-truncated active as safe restores
-    /// it to the standard safe-overflow flow.
     #[test]
     fn oversize_active_block_mark_safe_uses_natural_scroll_commit() {
-        // Terminal expanded from 5 to 6 rows so the natural-scroll
-        // commit leaves room for the block's trailing gap row above
-        // the footer alongside the four-row remnant (L6..L9).
         let mut terminal = mk_term_terminal(80, 6);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3701,10 +3657,6 @@ mod tests {
     /// scrollback.
     #[test]
     fn long_active_history_truncates_oldest_actives_and_keeps_newest_updatable() {
-        // Terminal expanded from 5 to 8 rows because every active block
-        // now takes 2 slot rows (1 content + 1 gap). With footer_h=1,
-        // available_h=7; ellipsis takes 1, so block_area_h=6 fits exactly
-        // three single-line actives (d, e, f).
         let mut terminal = mk_term_terminal(80, 8);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 
@@ -3782,10 +3734,6 @@ mod tests {
     /// the truncated visible content above the footer.
     #[test]
     fn partial_mark_safe_commits_to_scrollback_then_remaining_overflow_truncates() {
-        // Terminal expanded from 5 to 8 rows because every block now
-        // takes 2 slot rows (1 content + 1 gap). After mark_safe drains
-        // a + b into native scrollback, the visible window holds
-        // ellipsis + d/e/f (each followed by their gap) + footer.
         let mut terminal = mk_term_terminal(80, 8);
         let mut container = Rig::new(multi_text(&["footer"]), 0);
 

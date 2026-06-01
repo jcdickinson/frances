@@ -133,7 +133,7 @@ mod tests {
     }
 
     /// `BITS_PER_WORD` bytes encode to exactly 8 data words with zero residual
-    /// bits in the last word — so no padding marker is appended.
+    /// bits in the last word and no padding marker.
     #[test]
     fn payload_aligned_to_word_boundary_has_no_padding() {
         let bytes: Vec<u8> = (0..BITS_PER_WORD as u8).collect();
@@ -143,9 +143,8 @@ mod tests {
         round_trip(&bytes);
     }
 
-    /// Every padding marker (indices 0..N_PADDING_WORDS) must be reachable by
-    /// the encoder. If the dictionary shrinks below the number of distinct
-    /// residual-bit counts, decoding would silently break for some lengths.
+    /// Every padding marker (indices 0..N_PADDING_WORDS) is reachable by
+    /// the encoder.
     #[test]
     fn every_padding_marker_is_emitted() {
         use std::collections::HashSet;

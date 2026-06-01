@@ -1,8 +1,6 @@
 //! Unit tests for the workflow runtime, split by surface.
 //!
-//! Promoted out of the inline `mod tests` when `runtime.rs` outgrew
-//! 5.7k lines. Shared fixtures live here; each submodule pulls them in
-//! with `use super::*`.
+//! Shared fixtures live here; each submodule pulls them in with `use super::*`.
 
 pub(crate) use super::test_deps::StubDeps;
 pub(crate) use super::test_drive::{CYCLE_TIMEOUT, drive_one_cycle, drive_to_done};

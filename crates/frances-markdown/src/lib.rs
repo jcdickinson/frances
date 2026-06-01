@@ -12,14 +12,9 @@
 //! - [`parse_inline`] — single-pass scanner over a paragraph's chars
 //!   recognising CommonMark `**bold**` / `__bold__` and `*italic*` /
 //!   `_italic_`. No nesting, no escapes, no headings, no lists, no
-//!   code fences — PoC scope. The scanner only runs when
-//!   `source != Source::User`; user-echo sections render literal so
-//!   the user's `*.rs files` stays visible.
-//!
-//! Swap-out plan: when the time comes for real markdown, replace the
-//! contents of `inline.rs` with a `pulldown-cmark` / `comrak` adapter
-//! and let `MarkdownSection` emit richer block types (CodeBlock,
-//! Heading, List). The public surface stays the same.
+//!   code fences. The scanner only runs when `source != Source::User`;
+//!   user-echo sections render literal so the user's `*.rs files`
+//!   stays visible.
 
 mod inline;
 mod paragraph_block;

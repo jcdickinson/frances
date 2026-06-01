@@ -2,12 +2,6 @@
 //! arguments arrive double-encoded as JSON strings (e.g. `{"files": "[...]"}`
 //! instead of `{"files": [...]}`).
 //!
-//! This is JSON-coupled by design. We need `serde_json::Error::classify()` to
-//! tell shape-mismatch (`Category::Data`) apart from genuine syntax/IO errors,
-//! and we walk a `serde_json::Value` to repair stringified subtrees. Pretending
-//! to be format-agnostic via `Deserializer` would just be JSON coupling with
-//! extra steps and a misleading API.
-//!
 //! On strict deserialize success, we're a zero-cost passthrough. On a
 //! `Category::Data` error we recursively unwrap any `Value::String` whose
 //! contents parse to an array or object, then retry; if repair still fails,
@@ -38,11 +32,7 @@ impl<T: DeserializeOwned> JsonRepair<T> {
     /// Try strict `from_value`. On `Category::Data` errors (well-formed JSON
     /// but shape-mismatched against `T`'s schema), recursively unwrap any
     /// `Value::String` whose content parses to a JSON array or object, then
-    /// retry — and return whichever error the *retry* surfaces. The retry
-    /// error is the more useful one: when the repair fixed the obvious bug
-    /// but a sibling field is also wrong (e.g. model double-encoded `files`
-    /// AND omitted a required `path`), the post-repair error names the real
-    /// remaining problem instead of the now-stale "expected a sequence".
+    /// retry. Returns the retry error on failure.
     pub fn from_value(v: Value) -> Result<Self, Error> {
         match serde_json::from_value::<T>(v.clone()) {
             Ok(t) => Ok(Self(t)),
@@ -211,8 +201,6 @@ mod tests {
 
     #[test]
     fn unrepairable_input_surfaces_post_repair_error() {
-        // `files` is a number — can't be unwrapped. Strict fails, repair is a
-        // no-op, retry fails with the same "expected a sequence" shape.
         let v = json!({ "files": 42 });
         let err = JsonRepair::<Input>::from_value(v).unwrap_err();
         assert!(err.to_string().contains("expected"));

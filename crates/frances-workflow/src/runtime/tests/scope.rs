@@ -2,8 +2,6 @@ use super::*;
 
 #[tokio::test]
 async fn scope_lock_runs_after_batch_push() {
-    // The post-batch turn registered via scope.lock fires AFTER all
-    // initial tool_results have been pushed to chat history.
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
 
@@ -71,8 +69,6 @@ async fn scope_lock_runs_after_batch_push() {
 
 #[tokio::test]
 async fn scope_lock_turns_run_in_finish_order() {
-    // Two tools register turns. "fast" finishes before "slow"; turns
-    // run in finish order, not tool_calls order.
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
 

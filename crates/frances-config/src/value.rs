@@ -65,8 +65,7 @@ impl Value {
         }
     }
 
-    /// Render this value as a string regardless of variant. Used by the
-    /// deserializer when serde asks for `&str`/`String`.
+    /// Render this value as a string regardless of variant.
     pub fn coerce_string(&self) -> Cow<'_, str> {
         match self {
             Value::Null => Cow::Borrowed(""),
@@ -265,9 +264,7 @@ impl<const N: usize> From<[Value; N]> for Path {
     }
 }
 
-/// Convenience constructor for the common case of building a path from
-/// string literals or owned strings: `Path::from(["models", name])`. Each
-/// segment is parsed via `parse_segment` so numeric-looking strings
+/// Build a `Path` from a string-literal array. Numeric-looking segments
 /// become [`Value::Int`], matching [`Path::parse`].
 impl<S: AsRef<str>, const N: usize> From<[S; N]> for Path {
     fn from(arr: [S; N]) -> Self {
@@ -349,14 +346,12 @@ mod tests {
             ]
         );
 
-        // numeric-looking segments still become Int, like Path::parse
         let p: Path = ["tags", "0"].into();
         assert_eq!(
             p.segments(),
             &[Value::String(Arc::from("tags")), Value::Int(0)]
         );
 
-        // works with owned strings too
         let name = String::from("default");
         let p: Path = ["models", name.as_str()].into();
         assert_eq!(p.to_string(), "models::default");

@@ -121,8 +121,6 @@ async fn shell_keep_waiting_resumes_quiet_command() {
 
 #[tokio::test]
 async fn shell_run_tool_handler_formats_done_outcome() {
-    // Wire the Run tool through chat.tools and dispatch a fake
-    // shell_run tool call via the stubbed provider.
     use super::test_deps::StubDepsRealShell;
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
@@ -199,10 +197,6 @@ async fn shell_run_tool_handler_formats_done_outcome() {
 
 #[tokio::test]
 async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
-    // Long-running command goes Quiet → Run.handler registers a
-    // scope.lock turn. The turn streams; scripted LLM emits
-    // shell_wait → Wait.handler runs shell.keepWaiting until Done.
-    //
     // We script several shell_wait rounds because keepWaiting's
     // default 1s quiet window can time out before the sentinel
     // arrives, especially under load — Run's turn will loop until
@@ -321,15 +315,11 @@ async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
 
 #[tokio::test]
 async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
-    // Quiet shell + a model that emits no tool calls for multiple
-    // rounds: Run should scold up to `maxScolds` times, then SIGKILL
-    // the in-flight command and push a "killed" notice.
     use super::test_deps::StubDepsRealShell;
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
 
     let deps = StubDepsRealShell::default();
-    // Round 1: shell_run on a long-running command.
     deps.script_next_run(
         vec![StreamEvent::ToolCall(ToolCall {
             error: None,
@@ -347,8 +337,6 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
             }],
         },
     );
-    // Rounds 2-4 (in turn): model emits text but no tool calls.
-    // maxScolds=2 → round 2 scolds, round 3 scolds, round 4 kills.
     for _ in 0..3 {
         deps.script_next_run(
             vec![StreamEvent::TextDelta("I don't want to.".to_owned())],
@@ -421,8 +409,6 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
     });
     assert!(killed, "expected 'Killed' message in pending: {pending:?}");
 
-    // Scold and kill notices should also surface to the UI as
-    // transcript frames so the user sees what's happening.
     let scold_frames = frames
         .iter()
         .filter(|f| text_of(f).contains("still running"))
@@ -442,10 +428,9 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
 
 #[tokio::test]
 async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
-    // Same as the silent case but the model emits off-script tool
-    // calls each round. The gating hook turns them into error
-    // tool_results; the no-progress counter still ticks and the
-    // shell is eventually killed.
+    // The model emits off-script tool calls each round. The gating hook turns
+    // them into error tool_results; the no-progress counter still ticks and
+    // the shell is eventually killed.
     use super::test_deps::StubDepsRealShell;
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
@@ -572,7 +557,6 @@ async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
     });
     assert!(killed, "expected 'Killed' message in pending: {pending:?}");
 
-    // Scold and kill notices should also be in the transcript.
     let scold_frames = frames
         .iter()
         .filter(|f| text_of(f).contains("still running"))

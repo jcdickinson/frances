@@ -232,9 +232,7 @@ impl<B: Backend<Error = io::Error> + Write> Backend for ScrollbackBackend<B> {
         // offset cell `y` by `footer_anchor_y` before the bytes hit the
         // wire, (b) keeping a single emission path lets the test mock
         // (which carries a no-op `Backend::draw` but a real `Write`
-        // impl that feeds an alacritty parser) see footer cells. The
-        // production `CrosstermBackend::draw` does effectively the same
-        // thing, so this is a behavioural identity for it.
+        // impl that feeds an alacritty parser) see footer cells.
         use crossterm::style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor};
         let dy = match self.mode {
             BackendMode::Scrollback => 0,
@@ -381,9 +379,6 @@ mod tests {
     use super::*;
 
     /// Minimal `Write` + `Backend` mock that records every byte written.
-    /// The container's hot path writes through `crossterm::QueueableCommand`
-    /// (which calls `Write::write`), so capturing those bytes gives a
-    /// direct view of the ANSI stream the backend emits.
     struct RecorderBackend {
         buf: Vec<u8>,
         size: Size,

@@ -5,8 +5,7 @@ use crate::provider::{ConfigProvider, ProviderError};
 use crate::value::{Path, Value};
 
 /// In-memory `ConfigProvider` built from a pre-baked list of
-/// `(path, value)` pairs. Emits everything in a single batch on `load`
-/// and then drops `events`, so there are no runtime updates.
+/// `(path, value)` pairs. Emits everything in a single batch on `load`.
 ///
 /// Test-only: exposed under the `test-util` feature so downstream
 /// crates can spin up a `ConfigHandle` without writing TOML to disk.

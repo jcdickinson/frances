@@ -176,7 +176,6 @@ mod tests {
         assert_eq!(buf[(3, 0)].symbol(), "┐");
         assert_eq!(buf[(0, 2)].symbol(), "└");
         assert_eq!(buf[(3, 2)].symbol(), "┘");
-        // Child paints its 'x' at (1, 1) — the top-left inner cell.
         assert_eq!(buf[(1, 1)].symbol(), "x");
     }
 

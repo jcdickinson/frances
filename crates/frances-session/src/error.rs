@@ -10,11 +10,7 @@ use frances_edit::EditError;
 use frances_llm::ProviderCacheError;
 use frances_models_llm::chat::{ChatError, HistoryError};
 
-/// All errors raised by the session runtime. Each variant `#[from]`s
-/// a per-module typed error so callers and tests can match on the exact
-/// failure mode. This enum holds no generic carriers (no `Io`, no
-/// `String`, no `Box<dyn Error>`) — every `?` call site routes through
-/// a typed module error first.
+/// All errors raised by the session runtime.
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]

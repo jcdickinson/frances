@@ -70,9 +70,7 @@ pub enum OwnedHistoryInput {
 
 impl OwnedHistoryInput {
     /// Owning copy of a borrowed [`HistoryInput`] — the inverse of
-    /// [`as_borrowed`](Self::as_borrowed). Lets callers that need to grow
-    /// an input list across rounds (e.g. `complete_enforced`'s scold loop)
-    /// keep everything owned.
+    /// [`as_borrowed`](Self::as_borrowed).
     pub fn from_borrowed(input: &HistoryInput<'_>) -> Self {
         match *input {
             HistoryInput::System { text } => Self::System {
@@ -131,9 +129,7 @@ impl OwnedHistoryInput {
         }
     }
 
-    /// The serde tag for this variant, mirrored into the indexable
-    /// `type` column. Stays in lockstep with `#[serde(rename_all =
-    /// "snake_case")]` by construction.
+    /// The serde tag for this variant, mirrored into the indexable `type` column.
     pub fn kind(&self) -> &'static str {
         match self {
             Self::System { .. } => "system",
@@ -145,9 +141,7 @@ impl OwnedHistoryInput {
     }
 }
 
-/// One row queued for a [`HistoryBatch`] flush. Primitive and forged-history
-/// rows share the `chat_messages` table and one `seq` sequence, so they
-/// buffer together and flush in a single transaction.
+/// One row queued for a [`HistoryBatch`] flush.
 pub enum BatchRow {
     /// A conversation primitive. `ty` is [`OwnedHistoryInput::kind`];
     /// `json` is the serialized `OwnedHistoryInput`.
@@ -162,9 +156,8 @@ pub enum BatchRow {
 }
 
 /// In-memory accumulator for a turn's history writes. Each `primitive` /
-/// `history` call serializes eagerly (so encode errors surface at build
-/// time) and appends a [`BatchRow`]; the store flushes the whole batch
-/// under one transaction with a single sequence read.
+/// `history` call serializes eagerly and appends a [`BatchRow`]; the store
+/// flushes the whole batch under one transaction with a single sequence read.
 #[derive(Default)]
 pub struct HistoryBatch {
     pub rows: Vec<BatchRow>,

@@ -43,8 +43,7 @@ impl std::fmt::Display for ChatSessionId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChatSessionRow {
     pub id: ChatSessionId,
-    /// Opaque UUID; threaded through provider requests as a cache-scoping
-    /// hint.
+    /// Opaque UUID.
     pub session_id: String,
     /// Ordered list of `models::<intent>` config keys the session walks
     /// when resolving a model for the next call.

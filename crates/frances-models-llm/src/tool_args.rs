@@ -72,16 +72,13 @@ pub fn repair_qwen_quirks(call: &mut ToolCall, tools: &[ToolDef]) {
 
 /// A schema-validation failure rendered for the model. Terminal: only ever
 /// becomes the `message` of a `ToolCallError` shown to the model, never
-/// matched on in Rust. `jsonschema::ValidationError` borrows the validated
-/// instance, so it can't outlive [`validate`] — render it here.
+/// matched on in Rust.
 pub struct ValidationMessage(pub String);
 
 /// Validate `args` against a tool's `parameters` JSON schema. Returns a
 /// concise, model-facing [`ValidationMessage`] on mismatch.
 ///
-/// A schema that itself fails to compile is treated as "can't validate"
-/// (returns `Ok`) — that's a tool-author bug, not the model's fault, and
-/// we'd rather not block the call on it.
+/// An uncompilable schema returns `Ok` — no validation is attempted.
 pub fn validate(args: &Value, schema: &Value) -> Result<(), ValidationMessage> {
     let Ok(validator) = jsonschema::validator_for(schema) else {
         return Ok(());
@@ -92,11 +89,9 @@ pub fn validate(args: &Value, schema: &Value) -> Result<(), ValidationMessage> {
     }
 }
 
-/// Whether `schema` satisfies OpenAI strict structured-outputs rules, so we
-/// can set `strict: true` "when possible". Strict mode rejects extensible
-/// schemas: every object must set `additionalProperties: false` and list
-/// **every** property in `required` (recursively, through nested objects
-/// and array `items`).
+/// Whether `schema` satisfies OpenAI strict structured-outputs rules.
+/// Every object must set `additionalProperties: false` and list every
+/// property in `required` (recursively, through nested objects and array `items`).
 pub fn is_strict_compatible(schema: &Value) -> bool {
     let Value::Object(map) = schema else {
         return true;
@@ -175,7 +170,6 @@ mod tests {
 
     #[test]
     fn uncompilable_schema_skips() {
-        // A nonsense schema can't compile → we don't block the call.
         assert!(validate(&json!({ "type": "definitely-not-a-type" }), &json!(42)).is_ok());
     }
 

@@ -7,8 +7,7 @@ use thiserror::Error;
 use crate::anchor::Anchor;
 use crate::state::FileAnchorState;
 
-/// Boxed error wrapper so different `AnchorStore` backends can fail with
-/// different concrete error types without parameterising the trait.
+/// Boxed error type for [`AnchorStore`] backends.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct StoreError(pub Box<dyn std::error::Error + Send + Sync + 'static>);
@@ -35,9 +34,7 @@ pub trait AnchorStore: Send + Sync {
         content_digest: u64,
     ) -> StoreResult<()>;
     /// Replace all stored lines for `path` with `state.lines` and write
-    /// `state`'s meta, atomically. This is the whole-file persistence path
-    /// (the engine always rewrites the full line set, never patches lines
-    /// individually), so it subsumes a truncate + per-line upsert + meta save.
+    /// `state`'s meta, atomically.
     async fn replace_file_lines(&self, path: &Path, state: &FileAnchorState) -> StoreResult<()>;
     async fn used_anchors(&self, path: &Path) -> StoreResult<HashSet<Anchor>>;
     async fn tombstone(&self, path: &Path, anchors: &[Anchor]) -> StoreResult<()>;

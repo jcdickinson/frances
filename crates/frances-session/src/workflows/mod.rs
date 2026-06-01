@@ -19,9 +19,7 @@
 //! Pops never delete: they set `completed_at` and clear `active`.
 //! Push truncates any non-completed rows above the current top (a
 //! defensive sweep against crash-mid-pop) and inserts the new row
-//! with the next AUTOINCREMENT position. Rows accumulate; a future
-//! "resume previously-popped" feature is unblocked at the schema
-//! level but not built here.
+//! with the next AUTOINCREMENT position. Rows accumulate.
 //!
 //! ## Boot
 //!
@@ -283,7 +281,7 @@ impl EmitState {
     /// Persist one closing section's row (if it ever received body
     /// content) and, for a clean stop, emit its `SectionClose`. The
     /// `open` is consumed — its `kind`/`text` move straight into the
-    /// row, no clone.
+    /// row.
     async fn close_section(
         &self,
         mode: &CloseMode<'_>,
@@ -984,8 +982,7 @@ async fn hydrate_active_or_cascade<Io: frances_workflow::WorkflowIo>(
                     "workflow restore failed; tombstoning and trying next"
                 );
                 truncate_at_or_above(db, row.position).await?;
-                // Loop: try to promote next non-completed.
-            }
+                }
         }
     }
 }
@@ -1289,7 +1286,6 @@ mod tests {
         insert_pushed_row(&db, "a", a, &[]).await.unwrap();
         insert_pushed_row(&db, "b", b, &[]).await.unwrap();
 
-        // Both rows alive; B is on top.
         assert_eq!(count_live(&db).await, 2);
         let active = read_active_row(&db).await.unwrap().expect("top");
         assert_eq!(active.instance_id, b);
@@ -1307,7 +1303,6 @@ mod tests {
 
         mark_completed_and_promote(&db, b).await.unwrap();
 
-        // B is dead, A is back on top.
         assert_eq!(flags_for(&db, b).await, Some((false, false)));
         assert_eq!(flags_for(&db, a).await, Some((true, true)));
         assert_eq!(
@@ -1366,7 +1361,6 @@ mod tests {
 
         insert_pushed_row(&db, "c", c, &[]).await.unwrap();
 
-        // B is now tombstoned (truncated); A is demoted; C is active.
         assert_eq!(flags_for(&db, b).await, Some((false, false)));
         assert_eq!(flags_for(&db, a).await, Some((false, true)));
         assert_eq!(flags_for(&db, c).await, Some((true, true)));
@@ -1386,18 +1380,11 @@ mod tests {
         insert_pushed_row(&db, "b", b, &[]).await.unwrap();
         insert_pushed_row(&db, "c", c, &[]).await.unwrap();
 
-        // Pop C — but with the "pop doesn't tombstone the previous
-        // active" semantics: in our current design we DO tombstone,
-        // so let's just confirm the truncation rule via the explicit
-        // crash-style setup of the previous test rather than this
-        // narrative. Here we follow the implemented contract: C is
-        // tombstoned, B is promoted.
         mark_completed_and_promote(&db, c).await.unwrap();
         assert_eq!(flags_for(&db, c).await, Some((false, false)));
         assert_eq!(flags_for(&db, b).await, Some((true, true)));
 
         insert_pushed_row(&db, "d", d, &[]).await.unwrap();
-        // C stays tombstoned, B demoted, D on top, A demoted.
         assert_eq!(flags_for(&db, a).await, Some((false, true)));
         assert_eq!(flags_for(&db, b).await, Some((false, true)));
         assert_eq!(flags_for(&db, c).await, Some((false, false)));
@@ -1432,7 +1419,6 @@ mod tests {
 
         truncate_at_or_above(&db, b_pos).await.unwrap();
 
-        // A survives, B and C are tombstoned. A is now the active top.
         assert_eq!(flags_for(&db, a).await, Some((true, true)));
         assert_eq!(flags_for(&db, b).await, Some((false, false)));
         assert_eq!(flags_for(&db, c).await, Some((false, false)));

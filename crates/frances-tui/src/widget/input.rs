@@ -1,8 +1,4 @@
 //! [`Input`] — the event-handling half of the widget trait split.
-//!
-//! Split out from `Widget` so Phase C blocks can accept events
-//! (e.g. hscroll/vscroll inside the Phase D alt-view inspector)
-//! without becoming widgets in their own right.
 
 use crossterm::event::Event;
 

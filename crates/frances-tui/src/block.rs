@@ -8,16 +8,13 @@
 //! a code listing, a shell-output tail, anything that fits the trait.
 //!
 //! The trait is ratatui-coupled: `Rect` and `Buffer` show up in
-//! [`BlockRenderContext`]. That's a deliberate trade — we get any
-//! ratatui-styled cell to participate cheaply, at the cost of needing
-//! to redo this layer if we ever port to a non-ratatui frontend.
+//! [`BlockRenderContext`].
 //!
 //! ## Trait split
 //!
 //! [`Block`] is a [`crate::widget::Input`] sub-trait so the alt-view
 //! inspector can dispatch events to whichever block has focus
-//! (hscroll/vscroll, expand/collapse). Concrete blocks ship a no-op
-//! `Input` impl until Phase D wires up per-block keymaps.
+//! (hscroll/vscroll, expand/collapse).
 //!
 //! ## Persistence
 //!
@@ -176,11 +173,7 @@ pub trait Block: Input + 'static {
 }
 
 /// Adapter so a `ratatui::widgets::Paragraph` can be used as a `Block`
-/// directly. `Paragraph::render` consumes self upstream, so we clone —
-/// Paragraph clones are cheap (owned Lines, no internal handles).
-///
-/// Kept for the binary's `container_scratch` example and the container
-/// tests; the binary's real blocks live in `frances/src/tui/blocks.rs`.
+/// directly. Clones on render — `Paragraph::render` consumes self.
 impl Input for ratatui::widgets::Paragraph<'static> {
     fn handle_event(
         &mut self,

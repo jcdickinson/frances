@@ -23,9 +23,7 @@ use thiserror::Error;
 /// A shell-style template (`$VAR`, `${VAR}`, `${VAR:-default}`).
 ///
 /// Stored unparsed; expansion happens through `shellexpand` on each call
-/// to [`expand`](Self::expand). For typical config values (a handful of
-/// HTTP headers per request) the parse cost is negligible and saves us
-/// from carrying an AST that mirrors shellexpand's internals.
+/// to [`expand`](Self::expand).
 #[derive(Debug, Clone)]
 pub struct EnvString {
     raw: Arc<str>,
@@ -70,9 +68,7 @@ impl<'de> Deserialize<'de> for EnvString {
 
 /// Implemented by anything that can resolve env-var names to values.
 ///
-/// Implementers should return [`None`] for missing/unset vars. The
-/// `shellexpand` integration will surface that as a typed error unless a
-/// default form like `${VAR:-default}` is in play.
+/// Return [`None`] for missing/unset vars.
 pub trait EnvLookup {
     fn get(&self, name: &str) -> Option<&str>;
 }

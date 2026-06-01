@@ -733,8 +733,6 @@ impl Block for RawBlock {
 
 /// Overlay the dim "⋯ truncated ⋯" indicator on the bottom row of
 /// `ctx.area` when the container flagged this entry as truncated.
-/// Replaces the trailing-row Convention that `TruncatedBlock` used to
-/// own; per-block `render` decides whether to call this.
 fn paint_truncation_marker_if_set(ctx: &mut BlockRenderContext<'_>) {
     if !ctx.truncated || ctx.area.height == 0 || ctx.area.width == 0 {
         return;
@@ -829,10 +827,7 @@ pub fn sigil_for(kind: &WireBlockKind) -> Sigil {
 /// column 0.
 ///
 /// Always emits at least one range (`0..0` for empty `text`), matching
-/// the "one blank row" floor the string builders rely on. Splitting the
-/// row geometry out from materialisation lets [`Block::measure`] count
-/// rows with a [`CountingSink`] — no per-row `String` allocated — while
-/// `render` still slices the backing text.
+/// the "one blank row" floor the string builders rely on.
 /// An [`Extend`] sink that shifts each row range by `base` before
 /// forwarding it to `out`. Lets [`wrap_rows`] (which emits ranges
 /// relative to the slice it was given) write ranges relative to a larger
@@ -1015,7 +1010,6 @@ mod tests {
     }
 
     /// One round-trip-serde test per serializable block variant.
-    /// `RawBlock` is intentionally excluded — see its doc-comment.
     mod serde_roundtrip {
         use super::*;
 
@@ -1101,7 +1095,6 @@ mod tests {
         }
     }
 
-    /// Phase D — `TailedBlock` scroll state + alt-view rendering.
     mod shell_scroll {
         use super::*;
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -1262,8 +1255,7 @@ mod tests {
 
     /// `wrap_rows` (the allocation-free measure core) and `wrap_into`
     /// (the render path) must agree: same row count, and the ranges must
-    /// reconstruct the materialised strings. If these drift, `measure`
-    /// and `render` disagree on height and the container's layout breaks.
+    /// reconstruct the materialised strings.
     mod wrap_equivalence {
         use super::*;
 
@@ -1452,7 +1444,6 @@ mod tests {
             let wide = b.measure(&mctx(200));
             let narrow = b.measure(&mctx(12));
             assert!(narrow > wide, "narrower width should wrap to more rows");
-            // Re-visit each width; the cache must yield the same answers.
             assert_eq!(b.measure(&mctx(200)), wide);
             assert_eq!(b.measure(&mctx(12)), narrow);
         }

@@ -438,9 +438,7 @@ async fn capture_var_inner<F: WorkflowShell>(
 
 /// Issue a one-shot bash command and require a `Done` outcome. Used
 /// by export/capture, both of which run short deterministic commands
-/// where Quiet would be a tool-side bug (an infinite-output trap or
-/// equivalent). Re-uses the same closed/busy/spawn checks as
-/// `run_once_inner`.
+/// where Quiet would be a tool-side bug (an infinite-output trap or equivalent).
 async fn run_to_done<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
@@ -487,8 +485,8 @@ fn validate_bash_name(name: &str) -> Result<(), ShellToolError> {
 }
 
 /// Wrap a path in single quotes for bash, doubling any embedded
-/// single-quote via `'\''`. NamedTempFile paths shouldn't contain
-/// quotes in practice, but TMPDIR is user-controlled, so don't trust.
+/// single-quote via `'\''`. TMPDIR is user-controlled so the input
+/// cannot be trusted to be quote-free.
 fn shell_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('\'');

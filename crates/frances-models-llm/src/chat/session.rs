@@ -79,9 +79,8 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
     /// against `demand` (a call with schema-invalid arguments does **not**
     /// satisfy), and on a miss appends a scold — carrying the validation
     /// error when the model emitted the demanded tool with bad arguments —
-    /// then retries (up to `retries` times). The demand drives `tool_choice`
-    /// — any `tool_choice` on `req` is ignored. Generic over `complete`, so
-    /// it's a provided default.
+    /// then retries (up to `retries` times). The demand drives `tool_choice`;
+    /// any `tool_choice` on `req` is ignored.
     async fn complete_enforced(
         &self,
         req: CompleteRequest<'_>,
@@ -89,8 +88,6 @@ pub trait ChatSessionManager: Clone + Send + Sync + 'static {
         retries: u8,
     ) -> Result<CompletionOutcome, EnforceError> {
         let tool_choice = demand.to_tool_choice();
-        // Own the inputs so each round can append a fresh scold string and
-        // still hand `complete` a borrowed view.
         let mut owned: Vec<OwnedHistoryInput> = req
             .new_inputs
             .iter()

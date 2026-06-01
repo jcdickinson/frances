@@ -72,8 +72,7 @@ impl Configuration {
         ConfigBinding::from_snapshot(Path::new(), Some(self), Weak::new())
     }
 
-    /// Ergonomic single-event update against `ProviderId` 0. Used by tests
-    /// and ad-hoc snapshot construction. The processor uses the batch form.
+    /// Ergonomic single-event update against `ProviderId` 0.
     pub fn applied(&self, event: ConfigEvent) -> Self {
         self.applied_batch(ProviderId(0), std::slice::from_ref(&event))
             .unwrap_or_else(|| Self::empty(self.values.len()))

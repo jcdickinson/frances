@@ -8,9 +8,7 @@ use super::types::{EditError, EditResult, WriteMode};
 use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 impl<S: AnchorStore> EditSession<S> {
-    /// Create a brand-new file. Fails if the file already exists on disk —
-    /// the model must use `overwrite` for that case (which itself requires a
-    /// fresh `read_file` so the model has actually seen the prior content).
+    /// Create a brand-new file. Fails if the file already exists on disk.
     /// Mints fresh anchors for every line and renders a diff against an
     /// empty pre-state (all `+` lines).
     pub(super) async fn apply_new<F>(
@@ -23,9 +21,9 @@ impl<S: AnchorStore> EditSession<S> {
         F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let draft = split_text_to_lines(text);
-        // No `path.exists()` precheck — it can't be race-free. The drafter
-        // opens with `create_new`, so a file that appeared between then and
-        // now surfaces here as `AlreadyExists`; map it to the typed error.
+        // No `path.exists()` precheck — not race-free. The drafter opens with
+        // `create_new` so a race surfaces as `AlreadyExists` and maps to the
+        // typed error below.
         let (post_lines, mtime_ns, size) =
             on_draft(path, &draft, WriteMode::CreateNew).map_err(|e| match e.kind() {
                 io::ErrorKind::AlreadyExists => EditError::NewFileExists {
@@ -50,9 +48,8 @@ impl<S: AnchorStore> EditSession<S> {
     }
 
     /// Overwrite an existing, already-read file. Up-to-date read enforced via
-    /// the cache: every cached entry was populated by `read_file` in the
-    /// current session. Tombstones every prior anchor and mints fresh ones
-    /// via the normal reconcile path.
+    /// the cache. Tombstones every prior anchor and mints fresh ones via the
+    /// normal reconcile path.
     pub(super) async fn apply_overwrite<F>(
         &mut self,
         path: &Path,
@@ -108,8 +105,7 @@ impl<S: AnchorStore> EditSession<S> {
     }
 }
 
-/// Empty pre-state for diffing newly-created files. Only `lines` is read by
-/// `render_diff_block`; the meta fields are placeholders.
+/// Empty pre-state for diffing newly-created files.
 fn empty_state(path: &Path) -> FileAnchorState {
     FileAnchorState {
         path: path.to_path_buf(),
@@ -147,7 +143,6 @@ mod tests {
 
         assert!(block.text.contains("§alpha"));
         assert!(block.text.contains("§beta"));
-        // Diff vs empty pre-state ⇒ every line emitted as `+`.
         let plus_lines = block.text.lines().filter(|l| l.starts_with('+')).count();
         assert_eq!(plus_lines, 2);
 

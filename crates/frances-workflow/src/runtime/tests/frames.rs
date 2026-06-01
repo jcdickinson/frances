@@ -1,9 +1,7 @@
 use super::*;
 
-/// `new MarkdownSection({ source })` (and `{ content: undefined }`
-/// and `{ content: null }`) all produce `SectionKind::Markdown` with
-/// `content: None`. The wire opener carries no body, so the TUI
-/// defers measure / render until the workflow writes into it.
+/// `new MarkdownSection({ source })`, `{ content: undefined }`, and
+/// `{ content: null }` all produce `SectionKind::Markdown` with no seed.
 #[tokio::test]
 async fn markdown_frame_content_can_be_omitted() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
@@ -44,9 +42,7 @@ async fn markdown_frame_content_can_be_omitted() {
 }
 
 /// Pushing an empty-content frame and never writing to it produces
-/// `Push` + `Close` only — no `Append` in between. The runtime side
-/// uses this signal to skip persisting the row and the client uses
-/// the absent body delta to skip rendering.
+/// `Set` + `Close` only — no `Append` in between.
 #[tokio::test]
 async fn empty_markdown_frame_pushes_and_closes_without_appends() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
@@ -202,10 +198,6 @@ async fn markdown_frame_rejects_unknown_source_string() {
 
 #[tokio::test]
 async fn write_to_earlier_frame_after_newer_push_still_works() {
-    // Pushing a second frame doesn't seal the first — multiple
-    // frames can be writeable at once. Each frame's writes route
-    // by id, so a workflow can stream into a long-running shell
-    // block while also emitting markdown text alongside it.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -229,8 +221,6 @@ async fn write_to_earlier_frame_after_newer_push_still_works() {
     let (frames, result) = drive_one_cycle(&mut handle).await;
     let result = result.expect("workflow should have terminated");
     assert!(matches!(result, Ok(())), "got {result:?}");
-    // Two Push frames (a, b) then one Append carrying " extra"
-    // for `a`'s id.
     let appends: Vec<_> = frames
         .iter()
         .filter_map(|f| match f {
@@ -244,8 +234,6 @@ async fn write_to_earlier_frame_after_newer_push_still_works() {
 
 #[tokio::test]
 async fn shell_output_frame_pushes_streams_transitions_and_closes() {
-    // Exercise the ShellOutputSection lifecycle: push (Running), pipe
-    // stdout in, transition to exit, autoclose seals the block.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -271,8 +259,6 @@ async fn shell_output_frame_pushes_streams_transitions_and_closes() {
     let (frames, result) = drive_one_cycle(&mut handle).await;
     assert!(matches!(result, Some(Ok(()))), "got {result:?}");
 
-    // Expect: one Set (Running, seed ""), two Appends ("a\n",
-    // "b\n"), one metadata Set (Exit(0)), one Close.
     let frame_id = match frames.first() {
         Some(SectionTranscript::Set { id, section: spec }) => {
             match &spec.kind {
@@ -348,10 +334,7 @@ async fn frame_autoclose_can_be_disabled() {
 }
 
 /// `new MarkdownSection({ ..., closed: true })` pre-seals the frame:
-/// `transcript.push` emits the `Close` immediately after the `Push`
-/// so the TUI never paints the active-block spinner over the
-/// frame. Mirrors the workflow's one-shot patterns (greeting,
-/// echoed user message, scold messages from `shell.js`).
+/// `transcript.push` emits `Close` immediately after `Set`.
 #[tokio::test]
 async fn markdown_frame_closed_ctor_option_pushes_and_closes_in_one_shot() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
@@ -382,10 +365,8 @@ async fn markdown_frame_closed_ctor_option_pushes_and_closes_in_one_shot() {
     );
 }
 
-/// `new MarkdownSection(...).close()` returns `this`, so the
-/// construct-and-seal idiom can be a one-liner. Same wire effect
-/// as the `{ closed: true }` ctor option: pre-push close just
-/// records the intent; `transcript.push` emits Push then Close.
+/// `.close()` returns `this`; `transcript.push(frame.close())` emits
+/// `Set` then `Close`, the same as `{ closed: true }`.
 #[tokio::test]
 async fn markdown_frame_close_returns_this_for_chaining() {
     let rt = Runtime::new(StubDeps::default()).unwrap();

@@ -4,13 +4,8 @@
 //! anything. `get(id)` walks config-driven adds/removes since the last
 //! call, returns the cached entry if present, and otherwise runs
 //! `try_build(id)` to read `model_providers::<id>` and instantiate. Each
-//! entry owns subscribe streams for its provider config + extras so the
+//! entry owns subscribe streams for its provider config so the
 //! next `get` can rebuild on config change.
-//!
-//! What's NOT here: an external factory-map / `EntryFactory` trait. The
-//! impl-per-kind selection is a hard-coded match arm inside
-//! `try_build` (today: a single OpenAI arm). Adding a new provider
-//! is a one-line change here.
 
 use std::pin::Pin;
 use std::sync::Arc;
@@ -109,10 +104,8 @@ impl ProviderCache {
         self.try_build(&id_lc)
     }
 
-    /// Test-only: shove a pre-built provider into the cache keyed by
-    /// `id`. The next `get(id)` call returns it directly, bypassing the
-    /// hard-coded OpenRouter build path. The entry has a no-op refresh
-    /// closure so config churn never replaces it.
+    /// Test-only: insert a pre-built provider keyed by `id`, bypassing
+    /// the config-driven build path.
     #[cfg(any(test, feature = "test-util"))]
     pub fn insert_stub<P>(&self, id: &str, provider: Arc<P>)
     where
@@ -155,10 +148,7 @@ impl ProviderCache {
         }
     }
 
-    /// Build a new entry for `id_lc`. Hard-coded match-per-kind: today
-    /// every id resolves to the OpenRouter Responses-API impl. Adding a
-    /// new provider is a one-line addition here (key it on a
-    /// provider-name field on `ProviderConfig` once that exists).
+    /// Build a new entry for `id_lc`.
     fn try_build(&self, id_lc: &str) -> Option<Arc<ErasedProvider>> {
         let entry = match build_genai_entry(&self.inner.handle, id_lc) {
             Ok(entry) => entry,

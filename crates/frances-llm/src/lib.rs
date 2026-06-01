@@ -20,10 +20,6 @@ pub use chat::{
 pub use provider::{ErasedProvider, Provider, ProviderRequest};
 pub use provider_cache::{ProviderCache, ProviderCacheError};
 
-// Re-export the model-side surface so existing imports
-// (`frances_llm::HistoryInput`, etc.) keep working transitionally
-// where it's still convenient. New code should import from
-// `frances_models_llm::*` directly.
 pub use frances_models_llm::config::{
     AuthCommand, AuthMethod, ModelConfig, OpenRouterConfig, OpenRouterModelConfig, ProviderConfig,
 };

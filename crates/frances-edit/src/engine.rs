@@ -30,8 +30,8 @@ impl<S: AnchorStore> EditEngine<S> {
 
     /// Load anchored state for `path` and reconcile against the caller's
     /// already-read content. Drift ladder:
-    ///   - mtime/size match → cached state is current, no work
-    ///   - content_digest match → only meta touched, update meta and return cached
+    ///   - mtime/size match → cached state is current, no work needed
+    ///   - content_digest match → meta only changed, update meta and return cached
     ///   - else → reconcile against `on_disk_lines`, persist, return new state
     ///
     /// Cold path (no cached state): mint anchors for every line and persist.
@@ -101,9 +101,7 @@ impl<S: AnchorStore> EditEngine<S> {
         })
     }
 
-    /// Persist a final anchored state for `path`, replacing any existing
-    /// rows. Records `tombstones` (typically `outcome.tombstoned` from a
-    /// `reconcile` call) into the tombstones table.
+    /// Persist a final anchored state for `path`, replacing any existing rows.
     pub async fn commit(
         &self,
         path: &Path,
@@ -124,8 +122,7 @@ impl<S: AnchorStore> EditEngine<S> {
         Ok(())
     }
 
-    /// Commit accumulated edits: clear the tombstones table. Called at a
-    /// reconciliation boundary chosen by the workflow.
+    /// Clear the tombstones table at a reconciliation boundary.
     pub async fn commit_edits(&self) -> StoreResult<()> {
         self.store.clear_tombstones().await
     }
@@ -198,7 +195,6 @@ mod tests {
         let anchor_b = w1.state.lines[1].anchor.clone();
         let anchor_c = w1.state.lines[2].anchor.clone();
 
-        // Drift: 'b' was deleted externally
         let w2 = engine
             .open(p.clone(), lines_of("a\nc"), 200, 3)
             .await
@@ -220,7 +216,6 @@ mod tests {
             .unwrap();
         let anchor_a = working.state.lines[0].anchor.clone();
 
-        // Build a new state where 'a' was replaced (test commit + tombstone)
         let mut pool = Pool::load(engine.store(), &p).await.unwrap();
         let new_lines = lines_of("A2\nb");
         let outcome = reconcile(&working.state, &new_lines, &mut pool, None);

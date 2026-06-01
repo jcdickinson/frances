@@ -5,11 +5,7 @@
 //! the lifetime of the [`crate::runtime::SessionRuntime`] — there is no
 //! reattach race, no socket pairing, no per-client buffering.
 //!
-//! Writers ignore send failures: a closed receiver means the TUI has
-//! quit and the runtime is on its way to shutdown. Persistent state
-//! (scrollback rows, history rows) is written to the DB inside the
-//! workflow path, so a dropped frame does not lose anything that's
-//! supposed to survive a restart.
+//! Writers ignore send failures silently.
 
 use tokio::sync::mpsc;
 

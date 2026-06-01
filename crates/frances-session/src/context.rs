@@ -11,9 +11,6 @@ use crate::tty::TtyKey;
 #[derive(Debug, Clone)]
 pub struct ProcessContext {
     pub cwd: Option<PathBuf>,
-    /// Shared so per-completion reads (`current_env`) clone an `Arc`, not the
-    /// whole several-hundred-entry map. The context is replaced wholesale via
-    /// `update_invocation`, never mutated in place, so the sharing is safe.
     pub env: Arc<HashMap<OsString, OsString>>,
 }
 

@@ -16,8 +16,7 @@ use crate::value::{Path, Value};
 /// - With a prefix `MYAPP`: only names starting with `MYAPP` (or `MYAPP_`)
 ///   are read; the prefix is stripped before splitting.
 ///
-/// `EnvProvider` performs initial bulk load and does not retain `events`
-/// afterwards (no env-var watcher in v1).
+/// `EnvProvider` performs initial bulk load and does not retain `events`.
 pub struct EnvProvider {
     prefix: Option<String>,
     source: EnvSource,

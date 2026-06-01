@@ -58,8 +58,7 @@ pub struct Provider {
     /// we build via `ClientBuilder::with_adapter_kind`.
     adapter: AdapterKind,
     /// Live binding to the top-level `[openrouter]` config block — only
-    /// populated when this provider's `kind` is `openrouter`. Other
-    /// adapters that grow their own quirks would gain sibling fields here.
+    /// populated when this provider's `kind` is `openrouter`.
     openrouter: Option<ConfigBinding<OpenRouterConfig>>,
     /// One shared `reqwest::Client` (internally `Arc`'d) reused across every
     /// stream this provider runs, so sequential completions to the same
@@ -197,8 +196,6 @@ impl provider::Provider for Provider {
             on_event(StreamEvent::History(payload.clone()))?;
         }
 
-        // Bridge persisted history JSON back into typed `ChatMessage`s
-        // for the request.
         let mut messages: Vec<ChatMessage> =
             Vec::with_capacity(req.history.len() + forged_new.len());
         for (i, v) in req.history.iter().chain(forged_new.iter()).enumerate() {

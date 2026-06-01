@@ -33,8 +33,6 @@ pub async fn open(session: &Session) -> std::result::Result<Database, DatabaseEr
 }
 
 /// Build a fresh in-memory database with all session-runtime schemas applied.
-/// Test fixtures want a turso connection with no on-disk state — using
-/// `":memory:"` keeps everything in-process: no tempdir, no I/O.
 #[cfg(test)]
 pub(crate) async fn open_in_memory() -> std::result::Result<Database, DatabaseError> {
     let db = Database::open_in_memory().await?;

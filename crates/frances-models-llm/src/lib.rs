@@ -1,9 +1,4 @@
 //! Workflow-facing types + traits for chat sessions and LLM providers.
-//!
-//! `frances-llm` holds the actual provider implementations and the
-//! concrete `ChatSession`/`ChatSessionManager` structs. This crate is
-//! pure data + traits so consumers (notably `frances-workflow`) don't
-//! pull in HTTP / SSE machinery.
 
 pub mod chat;
 pub mod completion;

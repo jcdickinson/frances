@@ -15,7 +15,7 @@ use frances_shell::{Shell, ShellError, ShellOptions};
 use super::{FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer};
 use crate::closed::WorkflowClosed;
 
-/// Production IO bundle. Unit-struct sub-impls, so cloning is free.
+/// Production IO bundle.
 #[derive(Clone, Copy, Default)]
 pub struct RealIo {
     timer: RealTimer,
@@ -39,9 +39,7 @@ impl WorkflowIo for RealIo {
     }
 }
 
-/// `tokio::time::sleep` + `tokio::spawn`. The current production
-/// behaviour — lifted out of `modules/io.rs` so the test path can
-/// swap it.
+/// `tokio::time::sleep` + `tokio::spawn`.
 #[derive(Clone, Copy, Default)]
 pub struct RealTimer;
 
@@ -83,9 +81,7 @@ impl WorkflowShell for RealShell {
     }
 }
 
-/// `tokio::fs` passthrough. `WorkflowFs` is async on purpose: the JS
-/// thread is a `current_thread` runtime, and the old `std::fs` calls
-/// in `modules/file.rs` blocked it on every read/write.
+/// `tokio::fs` passthrough.
 #[derive(Clone, Copy, Default)]
 pub struct RealFs;
 

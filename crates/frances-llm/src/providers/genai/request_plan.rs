@@ -44,7 +44,7 @@ pub(super) struct RequestPlan {
     pub(super) api_key: String,
     /// User-defined HTTP headers (excluding `Authorization`) that
     /// downstream consumers (e.g. `ChatOptions.extra_headers`) can
-    /// forward. Empty if the config sets none.
+    /// forward.
     pub(super) extra_headers: Vec<(String, String)>,
     pub(super) model: ModelConfig,
 }

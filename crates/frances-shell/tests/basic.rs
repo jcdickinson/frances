@@ -40,7 +40,6 @@ async fn cwd_survives_across_calls() {
 async fn stderr_merged_into_stdout_in_order() {
     let mut shell = Shell::spawn(opts()).await.unwrap();
     let (_, out) = run_done(&mut shell, "echo err >&2; echo out").await;
-    // Both lines must appear, in the order bash emitted them.
     assert!(out.contains("err"));
     assert!(out.contains("out"));
     assert!(
@@ -58,8 +57,6 @@ async fn nonzero_exit_surfaces() {
 
 #[tokio::test]
 async fn multi_line_script_works() {
-    // Demonstrates that the caller can write bash code as-is, no escaping
-    // or `bash -c '...'` wrapping.
     let mut shell = Shell::spawn(opts()).await.unwrap();
     let script = r#"
         for i in 1 2 3; do

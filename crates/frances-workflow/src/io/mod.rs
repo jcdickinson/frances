@@ -1,11 +1,7 @@
 //! IO seam for the workflow runtime.
 //!
 //! Three peer sub-traits — [`WorkflowTimer`], [`WorkflowShell`],
-//! [`WorkflowFs`] — sit under an umbrella [`WorkflowIo`] trait. The
-//! umbrella exists so callers (production and tests) handle a single
-//! `Io` value through `WorkflowDeps::io()`, but each sub-piece is its
-//! own trait so a test can drag in the real shell while keeping a mock
-//! timer + mock fs (or any other combination).
+//! [`WorkflowFs`] — sit under an umbrella [`WorkflowIo`] trait.
 //!
 //! Production wires up [`real::RealIo`]; tests drag in
 //! [`mock::MockIo`] from the `test-utils` feature.
@@ -51,8 +47,7 @@ impl SleepOutcome {
     }
 }
 
-/// File metadata the host reads. Narrower than `std::fs::Metadata` —
-/// just the fields `modules/file.rs` actually consumes (mtime, size).
+/// File metadata the host reads: mtime and size.
 #[derive(Debug, Clone, Copy)]
 pub struct FsMetadata {
     /// Last-modified time as nanoseconds since the Unix epoch.
@@ -79,10 +74,6 @@ pub trait WorkflowIo: Clone + Send + Sync + 'static {
 /// - `duration` elapsed → [`SleepOutcome::Fired`]
 /// - `cancel` notify → [`SleepOutcome::Cancelled`]
 /// - `closed` → [`SleepOutcome::Closed`]
-///
-/// The returned future is `Send` and `'static` so the JS-side primitive
-/// can spawn it onto the global runtime without dragging lifetimes
-/// through rquickjs.
 pub trait WorkflowTimer: Clone + Send + Sync + 'static {
     fn sleep(
         &self,
@@ -93,20 +84,14 @@ pub trait WorkflowTimer: Clone + Send + Sync + 'static {
 }
 
 /// Spawns bash subprocesses for the `frances:v1/tools/shell` primitive.
-/// The returned `Shell` is the concrete `frances_shell::Shell`; this
-/// trait stubs the *spawn* boundary only — `Shell` itself stays a
-/// concrete struct, so test impls that need to stub shell behaviour
-/// either inject the real shell ([`real::RealShell`]) or fail spawn.
+/// Stubs the spawn boundary only; `Shell` itself is the concrete
+/// `frances_shell::Shell`.
 pub trait WorkflowShell: Clone + Send + Sync + 'static {
     fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send;
 }
 
 /// Filesystem accessor backing `frances:v1/tools/file` reads/writes and
 /// `file_find_or_grep`'s binary-detection peek.
-///
-/// Mirrors what `modules/file.rs` actually needs — no full `Metadata`,
-/// no directory walker (file_find_or_grep enumerates against the real
-/// filesystem; only its per-file reads route through here).
 pub trait WorkflowFs: Clone + Send + Sync + 'static {
     fn read_to_string(&self, path: &Path) -> impl Future<Output = std::io::Result<String>> + Send;
 

@@ -84,9 +84,7 @@ impl ConfigProvider for LatchingProvider {
     }
 }
 
-/// Build a `(handle, manual)` pair where every `publish`-style test gets a
-/// single `LatchingProvider` it can drive runtime events through. Mirrors
-/// the old `ConfigHandle::build(vec![])` + `handle.publish(...)` shape.
+/// Build a `(handle, manual)` pair backed by a single `LatchingProvider`.
 async fn handle_with_manual() -> (ConfigHandle, Arc<LatchingProvider>) {
     let manual = LatchingProvider::new(vec![]);
     let providers: Vec<Arc<dyn ConfigProvider>> = vec![manual.clone()];
@@ -394,10 +392,6 @@ tokens = 1
     assert_eq!(snap.get("llm::tokens").value(), Some(&Value::Int(1)));
 }
 
-// ---------------------------------------------------------------------------
-// New tests for round 2
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn send_batch_one_refresh() {
     let (handle, manual) = handle_with_manual().await;
@@ -417,7 +411,6 @@ async fn send_batch_one_refresh() {
         ])
         .await;
 
-    // Consume one yield; assert it's the post-batch state.
     let first = tokio::time::timeout(Duration::from_secs(1), stream.next())
         .await
         .expect("timeout")
@@ -447,9 +440,6 @@ e = 5
     .await
     .unwrap();
 
-    // Counter provider: a tiny custom provider that registers a binding
-    // first, then we rely on subsequent TomlProvider load to fire one refresh.
-    // We'll instrument by counting yields on a subscribe stream.
     let provider: Arc<dyn ConfigProvider> = Arc::new(TomlProvider::new(&path));
     let handle = ConfigHandle::build(vec![provider]).await.unwrap();
 
@@ -642,9 +632,6 @@ fn env_string_round_trips_through_config() {
 
 #[test]
 fn untagged_enum_round_trips_through_config() {
-    // Mirrors the AuthMethod enum the llm crate will define: untagged,
-    // each variant disambiguated by required field names. Most-specific
-    // variant first.
     #[derive(Debug, Deserialize, PartialEq)]
     #[serde(untagged, deny_unknown_fields)]
     enum AuthMethod {
@@ -695,7 +682,6 @@ async fn scoped_handle_concats_prefix_for_bind() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     assert_eq!(id.get().as_str(), "kimi");
 
-    // get() extends the prefix.
     let nested = handle.scoped("models").get("default");
     let id2 = nested.bind::<String>("id").unwrap().required().unwrap();
     assert_eq!(id2.get().as_str(), "kimi");

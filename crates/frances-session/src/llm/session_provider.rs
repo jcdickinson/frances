@@ -215,8 +215,6 @@ async fn write_rows(db: &Database, events: &[ConfigEvent]) -> Result<(), Session
                 )
                 .await?;
             }
-            // `value_row` returns `None` only for `Value::Null` (an unset
-            // key), so this is the delete path.
             None => {
                 conn.execute("DELETE FROM session_config WHERE path_hash = ?1", (hash,))
                     .await?;
@@ -226,9 +224,8 @@ async fn write_rows(db: &Database, events: &[ConfigEvent]) -> Result<(), Session
     Ok(())
 }
 
-/// Stable 64-bit hash of a [`Path`] for use as the `session_config` primary
-/// key. Lowercased so case-insensitive equality (per [`Value::String`]) maps
-/// to the same row. Stored as `i64` via bit-cast.
+/// Stable 64-bit hash of a [`Path`] for use as the `session_config` primary key.
+/// Lowercased; stored as `i64` via bit-cast.
 fn hash_path(path: &Path) -> i64 {
     let canonical = path.to_string().to_ascii_lowercase();
     XxHash3_64::oneshot(canonical.as_bytes()) as i64
@@ -278,8 +275,7 @@ fn parse_path_json(text: &str) -> Result<Path, SessionConfigRowError> {
 }
 
 /// Inverse of `RawRow::into_event` for the supported scalar kinds. Returns
-/// `None` for `Value::Null`, which means "unset the key" — the caller
-/// deletes the row.
+/// `None` for `Value::Null`.
 fn value_row(value: &Value) -> Option<(&'static str, String)> {
     match value {
         Value::String(s) => Some(("string", s.to_string())),

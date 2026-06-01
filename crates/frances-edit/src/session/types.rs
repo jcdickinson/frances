@@ -71,9 +71,7 @@ pub enum LlmEdit {
 /// signal through instead of doing a racy `path.exists()` itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteMode {
-    /// File must not already exist; open with `create_new(true)` so a
-    /// concurrent create fails atomically (surfaced as
-    /// `io::ErrorKind::AlreadyExists`) rather than silently clobbering.
+    /// File must not already exist; open with `create_new(true)`.
     CreateNew,
     /// Replace the contents of a file that was already read this session.
     Overwrite,

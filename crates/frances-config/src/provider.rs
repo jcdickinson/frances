@@ -26,8 +26,7 @@ pub trait ConfigProvider: Send + Sync + 'static {
     async fn load(&self, events: EventSender) -> Result<(), ProviderError>;
 }
 
-/// A boxed error wrapper so different providers can fail with different
-/// concrete error types without parameterising the trait.
+/// Type-erased error from a [`ConfigProvider::load`] call.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct ProviderError(pub Box<dyn std::error::Error + Send + Sync + 'static>);

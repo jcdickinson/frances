@@ -322,20 +322,11 @@ pub struct MarkdownSection {
     state: Arc<SectionsState>,
     /// Set by `transcript.push`; 0 means "not yet pushed".
     id: AtomicU64,
-    /// Initial content captured at construction. `None` when the
-    /// workflow omitted `content` (or passed `undefined` / `null`) —
-    /// the frame is pushed with no body, and the client defers measure
-    /// and render until the first `write` materialises it. Appends go
-    /// straight to the host channel; we don't reconstruct the full text
-    /// here.
+    /// Initial content captured at construction. `None` when the workflow omitted `content`.
     content: Option<String>,
-    /// Speaker for the frame. Drives the host-side sigil. Defaults to
-    /// [`Source::Internal`] when the workflow omits `source` — that's the
-    /// "no prefix" / chrome case (greetings, plan dumps, tag bodies).
+    /// Speaker for the frame. Drives the host-side sigil. Defaults to [`Source::Internal`].
     source: Source,
-    /// Flipped by [`close_section`] (either explicit `.close()` or the
-    /// writable's auto-close hook on the JS side). Subsequent writes
-    /// throw; subsequent closes are no-ops.
+    /// Flipped by [`close_section`]. Subsequent writes throw; subsequent closes are no-ops.
     closed: AtomicBool,
 }
 
@@ -386,9 +377,7 @@ impl<'js> JsClass<'js> for MarkdownSection {
     }
 }
 
-/// `ErrorSection` — one-shot error message. No `write` in v1; rendering
-/// goes through `StreamFrame::Error` (a non-block message) on the host
-/// side, so streaming-write semantics don't apply.
+/// `ErrorSection` — one-shot error message.
 pub struct ErrorSection {
     id: AtomicU64,
     content: String,
@@ -407,7 +396,6 @@ impl<'js> JsClass<'js> for ErrorSection {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `write` — error frames are one-shot for v1.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -490,8 +478,6 @@ impl<'js> JsClass<'js> for JsonSection {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // Intentionally empty — no `write` here; JsonSection is set at
-        // construction.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -515,14 +501,9 @@ const TOOL_DETAIL_MAX: usize = 160;
 pub struct ToolUseSection {
     id: AtomicU64,
     name: String,
-    /// When `true`, `transcript.push` skips the frame entirely — no
-    /// wire `Push` is emitted. Sourced from `tool.hidden` at
-    /// construction so callers can pass the unmodified call+tool pair.
+    /// When `true`, `transcript.push` skips the frame entirely — no wire `Push` is emitted.
     hidden: bool,
-    /// Optional human-readable suffix produced by `tool.describe(call)`
-    /// (e.g. the file path + ranges for `file_read`). `None` when the
-    /// tool didn't provide a `describe`, when it returned a non-string,
-    /// or when it threw.
+    /// Optional human-readable suffix produced by `tool.describe(call)`.
     detail: Option<String>,
 }
 
@@ -539,7 +520,6 @@ impl<'js> JsClass<'js> for ToolUseSection {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `write` / `close` — one-shot, sealed on the runtime side.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -635,14 +615,10 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 
 /// One-shot frame carrying a unified-diff payload. Constructed by the
 /// JS file tools after a successful mutation; the runtime translates each
-/// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff`
-/// block. Like `ToolUseSection`, the runtime seals and persists the block
-/// — there is no `write` / `close` on the JS side.
+/// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff` block.
 pub struct DiffSection {
     id: AtomicU64,
-    /// Drained on push — the runtime moves the ops into the wire
-    /// `SectionKind::Diff` rather than cloning, since a `DiffSection` is
-    /// pushed exactly once.
+    /// Drained on push — the runtime moves the ops into `SectionKind::Diff` rather than cloning.
     ops: Vec<DiffOp>,
 }
 
@@ -659,7 +635,6 @@ impl<'js> JsClass<'js> for DiffSection {
     type Mutable = rquickjs::class::Writable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        // No `write` / `close` — one-shot, sealed runtime-side.
         let proto = Object::new(ctx.clone())?;
         Ok(Some(proto))
     }
@@ -826,12 +801,9 @@ impl<'js> JsClass<'js> for ShellOutputSection {
                 },
             )?,
         )?;
-        // `frame.success()` and `frame.exit(code)` set the new state
-        // on the wire via a metadata-only `SectionTranscript::Set`. They do NOT close
-        // the frame — JS-side auto-close (writable's close hook) or
-        // an explicit `frame.close()` is still required to seal the
-        // block. Keeping these orthogonal lets the workflow stream a
-        // tail of output between "got exit code" and "EOF on stdout".
+        // `frame.success()` and `frame.exit(code)` set the new state on the wire via a
+        // metadata-only `SectionTranscript::Set`. They do NOT close the frame — an explicit
+        // `frame.close()` or the writable's auto-close hook is still required to seal the block.
         proto.set(
             "success",
             Function::new(
@@ -878,10 +850,7 @@ impl<'js> JsClass<'js> for ShellOutputSection {
 // ReasoningSection — streaming model reasoning
 // ---------------------------------------------------------------------
 
-/// `ReasoningSection` — mirrors [`ShellOutputSection`] but for the model's
-/// reasoning channel. `state` transitions `Streaming → Done` on close;
-/// there is no body-after-state phase, so `.close()` performs both the
-/// state transition and the seal in one call.
+/// `ReasoningSection` — streaming model reasoning. `state` transitions `Streaming → Done` on close.
 pub struct ReasoningSection {
     state: Arc<SectionsState>,
     id: AtomicU64,
@@ -1019,11 +988,6 @@ fn set_shell_state<'js>(
 // ---------------------------------------------------------------------
 // Constructors
 // ---------------------------------------------------------------------
-//
-// We define our own constructor `Function`s so each one can close over
-// the per-invocation `SectionsState`. The frame classes' own `JsClass`
-// impls return `None` from `constructor()` so user code can't do
-// `new (constructor)()` without going through these.
 
 fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<MarkdownSection, _, _>(
@@ -1078,8 +1042,7 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
                 .map_err(|_| throw_err(&ctx, "new JsonSection: missing `value`"))?;
 
             // Round-trip the JS value through JSON to get a serde_json::Value.
-            // Mirrors the old `workflow.frame.json` behaviour: silently drop
-            // values that don't JSON-encode (use `null`).
+            // Values that don't JSON-encode are silently replaced with `null`.
             let json_str: String = ctx
                 .json_stringify(value)?
                 .and_then(|s| s.to_string().ok())
@@ -1144,9 +1107,7 @@ fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResul
 /// Parse `new ShellOutputSection({ cmd, content?, closed? })`. `cmd` is
 /// required — it's the bash source that produced this output and the
 /// TUI renders it as a header. `content` is optional; if absent it
-/// defaults to an empty string (workflows usually push the frame first,
-/// then stream output via `.writable`). `closed` mirrors the
-/// MarkdownSection option: setting it to `true` pre-seals the frame so
+/// defaults to an empty string. `closed: true` pre-seals the frame so
 /// `transcript.push` emits a `Close` right after the `Push`.
 fn parse_shell_output_arg<'js>(
     ctx: &Ctx<'js>,
@@ -1200,8 +1161,7 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
 /// is one of `"user"`, `"assistant"`, `"internal"`; absent → `Internal`.
 /// `closed` is an optional bool defaulting to `false`; when `true` the
 /// frame's `closed` flag is pre-set so `transcript.push` emits a `Close`
-/// immediately after the `Push` — useful for one-shot frames like a
-/// greeting or echoed user message. Anything else throws.
+/// immediately after the `Push`. Anything else throws.
 fn parse_markdown_arg<'js>(
     ctx: &Ctx<'js>,
     arg: &Value<'js>,

@@ -9,9 +9,7 @@
 //! closes the inbox unconditionally after the (absent) hook returns.
 //!
 //! `setStatus(text | null)` drives the TUI footer's busy indicator:
-//! `Some(text)` shows the text with a spinner, `None` hides it. The
-//! workflow owns this — the host no longer infers a "streaming" state
-//! from token flow.
+//! `Some(text)` shows the text with a spinner, `None` hides it.
 
 use std::sync::Arc;
 
@@ -34,8 +32,7 @@ pub(crate) fn build_exit<'js>(
 
 /// Build `setStatus(text | null)`. The argument is optional and
 /// nullable: a string sets the indicator, `null`/`undefined`/omitted
-/// clears it. Best-effort send — a dropped host receiver means the
-/// session is winding down.
+/// clears it.
 pub(crate) fn build_set_status<'js>(
     ctx: &Ctx<'js>,
     surfaces_tx: UnboundedSender<SurfaceCmd>,

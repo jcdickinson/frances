@@ -1,8 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-/// Hashed identifier for the invoking process's controlling TTY. Used as a
-/// session-link filename. Distinct from arbitrary strings to prevent
-/// confusion with session ids, paths, etc.
+/// Hashed identifier for the invoking process's controlling TTY, used as a
+/// session-link filename.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TtyKey(pub String);

@@ -103,8 +103,7 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
         let _ = sink.send(ReadEvent::Output(chunk));
     }
 
-    /// Emit a terminal event if a sink is attached. Called from
-    /// `take_match` / `take_quiet` / `take_eof` after their final ship.
+    /// Emit a terminal event if a sink is attached.
     fn emit_terminal(&mut self, event: ReadEvent) {
         if let Some(sink) = self.sink.as_ref() {
             let _ = sink.send(event);
@@ -114,7 +113,7 @@ impl<R: AsyncRead + Unpin> OutputReader<R> {
     /// Ship every byte we've confirmed is not part of an in-flight
     /// sentinel match — i.e. all but the trailing
     /// `sentinel.max_match_len()` slack we hold back for cross-read
-    /// detection. Used inside the read loop after each successful read.
+    /// detection.
     fn ship_safe(&mut self) {
         let reserve = self.sentinel.max_match_len();
         let safe_end = self.buf.len().saturating_sub(reserve);
@@ -316,7 +315,6 @@ mod tests {
         let (client, mut server) = tokio::io::duplex(1024);
         let mut r = OutputReader::new(client, Sentinel::new(nonce()));
 
-        // Producer task: write a byte every 5 ms.
         let producer = tokio::spawn(async move {
             for _ in 0..200 {
                 if server.write_all(b"x").await.is_err() {
@@ -347,8 +345,7 @@ mod tests {
     #[tokio::test]
     async fn sentinel_at_chunk_boundary() {
         // First chunk: command output and the marker's leading \n.
-        // Second chunk: the rest of the marker. Tests that the buffer joins
-        // them and finds the boundary correctly.
+        // Second chunk: the rest of the marker.
         let (client, mut server) = tokio::io::duplex(64);
         let mut r = OutputReader::new(client, Sentinel::new(nonce()));
 

@@ -65,8 +65,6 @@ where
     F: Default,
 {
     /// Construct with `RealTimer` + the defaults for shell + fs.
-    /// Existing workflow tests rely on real time elapsing; this is
-    /// what `StubDeps::default()` reaches for.
     pub fn with_real_timer() -> Self {
         Self::default()
     }
@@ -140,9 +138,7 @@ impl MockTimer {
     /// Advance virtual time by `delta`. Every pending sleep whose
     /// deadline is ≤ the new `now` is settled with `Fired`
     /// synchronously inside this call. Returns once all settled
-    /// waiters have been notified (the `Notify` pulses immediately —
-    /// the test still has to drive the JS runtime for the JS-side
-    /// promise to resolve).
+    /// waiters have been notified.
     pub fn advance(&self, delta: Duration) {
         let inner = &self.inner;
         let new_now = inner
@@ -193,8 +189,6 @@ impl WorkflowTimer for MockTimer {
                 return SleepOutcome::Closed;
             }
 
-            // Compute deadline against the virtual clock at the moment
-            // the sleep was constructed.
             let now = inner.now_ns.load(Ordering::Acquire);
             let deadline = now.saturating_add(duration.as_nanos() as u64);
             let id = inner.next_id.fetch_add(1, Ordering::AcqRel);
@@ -226,7 +220,6 @@ impl WorkflowTimer for MockTimer {
             cancel_n.as_mut().enable();
             slot_n.as_mut().enable();
 
-            // If `advance` already settled us, skip the select.
             if let Some(outcome) = *slot.settled.lock() {
                 return outcome;
             }
@@ -258,18 +251,15 @@ impl WorkflowTimer for MockTimer {
 
 // ---------------- shell ----------------
 
-/// Test shell. Default impl errors on every spawn — matches today's
-/// `StubShellFactory`. Tests that need real bash construct
-/// `MockShell::with_real()`; tests that want to script bash output
-/// will (later) build on this; out of scope for the first cut.
+/// Test shell. Default impl errors on every spawn. Tests that need
+/// real bash construct `MockShell::with_real()`.
 #[derive(Clone, Default)]
 pub struct MockShell {
     real: bool,
 }
 
 impl MockShell {
-    /// Toggle to the real `frances_shell::Shell::spawn` path. Equivalent
-    /// to the old `StubDepsRealShell`/`RealShellFactory` pair.
+    /// Toggle to the real `frances_shell::Shell::spawn` path.
     pub fn with_real() -> Self {
         Self { real: true }
     }
@@ -292,8 +282,7 @@ impl WorkflowShell for MockShell {
 
 // ---------------- fs ----------------
 
-/// In-memory filesystem. One mutex per call site — kept simple over
-/// fast; tests don't hit this in hot loops.
+/// In-memory filesystem.
 #[derive(Clone, Default)]
 pub struct MockFs {
     inner: Arc<Mutex<MockFsInner>>,

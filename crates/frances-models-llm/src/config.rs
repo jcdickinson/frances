@@ -12,11 +12,10 @@ pub struct ProviderConfig {
     /// Wire-name selector. Identifies which provider wire shape the
     /// `Provider` impl should drive — e.g. `"openai-chat"`,
     /// `"openai-responses"`, `"anthropic"`, `"gemini"`, `"openrouter"`,
-    /// `"zai"`, `"moonshot"`, `"deepseek"`, `"ollama"`. The string is
-    /// validated at provider-build time and surfaces as `Provider::kind()`
-    /// (so every persisted history row carries it). Required.
+    /// `"zai"`, `"moonshot"`, `"deepseek"`, `"ollama"`. Validated at
+    /// provider-build time and surfaces as `Provider::kind()`. Required.
     pub kind: String,
-    /// Human-facing display name; not yet surfaced in the TUI.
+    /// Human-facing display name.
     #[serde(default)]
     pub name: Option<String>,
     pub base_url: Url,
@@ -26,13 +25,10 @@ pub struct ProviderConfig {
     /// Applied at request time; wired up after auth lands.
     #[serde(default)]
     pub query_params: BTreeMap<String, EnvString>,
-    /// WebSocket transport is a follow-up.
     #[serde(default)]
     pub supports_websockets: bool,
-    /// Retry policy not enforced this pass.
     #[serde(default = "default_request_max_retries")]
     pub request_max_retries: u32,
-    /// Retry policy not enforced this pass.
     #[serde(default = "default_stream_max_retries")]
     pub stream_max_retries: u32,
     /// Per-request stream timeout currently sourced from the model.
@@ -46,7 +42,6 @@ pub struct ProviderConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged, deny_unknown_fields)]
 pub enum AuthMethod {
-    /// Command auth is parsed but not yet implemented.
     Command {
         command: AuthCommand,
     },
@@ -63,8 +58,6 @@ pub enum AuthMethod {
     },
 }
 
-/// Command auth not implemented this pass — fields parse and round-trip,
-/// runtime side is a follow-up.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthCommand {
     pub command: String,

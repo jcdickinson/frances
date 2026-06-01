@@ -10,9 +10,7 @@
 
 use rquickjs::{Ctx, Object, Result as JsResult};
 
-/// Build the user-facing `lifecycle` object. Workflows assign
-/// `lifecycle.shutdown`; the runtime reads it back off this object when
-/// winding the workflow down.
+/// Build the user-facing `lifecycle` object.
 pub(crate) fn build_lifecycle_object<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
     let lifecycle = Object::new(ctx.clone())?;
     lifecycle.set("shutdown", rquickjs::Value::new_null(ctx.clone()))?;

@@ -12,7 +12,7 @@
 //! - `import { exit } from "frances:v1/workflow"`
 //! - `import { inbox } from "frances:v1/inbox"`
 //! - `import { transcript, MarkdownSection, ErrorSection, JsonSection } from "frances:v1/sections"`
-//! - `import { ChatSession } from "frances:v1/chat"` (LLM backend pending)
+//! - `import { ChatSession } from "frances:v1/chat"`
 //! - `import.meta.args` — per-invocation slash-command args.
 
 use std::marker::PhantomData;
@@ -41,8 +41,7 @@ use crate::modules;
 use crate::permission::PermissionRequest;
 use crate::transpile::{SourceKind, ts_to_js};
 
-/// Internal name we declare the user script under. Distinct from the
-/// `frances:v1/*` namespace so the two don't visually clash.
+/// Internal name we declare the user script under.
 const USER_MODULE_NAME: &str = "frances:user-script";
 
 /// The transcript stream — ordered block-lifecycle deltas from the
@@ -562,9 +561,9 @@ async fn run_shutdown_hook(
                 .catch(&ctx)
                 .map_err(caught("read lifecycle.shutdown"))?;
             if let Some(hook) = hook {
-                // Best-effort, like the old JS `try/catch`: run the hook
-                // (sync or async — `MaybePromise` handles both) and log on
-                // failure rather than failing the whole workflow.
+                // Best-effort: run the hook (sync or async — `MaybePromise`
+                // handles both) and log on failure rather than failing the
+                // whole workflow.
                 let outcome = async {
                     let ret: MaybePromise = hook.call((This(lifecycle.clone()),))?;
                     ret.into_future::<()>().await

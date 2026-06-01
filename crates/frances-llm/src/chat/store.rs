@@ -28,8 +28,7 @@ pub trait HistoryStore: Send + Sync + 'static {
     ) -> Result<(), HistoryError>;
 
     /// Persist a whole turn's worth of primitive and forged-history rows
-    /// in one transaction: a single sequence read, then one insert per
-    /// [`BatchRow`]. No-op on an empty batch.
+    /// in one transaction. No-op on an empty batch.
     async fn flush(&self, session: ChatSessionId, batch: HistoryBatch) -> Result<(), HistoryError>;
 
     /// Highest persisted row id for `session` (`RowId(0)` when empty).
@@ -42,7 +41,6 @@ pub trait HistoryStore: Send + Sync + 'static {
 
     /// Delete every persisted message for `session` whose row id is
     /// greater than `to` (the marker from [`checkpoint`](Self::checkpoint)).
-    /// Removes both primitive rows and forged-history rows in one pass.
     /// Default is a no-op for stores that don't support truncation.
     async fn rollback(&self, _session: ChatSessionId, _to: RowId) -> Result<(), HistoryError> {
         Ok(())

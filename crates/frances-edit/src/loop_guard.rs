@@ -7,9 +7,8 @@
 //! read can never be misdiagnosed as a loop.
 //!
 //! Unbounded by design — we want to catch the model looping over a
-//! horizon longer than three calls. The set only grows between
-//! writes, and writes clear it; in practice a turn won't accumulate
-//! enough distinct read keys to matter.
+//! horizon longer than three calls. The set only grows between writes,
+//! and writes clear it.
 
 use std::collections::HashSet;
 
@@ -31,10 +30,7 @@ pub enum LoopKey {
 }
 
 /// Discriminator prepended to a [`LoopKey`] argument hash so two read-style
-/// tools can't alias each other even with identical argument bytes. The
-/// hashers live in `frances-workflow`, split across two files; keeping the
-/// discriminants here in one enum is what stops a future hasher from silently
-/// reusing a value.
+/// tools can't alias each other even with identical argument bytes.
 #[repr(u8)]
 pub enum LoopKind {
     ReadFile = 0,

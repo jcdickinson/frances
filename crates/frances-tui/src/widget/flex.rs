@@ -1,7 +1,7 @@
 //! [`Flex`] — taffy-driven flexbox container. Children declare a
 //! `grow` weight; the container distributes available space
 //! proportionally along [`FlexDirection`]. Per-frame taffy tree
-//! (no caching in v1) keeps the implementation small.
+//! keeps the implementation small.
 //!
 //! Taffy's `f32` layout is truncated at the taffy → widget boundary
 //! via [`super::taffy_util::to_cell_rect`]; the [`Widget`] trait
@@ -125,7 +125,7 @@ impl Widget for Flex {
         {
             return 0;
         }
-        let _ = child_nodes; // children's layouts will be re-read in `layout`
+        let _ = child_nodes;
         tree.layout(root)
             .map(|l| l.size.height.ceil() as u16)
             .unwrap_or(0)
@@ -198,9 +198,7 @@ impl Flex {
                 flex_shrink: fc.shrink,
                 ..Style::DEFAULT
             };
-            // `expect` here is fine: new_leaf_with_context only errors
-            // on internal taffy bugs we don't recover from gracefully.
-            let leaf = tree
+                let leaf = tree
                 .new_leaf_with_context(style, idx)
                 .expect("taffy new_leaf_with_context");
             child_nodes.push(leaf);
@@ -353,16 +351,10 @@ mod tests {
 
     #[test]
     fn no_grow_uses_intrinsic_size() {
-        // Children with grow=0 take their measured size; remainder
-        // is empty space at the end of the row.
         let mut flex = Flex::row(vec![
             FlexChild::new(Box::new(Leaf::new(1, 'a'))),
             FlexChild::new(Box::new(Leaf::new(1, 'b'))),
         ]);
-        // Leaves measure as 1 row tall. Their width comes from the
-        // measure closure — given Auto width, they ask for 0 (no
-        // intrinsic width), so taffy gives them whatever it computes.
-        // Sanity: layout doesn't panic, total width is bounded by area.
         flex.layout(Rect::new(0, 0, 10, 1));
         let total: u16 = flex
             .children
@@ -379,7 +371,6 @@ mod tests {
             FlexChild::new(Box::new(Leaf::new(1, 'b'))).with_grow(1.0),
         ]);
         let buf = render(&mut flex, Rect::new(0, 0, 4, 1));
-        // Each child gets 2 cols. First two cells = 'a', next two = 'b'.
         assert_eq!(buf[(0, 0)].symbol(), "a");
         assert_eq!(buf[(1, 0)].symbol(), "a");
         assert_eq!(buf[(2, 0)].symbol(), "b");

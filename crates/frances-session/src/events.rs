@@ -25,8 +25,7 @@ pub use frances_workflow::permission::{
 
 /// Persistence-side block identity. The on-disk `scrollback_blocks`
 /// schema (today) is keyed by a per-row autoincrement; this type just
-/// scopes the BlockId u64 within session APIs. Step 5 swaps the schema
-/// to `scrollback_sections` and this type goes away.
+/// scopes the BlockId u64 within session APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct BlockId(pub u64);
@@ -39,8 +38,7 @@ impl std::fmt::Display for BlockId {
 
 /// Persistence-side kind discriminator. Used by [`crate::scrollback`]
 /// to encode rows; the live channel vocabulary uses [`SectionKind`]
-/// directly. Step 5 collapses this enum into the section-shaped
-/// persistence schema.
+/// directly.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlockKind {
     Text {

@@ -1,7 +1,5 @@
 //! [`ParaWidget`] — newtype around `ratatui::widgets::Paragraph<'static>`
-//! that owns a [`WidgetState`] and so satisfies [`Widget`]. The
-//! scratchpad (`bin/container_scratch.rs`) and `ui.rs` tests use
-//! this when they only need a "renders some text" footer.
+//! that owns a [`WidgetState`] and so satisfies [`Widget`].
 
 use crossterm::event::Event;
 use ratatui::widgets::Paragraph;

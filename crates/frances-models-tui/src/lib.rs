@@ -35,9 +35,7 @@ pub struct SectionId(pub u64);
 
 /// Who produced a [`SectionKind::Markdown`] section. Drives the host-
 /// side sigil (`User` → `>`, `Assistant` → `◆`, `Internal` → none) and
-/// gates inline markdown parsing (`source != User`). Closed set on
-/// purpose — adding a fourth speaker is a deliberate vocabulary change,
-/// not a free-form label.
+/// gates inline markdown parsing (`source != User`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {

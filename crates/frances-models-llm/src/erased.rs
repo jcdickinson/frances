@@ -11,8 +11,6 @@ pub type ErasedResult<T> = std::result::Result<T, ErasedError>;
 
 /// Signal value used at the type-erased provider boundary to abort a
 /// stream when the caller-provided `on_event` callback returned an error.
-/// The erased layer swallows the synthesised error and surfaces the
-/// original caller error.
 #[derive(Debug)]
 pub struct ChunkAbort;
 

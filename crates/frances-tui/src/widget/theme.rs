@@ -11,8 +11,7 @@ pub struct Theme {
     pub border_title: Style,
     /// "Dim" text — token-status row, secondary annotations.
     pub dim: Style,
-    /// Focus highlight; reserved for Phase D widgets that want to
-    /// visually indicate the focused state.
+    /// Focus highlight.
     pub focused: Style,
 }
 

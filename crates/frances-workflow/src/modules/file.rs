@@ -113,7 +113,6 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                             Ok(v) => match serde_json::from_value::<ReadFileArgs>(v.clone()) {
                                 Ok(args) => read_file_inner(&deps, args).await,
                                 Err(_) => {
-                                    // Fallback for when the args is just a string (the path) which was the old behavior
                                     if let Some(path_str) = v.as_str() {
                                         read_file_inner(
                                             &deps,
@@ -170,8 +169,7 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
         )?;
 
         // Commit accumulated edits (clears anchor tombstones). The
-        // workflow calls this at its own reconciliation boundary — the
-        // host no longer fires it automatically.
+        // workflow calls this at its own reconciliation boundary.
         proto.set(
             "commit",
             Function::new(ctx.clone(), |this: This<Class<'js, EditorJs<D>>>| {
@@ -190,13 +188,6 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
     }
 }
 
-/// Disk-only read. Returns the file as-is, with no `EditSession`
-/// interaction for anchors — so the path is *not* registered for
-/// editing and the caller doesn't get anchors. Used by `Read` when the
-/// LLM asks for the content to land in a Frances variable instead of
-/// in tool-result text. Still consults the session's loop guard so a
-/// `readRaw` immediately following an identical `readRaw` on an
-/// unchanged file trips the same guard as `file_read`.
 /// Failures from the editor bridge's `*_inner` ops. Kept typed all the way to
 /// the `IntoJs` boundary, which renders it via `Display` into a JS exception.
 #[derive(Debug, thiserror::Error)]
@@ -227,6 +218,8 @@ enum FileToolError {
     RangeStartZero,
 }
 
+/// Disk-only read with no `EditSession` anchor interaction — the path is
+/// not registered for editing and the caller gets no anchors.
 async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, FileToolError> {
     let resolved = resolve_relative(Path::new(&path), deps.current_cwd().as_deref());
     let fs = deps.fs();
@@ -303,8 +296,6 @@ async fn read_file_inner<D: WorkflowDeps>(
     sess.record_loop(key);
 
     if let Some(ranges) = args.ranges {
-        // Validate each 1-indexed range and clamp its end to the file
-        // length, then sort by start and merge overlapping/adjacent ones.
         let mut final_ranges = Vec::new();
         for [start, end] in ranges {
             if end < start {
@@ -376,16 +367,15 @@ fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
     *path = resolve_relative(path, cwd);
 }
 
-/// Stat without reading content — cheap, used by the loop guard so it
-/// can answer "same file, same mtime+size?" before deciding to read.
+/// Stat without reading content — used by the loop guard to check
+/// "same file, same mtime+size?" before deciding to read.
 async fn stat_file<F: WorkflowFs>(fs: &F, path: &Path) -> io::Result<(i64, u64)> {
     let meta = fs.metadata(path).await?;
     Ok((meta.mtime_ns, meta.size))
 }
 
-/// Read content as lines. Caller has typically already stat'd the
-/// file (and used the result to seed the loop-guard key), so we don't
-/// re-stat here.
+/// Read content as lines. Caller has already stat'd the file to seed
+/// the loop-guard key.
 async fn read_file_lines<F: WorkflowFs>(fs: &F, path: &Path) -> io::Result<Vec<String>> {
     let content = fs.read_to_string(path).await?;
     Ok(split_lines(&content))
@@ -486,9 +476,7 @@ impl<'js> IntoJs<'js> for EditorUnitResult {
     }
 }
 
-/// Promise payload that resolves to a string or rejects with an error
-/// message — matches `ShellOpResult`'s shape so the JS surface feels
-/// the same.
+/// Promise payload that resolves to a string or rejects with an error message.
 struct EditorStringResult(Result<String, FileToolError>);
 
 impl<'js> IntoJs<'js> for EditorStringResult {

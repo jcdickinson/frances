@@ -122,7 +122,6 @@ async fn interrupt_kills_running_command_keeps_shell_alive() {
     }
     assert!(shell.is_alive());
 
-    // Shell is reusable.
     let res = shell.run("echo alive", WaitOpts::default()).await.unwrap();
     assert!(matches!(res, RunOutcome::Done { exit_code: 0, .. }));
 }

@@ -1,9 +1,4 @@
 //! One-shot completion request + the forced-tool "enforce" vocabulary.
-//!
-//! Lives in `frances-models-llm` (not `frances-llm`) so the
-//! [`ChatSessionManager`](super::ChatSessionManager) trait can take
-//! `CompleteRequest` and expose `complete` / `complete_enforced` to
-//! trait-only callers (workflow code, the JS `complete` export).
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -15,13 +10,10 @@ use crate::chat::error::ChatError;
 use crate::{CompletionOutcome, HistoryInput, ToolCall, ToolChoice, ToolDef};
 
 /// Inputs to [`ChatSessionManager::complete`](super::ChatSessionManager::complete).
-/// Bundled so the call site reads as `chat.complete(CompleteRequest { … })`
-/// instead of a wall of positional args.
 pub struct CompleteRequest<'a> {
     /// Model-intent names to walk; first hit wins, default fallback.
     pub intents: &'a [&'a str],
-    /// Token-cache scope id. For classifier-style calls during a chat
-    /// turn, pass the parent chat session's id.
+    /// Token-cache scope id.
     pub session_id: &'a str,
     pub env: &'a HashMap<OsString, OsString>,
     pub history: &'a [Value],
@@ -38,7 +30,6 @@ pub struct CompleteRequest<'a> {
 
 /// The demanding subset of [`ToolChoice`] for
 /// [`ChatSessionManager::complete_enforced`](super::ChatSessionManager::complete_enforced).
-/// Excludes `Auto`/`None` so "enforce nothing" can't be requested.
 #[derive(Debug, Clone)]
 pub enum Demand {
     /// Any tool call satisfies.

@@ -20,11 +20,8 @@ pub struct RenderContext<'a> {
 }
 
 impl<'a> RenderContext<'a> {
-    /// Return a new context targeting `area` but sharing this
-    /// context's buffer, theme, focus, frame-time clock, and
-    /// animation gate. The borrow on the inner buffer is shortened
-    /// to `&mut self` so callers naturally walk children one at a
-    /// time.
+    /// Return a new context targeting `area`, sharing this context's
+    /// buffer, theme, focus, frame-time clock, and animation gate.
     pub fn with_area<'s>(&'s mut self, area: Rect) -> RenderContext<'s> {
         RenderContext {
             area,
@@ -36,7 +33,6 @@ impl<'a> RenderContext<'a> {
         }
     }
 
-    /// Shorthand for `self.animation.lease()`.
     pub fn animation_lease(&self) -> AnimationLease {
         self.animation.lease()
     }
@@ -44,8 +40,6 @@ impl<'a> RenderContext<'a> {
 
 pub struct EventContext<'a> {
     pub focus: &'a mut Focus,
-    /// Widget sets this if it needs the runloop to redraw before
-    /// the next event poll (e.g. animated content). Phase B widgets
-    /// don't touch it; reserved for Phase D.
+    /// Widget sets this if it needs the runloop to redraw before the next event poll.
     pub redraw: &'a mut bool,
 }

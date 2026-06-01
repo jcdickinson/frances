@@ -20,9 +20,7 @@ pub fn render_file(state: &FileAnchorState, lines: &[String]) -> String {
 }
 
 /// One entry in a structured diff. `Context` carries the post-side line
-/// number (1-based); `Added` / `Removed` carry only the raw line content
-/// because the wire-level `DiffLine` shape doesn't model line numbers for
-/// the changed sides.
+/// number (1-based); `Added` / `Removed` carry only the raw line content.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DiffOp {
     Context { text: String, line: u32 },
@@ -32,8 +30,7 @@ pub enum DiffOp {
 
 /// Combined output of [`render_diff_block`]: the LLM-facing unified-diff
 /// string (with anchors, sigils, and line numbers) and a structured set
-/// of ops carrying just the raw line content — the latter is what the
-/// TUI consumes via the workflow `DiffSection`.
+/// of ops carrying just the raw line content.
 #[derive(Debug, Clone)]
 pub struct DiffRender {
     pub text: String,
@@ -276,7 +273,6 @@ mod tests {
         assert!(lines[3].starts_with(' '));
         assert!(lines[3].contains("§baz"));
 
-        // Structured ops mirror the text: 2 context + 1 removed + 1 added.
         assert_eq!(render.ops.len(), 4);
         assert!(matches!(&render.ops[0], DiffOp::Context { text, .. } if text == "foo"));
         assert!(matches!(&render.ops[1], DiffOp::Removed(t) if t == "bar"));

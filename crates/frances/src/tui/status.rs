@@ -3,10 +3,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-/// Semantic colouring for a status pill. The text inside the brackets
-/// is content-specific; the tone fixes the colour family so disparate
-/// surfaces (shell exit code, model reasoning state, footer status)
-/// stay visually consistent.
+/// Semantic colouring for a status pill.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StatusTone {
     /// In-flight work — cyan. Shell `Running`, reasoning `Streaming`.
@@ -30,9 +27,7 @@ impl StatusTone {
     }
 }
 
-/// Format `[label] ` with the tone's style. Includes the trailing
-/// space so callers can concatenate the pill directly onto a body
-/// without re-padding.
+/// Format `[label] ` with the tone's style. Includes a trailing space.
 pub fn status_prefix(label: &str, tone: StatusTone) -> (String, Style) {
     (format!("[{label}] "), tone.style())
 }

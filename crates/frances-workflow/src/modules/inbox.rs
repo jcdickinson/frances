@@ -5,9 +5,6 @@
 //! suspending. `return()` and `workflow.exit()` close the shared
 //! [`WorkflowClosed`], breaking any in-flight `next()` with `{done:
 //! true}`.
-//!
-//! Same wiring as the previous `workflow.user.input` class, with the
-//! message field renamed `message` → `content`.
 
 use std::sync::Arc;
 
@@ -22,14 +19,10 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::closed::WorkflowClosed;
 use crate::runtime::InboxItem;
 
-/// Args for [`build_inbox`], bundled so the call site isn't a long
-/// positional list — and so the test-only `on_idle` signal can be
-/// cfg-gated as a field rather than a (non-cfg-able) positional param.
+/// Args for [`build_inbox`].
 pub(crate) struct InboxArgs {
     pub rx: Arc<AsyncMutex<UnboundedReceiver<InboxItem>>>,
     pub closed: Arc<WorkflowClosed>,
-    /// Test-harness "parked on input" pulse; see
-    /// [`crate::runtime::WorkflowHandle`]. Compiled only under test.
     #[cfg(any(test, feature = "test-utils"))]
     pub on_idle: Arc<tokio::sync::Notify>,
 }

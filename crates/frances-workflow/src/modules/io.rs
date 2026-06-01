@@ -226,8 +226,6 @@ fn sleep_token_then<'js>(
 }
 
 /// Newtype so we can implement `IntoJs` for the resolution string.
-/// Strings are passed by value through JS, so the &'static slice is
-/// just a tag we copy at the boundary.
 struct ResultStr(&'static str);
 
 impl<'js> IntoJs<'js> for ResultStr {

@@ -1,7 +1,5 @@
-//! `Footer` — Phase B composite that replaces the old
-//! `FooterBlock` MeasuredWidget. A `TextInput` (bordered textarea,
-//! one focusable child) stacked on top of a one-row `TextLine`
-//! status row.
+//! `Footer` — `TextInput` (bordered textarea, one focusable child)
+//! stacked on top of a one-row `TextLine` status row.
 
 use crossterm::event::Event;
 use frances_tui::{
@@ -11,8 +9,7 @@ use frances_tui::{
 use ratatui::layout::Rect;
 
 /// Heights: `TextInput` is `TEXT_INPUT_HEIGHT = 3` (border + 1 row of
-/// text), status row is `1`. Total: 4. Matches the pre-Phase-B
-/// `INPUT_HEIGHT + TOKEN_STATUS_HEIGHT`.
+/// text), status row is `1`. Total: 4.
 pub struct Footer {
     pub input: TextInput,
     pub status: TextLine,
@@ -31,9 +28,6 @@ impl Footer {
 
 impl Input for Footer {
     fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: &Event) -> EventOutcome {
-        // Only one focusable child — route directly. Once a second
-        // focusable lands (Phase D's inspector blocks) this branches
-        // on ctx.focus.is_focused(...).
         self.input.handle_event(ctx, event)
     }
 }

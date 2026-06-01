@@ -5,8 +5,7 @@ use crate::WorkflowError;
 ///
 /// Returns `Ok(None)` for plain prose or for malformed-but-not-a-command
 /// input (`/`, `/  foo`, no leading slash). Returns `Err` only when the
-/// input looks like a command but the args fail to shell-parse, so the
-/// caller can surface a precise error to the user.
+/// input looks like a command but the args fail to shell-parse.
 pub fn parse_slash_command(text: &str) -> Result<Option<(&str, Vec<String>)>, WorkflowError> {
     let Some(body) = text.strip_prefix('/') else {
         return Ok(None);

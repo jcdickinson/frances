@@ -3,10 +3,7 @@
 //! The `kind` string on `ProviderConfig` is the user-facing identifier
 //! for the wire shape (e.g. `"openai-chat"`, `"anthropic"`, `"zai"`). It
 //! also rides through to `Provider::kind()` so persisted history rows
-//! carry the wire that produced them. This module holds the single
-//! source of truth for that mapping.
-//!
-//! Adding a new wire is a one-line addition to the match arm.
+//! carry the wire that produced them.
 
 use genai::adapter::AdapterKind;
 use thiserror::Error as ThisError;
@@ -20,12 +17,7 @@ pub enum Error {
 }
 
 /// Parse the `ProviderConfig.kind` string into the genai `AdapterKind`
-/// it represents, alongside the canonical `'static` wire-name literal
-/// the `Provider` will return from `kind()`.
-///
-/// The canonical literal is returned (rather than just `kind.as_str()`)
-/// so the `&'static str` lifetime requirement of `Provider::kind()` is
-/// satisfied without leaking the user's String.
+/// it represents and the canonical `'static` wire-name literal.
 pub fn parse_kind(kind: &str) -> Result<(&'static str, AdapterKind), Error> {
     match kind {
         "openai-chat" => Ok(("openai-chat", AdapterKind::OpenAI)),
@@ -51,7 +43,6 @@ mod tests {
 
     #[test]
     fn parse_each_supported_kind() {
-        // Every arm round-trips its own canonical name.
         for name in [
             "openai-chat",
             "openai-responses",

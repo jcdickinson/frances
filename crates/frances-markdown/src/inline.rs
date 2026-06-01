@@ -49,8 +49,6 @@ pub fn parse_inline(text: &str) -> Vec<StyledSpan> {
     while i < len {
         let c = chars[i];
         if c == '*' || c == '_' {
-            // Try bold (`**...**` or `__...__`) first so the bold
-            // delimiters don't trip the italic scanner.
             if i + 1 < len
                 && chars[i + 1] == c
                 && let Some(close) = find_double(&chars, i + 2, c)
@@ -61,7 +59,6 @@ pub fn parse_inline(text: &str) -> Vec<StyledSpan> {
                 i = close + 2;
                 continue;
             }
-            // Then italic (`*...*` or `_..._`).
             if let Some(close) = find_single(&chars, i + 1, c) {
                 flush_plain(&mut out, &mut plain);
                 let inner: String = chars[i + 1..close].iter().collect();

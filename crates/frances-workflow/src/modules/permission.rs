@@ -52,8 +52,6 @@ pub(crate) fn build_approve_primitive<'js>(
                 allow_auto,
             } = parse_options(&ctx, &options)?;
 
-            // The request carries its own reply slot — no gateway, no id
-            // table. Whoever answers (auto-judge or TUI) resolves it.
             let (reply, rx) = oneshot::channel();
 
             // Best-effort emit; the receiver side is a tokio mpsc that

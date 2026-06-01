@@ -1,7 +1,6 @@
 //! Widget framework — [`Input`] + [`Widget`] trait split, per-frame
 //! contexts ([`RenderContext`], [`EventContext`]), a slotmap-keyed
-//! [`Focus`] arena, and (in later commits) container + primitive
-//! widgets.
+//! [`Focus`] arena, and container + primitive widgets.
 //!
 //! ## The trait split
 //!

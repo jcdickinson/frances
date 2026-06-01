@@ -31,18 +31,10 @@ pub use frances_models_tui::SectionApply;
 /// Concrete impls live in `frances-markdown` (`MarkdownSection`) and
 /// the binary's `tui::sections` module (`SingleBlockSection`).
 ///
-/// `apply` returns an owned `Vec<Box<dyn Block>>` (rather than a
-/// borrowed slice) because the section rebuilds its blocks from
-/// accumulated state each call — there's nothing stable to borrow. The
-/// dispatcher takes ownership into the `SectionView`. For typical
-/// LLM-paragraph payloads the rebuild cost is negligible.
+/// `apply` returns an owned `Vec<Box<dyn Block>>` rather than a borrowed slice.
 pub trait Section: 'static {
-    /// Apply an event and return the section's full block list AFTER
-    /// the event. The first call (right after construction) processes
-    /// the initial `SectionApply::Append` so the section absorbs its
-    /// seed delta uniformly. Returning `Vec::new()` means the section
-    /// has no renderable blocks yet — the dispatcher tracks the id
-    /// but pushes nothing.
+    /// Apply an event and return the section's full block list AFTER the event.
+    /// Returns `Vec::new()` when the section has no renderable blocks yet.
     fn apply(&mut self, event: SectionApply<'_>) -> Vec<Box<dyn Block>>;
 
     /// Glyph painted in the left gutter at this section's first
@@ -52,13 +44,10 @@ pub trait Section: 'static {
     fn sigil(&self) -> Sigil;
 }
 
-/// A section's inner blocks rendered as one container entry. The
-/// dispatcher builds one per `Section::apply`: it owns the section's
-/// current `blocks() + sigil()` and renders them stacked (intra-section
-/// gap 0), straddle-aware for the inspector. While `streaming` (the
-/// section is still open), it paints its own streaming indicator on its
-/// last content row — streaming is a section concept, so the section
-/// owns the glyph, not the container.
+/// A section's inner blocks rendered as one container entry. Owns the section's
+/// current blocks and sigil; renders them stacked (intra-section gap 0),
+/// straddle-aware for the inspector. While `streaming`, paints its own
+/// streaming indicator on its last content row.
 ///
 /// A sealed section is just a `SectionView` with `streaming = false`;
 /// the same type covers the live, safe, and committed lifetimes.
@@ -78,8 +67,7 @@ impl SectionView {
     }
 
     /// Measure context for inner block `i`: selected iff the inspector's
-    /// selected part is this child. Children never carry their own
-    /// `selected_part` — selection bottoms out at the leaf.
+    /// selected part is this child.
     fn child_measure_ctx<'a>(
         &self,
         ctx: &BlockMeasureContext<'a>,
@@ -193,8 +181,6 @@ impl Block for SectionView {
             };
             let _ = block.render(&mut child_ctx);
         }
-        // The streaming indicator rides the last painted content row —
-        // the tail of the section's last paragraph.
         if self.streaming && painted > 0 {
             self.paint_streaming_indicator(ctx, ctx.area.y + painted - 1);
         }

@@ -412,7 +412,6 @@ mod tests {
             vec!["a".to_string(), "world".to_string(), "b".to_string()]
         );
 
-        // Genuinely different content fails.
         let working = session.open_files.get(&path).unwrap();
         let anchor_word = working.state.lines[1].anchor.clone();
         let wrong = format!("{anchor_word}§not the real content");
@@ -672,8 +671,6 @@ mod tests {
 
     #[tokio::test]
     async fn edit_anchor_pasteback_preserves_cache() {
-        // Same contract as edit_validation_failure_preserves_cache:
-        // a guard rejection must not corrupt the session cache.
         let mut session = fresh_session();
         let path = PathBuf::from("/x");
         session
@@ -696,7 +693,6 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, EditError::AnchorPastebackDetected { .. }));
 
-        // Retry with clean content succeeds.
         session
             .edit(
                 LlmEdit::InsertAfter {

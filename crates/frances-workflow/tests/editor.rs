@@ -103,7 +103,6 @@ async fn editor_edit_replace_writes_disk() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const editor = new Editor();
         const read = await editor.readFile("file.txt");
-        // Pick the second line's full anchor field (Word§b).
         const line_b = read.split("\n")[1];
         const result = await editor.edit({
             kind: "ReplaceLines",
@@ -289,7 +288,6 @@ async fn read_into_var_stores_raw_and_skips_registration() {
         transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
         transcript.push(new MarkdownSection({ content: vars.get("blob") }));
 
-        // The into-read did NOT register the file. file_replace_lines should fail.
         const edit = await replace.handler({
             call: { id: "c2", name: "file_replace_lines",
                     arguments: { path: "note.txt",
@@ -444,8 +442,6 @@ async fn editor_new_creates_parent_directory() {
 
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let rt = Runtime::new(deps).unwrap();
-    // Pass the absolute nested path so the test is robust to whether
-    // `current_cwd` is honoured or not.
     let nested_str = nested.to_str().unwrap();
     let script = format!(
         r#"
@@ -524,7 +520,6 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
     let rendered = text_of(&frames[0]);
     let lines: Vec<&str> = rendered.lines().collect();
 
-    // 1, 2, separator, 8, 9, 10 -> 6 lines total
     assert_eq!(lines.len(), 6, "got: {rendered:?}");
     assert!(lines[0].ends_with("§1"), "line 0: {}", lines[0]);
     assert!(lines[1].ends_with("§2"), "line 1: {}", lines[1]);
@@ -686,8 +681,6 @@ async fn loop_guard_clears_after_edit() {
             end_anchor: line_b,
             text: "B2",
         });
-        // Same args as the first read — but the edit cleared the ring,
-        // so this should succeed rather than tripping the guard.
         const second = await editor.readFile("loop.txt");
         transcript.push(new MarkdownSection({ content: second }));
         "#,
@@ -711,9 +704,6 @@ async fn loop_guard_clears_after_edit() {
 
 #[tokio::test]
 async fn loop_guard_lets_through_after_size_change() {
-    // The LoopKey::Read includes both mtime and size; changing content
-    // size (which our `fs::write` does) is enough to miss the ring,
-    // independent of filesystem mtime resolution.
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("loop.txt");
     std::fs::write(&path, "a\nb\nc\n").unwrap();
@@ -740,7 +730,6 @@ async fn loop_guard_lets_through_after_size_change() {
     let (_frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    // Replace with a different-sized payload — size delta forces a ring miss.
     std::fs::write(&path, "alpha\nbeta\ngamma\ndelta\n").unwrap();
 
     let file = write_source(
@@ -786,7 +775,6 @@ async fn loop_guard_distinguishes_ranges() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const editor = new Editor();
         const a = await editor.readFile({ path: "ranges.txt", ranges: [[1, 2]] });
-        // Different ranges → different args hash → no collision.
         const b = await editor.readFile({ path: "ranges.txt", ranges: [[5, 6]] });
         transcript.push(new MarkdownSection({ content: a + "|||" + b }));
         "#,

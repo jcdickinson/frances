@@ -1,12 +1,7 @@
 //! The shared "workflow is shutting down" signal.
 //!
-//! A workflow's graceful-shutdown state used to travel as a loose
-//! `(Arc<AtomicBool>, Arc<Notify>)` pair threaded through every host
-//! primitive (inbox, approval, sleep timer). Two fields that must stay
-//! in lockstep, with the set-and-notify idiom and the check-then-wait
-//! idiom hand-rolled at each site. [`WorkflowClosed`] bundles them so
-//! the flag and the wakeup can't drift and the await-until-closed logic
-//! lives in exactly one place.
+//! [`WorkflowClosed`] bundles the flag and the wakeup so they can't
+//! drift and the await-until-closed logic lives in exactly one place.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -40,8 +35,7 @@ impl WorkflowClosed {
 
     /// Resolve once the workflow is closed, returning immediately if it
     /// already is. Registers the wakeup *before* re-reading the flag so
-    /// a [`close`](Self::close) racing this call is observed, not lost —
-    /// the race every hand-rolled awaiter had to get right on its own.
+    /// a [`close`](Self::close) racing this call is observed, not lost.
     pub async fn closed(&self) {
         let notified = self.notify.notified();
         tokio::pin!(notified);

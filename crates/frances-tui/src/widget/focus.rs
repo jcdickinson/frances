@@ -2,11 +2,6 @@
 //! [`FocusManager`] arena, with a per-frame [`Focus`] that tracks
 //! the currently-focused id plus the tree-order list of every
 //! focusable id (rebuilt each frame via [`Widget::collect_focusable`]).
-//!
-//! The arena (slotmap) gives stable ids that survive widget-tree
-//! mutation; rebuilding `Focus::ordered` each frame keeps
-//! traversal order in sync with the live tree without forcing
-//! widgets to publish parent-pointer invariants.
 
 use slotmap::{SlotMap, new_key_type};
 
@@ -19,10 +14,8 @@ new_key_type! {
     pub struct FocusId;
 }
 
-/// Arena of allocated focus identities. Lives for the app's
-/// lifetime; widgets allocate at construction and release on
-/// drop. In Phase B nothing releases — the `Footer` lives as
-/// long as the app — but the surface is here for Phase D.
+/// Arena of allocated focus identities. Widgets allocate at
+/// construction and release on drop.
 #[derive(Default)]
 pub struct FocusManager {
     arena: SlotMap<FocusId, ()>,
@@ -66,8 +59,7 @@ impl Focus {
     }
 
     /// Move focus to `id` iff it's currently registered. Calls
-    /// targeting a stale id are silently dropped — the next
-    /// [`Self::refresh`] would clobber the set anyway.
+    /// targeting a stale id are silently dropped.
     pub fn set(&mut self, id: FocusId) {
         if self.ordered.contains(&id) {
             self.current = Some(id);
@@ -287,7 +279,6 @@ mod tests {
         focus.set(b);
         assert_eq!(focus.current(), Some(b));
 
-        // b leaves the tree.
         t.children.pop();
         focus.refresh(&t);
 

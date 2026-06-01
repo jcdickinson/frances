@@ -21,10 +21,7 @@ pub struct DeviceId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Inode(pub u64);
 
-/// Identifies the invoking process's controlling terminal. Only `key` is
-/// read externally (used as a session-link filename); the other fields are
-/// retained as forensic context — anything that contributes to `key` should
-/// stay reachable so we can debug a stale link.
+/// Identifies the invoking process's controlling terminal.
 #[derive(Debug, Clone)]
 #[expect(
     dead_code,

@@ -1,9 +1,7 @@
 use super::*;
 
-/// `approve()` emits a HostFrame::Permission and awaits the host's
-/// response. Unlike `inbox.next()` it does not park, so we drive
-/// the body inline: wait for the first approval frame, answer it,
-/// then drain to `done`.
+/// `approve()` emits a HostFrame::Permission, awaits the host's response,
+/// and resumes with the reply value.
 #[tokio::test]
 async fn approve_yes_round_trip() {
     let deps = StubDeps::default();

@@ -17,10 +17,6 @@ use crate::paragraph_block::ParagraphBlock;
 
 pub struct MarkdownSection {
     source: Source,
-    /// Accumulated text since construction. Paragraphs are derived by
-    /// splitting on `\n\n` at every apply — cheap for typical
-    /// LLM-paragraph sizes, swappable for an incremental splitter
-    /// later if it bites.
     buffer: String,
     sealed: bool,
     truncated: bool,
@@ -95,7 +91,6 @@ mod tests {
         MarkdownSection::new(Source::User)
     }
 
-    /// Two paragraphs in one apply produce two ParagraphBlocks.
     #[test]
     fn two_paragraphs_produce_two_blocks() {
         let mut s = assistant();
@@ -109,7 +104,6 @@ mod tests {
         assert_eq!(blocks.len(), 2);
     }
 
-    /// Empty buffer (just Append("")) produces zero blocks.
     #[test]
     fn empty_apply_produces_no_blocks() {
         let mut s = assistant();
@@ -123,10 +117,7 @@ mod tests {
         assert_eq!(blocks.len(), 0);
     }
 
-    /// User echo with literal `*foo*` renders as plain, not italic.
-    /// We can't easily peek at the styled spans through the trait, but
-    /// we can verify through inline directly: the section delegates to
-    /// `parse_inline` only when source != User.
+    /// User echo with `source == User` skips `parse_inline`.
     #[test]
     fn user_source_skips_inline_parse() {
         let mut s = user();
@@ -137,15 +128,11 @@ mod tests {
             kind: &kind,
             delta: "look at *.rs files",
         });
-        // build_blocks for User builds a single plain span per
-        // paragraph; verify by reaching past the trait.
         let blocks = s.build_blocks();
         assert_eq!(blocks.len(), 1);
     }
 
-    /// Assistant source actually parses inline markdown — verify by
-    /// confirming a `**bold**` chunk produces a span with the BOLD
-    /// modifier when parsed through the inline scanner directly.
+    /// `source == Assistant` parses `**bold**` into a BOLD-modifier span.
     #[test]
     fn assistant_source_parses_bold() {
         let spans = parse_inline("hello **there**");

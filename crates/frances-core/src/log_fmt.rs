@@ -29,7 +29,6 @@ impl<const N: usize, const KEEP_HEAD: bool> fmt::Display for Truncated<'_, N, KE
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = self.0.as_ref();
         if KEEP_HEAD {
-            // Keep the leading N chars; append the ellipsis when we cut.
             match s.char_indices().nth(N) {
                 Some((idx, _)) => {
                     f.write_str(&s[..idx])?;
@@ -38,7 +37,6 @@ impl<const N: usize, const KEEP_HEAD: bool> fmt::Display for Truncated<'_, N, KE
                 None => f.write_str(s),
             }
         } else {
-            // Keep the trailing N chars; prepend the ellipsis when we cut.
             if N == 0 {
                 return f.write_str(ELLIPSIS);
             }

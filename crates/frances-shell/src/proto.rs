@@ -193,18 +193,12 @@ mod tests {
         let s = Sentinel::new("abc");
         let buf = b"junk1\njunk2 __F_abc_0__\nstill garbage\n__F_abc_7__\n";
         let m = s.find(buf).unwrap();
-        // First real candidate is `\n__F_abc_0__\n` after "junk1".
-        // "junk1\n__F_abc_0__\n" wait — that's the actual structure, "junk2 __F_abc_0__" lacks the leading \n adjacency.
-        // Let me re-read: "junk1" + "\n" + "junk2 __F_abc_0__" + "\n" + "still garbage" + "\n__F_abc_7__\n".
-        // The first \n followed immediately by __F_abc_ is right before "still garbage"? No — "\njunk2..." has \n followed by 'j', not __F_.
-        // Then "still garbage\n__F_abc_7__\n" — the \n before __F_abc_7__ is the match.
         assert_eq!(m.exit_code, 7);
     }
 
     #[test]
     fn sentinel_handles_digits_only() {
         let s = Sentinel::new("abc");
-        // Multi-digit exit code.
         let m = s.find(b"\n__F_abc_137__\n").unwrap();
         assert_eq!(m.exit_code, 137);
     }

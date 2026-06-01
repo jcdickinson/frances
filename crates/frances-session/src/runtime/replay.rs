@@ -14,8 +14,7 @@ use super::EventsChannel;
 /// workflow this is the same [`ScrollbackFrame::Reset`] / replay /
 /// [`ScrollbackFrame::End`] bracket emitted by
 /// [`crate::scrollback::replay_to_channel`]; with no active workflow
-/// we still emit an empty bracket so the TUI clears any stale
-/// in-memory scrollback before going live.
+/// an empty bracket is emitted.
 pub(super) async fn write_initial_replay(
     events: &EventsChannel,
     db: &Database,
