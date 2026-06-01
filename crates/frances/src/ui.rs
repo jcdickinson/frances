@@ -6,9 +6,13 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use crossterm::QueueableCommand;
 use crossterm::cursor::{self, Show};
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode, size,
+    supports_keyboard_enhancement,
 };
 use futures_util::StreamExt;
 use ratatui::Terminal;
@@ -49,6 +53,7 @@ pub struct App<'a> {
     pub events: mpsc::UnboundedReceiver<StreamFrame>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum KeyAction {
     Quit,
     Interrupt,
@@ -203,11 +208,30 @@ type AppTerminal = Terminal<ScrollbackBackend<CrosstermBackend<Stdout>>>;
 impl App<'_> {
     pub async fn run(self) -> Result<()> {
         enable_raw_mode().context("enable raw mode")?;
+        // Enable the kitty keyboard protocol where the terminal supports
+        // it, so modifiers are reported on keys that legacy encoding
+        // leaves ambiguous — notably Shift+Enter, which otherwise sends
+        // the same bytes as a bare Enter. Without this `classify_key`
+        // never sees the Shift bit and Shift+Enter submits instead of
+        // inserting a newline.
+        let enhanced_keys = matches!(supports_keyboard_enhancement(), Ok(true));
+        if enhanced_keys {
+            let mut out = stdout();
+            let _ = out.queue(PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+            ));
+            let _ = out.flush();
+        }
+
         let outcome = self.run_loop().await;
-        let _ = disable_raw_mode();
+
         let mut out = stdout();
+        if enhanced_keys {
+            let _ = out.queue(PopKeyboardEnhancementFlags);
+        }
         let _ = out.queue(Show);
         let _ = out.flush();
+        let _ = disable_raw_mode();
         println!();
         outcome
     }
@@ -409,7 +433,7 @@ impl App<'_> {
     fn banner_lines(&self) -> Vec<String> {
         vec![
             format!("frances session {}", self.session.id),
-            "  Enter to send. Alt+Enter for newline. Esc to interrupt. Ctrl-O for history. Ctrl-C or Ctrl-D to exit.".to_string(),
+            "  Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for history. Ctrl-C or Ctrl-D to exit.".to_string(),
         ]
     }
 }
@@ -643,6 +667,7 @@ fn format_token_status(usage: &Usage) -> String {
 fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
 
     match key.code {
         // Esc interrupts the running workflow (delivered to its inbox).
@@ -651,9 +676,9 @@ fn classify_key(key: &KeyEvent, pending_approval: bool) -> KeyAction {
         KeyCode::Char('o' | 'O') if ctrl && !pending_approval => KeyAction::EnterScrollback,
         KeyCode::Char('y' | 'Y') if alt && pending_approval => KeyAction::Approve,
         KeyCode::Char('n' | 'N') if alt && pending_approval => KeyAction::Reject,
-        KeyCode::Enter if !alt => KeyAction::Submit,
+        KeyCode::Enter if !alt && !shift => KeyAction::Submit,
         _ => {
-            let _ = (ctrl, alt);
+            let _ = (ctrl, alt, shift);
             KeyAction::Edit
         }
     }
@@ -713,7 +738,30 @@ fn leave_scrollback(terminal: &mut AppTerminal) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyEventKind;
     use frances_session::events::Source;
+
+    fn enter(modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new_with_kind(KeyCode::Enter, modifiers, KeyEventKind::Press)
+    }
+
+    /// Bare Enter submits; Enter with Shift or Alt falls through to
+    /// `Edit` so the textarea inserts a newline instead of submitting.
+    #[test]
+    fn enter_submits_only_without_shift_or_alt() {
+        assert_eq!(
+            classify_key(&enter(KeyModifiers::NONE), false),
+            KeyAction::Submit
+        );
+        assert_eq!(
+            classify_key(&enter(KeyModifiers::SHIFT), false),
+            KeyAction::Edit
+        );
+        assert_eq!(
+            classify_key(&enter(KeyModifiers::ALT), false),
+            KeyAction::Edit
+        );
+    }
 
     /// Drives [`LiveBlocks::append`] / [`LiveBlocks::close`] against a
     /// real `ScrollbackContainer`. Two distinct section ids coexist as

@@ -20,8 +20,15 @@ use super::{
     WidgetState,
 };
 
-/// Total rows occupied by a single-line `TextInput`: top + bottom border = 2 + 1 row of text.
-pub const TEXT_INPUT_HEIGHT: u16 = 3;
+/// Top + bottom border rows that frame the text area.
+const BORDER_ROWS: u16 = 2;
+
+/// Total rows occupied by a single-line `TextInput`: the border plus one row of text.
+pub const TEXT_INPUT_HEIGHT: u16 = BORDER_ROWS + 1;
+
+/// The text area grows one row per line up to this many rows; beyond it
+/// the textarea scrolls vertically instead of the box growing further.
+const MAX_TEXT_ROWS: u16 = 5;
 
 pub struct TextInput {
     textarea: TextArea<'static>,
@@ -38,6 +45,10 @@ impl TextInput {
     pub fn new(focus: &mut FocusManager, placeholder: impl Into<String>) -> Self {
         let mut textarea = TextArea::new(vec![String::new()]);
         textarea.set_placeholder_text(placeholder);
+        // Use an explicit Gray background for the cursor cell so it is
+        // visible in terminals that do not faithfully render REVERSED
+        // (inverse video) — notably `foot` and others.
+        textarea.set_cursor_style(Style::default().bg(Color::Gray));
         // The cursor cell stays at the widget's default reversed
         // style, but the whole-line underline is too noisy for a
         // single-row input box.
@@ -105,7 +116,8 @@ impl Widget for TextInput {
     }
 
     fn measure(&self, _: u16) -> u16 {
-        TEXT_INPUT_HEIGHT
+        let text_rows = (self.textarea.lines().len() as u16).clamp(1, MAX_TEXT_ROWS);
+        text_rows + BORDER_ROWS
     }
 
     fn render(&self, ctx: &mut RenderContext<'_>) {
@@ -268,10 +280,25 @@ mod tests {
     }
 
     #[test]
-    fn measure_is_three_rows() {
+    fn empty_input_is_three_rows() {
         let mut mgr = FocusManager::new();
         let input = TextInput::new(&mut mgr, "hi");
         assert_eq!(input.measure(80), TEXT_INPUT_HEIGHT);
+    }
+
+    #[test]
+    fn measure_grows_per_line_then_caps() {
+        let mut mgr = FocusManager::new();
+        let mut input = TextInput::new(&mut mgr, "hi");
+        // Three lines → three text rows + border.
+        input.textarea.insert_newline();
+        input.textarea.insert_newline();
+        assert_eq!(input.measure(80), 3 + BORDER_ROWS);
+        // Past the cap the box stops growing.
+        for _ in 0..10 {
+            input.textarea.insert_newline();
+        }
+        assert_eq!(input.measure(80), MAX_TEXT_ROWS + BORDER_ROWS);
     }
 
     #[test]
@@ -279,6 +306,42 @@ mod tests {
         let mut mgr = FocusManager::new();
         let input = TextInput::new(&mut mgr, "hi");
         assert!(input.state().focus_id.is_some());
+    }
+
+    // Cursor visibility test lives in scrollback_container.rs where it
+    // renders through the full terminal pipeline (ScrollbackContainer +
+    // TermBackend).
+
+    #[test]
+    fn cursor_cell_has_gray_bg_in_buffer() {
+        let mut mgr = FocusManager::new();
+        let input = TextInput::new(&mut mgr, "type a message");
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::default();
+        let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
+        let mut ctx = RenderContext {
+            area,
+            buf: &mut buf,
+            theme: &theme,
+            focus: &focus,
+            frame_time: &frame_time,
+            animation: &animation,
+        };
+        input.render(&mut ctx);
+        // Inner rect starts at col 1, row 1 (inside borders). Cursor
+        // cell should have a Gray background.
+        let cell = &buf[(1, 1)];
+        assert_eq!(
+            cell.bg,
+            Color::Gray,
+            "cursor cell bg should be Gray, got {:?}. cell: symbol={:?}, fg={:?}",
+            cell.bg,
+            cell.symbol(),
+            cell.fg,
+        );
     }
 
     #[test]

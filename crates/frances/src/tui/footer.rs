@@ -8,8 +8,9 @@ use frances_tui::{
 };
 use ratatui::layout::Rect;
 
-/// Heights: `TextInput` is `TEXT_INPUT_HEIGHT = 3` (border + 1 row of
-/// text), status row is `1`. Total: 4.
+/// Heights: `TextInput` starts at `TEXT_INPUT_HEIGHT = 3` (border + 1
+/// row of text) and grows with its content up to a capped number of
+/// rows; the status row is always `1`.
 pub struct Footer {
     pub input: TextInput,
     pub status: TextLine,

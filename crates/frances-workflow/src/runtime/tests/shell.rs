@@ -272,6 +272,88 @@ async fn shell_run_head_and_tail_clamp_model_output() {
 }
 
 #[tokio::test]
+async fn shell_run_head_tail_larger_than_doc_returns_all() {
+    // When head + tail covers the whole output there's nothing to elide:
+    // the full output comes back verbatim, with no marker and no line
+    // duplicated across the head and tail slices.
+    use super::test_deps::StubDepsRealShell;
+    use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
+    use serde_json::json;
+
+    let deps = StubDepsRealShell::default();
+    let call = ToolCall {
+        error: None,
+        id: "c1".to_owned(),
+        name: "shell_run".to_owned(),
+        arguments: json!({ "cmd": "seq 1 5", "head": 10, "tail": 10 }),
+    };
+    deps.script_next_run(
+        vec![StreamEvent::ToolCall(call.clone())],
+        CompletionOutcome {
+            text: String::new(),
+            tool_calls: vec![call],
+        },
+    );
+
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const chat = new ChatSession({ model_intents: ["x"] });
+        const sh = new Shell();
+        chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
+        chat.push({ role: "user", content: "count" });
+        const r = await chat.stream();
+        const reader = r.events.getReader();
+        while (true) { const { done } = await reader.read(); if (done) break; }
+        reader.releaseLock();
+        await r.completed;
+        await sh.close();
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        drive_one_cycle(&mut handle),
+    )
+    .await
+    .expect("test should finish within 10s");
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let content = sessions[0]
+        .pending()
+        .iter()
+        .find_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+                call_id, content, ..
+            } if call_id == "c1" => Some(content.clone()),
+            _ => None,
+        })
+        .expect("shell_run result present");
+    assert!(content.starts_with("Exit 0"), "got `{content}`");
+    assert!(
+        content.contains("1\n2\n3\n4\n5"),
+        "all lines kept: `{content}`"
+    );
+    assert!(
+        !content.contains("elided"),
+        "no elision marker: `{content}`"
+    );
+}
+
+#[tokio::test]
 async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
     // We script several shell_wait rounds because keepWaiting's
     // default 1s quiet window can time out before the sentinel

@@ -2386,6 +2386,13 @@ mod tests {
                 s.trim_end().to_string()
             }
 
+            /// Background color of the cell at screen position `(x, y)`.
+            pub fn cell_bg(&self, x: usize, y: usize) -> alacritty_terminal::vte::ansi::Color {
+                let line = Line(y as i32);
+                let row = &self.term.grid()[line];
+                row[Column(x)].bg
+            }
+
             /// Number of rows currently in native scrollback (history).
             pub fn scrollback_len(&self) -> usize {
                 self.term.grid().history_size()
@@ -3006,6 +3013,125 @@ mod tests {
         assert!(
             top.contains('┌') && top.contains('┐') && top.contains("streaming"),
             "footer top border at row 10 missing or corrupted: {top:?}\n{screen}",
+        );
+    }
+
+    /// The TextInput cursor cell must render with a visible style (a
+    /// coloured background) so the user can see where they're typing.
+    /// This test renders through the full ScrollbackContainer →
+    /// TerminalBackend pipeline and checks that the cell inside the
+    /// TextInput's inner rect has a non-default background.
+    #[test]
+    fn text_input_cursor_cell_is_visible_through_terminal() {
+        use crate::widget::{
+            EventContext, EventOutcome, Focus, FocusId, FocusManager, Input, RenderContext,
+            TextInput, TextLine, Theme, Widget, WidgetState,
+        };
+        use alacritty_terminal::vte::ansi::{Color, NamedColor};
+        use crossterm::event::Event;
+
+        // The test runner sets NO_COLOR=1 which causes crossterm to
+        // suppress all colour ANSI sequences. Re-enable so the
+        // terminal pipeline test can verify colour propagation.
+        crossterm::style::Colored::set_ansi_color_disabled(false);
+
+        struct TestFooter {
+            input: TextInput,
+            status: TextLine,
+            state: WidgetState,
+        }
+
+        impl Input for TestFooter {
+            fn handle_event(&mut self, ctx: &mut EventContext<'_>, event: &Event) -> EventOutcome {
+                self.input.handle_event(ctx, event)
+            }
+        }
+
+        impl Widget for TestFooter {
+            fn state(&self) -> &WidgetState {
+                &self.state
+            }
+            fn state_mut(&mut self) -> &mut WidgetState {
+                &mut self.state
+            }
+            fn measure(&self, width: u16) -> u16 {
+                self.input.measure(width) + self.status.measure(width)
+            }
+            fn layout(&mut self, area: Rect) {
+                self.state.rect = area;
+                let input_h = self.input.measure(area.width).min(area.height);
+                let input_area = Rect::new(area.x, area.y, area.width, input_h);
+                let remaining = area.height.saturating_sub(input_h);
+                let status_area = Rect::new(area.x, area.y + input_h, area.width, remaining);
+                self.input.layout(input_area);
+                self.status.layout(status_area);
+            }
+            fn render(&self, ctx: &mut RenderContext<'_>) {
+                let mut input_ctx = ctx.with_area(self.input.state().rect);
+                self.input.render(&mut input_ctx);
+                let mut status_ctx = ctx.with_area(self.status.state().rect);
+                self.status.render(&mut status_ctx);
+            }
+            fn collect_focusable(&self, out: &mut Vec<FocusId>) {
+                self.input.collect_focusable(out);
+                self.status.collect_focusable(out);
+            }
+        }
+
+        let mut focus_mgr = FocusManager::new();
+        let footer = TestFooter {
+            input: TextInput::new(&mut focus_mgr, "type a message"),
+            status: TextLine::new("status"),
+            state: WidgetState::default(),
+        };
+
+        // Terminal big enough for a banner + the 4-row footer
+        // (TextInput = 3 rows + TextLine = 1 row).
+        let mut terminal = mk_term_terminal(32, 8);
+        let mut container = ScrollbackContainer::new(5);
+        container.push(multi_text(&["banner"]));
+
+        let theme = Theme::default();
+        let focus = Focus::new();
+        let frame_time = crate::widget::FixedFrameTime(0.0);
+        let animation = crate::widget::AnimationGate::new();
+        let mut footer = footer;
+        let ctx = DrawContext {
+            theme: &theme,
+            focus: &focus,
+            frame_time: &frame_time,
+            animation: &animation,
+        };
+        container.draw(&mut terminal, &mut footer, &ctx).unwrap();
+
+        let b = terminal.backend().inner();
+
+        // After draw: row 0 = banner (with 2-col sigil gutter), rows
+        // 1 = gap, rows 2-4 = TextInput (border top, text row,
+        // border bottom), row 5 = TextLine "status".
+        // The cursor cell sits inside the TextInput's inner rect:
+        // column 1 (inside left border), row 3 (text row inside
+        // borders). It must be visually distinct.
+        // Layout with initial_y=5, terminal_h=8, banner(1 line, slot_h=2):
+        //   row 0-1: pre-scroll space (initial_y offset)
+        //   row 2:   banner content (with 2-col sigil gutter)
+        //   row 3:   gap row below banner
+        //   row 4:   TextInput top border ┌──…──┐
+        //   row 5:   TextInput text row (cursor cell here)
+        //   row 6:   TextInput bottom border └──…──┘
+        //   row 7:   TextLine "status"
+        let cursor_x: usize = 1;
+        let cursor_y: usize = 5;
+        let bg = b.cell_bg(cursor_x, cursor_y);
+        assert_ne!(
+            bg,
+            Color::Named(NamedColor::Background),
+            "cursor cell at ({cursor_x}, {cursor_y}) should have a non-default background, \
+             got bg: {bg:?}\n\
+             screen around cursor:\n  row 4: {:?}\n  row 5: {:?}\n  row 6: {:?}",
+            b.screen_row(4),
+            b.screen_row(5),
+            b.screen_row(6),
         );
     }
 
