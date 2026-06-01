@@ -53,6 +53,42 @@ import { approve } from "frances:v1/approval";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
 
+// Shared wait-tuning fields for shell_run / shell_wait. Both are in
+// seconds and optional; omitting them uses the defaults (10s quiet,
+// 120s max). Neither kills the command — they only hand control back.
+const QUIET_PROP = {
+  type: "number",
+  description:
+    "Seconds of output silence before control returns to you (default 10). " +
+    "The command keeps running — call shell_wait to resume. Lower it when you " +
+    "expect a quick command; raise it for ones with long silent phases.",
+};
+const MAX_PROP = {
+  type: "number",
+  description:
+    "Wall-clock seconds before control returns to you regardless of output " +
+    "(default 120). The command is NOT killed — shell_wait resumes it. Raise it " +
+    "for known-long or streaming commands (builds, dev servers, log tails) so " +
+    "you aren't interrupted every couple of minutes; this is your timeout knob. " +
+    "If set at or below quiet, it's raised to quiet + 10s.",
+};
+// `head` / `tail` bound only the copy of the output returned to YOU; the
+// user always sees the full stream in the scrollback. Prefer these over
+// piping to `head`/`tail` in bash, which would discard output for everyone.
+const HEAD_PROP = {
+  type: "number",
+  description:
+    "Return only the first N lines of output to you (the full output is always " +
+    "kept in the user's scrollback). Combine with `tail` to see both ends.",
+};
+const TAIL_PROP = {
+  type: "number",
+  description:
+    "Return only the last N lines of output to you (full output kept in " +
+    "scrollback). Combine with `head`. When neither is set, the last ~200 lines " +
+    "are returned by default. Prefer this over piping to `tail` in bash.",
+};
+
 const RUN_SCHEMA = {
   type: "object",
   properties: {
@@ -61,13 +97,22 @@ const RUN_SCHEMA = {
       description:
         "Bash code to run. Multi-line, pipelines, heredocs, etc. all work.",
     },
+    quiet: QUIET_PROP,
+    max: MAX_PROP,
+    head: HEAD_PROP,
+    tail: TAIL_PROP,
   },
   required: ["cmd"],
 };
 
 const WAIT_SCHEMA = {
   type: "object",
-  properties: {},
+  properties: {
+    quiet: QUIET_PROP,
+    max: MAX_PROP,
+    head: HEAD_PROP,
+    tail: TAIL_PROP,
+  },
 };
 
 const KILL_SCHEMA = {
@@ -75,12 +120,51 @@ const KILL_SCHEMA = {
   properties: {},
 };
 
-function _format(call_id, outcome) {
+// Last-N-lines kept for the model when neither `head` nor `tail` is set.
+// The user always sees the full stream in the frame; this only bounds the
+// copy that lands in the model's tool result.
+const DEFAULT_TAIL_LINES = 200;
+
+// Trim `output` to a `head` (first N lines) + `tail` (last M lines) view
+// for the model, eliding the middle with a marker that points at the
+// scrollback. Either bound may be 0/unset; when both are unset, fall back
+// to the default tail cap. The full output is never altered upstream —
+// it's already been streamed to the frame.
+function _clampOutput(output, head, tail) {
+  const hasHead = Number.isFinite(head) && head > 0;
+  const hasTail = Number.isFinite(tail) && tail > 0;
+  let h, t;
+  if (!hasHead && !hasTail) {
+    h = 0;
+    t = DEFAULT_TAIL_LINES;
+  } else {
+    h = hasHead ? Math.floor(head) : 0;
+    t = hasTail ? Math.floor(tail) : 0;
+  }
+  let lines = output.split("\n");
+  // A trailing newline yields a final empty element; drop it so `tail`
+  // counts real content lines, and re-add it after.
+  const trailingNewline = lines.length > 0 && lines[lines.length - 1] === "";
+  if (trailingNewline) lines = lines.slice(0, -1);
+  if (lines.length <= h + t) return output;
+  const elided = lines.length - h - t;
+  const kept = [
+    ...lines.slice(0, h),
+    `[… ${elided} line${elided === 1 ? "" : "s"} elided — full output in scrollback …]`,
+    ...lines.slice(lines.length - t),
+  ].join("\n");
+  return trailingNewline ? `${kept}\n` : kept;
+}
+
+function _format(call_id, outcome, view) {
+  const head = view && view.head;
+  const tail = view && view.tail;
+  const out = _clampOutput(outcome.output, head, tail);
   if (outcome.kind === "done") {
     return {
       role: "tool",
       call_id,
-      content: `Exit ${outcome.exit_code}\n${outcome.output}`,
+      content: `Exit ${outcome.exit_code}\n${out}`,
       is_error: outcome.exit_code !== 0,
     };
   }
@@ -89,7 +173,7 @@ function _format(call_id, outcome) {
       role: "tool",
       call_id,
       content:
-        `Still running (${outcome.reason}). Output so far:\n${outcome.output}\n` +
+        `Still running (${outcome.reason}). Output so far:\n${out}\n` +
         `Call shell_wait to keep waiting, or shell_kill to stop.`,
       is_error: false,
     };
@@ -98,7 +182,7 @@ function _format(call_id, outcome) {
   return {
     role: "tool",
     call_id,
-    content: `Bash exited. Output:\n${outcome.output}`,
+    content: `Bash exited. Output:\n${out}`,
     is_error: true,
   };
 }
@@ -119,11 +203,22 @@ function _errResult(call_id, err) {
 // matching outcome is resolved by `op`'s promise.
 async function _streamUntilSettled(shell, op) {
   const opPromise = op();
+  // A resolved `op` always emits a terminal event, so on the normal path
+  // `nextEvent()` drives the loop and no events are ever dropped. But if
+  // `op` *rejects* before a command was issued (shell busy/closed, or a
+  // pre-flight error), no event will ever arrive — without this escape the
+  // `nextEvent()` await would block forever. Resolve → never wins the race;
+  // reject → unblocks the loop so the error surfaces via `await opPromise`.
+  const FAILED = Symbol("op-failed");
+  const failFast = opPromise.then(
+    () => new Promise(() => {}),
+    () => FAILED,
+  );
   while (true) {
-    const event = await shell.nextEvent();
-    if (event === null) {
-      // All senders gone — shell was closed mid-call. Fall through
-      // and let `op` resolve with whatever error/outcome Rust returns.
+    const event = await Promise.race([shell.nextEvent(), failFast]);
+    if (event === FAILED || event === null) {
+      // op rejected with no terminal event, or all senders gone (shell
+      // closed mid-call). Fall through to `op`'s error/outcome.
       break;
     }
     if (event.kind === "output") {
@@ -231,6 +326,29 @@ async function _frameOutcome(shell, outcome, killedSuffix) {
   return outcome;
 }
 
+// Stop the in-flight command and return the shell to idle: SIGKILL, drain
+// to the terminal outcome, finalise the frame, then tell the model what
+// happened. Used both when the negotiation scold budget is exhausted and
+// when the negotiation stream itself errors — either way the command must
+// not be left running with its frame open (a still-`running` shell wedges
+// the next `shell_run` on `busy`).
+async function _abortRunningShell(shell, scope, notice) {
+  try {
+    await shell.kill();
+  } catch (_) {
+    // Already settled — fine.
+  }
+  try {
+    const drained = await _streamUntilSettled(shell, () => shell.keepWaiting());
+    await _frameOutcome(shell, drained, "\n(killed)");
+  } catch (_) {
+    // Already idle — close the frame defensively if anyone left it open.
+    await _closeShellFrame(shell, { exit: -1 });
+  }
+  transcript.push(new MarkdownSection({ content: notice, closed: true }));
+  scope.push({ role: "user", content: notice });
+}
+
 // Ask the user to approve a `shell_run` call. Returns `null` if the
 // user said yes and the command should proceed, otherwise a fully
 // formed tool_result the handler should return verbatim.
@@ -288,7 +406,9 @@ class Run {
     this.description =
       "Run a bash command. State (cwd, env, functions) persists across calls. " +
       "If output goes quiet before the command finishes, the result will say so — " +
-      "call shell_wait to keep waiting or shell_kill to stop.";
+      "call shell_wait to keep waiting or shell_kill to stop. Set `quiet` and " +
+      "`max` (seconds) to tune how long it waits before handing control back — " +
+      "raise them for slow or streaming commands so you aren't pinged early.";
     this.parameters = RUN_SCHEMA;
   }
 
@@ -303,11 +423,17 @@ class Run {
       if (gate !== null) return gate;
     }
 
+    // `head`/`tail` bound only what we hand back to the model; the frame
+    // gets the full stream regardless.
+    const view = { head: call.arguments.head, tail: call.arguments.tail };
     _openShellFrame(this.shell, call.arguments.cmd);
     let outcome;
     try {
       outcome = await _streamUntilSettled(this.shell, () =>
-        this.shell.runOnce(call.arguments.cmd),
+        this.shell.runOnce(call.arguments.cmd, {
+          quiet: call.arguments.quiet,
+          max: call.arguments.max,
+        }),
       );
     } catch (err) {
       // The frame is open but the command never produced an outcome;
@@ -316,7 +442,7 @@ class Run {
       return _errResult(call.id, err);
     }
     await _frameOutcome(this.shell, outcome);
-    if (outcome.kind !== "quiet") return _format(call.id, outcome);
+    if (outcome.kind !== "quiet") return _format(call.id, outcome, view);
 
     // Quiet: register a post-batch turn to negotiate wait/kill with the
     // model. The initial tool_result for this call still goes out below
@@ -344,9 +470,24 @@ class Run {
         // Render the inner round's LLM text into a frame.
         const out = new MarkdownSection();
         transcript.push(out);
-        const r = await scope.stream();
-        await r.text.pipeTo(out.writable);
-        const { tool_calls } = await r.completed;
+        let tool_calls;
+        try {
+          const r = await scope.stream();
+          await r.text.pipeTo(out.writable);
+          ({ tool_calls } = await r.completed);
+        } catch (err) {
+          // The negotiation round's own stream failed (e.g. a provider
+          // error that outlived the transient-retry budget). Leaving the
+          // command running would wedge the next `shell_run` on `busy`, so
+          // kill it, drain, and hand control back to the outer loop.
+          await _abortRunningShell(
+            shell,
+            scope,
+            `Aborted the shell command from ${call.id} — provider error ` +
+              `while resolving it: ${String((err && err.message) || err)}`,
+          );
+          break;
+        }
 
         // Forward progress means the model called wait or kill. Off-
         // script tool calls (caught by scope.toolCall) and empty
@@ -360,31 +501,15 @@ class Run {
         }
 
         if (scoldsRemaining <= 0) {
-          // Budget exhausted — kill the in-flight command and drain.
-          // Both phases' outputs land in the shell frame so the user
-          // sees the final state.
-          try {
-            await shell.kill();
-          } catch (_) {
-            // Already settled — fine.
-          }
-          try {
-            const drained = await _streamUntilSettled(shell, () =>
-              shell.keepWaiting(),
-            );
-            await _frameOutcome(shell, drained, "\n(killed)");
-          } catch (_) {
-            // Already idle — close the frame defensively if anyone
-            // left it open.
-            await _closeShellFrame(shell, { exit: -1 });
-          }
-          const killMsg =
+          // Budget exhausted — kill the in-flight command and drain. Both
+          // phases' outputs land in the shell frame so the user sees the
+          // final state.
+          await _abortRunningShell(
+            shell,
+            scope,
             `Killed the shell command from ${call.id} — model did not call ` +
-            `${waitName} or ${killName} after ${maxScolds} scold(s).`;
-          transcript.push(
-            new MarkdownSection({ content: killMsg, closed: true }),
+              `${waitName} or ${killName} after ${maxScolds} scold(s).`,
           );
-          scope.push({ role: "user", content: killMsg });
           break;
         }
         scoldsRemaining -= 1;
@@ -398,7 +523,7 @@ class Run {
       }
     });
 
-    return _format(call.id, outcome);
+    return _format(call.id, outcome, view);
   };
 }
 
@@ -417,10 +542,16 @@ class Wait {
   handler = async ({ call }) => {
     try {
       const outcome = await _streamUntilSettled(this.shell, () =>
-        this.shell.keepWaiting(),
+        this.shell.keepWaiting({
+          quiet: call.arguments.quiet,
+          max: call.arguments.max,
+        }),
       );
       await _frameOutcome(this.shell, outcome);
-      return _format(call.id, outcome);
+      return _format(call.id, outcome, {
+        head: call.arguments.head,
+        tail: call.arguments.tail,
+      });
     } catch (err) {
       return _errResult(call.id, err);
     }

@@ -38,4 +38,4 @@ mod shell;
 
 pub use error::{ShellError, ShellResult};
 pub use reader::ReadEvent;
-pub use shell::{QuietReason, RunOutcome, Shell, ShellOptions, WaitOpts};
+pub use shell::{DEFAULT_QUIET, QuietReason, RunOutcome, Shell, ShellOptions, WaitOpts};

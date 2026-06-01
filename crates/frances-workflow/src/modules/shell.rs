@@ -39,9 +39,10 @@
 use std::fs;
 use std::io::{self, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
-use rquickjs::function::{Constructor, This};
+use rquickjs::function::{Constructor, Opt, This};
 use rquickjs::promise::Promised;
 use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -126,13 +127,14 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
             "runOnce",
             Function::new(
                 ctx.clone(),
-                |this: This<Class<'js, ShellJs<F>>>, cmd: String| {
+                |this: This<Class<'js, ShellJs<F>>>, cmd: String, opts: Opt<Object<'js>>| {
                     let borrow = this.0.borrow();
                     let state = borrow.state.clone();
                     let factory = borrow.factory.clone();
                     drop(borrow);
+                    let wait = parse_wait_opts(opts);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        ShellOpResult(run_once_inner(&factory, &state, cmd).await)
+                        ShellOpResult(run_once_inner(&factory, &state, cmd, wait).await)
                     }))
                 },
             )?,
@@ -140,12 +142,16 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
 
         proto.set(
             "keepWaiting",
-            Function::new(ctx.clone(), |this: This<Class<'js, ShellJs<F>>>| {
-                let state = this.0.borrow().state.clone();
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    ShellOpResult(keep_waiting_inner(&state).await)
-                }))
-            })?,
+            Function::new(
+                ctx.clone(),
+                |this: This<Class<'js, ShellJs<F>>>, opts: Opt<Object<'js>>| {
+                    let state = this.0.borrow().state.clone();
+                    let wait = parse_wait_opts(opts);
+                    Ok::<_, rquickjs::Error>(Promised::from(async move {
+                        ShellOpResult(keep_waiting_inner(&state, wait).await)
+                    }))
+                },
+            )?,
         )?;
 
         proto.set(
@@ -294,10 +300,51 @@ enum ShellToolError {
     InvalidBashName(String),
 }
 
+/// The shell tool's wall-clock ceiling when the model doesn't set `max`.
+/// Unlike `frances_shell` (which leaves `max` unbounded by default), the
+/// model-facing tool always applies a backstop so a chatty-but-endless
+/// command (a streaming build, `tail -f`, a dev server) can't hold the
+/// session forever — `quiet` never trips while output flows.
+const DEFAULT_MAX: Duration = Duration::from_secs(120);
+/// Smallest gap kept between the effective `quiet` and `max`. `max` is a
+/// wall-clock backstop, so it must sit past `quiet` or it would pre-empt
+/// the silence window. Too-small a `max` is clamped up, never rejected.
+const MAX_MARGIN: Duration = Duration::from_secs(10);
+
+/// Convert a JS-supplied number of seconds into a `Duration`. Non-finite
+/// or negative values are treated as "not set" (`None`).
+fn secs_to_duration(secs: f64) -> Option<Duration> {
+    (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
+}
+
+/// Resolve the model-facing `{ quiet, max }` (seconds, both optional) into
+/// the concrete `WaitOpts` the shell runs with. Quiet falls back to
+/// `frances_shell::DEFAULT_QUIET`, max to [`DEFAULT_MAX`], and max is
+/// clamped up to at least `quiet + MAX_MARGIN` so the ceiling can never
+/// fire before the silence window.
+fn parse_wait_opts(opts: Opt<Object<'_>>) -> WaitOpts {
+    let (mut quiet, mut max) = (None, None);
+    if let Some(obj) = opts.0 {
+        if let Ok(Some(q)) = obj.get::<_, Option<f64>>("quiet") {
+            quiet = secs_to_duration(q);
+        }
+        if let Ok(Some(m)) = obj.get::<_, Option<f64>>("max") {
+            max = secs_to_duration(m);
+        }
+    }
+    let quiet = quiet.unwrap_or(frances_shell::DEFAULT_QUIET);
+    let max = max.unwrap_or(DEFAULT_MAX).max(quiet + MAX_MARGIN);
+    WaitOpts {
+        quiet: Some(quiet),
+        max: Some(max),
+    }
+}
+
 async fn run_once_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: String,
+    wait: WaitOpts,
 ) -> Result<Outcome, ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
@@ -309,10 +356,7 @@ async fn run_once_inner<F: WorkflowShell>(
     ensure_shell(&mut guard, factory).await?;
     let outcome = {
         let shell = guard.shell.as_mut().expect("shell is Some");
-        shell
-            .run(&cmd, WaitOpts::default())
-            .await
-            .map_err(ShellToolError::Run)?
+        shell.run(&cmd, wait).await.map_err(ShellToolError::Run)?
     };
     Ok(absorb_outcome(&mut guard, outcome))
 }
@@ -340,6 +384,7 @@ async fn ensure_shell<F: WorkflowShell>(
 
 async fn keep_waiting_inner(
     state: &Arc<AsyncMutex<ShellState>>,
+    wait: WaitOpts,
 ) -> Result<Outcome, ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
@@ -351,7 +396,7 @@ async fn keep_waiting_inner(
     let outcome = {
         let shell = guard.shell.as_mut().ok_or(ShellToolError::HandleGone)?;
         shell
-            .keep_waiting(WaitOpts::default())
+            .keep_waiting(wait)
             .await
             .map_err(ShellToolError::KeepWaiting)?
     };

@@ -31,7 +31,7 @@ use genai::resolver::{AuthData, AuthResolver, Endpoint, ServiceTargetResolver};
 use serde_json::Value;
 use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_core::Truncated;
@@ -100,6 +100,56 @@ impl From<ErasedError> for Error {
     fn from(e: ErasedError) -> Self {
         Self::OnEvent(e)
     }
+}
+
+/// Total attempts for one chat call (1 initial + retries) when the
+/// failure is transient and lands before any model output.
+const MAX_STREAM_ATTEMPTS: u32 = 4;
+
+/// Backoff before the next attempt, given the attempt number that just
+/// failed (1-based): 250ms, 500ms, 1s.
+fn retry_backoff(failed_attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_millis(250 * (1u64 << (failed_attempt - 1)))
+}
+
+/// Whether an error is a transient network/server fault worth retrying.
+/// Conservative: 5xx, 429, and dropped connections/streams only — never
+/// 4xx (bad request / auth) or our own encode/decode/cancel errors,
+/// which would fail identically on retry.
+fn is_transient(err: &Error) -> bool {
+    match err {
+        Error::GenAI(e) => genai_transient(e),
+        _ => false,
+    }
+}
+
+fn genai_transient(e: &genai::Error) -> bool {
+    use genai::Error as G;
+    match e {
+        G::HttpError { status, .. } => transient_status(*status),
+        // A broken stream is safe to retry *before any output* (the only
+        // place `is_transient` is consulted). genai collapses the cause to
+        // a string here, so we can't see the status — but a stream that
+        // died before emitting anything is exactly what we want to retry.
+        G::WebStream { .. } => true,
+        G::WebModelCall { webc_error, .. } | G::WebAdapterCall { webc_error, .. } => {
+            webc_transient(webc_error)
+        }
+        _ => false,
+    }
+}
+
+fn webc_transient(e: &genai::webc::Error) -> bool {
+    use genai::webc::Error as W;
+    match e {
+        W::Reqwest(_) => true,
+        W::ResponseFailedStatus { status, .. } => transient_status(*status),
+        _ => false,
+    }
+}
+
+fn transient_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
 }
 
 #[async_trait]
@@ -210,121 +260,172 @@ impl provider::Provider for Provider {
 
         let client = build_client(self.adapter, &plan, &self.http)?;
 
-        debug!(
-            adapter = ?self.adapter,
-            messages = chat_req.messages.len(),
-            tools = req.tools.len(),
-            base_url = %plan.base_url,
-            model = %plan.model.id,
-            "calling genai chat stream"
-        );
         // Serialising the whole request (full history) is not free, so only
         // pay for it when TRACE is actually live. Cap is large enough that a
-        // typical multi-turn body fits even with several tool messages.
+        // typical multi-turn body fits even with several tool messages. The
+        // body is identical across retries, so trace it once.
         if tracing::enabled!(tracing::Level::TRACE)
             && let Ok(s) = serde_json::to_string(&chat_req)
         {
             trace!(body = %Truncated::<20000>::new(s), "chat request body");
         }
 
-        let response = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(Error::Cancelled),
-            res = client.exec_chat_stream(model_id.as_str(), chat_req, Some(&chat_options))
-                => res.map_err(Error::GenAI)?,
-        };
-        let mut stream = response.stream;
-
-        let mut text = String::new();
-        let mut reasoning_text = String::new();
-        let mut thought_signatures: Vec<String> = Vec::new();
-        let mut tool_calls: Vec<ToolCall> = Vec::new();
-        let mut final_usage: Option<Usage> = None;
-
+        // Transparent transient-failure retry. Retrying is only safe while NO
+        // model output has reached `on_event` yet: once a TextDelta /
+        // ReasoningDelta / ToolCall / History has been emitted, a retry would
+        // re-stream it (duplicate text on screen, duplicate tool calls in
+        // history). `emitted` gates that — it only flips false→true, so any
+        // error after the first output is terminal. History for `new_inputs`
+        // was already emitted above, once, before this loop.
+        let mut emitted = false;
+        let mut attempt: u32 = 0;
         loop {
-            let event = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return Err(Error::Cancelled),
-                next = stream.next() => match next {
-                    Some(Ok(ev)) => ev,
-                    Some(Err(e)) => return Err(Error::GenAI(e)),
-                    None => break,
-                },
-            };
+            attempt += 1;
+            debug!(
+                adapter = ?self.adapter,
+                messages = chat_req.messages.len(),
+                tools = req.tools.len(),
+                base_url = %plan.base_url,
+                model = %plan.model.id,
+                attempt,
+                "calling genai chat stream"
+            );
 
-            match event {
-                ChatStreamEvent::Start => {}
-                ChatStreamEvent::Chunk(chunk) if !chunk.content.is_empty() => {
-                    text.push_str(&chunk.content);
-                    on_event(StreamEvent::TextDelta(chunk.content))?;
-                }
-                ChatStreamEvent::Chunk(_) => {}
-                ChatStreamEvent::ReasoningChunk(chunk) if !chunk.content.is_empty() => {
-                    // Reasoning rides its own channel — consumers (TUI,
-                    // step-transcript summariser) treat it differently
-                    // from response text. It's also retained verbatim for
-                    // the assistant `reasoning_content` round-trip.
-                    reasoning_text.push_str(&chunk.content);
-                    on_event(StreamEvent::ReasoningDelta(chunk.content))?;
-                }
-                ChatStreamEvent::ReasoningChunk(_) => {}
-                ChatStreamEvent::ThoughtSignatureChunk(chunk) if !chunk.content.is_empty() => {
-                    thought_signatures.push(chunk.content);
-                }
-                ChatStreamEvent::ThoughtSignatureChunk(_) => {}
-                ChatStreamEvent::ToolCallChunk(tc) => {
-                    let mut call = map_tool_call(tc.tool_call);
-                    if qwen_quirks {
-                        frances_models_llm::tool_args::repair_qwen_quirks(&mut call, req.tools);
+            let result: std::result::Result<CompletionOutcome, Error> = async {
+                let response = tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => return Err(Error::Cancelled),
+                    res = client.exec_chat_stream(model_id.as_str(), chat_req.clone(), Some(&chat_options))
+                        => res.map_err(Error::GenAI)?,
+                };
+                let mut stream = response.stream;
+
+                let mut text = String::new();
+                let mut reasoning_text = String::new();
+                let mut thought_signatures: Vec<String> = Vec::new();
+                let mut tool_calls: Vec<ToolCall> = Vec::new();
+                let mut final_usage: Option<Usage> = None;
+
+                loop {
+                    let event = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => return Err(Error::Cancelled),
+                        next = stream.next() => match next {
+                            Some(Ok(ev)) => ev,
+                            Some(Err(e)) => return Err(Error::GenAI(e)),
+                            None => break,
+                        },
+                    };
+
+                    match event {
+                        ChatStreamEvent::Start => {}
+                        ChatStreamEvent::Chunk(chunk) if !chunk.content.is_empty() => {
+                            text.push_str(&chunk.content);
+                            emitted = true;
+                            on_event(StreamEvent::TextDelta(chunk.content))?;
+                        }
+                        ChatStreamEvent::Chunk(_) => {}
+                        ChatStreamEvent::ReasoningChunk(chunk) if !chunk.content.is_empty() => {
+                            // Reasoning rides its own channel — consumers (TUI,
+                            // step-transcript summariser) treat it differently
+                            // from response text. It's also retained verbatim for
+                            // the assistant `reasoning_content` round-trip.
+                            reasoning_text.push_str(&chunk.content);
+                            emitted = true;
+                            on_event(StreamEvent::ReasoningDelta(chunk.content))?;
+                        }
+                        ChatStreamEvent::ReasoningChunk(_) => {}
+                        ChatStreamEvent::ThoughtSignatureChunk(chunk) if !chunk.content.is_empty() => {
+                            thought_signatures.push(chunk.content);
+                        }
+                        ChatStreamEvent::ThoughtSignatureChunk(_) => {}
+                        ChatStreamEvent::ToolCallChunk(tc) => {
+                            let mut call = map_tool_call(tc.tool_call);
+                            if qwen_quirks {
+                                frances_models_llm::tool_args::repair_qwen_quirks(&mut call, req.tools);
+                            }
+                            trace!(
+                                call_id = %call.id,
+                                name = %call.name,
+                                arguments = %call.arguments,
+                                "tool call from model",
+                            );
+                            emitted = true;
+                            on_event(StreamEvent::ToolCall(call.clone()))?;
+                            tool_calls.push(call);
+                            if let Some(cap) = max_tool_calls
+                                && tool_calls.len() >= cap
+                            {
+                                let assistant = build_assistant_payload(
+                                    &text,
+                                    &tool_calls,
+                                    &reasoning_text,
+                                    &thought_signatures,
+                                )
+                                .map_err(Error::EncodeHistory)?;
+                                on_event(StreamEvent::History(assistant))?;
+                                return Ok(CompletionOutcome { text, tool_calls });
+                            }
+                        }
+                        ChatStreamEvent::End(end) => {
+                            if let Some(u) = end.captured_usage.as_ref() {
+                                final_usage = Some(map_usage(u));
+                            }
+                            if let Some(rc) = &end.captured_reasoning_content
+                                && reasoning_text.is_empty()
+                            {
+                                // Adapter captured a normalised reasoning string
+                                // that we missed via deltas (e.g. </think>-style
+                                // post-hoc extraction). Honour it.
+                                reasoning_text.push_str(rc);
+                            }
+                        }
                     }
-                    trace!(
-                        call_id = %call.id,
-                        name = %call.name,
-                        arguments = %call.arguments,
-                        "tool call from model",
-                    );
-                    on_event(StreamEvent::ToolCall(call.clone()))?;
-                    tool_calls.push(call);
-                    if let Some(cap) = max_tool_calls
-                        && tool_calls.len() >= cap
-                    {
-                        let assistant = build_assistant_payload(
-                            &text,
-                            &tool_calls,
-                            &reasoning_text,
-                            &thought_signatures,
-                        )
-                        .map_err(Error::EncodeHistory)?;
-                        on_event(StreamEvent::History(assistant))?;
-                        return Ok(CompletionOutcome { text, tool_calls });
-                    }
                 }
-                ChatStreamEvent::End(end) => {
-                    if let Some(u) = end.captured_usage.as_ref() {
-                        final_usage = Some(map_usage(u));
+
+                // Stream completed cleanly; any failure past this point is in
+                // our own post-processing, not a retryable network fault.
+                emitted = true;
+                if let Some(u) = final_usage {
+                    on_event(StreamEvent::Usage(u))?;
+                }
+                let assistant = build_assistant_payload(
+                    &text,
+                    &tool_calls,
+                    &reasoning_text,
+                    &thought_signatures,
+                )
+                .map_err(Error::EncodeHistory)?;
+                on_event(StreamEvent::History(assistant))?;
+
+                Ok(CompletionOutcome { text, tool_calls })
+            }
+            .await;
+
+            match result {
+                Ok(outcome) => return Ok(outcome),
+                Err(Error::Cancelled) => return Err(Error::Cancelled),
+                Err(e) => {
+                    if !emitted && attempt < MAX_STREAM_ATTEMPTS && is_transient(&e) {
+                        let delay = retry_backoff(attempt);
+                        warn!(
+                            attempt,
+                            max_attempts = MAX_STREAM_ATTEMPTS,
+                            delay_ms = delay.as_millis() as u64,
+                            error = %e,
+                            "transient provider failure before any output; retrying"
+                        );
+                        tokio::select! {
+                            biased;
+                            () = cancel.cancelled() => return Err(Error::Cancelled),
+                            () = tokio::time::sleep(delay) => {}
+                        }
+                        continue;
                     }
-                    if let Some(rc) = &end.captured_reasoning_content
-                        && reasoning_text.is_empty()
-                    {
-                        // Adapter captured a normalised reasoning string
-                        // that we missed via deltas (e.g. </think>-style
-                        // post-hoc extraction). Honour it.
-                        reasoning_text.push_str(rc);
-                    }
+                    return Err(e);
                 }
             }
         }
-
-        if let Some(u) = final_usage {
-            on_event(StreamEvent::Usage(u))?;
-        }
-
-        let assistant =
-            build_assistant_payload(&text, &tool_calls, &reasoning_text, &thought_signatures)
-                .map_err(Error::EncodeHistory)?;
-        on_event(StreamEvent::History(assistant))?;
-
-        Ok(CompletionOutcome { text, tool_calls })
     }
 }
 

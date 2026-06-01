@@ -589,9 +589,9 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
         const sh = new Shell();
         const kill = new Kill(sh);
 
-        // Long sleep — runOnce returns Quiet after the default 1s
-        // silence window.
-        const r1 = await sh.runOnce("sleep 30");
+        // Long sleep — a short quiet makes runOnce return Quiet while
+        // the sleep is still silent.
+        const r1 = await sh.runOnce("sleep 30", { quiet: 0.3 });
 
         // Now drive the Kill tool the same way the workflow runtime
         // would.

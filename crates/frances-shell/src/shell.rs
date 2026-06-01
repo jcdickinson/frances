@@ -17,7 +17,11 @@ use crate::proto::{Sentinel, handshake_bytes, make_nonce, wrapper_bytes};
 pub use crate::reader::QuietReason;
 use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
 
-const DEFAULT_QUIET: Duration = Duration::from_secs(1);
+/// Output-silence window used when [`WaitOpts::quiet`] is `None`. This is
+/// the mechanism's only built-in default — a `None` `max` stays unbounded.
+/// Higher-level callers that want a wall-clock ceiling (e.g. the shell
+/// tool) layer their own default and any quiet/max relationship on top.
+pub const DEFAULT_QUIET: Duration = Duration::from_secs(10);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A long-lived bash subprocess.
@@ -72,9 +76,10 @@ pub struct ShellOptions {
 /// before returning [`RunOutcome::Quiet`].
 ///
 /// Both fields are independent and either can be `None`:
-/// - `quiet = None` falls back to a 1-second default.
+/// - `quiet = None` falls back to [`DEFAULT_QUIET`] (10s).
 /// - `max = None` disables the wall-clock ceiling — only output silence
-///   (or the sentinel) will return early.
+///   (or the sentinel) returns early. Either way `max` only yields
+///   `Quiet`; the command keeps running, so it's never a kill.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WaitOpts {
     /// Return [`RunOutcome::Quiet`] after this much output silence. The
