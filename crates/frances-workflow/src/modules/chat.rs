@@ -153,7 +153,7 @@ pub(crate) fn build_complete_fn<'js, D: WorkflowDeps>(
                 let req = CompleteRequest {
                     intents: &intents_ref,
                     session_id: &session_id,
-                    env: &env,
+                    env: env.as_ref(),
                     history: &[],
                     new_inputs: &new_inputs,
                     tools: &tools,

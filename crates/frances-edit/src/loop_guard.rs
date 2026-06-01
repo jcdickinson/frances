@@ -30,6 +30,18 @@ pub enum LoopKey {
     Search { args_hash: u64 },
 }
 
+/// Discriminator prepended to a [`LoopKey`] argument hash so two read-style
+/// tools can't alias each other even with identical argument bytes. The
+/// hashers live in `frances-workflow`, split across two files; keeping the
+/// discriminants here in one enum is what stops a future hasher from silently
+/// reusing a value.
+#[repr(u8)]
+pub enum LoopKind {
+    ReadFile = 0,
+    ReadRaw = 1,
+    Search = 2,
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct LoopSet {
     entries: HashSet<LoopKey>,

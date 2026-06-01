@@ -1623,6 +1623,7 @@ dependencies = [
 name = "frances-shell"
 version = "0.1.0"
 dependencies = [
+ "frances-core",
  "getrandom 0.2.17",
  "libc",
  "tempfile",

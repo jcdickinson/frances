@@ -771,8 +771,8 @@ pub mod test_deps {
             &self.editor_factory
         }
 
-        fn current_env(&self) -> HashMap<OsString, OsString> {
-            HashMap::new()
+        fn current_env(&self) -> Arc<HashMap<OsString, OsString>> {
+            Arc::new(HashMap::new())
         }
 
         fn current_cwd(&self) -> Option<PathBuf> {
@@ -895,8 +895,8 @@ pub mod test_deps {
             &self.editor_factory
         }
 
-        fn current_env(&self) -> HashMap<OsString, OsString> {
-            HashMap::new()
+        fn current_env(&self) -> Arc<HashMap<OsString, OsString>> {
+            Arc::new(HashMap::new())
         }
 
         fn current_cwd(&self) -> Option<PathBuf> {
@@ -1057,7 +1057,7 @@ pub mod test_deps {
 
         async fn run(
             &self,
-            _env: HashMap<OsString, OsString>,
+            _env: Arc<HashMap<OsString, OsString>>,
             tools: Vec<ToolDef>,
             _tool_choice: Option<ToolChoice>,
             cancel: tokio_util::sync::CancellationToken,

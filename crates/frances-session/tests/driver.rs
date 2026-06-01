@@ -107,7 +107,7 @@ async fn harness(workflow_src: &str) -> Harness {
         tty_key: None,
         process: ProcessContext {
             cwd: Some(tempdir.path().to_path_buf()),
-            env: std::env::vars_os().collect(),
+            env: std::sync::Arc::new(std::env::vars_os().collect()),
         },
     };
 

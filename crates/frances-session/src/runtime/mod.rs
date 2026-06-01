@@ -113,7 +113,7 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
         &self.editor_factory
     }
 
-    fn current_env(&self) -> HashMap<std::ffi::OsString, std::ffi::OsString> {
+    fn current_env(&self) -> Arc<HashMap<std::ffi::OsString, std::ffi::OsString>> {
         self.invocation.lock().process.env.clone()
     }
 

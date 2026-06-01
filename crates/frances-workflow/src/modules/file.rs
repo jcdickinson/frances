@@ -25,6 +25,7 @@
 //! other ops require a prior successful `readFile`.
 
 use std::fs;
+use std::hash::Hasher;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
@@ -37,7 +38,7 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use twox_hash::XxHash3_64;
 
 use frances_core::resolve_relative;
-use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, WriteMode};
+use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, LoopKind, WriteMode};
 
 use super::throw_js as throw;
 use crate::deps::{EditorFactory, WorkflowDeps};
@@ -391,26 +392,26 @@ async fn read_file_lines<F: WorkflowFs>(fs: &F, path: &Path) -> io::Result<Vec<S
 }
 
 fn hash_read_file_args(args: &ReadFileArgs) -> u64 {
-    let mut buf = Vec::with_capacity(64);
+    let mut hasher = XxHash3_64::new();
     // Discriminator so file_read and readRaw on the same path don't
     // collide; their result shapes are different.
-    buf.push(0u8);
-    buf.extend_from_slice(args.path.as_bytes());
-    buf.push(0);
+    hasher.write(&[LoopKind::ReadFile as u8]);
+    hasher.write(args.path.as_bytes());
+    hasher.write(&[0]);
     if let Some(ranges) = &args.ranges {
         for r in ranges {
-            buf.extend_from_slice(&r[0].to_le_bytes());
-            buf.extend_from_slice(&r[1].to_le_bytes());
+            hasher.write(&r[0].to_le_bytes());
+            hasher.write(&r[1].to_le_bytes());
         }
     }
-    XxHash3_64::oneshot(&buf)
+    hasher.finish()
 }
 
 fn hash_read_raw_args(path: &str) -> u64 {
-    let mut buf = Vec::with_capacity(path.len() + 1);
-    buf.push(1u8);
-    buf.extend_from_slice(path.as_bytes());
-    XxHash3_64::oneshot(&buf)
+    let mut hasher = XxHash3_64::new();
+    hasher.write(&[LoopKind::ReadRaw as u8]);
+    hasher.write(path.as_bytes());
+    hasher.finish()
 }
 
 fn write_draft(

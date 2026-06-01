@@ -282,9 +282,9 @@ impl WorkflowShell for MockShell {
             if real {
                 Shell::spawn(opts).await
             } else {
-                Err(ShellError::Handshake(
-                    "MockShell: real bash not enabled (use MockShell::with_real)".to_owned(),
-                ))
+                Err(ShellError::Spawn(std::io::Error::other(
+                    "MockShell: real bash not enabled (use MockShell::with_real)",
+                )))
             }
         }
     }

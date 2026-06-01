@@ -9,8 +9,10 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use frances_core::Truncated;
+
 use crate::child::{list_children, signal_pid};
-use crate::error::{ShellError, ShellResult};
+use crate::error::{HandshakeFailure, ShellError, ShellResult};
 use crate::proto::{Sentinel, handshake_bytes, make_nonce, wrapper_bytes};
 pub use crate::reader::QuietReason;
 use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
@@ -33,9 +35,14 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// `-c`) will not work in this mode. Non-interactive equivalents (`psql -c
 /// "SELECT 1"`, `ssh host cmd`) work fine.
 pub struct Shell {
-    child: Option<Child>,
-    stdin: Option<ChildStdin>,
-    reader: Option<OutputReader<ChildStdout>>,
+    // Field declaration order is load-bearing for drop: fields drop
+    // top-to-bottom, so `stdin` closes before `_child`. Closing stdin asks
+    // bash to exit gracefully (it sees EOF); the Command's `kill_on_drop`
+    // is the backstop when `_child` drops a moment later.
+    stdin: ChildStdin,
+    reader: OutputReader<ChildStdout>,
+    // Held only for its `kill_on_drop` side effect; never read after spawn.
+    _child: Child,
     bash_pid: u32,
     nonce: String,
     // Held for RAII cleanup of the per-shell tmpdir on drop.
@@ -133,47 +140,45 @@ impl Shell {
         let mut child = cmd.spawn().map_err(ShellError::Spawn)?;
         let bash_pid = child
             .id()
-            .ok_or_else(|| ShellError::Handshake("bash spawned without a PID".into()))?;
+            .ok_or(ShellError::Handshake(HandshakeFailure::MissingPid))?;
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| ShellError::Handshake("bash spawned without stdin".into()))?;
+            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdin))?;
         let stdout = child
             .stdout
             .take()
-            .ok_or_else(|| ShellError::Handshake("bash spawned without stdout".into()))?;
+            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdout))?;
 
         let mut reader = OutputReader::new(stdout, Sentinel::new(&nonce));
 
         stdin
             .write_all(&handshake_bytes(&nonce))
             .await
-            .map_err(|e| ShellError::Handshake(format!("write: {e}")))?;
+            .map_err(|e| ShellError::Handshake(HandshakeFailure::WriteFailed(e)))?;
         stdin
             .flush()
             .await
-            .map_err(|e| ShellError::Handshake(format!("flush: {e}")))?;
+            .map_err(|e| ShellError::Handshake(HandshakeFailure::FlushFailed(e)))?;
 
         match reader
             .read_until_sentinel(None, Some(HANDSHAKE_TIMEOUT))
             .await
-            .map_err(|e| ShellError::Handshake(format!("read: {e}")))?
+            .map_err(|e| ShellError::Handshake(HandshakeFailure::ReadFailed(e)))?
         {
             ReadOutcome::Done { .. } => {}
             ReadOutcome::Quiet { .. } => {
-                return Err(ShellError::Handshake(
-                    "timed out waiting for handshake sentinel".into(),
-                ));
+                return Err(ShellError::Handshake(HandshakeFailure::SentinelTimedOut));
             }
             ReadOutcome::Eof { .. } => {
-                return Err(ShellError::Handshake("bash exited during startup".into()));
+                return Err(ShellError::Handshake(HandshakeFailure::ExitedDuringStartup));
             }
         }
 
         let mut shell = Shell {
-            child: Some(child),
-            stdin: Some(stdin),
-            reader: Some(reader),
+            stdin,
+            reader,
+            _child: child,
             bash_pid,
             nonce,
             _tmpdir: tmpdir,
@@ -186,19 +191,20 @@ impl Shell {
             match shell.run(&script, WaitOpts::default()).await? {
                 RunOutcome::Done { exit_code: 0, .. } => {}
                 RunOutcome::Done { exit_code, output } => {
-                    return Err(ShellError::Handshake(format!(
-                        "init_script failed (exit {exit_code}): {output}"
-                    )));
+                    return Err(ShellError::Handshake(HandshakeFailure::InitScriptFailed {
+                        exit_code,
+                        output: Truncated::new(output),
+                    }));
                 }
                 RunOutcome::Quiet { .. } => {
-                    return Err(ShellError::Handshake(
-                        "init_script did not complete within default wait".into(),
-                    ));
+                    return Err(ShellError::Handshake(HandshakeFailure::InitScriptQuiet));
                 }
                 RunOutcome::Dead { output } => {
-                    return Err(ShellError::Handshake(format!(
-                        "bash died running init_script: {output}"
-                    )));
+                    return Err(ShellError::Handshake(
+                        HandshakeFailure::BashDiedDuringInit {
+                            output: Truncated::new(output),
+                        },
+                    ));
                 }
             }
         }
@@ -220,9 +226,7 @@ impl Shell {
     /// full output bytes so direct callers don't need to consume the
     /// channel.
     pub fn set_output_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>) {
-        if let Some(reader) = self.reader.as_mut() {
-            reader.set_sink(sink);
-        }
+        self.reader.set_sink(sink);
     }
 
     /// Submit `cmd` to the shell and read until the sentinel, an output
@@ -248,10 +252,9 @@ impl Shell {
         }
         if !self.running {
             tokio::fs::write(&self.cmd_path, cmd).await?;
-            let stdin = self.stdin.as_mut().ok_or(ShellError::Dead)?;
             let bytes = wrapper_bytes(&self.cmd_path, &self.nonce);
-            stdin.write_all(&bytes).await?;
-            stdin.flush().await?;
+            self.stdin.write_all(&bytes).await?;
+            self.stdin.flush().await?;
             self.running = true;
         }
         self.read_outcome(wait).await
@@ -292,7 +295,7 @@ impl Shell {
         if !self.running {
             return Ok(());
         }
-        let kids = list_children(self.bash_pid).map_err(|e| ShellError::NoChild(e.to_string()))?;
+        let kids = list_children(self.bash_pid).map_err(ShellError::NoChild)?;
         for pid in kids {
             let _ = signal_pid(pid, sig);
         }
@@ -300,8 +303,8 @@ impl Shell {
     }
 
     async fn read_outcome(&mut self, wait: WaitOpts) -> ShellResult<RunOutcome> {
-        let reader = self.reader.as_mut().ok_or(ShellError::Dead)?;
-        let outcome = reader
+        let outcome = self
+            .reader
             .read_until_sentinel(Some(wait.quiet.unwrap_or(DEFAULT_QUIET)), wait.max)
             .await?;
         Ok(match outcome {
@@ -324,14 +327,5 @@ impl Shell {
                 }
             }
         })
-    }
-}
-
-impl Drop for Shell {
-    fn drop(&mut self) {
-        // Closing stdin politely asks bash to exit; kill_on_drop on the
-        // Command makes sure it dies even if it's blocked.
-        self.stdin.take();
-        self.child.take();
     }
 }

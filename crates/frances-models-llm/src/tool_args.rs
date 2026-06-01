@@ -26,10 +26,10 @@ pub fn annotate(calls: &mut [ToolCall], tools: &[ToolDef]) {
         else {
             continue;
         };
-        if let Err(message) = validate(&call.arguments, schema) {
+        if let Err(failure) = validate(&call.arguments, schema) {
             call.error = Some(ToolCallError {
                 expected_schema: schema.clone(),
-                message,
+                message: failure.0,
             });
         }
     }
@@ -70,19 +70,25 @@ pub fn repair_qwen_quirks(call: &mut ToolCall, tools: &[ToolDef]) {
     }
 }
 
+/// A schema-validation failure rendered for the model. Terminal: only ever
+/// becomes the `message` of a `ToolCallError` shown to the model, never
+/// matched on in Rust. `jsonschema::ValidationError` borrows the validated
+/// instance, so it can't outlive [`validate`] — render it here.
+pub struct ValidationMessage(pub String);
+
 /// Validate `args` against a tool's `parameters` JSON schema. Returns a
-/// concise, model-facing error string on mismatch.
+/// concise, model-facing [`ValidationMessage`] on mismatch.
 ///
 /// A schema that itself fails to compile is treated as "can't validate"
 /// (returns `Ok`) — that's a tool-author bug, not the model's fault, and
 /// we'd rather not block the call on it.
-pub fn validate(args: &Value, schema: &Value) -> Result<(), String> {
+pub fn validate(args: &Value, schema: &Value) -> Result<(), ValidationMessage> {
     let Ok(validator) = jsonschema::validator_for(schema) else {
         return Ok(());
     };
     match validator.validate(args) {
         Ok(()) => Ok(()),
-        Err(error) => Err(error.to_string()),
+        Err(error) => Err(ValidationMessage(error.to_string())),
     }
 }
 
@@ -146,7 +152,7 @@ mod tests {
         let schema = decide_schema();
         let err = validate(&json!({ "verdict": "maybe", "reason": "x" }), &schema)
             .expect_err("verdict outside enum should fail");
-        assert!(!err.is_empty());
+        assert!(!err.0.is_empty());
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
 
-use arc_swap::{ArcSwapOption, Guard};
+use arc_swap::ArcSwapOption;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{Stream, StreamExt, stream};
@@ -256,12 +256,10 @@ where
 
     /// Sync, lock-free read.
     pub fn get(&self) -> Option<ConfigBindingRef<U>> {
-        let guard = self.inner.value.load();
-        if guard.is_some() {
-            Some(ConfigBindingRef { guard })
-        } else {
-            None
-        }
+        self.inner
+            .value
+            .load_full()
+            .map(|value| ConfigBindingRef { value })
     }
 
     /// Future changes only. Yields `Some(_)` when a value is set or replaced;
@@ -320,10 +318,8 @@ where
             return r;
         }
         let default = Arc::new(U::default());
-        self.inner.value.store(Some(default));
-        ConfigBindingRef {
-            guard: self.inner.value.load(),
-        }
+        self.inner.value.store(Some(default.clone()));
+        ConfigBindingRef { value: default }
     }
 }
 
@@ -418,7 +414,11 @@ where
     /// on absence and never observe a `None` after promotion.
     pub fn get(&self) -> ConfigBindingRef<U> {
         ConfigBindingRef {
-            guard: self.inner.value.load(),
+            value: self
+                .inner
+                .value
+                .load_full()
+                .expect("required binding is sticky on absence"),
         }
     }
 
@@ -460,9 +460,9 @@ where
 // Read guard
 // --------------------------------------------------------------------------
 
-/// A lock-free read guard for a binding's current value. Derefs to `&U`.
+/// A snapshot of a binding's current value. Derefs to `&U`.
 pub struct ConfigBindingRef<U> {
-    guard: Guard<Option<Arc<U>>>,
+    value: Arc<U>,
 }
 
 impl<U: fmt::Debug> fmt::Debug for ConfigBindingRef<U> {
@@ -477,9 +477,6 @@ impl<U> Deref for ConfigBindingRef<U> {
     type Target = U;
 
     fn deref(&self) -> &U {
-        match self.guard.as_ref() {
-            Some(v) => v.as_ref(),
-            None => unreachable!("ConfigBindingRef constructed only when value is Some"),
-        }
+        &self.value
     }
 }

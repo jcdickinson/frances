@@ -42,7 +42,7 @@ use std::sync::Arc;
 use frances_core::now_ns;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
-use turso::{Builder, Connection, Value};
+use turso::{Builder, Connection, Row, Value};
 use twox_hash::XxHash3_64;
 use uuid::Uuid;
 
@@ -233,6 +233,20 @@ struct AppliedRow {
     checksum: i64,
 }
 
+fn expect_i64(row: &Row, idx: usize, column: &'static str) -> Result<i64> {
+    match row.get_value(idx)? {
+        Value::Integer(v) => Ok(v),
+        found => Err(MigrationError::NonIntegerColumn { column, found }),
+    }
+}
+
+fn expect_text(row: &Row, idx: usize, column: &'static str) -> Result<String> {
+    match row.get_value(idx)? {
+        Value::Text(t) => Ok(t),
+        found => Err(MigrationError::NonTextColumn { column, found }),
+    }
+}
+
 async fn load_applied(conn: &Connection, entity: &[u8]) -> Result<Vec<AppliedRow>> {
     let mut rows = conn
         .query(
@@ -242,37 +256,10 @@ async fn load_applied(conn: &Connection, entity: &[u8]) -> Result<Vec<AppliedRow
         .await?;
     let mut out = Vec::new();
     while let Some(row) = rows.next().await? {
-        let version = match row.get_value(0)? {
-            Value::Integer(v) => v,
-            other => {
-                return Err(MigrationError::NonIntegerColumn {
-                    column: "version",
-                    found: other,
-                });
-            }
-        };
-        let name = match row.get_value(1)? {
-            Value::Text(t) => t,
-            other => {
-                return Err(MigrationError::NonTextColumn {
-                    column: "name",
-                    found: other,
-                });
-            }
-        };
-        let checksum = match row.get_value(2)? {
-            Value::Integer(v) => v,
-            other => {
-                return Err(MigrationError::NonIntegerColumn {
-                    column: "checksum",
-                    found: other,
-                });
-            }
-        };
         out.push(AppliedRow {
-            version,
-            name,
-            checksum,
+            version: expect_i64(&row, 0, "version")?,
+            name: expect_text(&row, 1, "name")?,
+            checksum: expect_i64(&row, 2, "checksum")?,
         });
     }
     Ok(out)

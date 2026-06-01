@@ -12,7 +12,7 @@ mod store;
 pub use anchor::{Anchor, AnchorParseError};
 pub use edit::{EditOp, apply_ops};
 pub use engine::{EditEngine, WorkingFile};
-pub use loop_guard::LoopKey;
+pub use loop_guard::{LoopKey, LoopKind};
 pub use pool::Pool;
 pub use reconcile::{EditHints, ReconcileOutcome, reconcile};
 pub use render::{DiffOp, DiffRender, render_diff_block, render_file};

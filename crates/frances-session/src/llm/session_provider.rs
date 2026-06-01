@@ -177,10 +177,6 @@ pub enum SessionConfigLoadError {
 pub enum SessionConfigWriteError {
     #[error("session_config write: {0}")]
     Turso(#[from] turso::Error),
-    #[error(
-        "session_config write at {path}: {kind} values are not supported (only string|int|float|bool)"
-    )]
-    UnsupportedKind { path: String, kind: &'static str },
 }
 
 async fn read_rows(
@@ -219,15 +215,11 @@ async fn write_rows(db: &Database, events: &[ConfigEvent]) -> Result<(), Session
                 )
                 .await?;
             }
-            None if event.value.is_null() => {
+            // `value_row` returns `None` only for `Value::Null` (an unset
+            // key), so this is the delete path.
+            None => {
                 conn.execute("DELETE FROM session_config WHERE path_hash = ?1", (hash,))
                     .await?;
-            }
-            None => {
-                return Err(SessionConfigWriteError::UnsupportedKind {
-                    path: event.path.to_string(),
-                    kind: variant_name(&event.value),
-                });
             }
         }
     }
@@ -286,8 +278,8 @@ fn parse_path_json(text: &str) -> Result<Path, SessionConfigRowError> {
 }
 
 /// Inverse of `RawRow::into_event` for the supported scalar kinds. Returns
-/// `None` for `Value::Null` (the caller deletes the row) and for any
-/// variant the schema does not support.
+/// `None` for `Value::Null`, which means "unset the key" — the caller
+/// deletes the row.
 fn value_row(value: &Value) -> Option<(&'static str, String)> {
     match value {
         Value::String(s) => Some(("string", s.to_string())),
@@ -295,16 +287,6 @@ fn value_row(value: &Value) -> Option<(&'static str, String)> {
         Value::Float(f) => Some(("float", f.to_string())),
         Value::Bool(b) => Some(("bool", if *b { "true" } else { "false" }.to_owned())),
         Value::Null => None,
-    }
-}
-
-fn variant_name(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Int(_) => "int",
-        Value::Float(_) => "float",
-        Value::String(_) => "string",
     }
 }
 

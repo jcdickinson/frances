@@ -17,13 +17,14 @@
 //! Paths are resolved against the latest invocation's cwd
 //! (`WorkflowDeps::current_cwd`), matching the file editor.
 
+use std::hash::Hasher;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use frances_core::JsonRepair;
-use frances_edit::LoopKey;
+use frances_edit::{LoopKey, LoopKind};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Sink, SinkMatch};
@@ -162,40 +163,39 @@ async fn search_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Resu
 }
 
 fn hash_search_args(args: &FileSearchArgs) -> u64 {
-    // Hand-pack a canonical byte sequence rather than serde_json so
-    // the layout is fixed regardless of field-order drift in
-    // `FileSearchArgs`. Order matches the struct fields.
-    let mut buf = Vec::with_capacity(64);
+    // Hash a canonical byte sequence straight into the hasher (rather than
+    // serde_json, or a throwaway Vec) so the layout is fixed regardless of
+    // field-order drift in `FileSearchArgs`. Order matches the struct fields.
+    let mut hasher = XxHash3_64::new();
     // Discriminator — keeps file_find_or_grep keys from colliding with
     // anything else that might one day land in this hasher.
-    buf.push(2u8);
-    push_str_list_sorted(&mut buf, args.paths.as_deref());
-    buf.push(0xFE);
+    hasher.write(&[LoopKind::Search as u8]);
+    hash_str_list_sorted(&mut hasher, args.paths.as_deref());
+    hasher.write(&[0xFE]);
     if let Some(s) = &args.search {
-        buf.extend_from_slice(s.as_bytes());
+        hasher.write(s.as_bytes());
     }
-    buf.push(0xFE);
-    push_str_list_sorted(&mut buf, args.exclude.as_deref());
-    buf.push(0xFE);
-    buf.push(u8::from(args.ignore));
-    buf.push(u8::from(args.hidden));
+    hasher.write(&[0xFE]);
+    hash_str_list_sorted(&mut hasher, args.exclude.as_deref());
+    hasher.write(&[0xFE]);
+    hasher.write(&[u8::from(args.ignore), u8::from(args.hidden)]);
     if let Some(d) = args.depth {
-        buf.extend_from_slice(&d.to_le_bytes());
+        hasher.write(&d.to_le_bytes());
     }
-    buf.push(0xFE);
-    buf.push(u8::from(args.paths_only));
-    XxHash3_64::oneshot(&buf)
+    hasher.write(&[0xFE]);
+    hasher.write(&[u8::from(args.paths_only)]);
+    hasher.finish()
 }
 
-fn push_str_list_sorted(buf: &mut Vec<u8>, items: Option<&[String]>) {
+fn hash_str_list_sorted(hasher: &mut XxHash3_64, items: Option<&[String]>) {
     let Some(items) = items else {
         return;
     };
     let mut sorted: Vec<&String> = items.iter().collect();
     sorted.sort();
     for item in sorted {
-        buf.extend_from_slice(item.as_bytes());
-        buf.push(0);
+        hasher.write(item.as_bytes());
+        hasher.write(&[0]);
     }
 }
 

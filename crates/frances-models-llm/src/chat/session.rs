@@ -6,6 +6,7 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
@@ -35,7 +36,7 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
     /// `None` is unbounded.
     async fn run(
         &self,
-        env: HashMap<OsString, OsString>,
+        env: Arc<HashMap<OsString, OsString>>,
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
         cancel: CancellationToken,

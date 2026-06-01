@@ -2,19 +2,22 @@ use std::collections::HashMap;
 use std::env;
 use std::ffi::OsString;
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tracing::trace;
 
 use crate::tty::TtyKey;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct ProcessContext {
     pub cwd: Option<PathBuf>,
-    pub env: HashMap<OsString, OsString>,
+    /// Shared so per-completion reads (`current_env`) clone an `Arc`, not the
+    /// whole several-hundred-entry map. The context is replaced wholesale via
+    /// `update_invocation`, never mutated in place, so the sharing is safe.
+    pub env: Arc<HashMap<OsString, OsString>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct InvocationContext {
     pub tty_key: Option<TtyKey>,
     pub process: ProcessContext,
@@ -26,7 +29,7 @@ impl InvocationContext {
             tty_key,
             process: ProcessContext {
                 cwd: env::current_dir().ok(),
-                env: env::vars_os().collect(),
+                env: Arc::new(env::vars_os().collect()),
             },
         };
 

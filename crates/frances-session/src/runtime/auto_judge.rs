@@ -43,12 +43,14 @@ const INTENTS: &[&str] = &["auto", "referee", "cheap"];
 
 const SYSTEM_PROMPT: &str = include_str!("auto_judge/system_prompt.md");
 
-/// The single forced tool. `verdict` carries the decision. The schema is
-/// kept strict-compatible (`additionalProperties: false`, both `required`)
-/// so the provider gets OpenAI strict mode automatically; host-side
-/// validation backs it up where the provider ignores strict.
-static DECIDE_TOOL: LazyLock<ToolDef> = LazyLock::new(|| {
-    ToolDef::Function(ToolFunction {
+/// The single forced tool, held as the `[ToolDef; 1]` the request wants so
+/// each judge borrows `&*DECIDE_TOOLS` instead of deep-cloning the JSON
+/// schema per call. `verdict` carries the decision. The schema is kept
+/// strict-compatible (`additionalProperties: false`, both `required`) so the
+/// provider gets OpenAI strict mode automatically; host-side validation backs
+/// it up where the provider ignores strict.
+static DECIDE_TOOLS: LazyLock<[ToolDef; 1]> = LazyLock::new(|| {
+    [ToolDef::Function(ToolFunction {
         name: "decide".into(),
         description: "Decide whether to auto-approve the proposed action. Call this exactly once."
             .into(),
@@ -68,7 +70,7 @@ static DECIDE_TOOL: LazyLock<ToolDef> = LazyLock::new(|| {
             },
             "required": ["verdict", "reason"],
         }),
-    })
+    })]
 });
 
 #[derive(Debug)]
@@ -97,7 +99,6 @@ pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
 ) -> JudgeOutcome {
     let env = runtime.invocation.lock().process.env.clone();
     let session_id = format!("auto-judge:{}", uuid::Uuid::new_v4());
-    let tools = [DECIDE_TOOL.clone()];
     let inputs: Vec<HistoryInput<'_>> = vec![
         HistoryInput::System {
             text: SYSTEM_PROMPT,
@@ -110,10 +111,10 @@ pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
     let req = CompleteRequest {
         intents: INTENTS,
         session_id: &session_id,
-        env: &env,
+        env: env.as_ref(),
         history: &[],
         new_inputs: &inputs,
-        tools: &tools,
+        tools: &*DECIDE_TOOLS,
         // `complete_enforced` drives tool_choice from the demand.
         tool_choice: None,
         cancel: CancellationToken::new(),

@@ -152,7 +152,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
 
     async fn run(
         &self,
-        env: HashMap<OsString, OsString>,
+        env: Arc<HashMap<OsString, OsString>>,
         tools: Vec<ToolDef>,
         tool_choice: Option<ToolChoice>,
         cancel: CancellationToken,
@@ -205,7 +205,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             new_inputs: &new_inputs,
             tools: &tools,
             tool_choice: tool_choice.as_ref(),
-            env: &env,
+            env: env.as_ref(),
             max_tool_calls,
         };
 
@@ -482,7 +482,7 @@ mod tests {
     async fn run_once<D: ChatManagerDeps>(session: &super::ChatSession<D>) {
         session
             .run(
-                std::collections::HashMap::new(),
+                Arc::new(std::collections::HashMap::new()),
                 Vec::new(),
                 None,
                 tokio_util::sync::CancellationToken::new(),
@@ -645,7 +645,7 @@ mod tests {
         let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
         let outcome = session
             .run(
-                std::collections::HashMap::new(),
+                Arc::new(std::collections::HashMap::new()),
                 Vec::new(),
                 None,
                 tokio_util::sync::CancellationToken::new(),
@@ -712,7 +712,7 @@ mod tests {
         let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
         let outcome = session
             .run(
-                std::collections::HashMap::new(),
+                Arc::new(std::collections::HashMap::new()),
                 Vec::new(),
                 None,
                 tokio_util::sync::CancellationToken::new(),
@@ -743,7 +743,7 @@ mod tests {
 
         let result = session
             .run(
-                std::collections::HashMap::new(),
+                Arc::new(std::collections::HashMap::new()),
                 Vec::new(),
                 None,
                 cancel,
@@ -807,7 +807,7 @@ mod tests {
         let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
         let outcome = session
             .run(
-                std::collections::HashMap::new(),
+                Arc::new(std::collections::HashMap::new()),
                 decide,
                 None,
                 tokio_util::sync::CancellationToken::new(),

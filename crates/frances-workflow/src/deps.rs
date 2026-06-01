@@ -44,7 +44,7 @@ pub trait WorkflowDeps: WorkflowIo + Clone {
     /// (e.g. `OPENROUTER_API_KEY`) against the invoking process, not the
     /// session-runtime process. Returns an empty map before the
     /// invocation context is set.
-    fn current_env(&self) -> HashMap<OsString, OsString>;
+    fn current_env(&self) -> Arc<HashMap<OsString, OsString>>;
 
     /// Snapshot of the latest invocation's working directory. `Editor`
     /// resolves relative paths against this on every call, so a new
