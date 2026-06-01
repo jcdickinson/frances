@@ -1,10 +1,12 @@
 //! `frances:v1/tools/file` — anchor-aware file editor primitive.
 //!
-//! `new Editor()` represents the session-scoped editor. Each
-//! construction returns a handle backed by the *same* `EditSession`
-//! held by the runtime, so all reads/edits across a workflow share the
-//! anchor cache. The Rust side owns I/O (disk read, write, stat) and
-//! delegates anchor work to `frances_edit::EditSession`.
+//! `new Editor()` mints a fresh read context: an empty read cache + loop
+//! guard over the host's shared anchor engine. So anchor state persists
+//! across contexts (the engine is shared), but "have I read this here?"
+//! tracks the live context — a new `Editor` must `readFile` before it can
+//! edit. The Rust side owns I/O (disk read, write, stat) and delegates anchor
+//! work to `frances_edit::EditSession`. A `FileSearch` binds to an `Editor`
+//! to share its loop guard.
 //!
 //! Methods on the JS side:
 //!
@@ -35,13 +37,14 @@ use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
 use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value};
+use tokio::sync::Mutex as AsyncMutex;
 use twox_hash::XxHash3_64;
 
 use frances_core::resolve_relative;
 use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, LoopKind, WriteMode};
 
 use super::throw_js as throw;
-use crate::deps::{EditorFactory, WorkflowDeps};
+use crate::deps::{EditorFactory, EditorSession, WorkflowDeps};
 use crate::io::WorkflowFs;
 
 pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
@@ -51,7 +54,16 @@ pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     Constructor::new_class::<EditorJs<D>, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>| -> JsResult<Class<'js, EditorJs<D>>> {
-            Class::instance(ctx.clone(), EditorJs { deps: deps.clone() })
+            // Each `new Editor()` is a fresh read context: an empty read cache
+            // + loop guard over the host's shared anchor engine.
+            let session = Arc::new(AsyncMutex::new(deps.editor_factory().new_session()));
+            Class::instance(
+                ctx.clone(),
+                EditorJs {
+                    deps: deps.clone(),
+                    session,
+                },
+            )
         },
     )
 }
@@ -84,6 +96,9 @@ pub(crate) fn build_descriptions<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
 
 pub struct EditorJs<D: WorkflowDeps> {
     deps: D,
+    /// This editor's per-context read session. `pub(crate)` so a `FileSearch`
+    /// can bind to the same session (shared loop guard) at construction.
+    pub(crate) session: EditorSession<D>,
 }
 
 impl<'js, D: WorkflowDeps> Trace<'js> for EditorJs<D> {
@@ -107,15 +122,19 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                 ctx.clone(),
                 |this: This<Class<'js, EditorJs<D>>>, value: Value<'js>| {
                     let raw = super::rquickjs_to_json(&value);
-                    let deps = this.0.borrow().deps.clone();
+                    let b = this.0.borrow();
+                    let deps = b.deps.clone();
+                    let session = b.session.clone();
+                    drop(b);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
                             Ok(v) => match serde_json::from_value::<ReadFileArgs>(v.clone()) {
-                                Ok(args) => read_file_inner(&deps, args).await,
+                                Ok(args) => read_file_inner(&deps, &session, args).await,
                                 Err(_) => {
                                     if let Some(path_str) = v.as_str() {
                                         read_file_inner(
                                             &deps,
+                                            &session,
                                             ReadFileArgs {
                                                 path: path_str.to_string(),
                                                 ranges: None,
@@ -142,9 +161,12 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
             Function::new(
                 ctx.clone(),
                 |this: This<Class<'js, EditorJs<D>>>, path: String| {
-                    let deps = this.0.borrow().deps.clone();
+                    let b = this.0.borrow();
+                    let deps = b.deps.clone();
+                    let session = b.session.clone();
+                    drop(b);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        EditorStringResult(read_raw_inner(&deps, path).await)
+                        EditorStringResult(read_raw_inner(&deps, &session, path).await)
                     }))
                 },
             )?,
@@ -156,10 +178,13 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
                 ctx.clone(),
                 |this: This<Class<'js, EditorJs<D>>>, value: Value<'js>| {
                     let raw = super::rquickjs_to_json(&value);
-                    let deps = this.0.borrow().deps.clone();
+                    let b = this.0.borrow();
+                    let deps = b.deps.clone();
+                    let session = b.session.clone();
+                    drop(b);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
-                            Ok(v) => edit_inner(&deps, v).await,
+                            Ok(v) => edit_inner(&deps, &session, v).await,
                             Err(msg) => Err(FileToolError::DecodeArgs(msg)),
                         };
                         EditorEditResult(result)
@@ -173,9 +198,9 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for EditorJs<D> {
         proto.set(
             "commit",
             Function::new(ctx.clone(), |this: This<Class<'js, EditorJs<D>>>| {
-                let deps = this.0.borrow().deps.clone();
+                let session = this.0.borrow().session.clone();
                 Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    EditorUnitResult(commit_inner(&deps).await)
+                    EditorUnitResult(commit_inner::<D>(&session).await)
                 }))
             })?,
         )?;
@@ -220,7 +245,11 @@ enum FileToolError {
 
 /// Disk-only read with no `EditSession` anchor interaction — the path is
 /// not registered for editing and the caller gets no anchors.
-async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<String, FileToolError> {
+async fn read_raw_inner<D: WorkflowDeps>(
+    deps: &D,
+    session: &EditorSession<D>,
+    path: String,
+) -> Result<String, FileToolError> {
     let resolved = resolve_relative(Path::new(&path), deps.current_cwd().as_deref());
     let fs = deps.fs();
     let (mtime_ns, size) = stat_file(fs, &resolved)
@@ -235,7 +264,6 @@ async fn read_raw_inner<D: WorkflowDeps>(deps: &D, path: String) -> Result<Strin
         size,
     };
 
-    let session = deps.editor_factory().session();
     let mut sess = session.lock().await;
     if sess.is_loop(&key) {
         return Err(FileToolError::Loop { path });
@@ -262,6 +290,7 @@ struct ReadFileArgs {
 
 async fn read_file_inner<D: WorkflowDeps>(
     deps: &D,
+    session: &EditorSession<D>,
     args: ReadFileArgs,
 ) -> Result<String, FileToolError> {
     let resolved = resolve_relative(Path::new(&args.path), deps.current_cwd().as_deref());
@@ -278,7 +307,6 @@ async fn read_file_inner<D: WorkflowDeps>(
         size,
     };
 
-    let session: Arc<_> = deps.editor_factory().session();
     let mut sess = session.lock().await;
     if sess.is_loop(&key) {
         return Err(FileToolError::Loop { path: args.path });
@@ -346,11 +374,11 @@ async fn read_file_inner<D: WorkflowDeps>(
 
 async fn edit_inner<D: WorkflowDeps>(
     deps: &D,
+    session: &EditorSession<D>,
     raw: serde_json::Value,
 ) -> Result<DiffRender, FileToolError> {
     let mut edit: LlmEdit = serde_json::from_value(raw).map_err(FileToolError::ParseEdit)?;
     resolve_edit_path(&mut edit, deps.current_cwd().as_deref());
-    let session = deps.editor_factory().session();
     let mut sess = session.lock().await;
     Ok(sess.edit(edit, write_draft).await?)
 }
@@ -456,9 +484,8 @@ fn mtime_ns_from(meta: &fs::Metadata) -> io::Result<i64> {
     i64::try_from(dur.as_nanos()).map_err(|e| io::Error::other(format!("mtime overflow: {e}")))
 }
 
-/// Run the session-scoped edit commit (clears anchor tombstones).
-async fn commit_inner<D: WorkflowDeps>(deps: &D) -> Result<(), FileToolError> {
-    let session = deps.editor_factory().session();
+/// Run the edit commit (clears anchor tombstones on the shared engine).
+async fn commit_inner<D: WorkflowDeps>(session: &EditorSession<D>) -> Result<(), FileToolError> {
     let mut sess = session.lock().await;
     Ok(sess.commit_edits().await?)
 }

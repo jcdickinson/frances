@@ -2,15 +2,18 @@
 // content search, and directory listing tool.
 //
 // `FileSearch` is the Rust-backed primitive: one async `search(args)`
-// method that returns a JSON-string payload. `Search` is the LLM-facing
-// tool class shaped for `chat.tools.push(...)`. It takes a `Variables`
-// instance so the `into` arg can route the full structured result into
-// a Frances variable, while the LLM still gets a compact inline preview.
+// method that returns a JSON-string payload. It binds to an `Editor` so it
+// shares that context's loop guard (an edit clears it, and it resets when the
+// context clears). `Search` is the LLM-facing tool class shaped for
+// `chat.tools.push(...)`. It takes a `Variables` instance so the `into` arg
+// can route the full structured result into a Frances variable, while the LLM
+// still gets a compact inline preview.
 //
 // Typical wiring:
 //
-//   const fs   = new FileSearch();
-//   const vars = new Variables();
+//   const editor = new Editor();
+//   const fs     = new FileSearch(editor);
+//   const vars   = new Variables();
 //   chat.tools.push(new Search(fs, vars));
 
 const { FileSearch, FileSearchDescriptions: desc } =

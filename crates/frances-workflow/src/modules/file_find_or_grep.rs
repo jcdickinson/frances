@@ -1,8 +1,8 @@
 //! `frances:v1/tools/file_find_or_grep` — combined name-pattern lookup,
 //! content search, and directory listing primitive.
 //!
-//! `new FileSearch()` exposes a single async method, `search(args)`, that
-//! drives `ignore::WalkParallel` (the same multi-threaded walker ripgrep
+//! `new FileSearch(editor)` exposes a single async method, `search(args)`,
+//! that drives `ignore::WalkParallel` (the same multi-threaded walker ripgrep
 //! uses) and — when `args.search` is set — runs `grep-searcher` per-file
 //! through a per-thread `Searcher`/`RegexMatcher` clone. The result is a
 //! JSON string the JS wrapper parses; building a JS value tree directly
@@ -37,8 +37,9 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use serde::{Deserialize, Serialize};
 use twox_hash::XxHash3_64;
 
+use super::file::EditorJs;
 use super::throw_js as throw;
-use crate::deps::{EditorFactory, WorkflowDeps};
+use crate::deps::{EditorSession, WorkflowDeps};
 
 /// Hard cap on result entries. Workers atomically reserve a slot before
 /// pushing; the (cap+1)-th reservation flips a sticky `truncated` flag
@@ -90,14 +91,27 @@ pub(crate) fn build_file_search_ctor<'js, D: WorkflowDeps>(
 ) -> JsResult<Constructor<'js>> {
     Constructor::new_class::<FileSearchJs<D>, _, _>(
         ctx.clone(),
-        move |ctx: Ctx<'js>| -> JsResult<Class<'js, FileSearchJs<D>>> {
-            Class::instance(ctx.clone(), FileSearchJs { deps: deps.clone() })
+        move |ctx: Ctx<'js>,
+              editor: Class<'js, EditorJs<D>>|
+              -> JsResult<Class<'js, FileSearchJs<D>>> {
+            // `new FileSearch(editor)` binds to the editor's per-context read
+            // session, so search and edit share one loop guard (an edit clears
+            // it) and both reset together when the context clears.
+            let session = editor.borrow().session.clone();
+            Class::instance(
+                ctx.clone(),
+                FileSearchJs {
+                    deps: deps.clone(),
+                    session,
+                },
+            )
         },
     )
 }
 
 pub struct FileSearchJs<D: WorkflowDeps> {
     deps: D,
+    session: EditorSession<D>,
 }
 
 impl<'js, D: WorkflowDeps> Trace<'js> for FileSearchJs<D> {
@@ -121,10 +135,13 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for FileSearchJs<D> {
                 ctx.clone(),
                 |this: This<Class<'js, FileSearchJs<D>>>, value: Value<'js>| {
                     let raw = super::rquickjs_to_json(&value);
-                    let deps = this.0.borrow().deps.clone();
+                    let b = this.0.borrow();
+                    let deps = b.deps.clone();
+                    let session = b.session.clone();
+                    drop(b);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
-                            Ok(v) => search_inner(&deps, v).await,
+                            Ok(v) => search_inner(&deps, &session, v).await,
                             Err(msg) => Err(msg),
                         };
                         SearchStringResult(result)
@@ -141,7 +158,11 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for FileSearchJs<D> {
     }
 }
 
-async fn search_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Result<String, String> {
+async fn search_inner<D: WorkflowDeps>(
+    deps: &D,
+    session: &EditorSession<D>,
+    raw: serde_json::Value,
+) -> Result<String, String> {
     let args = JsonRepair::<FileSearchArgs>::from_value(raw)
         .map_err(|e| format!("parse args: {e}"))?
         .into_inner();
@@ -149,7 +170,6 @@ async fn search_inner<D: WorkflowDeps>(deps: &D, raw: serde_json::Value) -> Resu
         args_hash: hash_search_args(&args),
     };
 
-    let session = deps.editor_factory().session();
     if session.lock().await.is_loop(&key) {
         return Err(loop_error_search().to_string());
     }

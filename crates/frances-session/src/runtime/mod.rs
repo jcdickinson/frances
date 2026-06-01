@@ -11,7 +11,6 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 use parking_lot::Mutex as StdMutex;
-use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -146,18 +145,19 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
 #[error("workflow stopped waiting for this permission")]
 pub struct PermissionDropped;
 
-/// Hands out the session-scoped `EditSession` — same `Arc` every call,
-/// so all workflow invocations share the anchor cache with the host.
+/// Hands out fresh per-context read sessions over one shared anchor engine,
+/// so workflow contexts share the persistent anchor state but each gets its
+/// own "have I read this here?" cache.
 #[derive(Clone)]
 pub struct SessionEditorFactory {
-    pub session: Arc<AsyncMutex<EditSession<AnchorStoreImpl>>>,
+    pub engine: Arc<EditEngine<AnchorStoreImpl>>,
 }
 
 impl EditorFactory for SessionEditorFactory {
     type Store = AnchorStoreImpl;
 
-    fn session(&self) -> Arc<AsyncMutex<EditSession<AnchorStoreImpl>>> {
-        self.session.clone()
+    fn new_session(&self) -> EditSession<AnchorStoreImpl> {
+        EditSession::new(self.engine.clone())
     }
 }
 
@@ -306,7 +306,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
 
         let invocation = Arc::new(StdMutex::new(invocation));
         let editor_factory = SessionEditorFactory {
-            session: Arc::new(AsyncMutex::new(EditSession::new(edit_engine))),
+            engine: Arc::new(edit_engine),
         };
         let workflow_runtime = Arc::new(WorkflowRuntime::new(WorkflowDepsImpl {
             chat: chat.clone(),

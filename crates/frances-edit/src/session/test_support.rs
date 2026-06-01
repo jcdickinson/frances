@@ -1,5 +1,6 @@
 use std::io;
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::{EditEngine, FakeStore, WriteMode};
 
@@ -10,7 +11,7 @@ pub fn lines_of(s: &str) -> Vec<String> {
 }
 
 pub fn fresh_session() -> EditSession<FakeStore> {
-    EditSession::new(EditEngine::new(FakeStore::new()))
+    EditSession::new(Arc::new(EditEngine::new(FakeStore::new())))
 }
 
 pub fn no_format(

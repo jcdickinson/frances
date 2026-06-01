@@ -198,7 +198,7 @@ impl Flex {
                 flex_shrink: fc.shrink,
                 ..Style::DEFAULT
             };
-                let leaf = tree
+            let leaf = tree
                 .new_leaf_with_context(style, idx)
                 .expect("taffy new_leaf_with_context");
             child_nodes.push(leaf);

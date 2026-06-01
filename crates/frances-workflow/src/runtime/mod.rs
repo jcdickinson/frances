@@ -692,7 +692,6 @@ pub mod test_deps {
     use std::ffi::OsString;
     use std::path::PathBuf;
     use std::sync::Arc;
-    use tokio::sync::Mutex as AsyncMutex;
     use uuid::Uuid;
 
     use crate::deps::{EditorFactory, WorkflowDeps};
@@ -911,20 +910,18 @@ pub mod test_deps {
         }
     }
 
-    /// Test editor factory: hands out a fresh in-memory `EditSession`
-    /// backed by `FakeStore`. Each clone shares the same session, so
-    /// reads and edits in a single test see the same anchor cache.
+    /// Test editor factory: hands out fresh in-memory read contexts over a
+    /// shared `FakeStore`-backed engine. Each clone shares the engine (so
+    /// anchors persist), but every `new_session` gets its own read cache.
     #[derive(Clone)]
     pub struct StubEditorFactory {
-        session: Arc<AsyncMutex<EditSession<FakeStore>>>,
+        engine: Arc<EditEngine<FakeStore>>,
     }
 
     impl Default for StubEditorFactory {
         fn default() -> Self {
             Self {
-                session: Arc::new(AsyncMutex::new(EditSession::new(EditEngine::new(
-                    FakeStore::new(),
-                )))),
+                engine: Arc::new(EditEngine::new(FakeStore::new())),
             }
         }
     }
@@ -932,8 +929,8 @@ pub mod test_deps {
     impl EditorFactory for StubEditorFactory {
         type Store = FakeStore;
 
-        fn session(&self) -> Arc<AsyncMutex<EditSession<FakeStore>>> {
-            self.session.clone()
+        fn new_session(&self) -> EditSession<FakeStore> {
+            EditSession::new(self.engine.clone())
         }
     }
 

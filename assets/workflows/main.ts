@@ -4,10 +4,14 @@
 // anchor-aware file_read/replace/insert_*/new/overwrite family.
 //
 // This version also keeps a rudimentary in-memory agentic loop:
+//   - a planning phase that interviews the user, then `plan_exit`
+//   - `plan_begin` to drop back into planning mid-execution to ask the user
+//     questions, carrying a goal + self-context across the context clear
 //   - a living typed plan (`plan_update`)
 //   - a structured task-completion signal (`task_complete`)
 //   - a cheap/referee model that approves or declines completion
-//   - context reset after each approved task, seeded with the plan state
+//   - ralph-wiggum reset after every referee verdict (approve or decline):
+//     the context is cleared and re-seeded from the plan state
 //
 // Wire up as the daemon's default workflow via config:
 //   default_workflow = "main"
@@ -102,20 +106,48 @@ let plan: Plan = {
 };
 let nextStepId = 1;
 let pendingCompletion: CompletionSignal | null = null;
+let pendingPlanExit = false;
+// When set, the execution agent has asked to drop back into planning. `goal`
+// is what it wants to resolve with the user; `context` is self-context it
+// wants carried across the context clear. Both seed the planning conversation.
+type PlanBeginRequest = { goal: string; context: string };
+let pendingPlanBegin: PlanBeginRequest | null = null;
+
+type Mode = "planning" | "executing";
+let mode: Mode = "planning";
+
+// The planning interview is adapted from Matt Pocock's "grill-me" skill:
+// https://github.com/mattpocock/skills/blob/main/skills/productivity/grill-me/SKILL.md
+const PLANNING_PROMPT =
+  "You are an agentic coding assistant, currently in the PLANNING phase. Your " +
+  "job here is not to do the work — it is to reach a shared understanding with " +
+  "the user and capture it as a typed plan.\n\n" +
+  "Interview the user relentlessly about every aspect of this plan until you " +
+  "reach a shared understanding. Walk down each branch of the design tree, " +
+  "resolving dependencies between decisions one-by-one. For each question, " +
+  "provide your recommended answer.\n\n" +
+  "Ask the questions one at a time.\n\n" +
+  "If a question can be answered by exploring the codebase, explore the " +
+  "codebase instead (you have read and search tools).\n\n" +
+  "As understanding crystallises, record it with the `plan_update` tool: a " +
+  "title, a prelude capturing durable context and the decisions reached, and " +
+  "an ordered list of steps. The plan should read like an ADR. When you and " +
+  "the user share a clear understanding and the plan has concrete steps, call " +
+  "`plan_exit` to leave planning and begin execution.";
 
 const SYSTEM_PROMPT =
-  "You are an agentic coding assistant. " +
-  "You are running inside a rudimentary structured agentic loop. Maintain a " +
-  "typed plan with the `plan_update` tool. The plan is living state: update " +
-  "titles, bodies, ordering, and the current step whenever reality changes. " +
-  "No work should happen outside an active step; if there is no suitable " +
-  "active step, update the plan first. When the active step is complete, call " +
-  "`task_complete` with an outcome, summary, and concrete proof. A separate " +
-  "referee model will approve or decline the completion. On approval, your " +
-  "conversation context is cleared and you are restarted with the whole plan " +
-  "(each step title, body, and completed proof) plus the current location." +
-  "Occassionally provide updates on what you are trying to do, don't just " +
-  "present the user with a stream of tool calls.";
+  "You are an agentic coding assistant in the EXECUTION phase of a structured " +
+  "agentic loop. A plan has already been agreed with the user. The plan is " +
+  "living state: keep it accurate with the `plan_update` tool whenever reality " +
+  "changes, but don't re-plan from scratch. No work should happen outside an " +
+  "active step. When the active step is complete, call `task_complete` with an " +
+  "outcome, summary, and concrete proof. A separate referee model will approve " +
+  "or decline the completion. On approval, your conversation context is cleared " +
+  "and you are restarted with the whole plan (each step title, body, and " +
+  "completed proof) plus the current location. If you are blocked on something " +
+  "only the user can decide, call `plan_begin` to return to planning and ask — " +
+  "don't guess. Occasionally provide updates on what you are trying to do; " +
+  "don't just present the user with a stream of tool calls.";
 
 function _okResult(call_id: string, content: string): ToolResult {
   return { role: "tool", call_id, content, is_error: false };
@@ -304,7 +336,7 @@ async function pipeAssistantTextToFrame(
 //      model on the next assistant turn as `ContentPart::ReasoningContent`
 //      (genai builds that payload from the chunks; we don't touch it).
 //   2. Frances's step summariser (`recordStepTranscript` →
-//      `summarizeStepTranscript` → `renderPlanForPrompt`) — this is the
+//      `summarizeStepTranscript` → `renderPlan`) — this is the
 //      one we *deliberately* exclude reasoning from. Reasoning is bulky
 //      model-internal scratch work; folding it into the step summary
 //      would dilute the summary and burn tokens for no real benefit.
@@ -331,42 +363,38 @@ async function pipeReasoningToFrame(
   }
 }
 
-function renderPlanForPrompt(): string {
+// Render the plan as an ADR-style markdown document: a title, prelude prose,
+// and one section per step. This is what the user sees in the transcript and
+// what the model and referee read back in their prompts.
+function renderPlan(): string {
   normalizePlan();
-  const lines = [
-    `Plan: ${plan.title}`,
-    plan.prelude ? `Prelude:\n${plan.prelude}` : "Prelude: (none)",
-    "",
-    "Steps:",
-  ];
+  const out = [`# ${plan.title}`];
+  if (plan.prelude.trim()) out.push("", plan.prelude.trim());
   if (plan.steps.length === 0) {
-    lines.push("  (no steps yet — create a plan before doing work)");
+    out.push("", "_No steps yet — agree a plan before doing work._");
+    return out.join("\n");
   }
   for (let i = 0; i < plan.steps.length; i++) {
     const step = plan.steps[i];
-    lines.push(`  ${i + 1}. [${step.status}] ${step.title} (id: ${step.id})`);
-    lines.push(`     body: ${step.body || "(empty)"}`);
+    out.push("", `## ${i + 1}. ${step.title} _(${step.status})_`);
+    if (step.body.trim()) out.push("", step.body.trim());
     if (step.status === "completed") {
-      lines.push(`     outcome: ${step.outcome || "succeeded"}`);
-      if (step.summary) lines.push(`     summary: ${step.summary}`);
-      lines.push(`     proof: ${proofToString(step.proof)}`);
+      out.push("", `**Outcome:** ${step.outcome || "succeeded"}`);
+      if (step.summary) out.push("", `**Summary:** ${step.summary}`);
+      out.push("", "**Proof:**", "", "```", proofToString(step.proof), "```");
       if (step.transcript_summary) {
-        lines.push(`     transcript_summary: ${step.transcript_summary}`);
+        out.push("", `**Transcript summary:** ${step.transcript_summary}`);
       }
     }
   }
   const active = currentStep();
-  lines.push("");
-  lines.push(
+  out.push(
+    "",
     active
-      ? `Current location: step ${stepNumber(active)} (${active.id}) — ${active.title}`
-      : "Current location: no active step",
+      ? `**Current step:** ${stepNumber(active)}. ${active.title}`
+      : "**Current step:** none",
   );
-  return lines.join("\n");
-}
-
-function renderPlanForTool(): string {
-  return renderPlanForPrompt();
+  return out.join("\n");
 }
 
 function activateStep(ref: unknown): void {
@@ -409,7 +437,47 @@ function contextAfterCompletion(completed: PlanStep): string {
     "Here is the full living plan state. It includes all steps with title, " +
     "body, and proof for completed steps, plus the current location. Continue " +
     "from there. If the plan is finished, report the final result to the user.\n\n" +
-    renderPlanForPrompt()
+    renderPlan()
+  );
+}
+
+function executionSeed(): string {
+  return (
+    "Planning is complete. The agreed plan is below. Begin executing from the " +
+    "active step. Work only that step; when it is done call `task_complete` " +
+    "with an outcome, summary, and concrete proof.\n\n" +
+    renderPlan()
+  );
+}
+
+function planBeginSeed(req: PlanBeginRequest): string {
+  const goal = req.goal || "(no goal stated)";
+  const context = req.context
+    ? `Context you carried forward:\n\n${req.context}\n\n`
+    : "";
+  return (
+    "You have returned to PLANNING from execution to resolve something with " +
+    "the user. Your execution context has been cleared.\n\n" +
+    `What you need to resolve:\n\n${goal}\n\n` +
+    context +
+    "Interview the user to resolve it. Record the resolution in the plan with " +
+    "`plan_update` (in the prelude or the relevant step body) so it survives " +
+    "the context clear; completed steps keep their proof, so do not redo or " +
+    "discard them. When the plan is right, call `plan_exit` to resume " +
+    "execution from the active step.\n\n" +
+    renderPlan()
+  );
+}
+
+function declineSeed(reason: string): string {
+  return (
+    "A referee reviewed your `task_complete` signal for the active step and " +
+    "DECLINED it. Your conversation context has been cleared. Reason given:\n\n" +
+    reason +
+    "\n\nThe full plan and your current position are below. Do the missing " +
+    "work for the active step, then call `task_complete` again only once the " +
+    "proof is adequate.\n\n" +
+    renderPlan()
   );
 }
 
@@ -485,12 +553,12 @@ class PlanUpdate {
       normalizePlan();
       transcript.push(
         new MarkdownSection({
-          content: `Plan updated.\n\n\`\`\`\n${renderPlanForPrompt()}\n\`\`\``,
+          content: `**Plan updated.**\n\n${renderPlan()}`,
           source: "assistant",
           closed: true,
         }),
       );
-      return _okResult(call.id, renderPlanForTool());
+      return _okResult(call.id, renderPlan());
     } catch (err) {
       return _errResult(call.id, err);
     }
@@ -564,6 +632,71 @@ class TaskComplete {
   };
 }
 
+class PlanExit {
+  name = "plan_exit";
+  description =
+    "Leave the planning phase and begin executing the plan. Call this only " +
+    "once you and the user share a clear understanding and the plan has " +
+    "concrete steps.";
+  parameters = { type: "object", properties: {} };
+
+  describe() {
+    return "";
+  }
+
+  handler = async ({ call }: any) => {
+    if (plan.steps.length === 0) {
+      return _errResult(
+        call.id,
+        "cannot exit planning with an empty plan; call plan_update to add steps first",
+      );
+    }
+    pendingPlanExit = true;
+    return _okResult(call.id, "Planning complete; beginning execution.");
+  };
+}
+
+const PLAN_BEGIN_SCHEMA = {
+  type: "object",
+  properties: {
+    goal: {
+      type: "string",
+      description:
+        "What you need to resolve with the user, and why it blocks the current step.",
+    },
+    context: {
+      type: "string",
+      description:
+        "Self-context to carry across the context clear: what you have " +
+        "discovered, tried, or decided so far that your planning self will need.",
+    },
+  },
+};
+
+class PlanBegin {
+  name = "plan_begin";
+  description =
+    "Return to the planning phase to ask the user questions or reshape the " +
+    "plan when you are blocked on something only the user can resolve. Your " +
+    "execution context is cleared, so state the `goal` and any `context` worth " +
+    "keeping. Call `plan_exit` to resume execution once it is resolved.";
+  parameters = PLAN_BEGIN_SCHEMA;
+
+  describe(call: any) {
+    const a = call.arguments || {};
+    return typeof a.goal === "string" ? a.goal : "";
+  }
+
+  handler = async ({ call }: any) => {
+    const args = call.arguments || {};
+    pendingPlanBegin = {
+      goal: typeof args.goal === "string" ? args.goal.trim() : "",
+      context: typeof args.context === "string" ? args.context.trim() : "",
+    };
+    return _okResult(call.id, "Returning to planning to resolve with the user.");
+  };
+}
+
 const DECIDE_SCHEMA = {
   type: "object",
   properties: {
@@ -606,7 +739,7 @@ async function referee(
           role: "user",
           content:
             "Current plan state:\n\n" +
-            renderPlanForPrompt() +
+            renderPlan() +
             "\n\nTask-completion signal:\n\n" +
             JSON.stringify(signal, null, 2),
         },
@@ -649,32 +782,15 @@ async function referee(
 const sh = new Shell();
 const wait = new Wait(sh);
 const kill = new Kill(sh);
-const editor = new Editor();
-const fileSearch = new FileSearch();
 const stepTranscriptEntries: string[] = [];
 let stepTranscriptSummary: string | null = null;
 const vars = new Variables();
-const tools = [
-  new Run(sh, { wait, kill }),
-  wait,
-  kill,
-  new ShellSet(sh, vars),
-  new ShellCapture(sh, vars),
-  new Read(editor, vars),
-  new ReplaceLines(editor, vars),
-  new InsertAfter(editor, vars),
-  new InsertBefore(editor, vars),
-  new New(editor, vars),
-  new Overwrite(editor, vars),
-  new Search(fileSearch, vars),
-  new VarGet(vars),
-  new VarSet(vars),
-  new VarAssign(vars),
-  new PlanUpdate(),
-  new TaskComplete(),
-];
 
-for (const tool of tools) {
+// Wrap a tool's handler to mirror its calls/results into the transcript and the
+// step summary. Each tool must be wrapped exactly once — wrapping is not
+// idempotent (it captures the current handler), so only ever wrap a fresh
+// instance.
+function wrapTool(tool: any): void {
   const original = tool.handler.bind(tool);
   tool.handler = async ({ call, scope }: any) => {
     transcript.push(new ToolUseSection({ call, tool }));
@@ -693,15 +809,92 @@ for (const tool of tools) {
   };
 }
 
-function newAgentChat(seed?: string): ChatSession {
+// Persistent tools: the long-lived shell subprocess, the variable store, and
+// the global plan all outlive any single context, so these are built and
+// wrapped once.
+const run = new Run(sh, { wait, kill });
+const shellSet = new ShellSet(sh, vars);
+const shellCapture = new ShellCapture(sh, vars);
+const varGet = new VarGet(vars);
+const varSet = new VarSet(vars);
+const varAssign = new VarAssign(vars);
+const planUpdate = new PlanUpdate();
+const taskComplete = new TaskComplete();
+const planExit = new PlanExit();
+const planBegin = new PlanBegin();
+const persistentTools = [
+  run,
+  wait,
+  kill,
+  shellSet,
+  shellCapture,
+  varGet,
+  varSet,
+  varAssign,
+  planUpdate,
+  taskComplete,
+  planExit,
+  planBegin,
+];
+for (const tool of persistentTools) wrapTool(tool);
+
+// Per-context file tools. A fresh `Editor` owns this context's read state
+// ("have I read this here?"); the `FileSearch` bound to it shares the loop
+// guard. `freshContext()` rebuilds them — and the planning/execution tool
+// lists — against a new Editor, so reads reset whenever context clears.
+let editor: any;
+let planningTools: any[];
+let executingTools: any[];
+
+function freshContext(): void {
+  editor = new Editor();
+  const fileSearch = new FileSearch(editor);
+  const read = new Read(editor, vars);
+  const search = new Search(fileSearch, vars);
+  const editTools = [
+    new ReplaceLines(editor, vars),
+    new InsertAfter(editor, vars),
+    new InsertBefore(editor, vars),
+    new New(editor, vars),
+    new Overwrite(editor, vars),
+  ];
+  for (const tool of [read, search, ...editTools]) wrapTool(tool);
+
+  const explore = [
+    run,
+    wait,
+    kill,
+    shellSet,
+    shellCapture,
+    read,
+    search,
+    varGet,
+    varSet,
+    varAssign,
+  ];
+  planningTools = [...explore, planUpdate, planExit];
+  executingTools = [...explore, ...editTools, planUpdate, taskComplete, planBegin];
+}
+
+function newPlanningChat(seed?: string): ChatSession {
+  freshContext();
   const session = new ChatSession({ model_intents: ["chat"] });
-  session.push({ role: "system", content: SYSTEM_PROMPT });
-  session.tools.push(...tools);
+  session.push({ role: "system", content: PLANNING_PROMPT });
+  session.tools.push(...planningTools);
   if (seed) session.push({ role: "user", content: seed });
   return session;
 }
 
-let chat = newAgentChat();
+function newExecutionChat(seed?: string): ChatSession {
+  freshContext();
+  const session = new ChatSession({ model_intents: ["chat"] });
+  session.push({ role: "system", content: SYSTEM_PROMPT });
+  session.tools.push(...executingTools);
+  if (seed) session.push({ role: "user", content: seed });
+  return session;
+}
+
+let chat = newPlanningChat();
 
 async function handlePendingCompletion(): Promise<boolean> {
   if (!pendingCompletion) return false;
@@ -709,15 +902,14 @@ async function handlePendingCompletion(): Promise<boolean> {
   pendingCompletion = null;
   const judgement = await referee(signal);
   if (judgement.type === "decline") {
+    // Ralph Wiggum retry: clear context and restart the step from the plan,
+    // carrying only the referee's reason forward. Same reset as an approval;
+    // the difference is the step doesn't advance and the step transcript
+    // keeps accumulating across the retry (so the eventual summary covers it).
     const msg = `Referee declined task completion: ${judgement.message}`;
     transcript.push(new MarkdownSection({ content: msg, closed: true }));
-    chat.push({
-      role: "user",
-      content:
-        msg +
-        "\n\nContinue in the current context. Update the plan if needed, do the missing work, and call task_complete again only when the proof is adequate.",
-    });
-    return false;
+    chat = newExecutionChat(declineSeed(judgement.message));
+    return true;
   }
 
   let completed: PlanStep;
@@ -745,7 +937,7 @@ async function handlePendingCompletion(): Promise<boolean> {
     }),
   );
   resetStepTranscript();
-  chat = newAgentChat(contextAfterCompletion(completed));
+  chat = newExecutionChat(contextAfterCompletion(completed));
   return true;
 }
 
@@ -767,9 +959,24 @@ type TurnEnd = "idle" | "interjected";
 // assistant turn + any orphaned tool_calls — keeping the OpenAI
 // contract that tool_calls are immediately answered).
 async function turn(): Promise<TurnEnd> {
+  // Bound the automatic loop: every context reset (step advance / retry) and
+  // every nudge counts against the same budget. Returns true once the budget
+  // is blown, having surfaced the error — the caller should stop the loop.
   let resetCount = 0;
+  function overBudget(): boolean {
+    resetCount += 1;
+    if (resetCount <= 50) return false;
+    transcript.push(
+      new ErrorSection({
+        content:
+          "agentic loop stopped after 50 automatic iterations (resets + nudges)",
+      }),
+    );
+    return true;
+  }
+
   while (true) {
-    setStatus("working…");
+    setStatus(mode === "planning" ? "planning…" : "working…");
     const cp = await chat.checkpoint();
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
@@ -812,23 +1019,68 @@ async function turn(): Promise<TurnEnd> {
     }
 
     const { tool_calls } = winner.completed;
+    if (pendingPlanExit) {
+      pendingPlanExit = false;
+      mode = "executing";
+      resetStepTranscript();
+      transcript.push(
+        new MarkdownSection({
+          content: "Planning complete — beginning execution.",
+          source: "assistant",
+          closed: true,
+        }),
+      );
+      chat = newExecutionChat(executionSeed());
+      continue;
+    }
+    if (pendingPlanBegin) {
+      // Execution agent dropped back into planning to ask the user. Clear
+      // context and switch toolsets; the plan (with its completion statuses)
+      // is preserved, so `plan_exit` later just resumes from the active step.
+      // Counting this against the budget bounds any plan_begin/plan_exit
+      // ping-pong (only one side needs to count to bound the round-trip).
+      const req = pendingPlanBegin;
+      pendingPlanBegin = null;
+      if (overBudget()) break;
+      mode = "planning";
+      transcript.push(
+        new MarkdownSection({
+          content: "Returning to planning to resolve a question with the user.",
+          source: "assistant",
+          closed: true,
+        }),
+      );
+      chat = newPlanningChat(planBeginSeed(req));
+      continue;
+    }
     if (pendingCompletion) {
       const reset = await handlePendingCompletion();
       if (reset) {
-        resetCount += 1;
-        if (resetCount > 50) {
-          transcript.push(
-            new ErrorSection({
-              content:
-                "agentic loop stopped after 50 automatic step transitions",
-            }),
-          );
-          break;
-        }
+        if (overBudget()) break;
         continue;
       }
     }
-    if (!tool_calls || tool_calls.length === 0) break;
+    if (!tool_calls || tool_calls.length === 0) {
+      // The only clean way out of a step is `task_complete`. If the model went
+      // idle while a step is still active, it stopped prematurely — nudge it
+      // to drive the step to a completion signal rather than handing a
+      // half-done step back to the user. With no active step the plan is
+      // finished, so break and yield (the same as planning's Q&A pause).
+      if (mode === "executing" && currentStep()) {
+        if (overBudget()) break;
+        chat.push({
+          role: "user",
+          content:
+            "You stopped without finishing the active step. Continue working " +
+            "on it. Call `task_complete` with an outcome (succeeded / partial " +
+            "/ failed), a summary, and concrete proof once it is done or you " +
+            "are blocked; call `plan_update` if the plan needs to change, or " +
+            "`plan_begin` if you need to ask the user something.",
+        });
+        continue;
+      }
+      break;
+    }
   }
   // Turn boundary: reconcile accumulated file edits (clears anchor
   // tombstones). The workflow owns this now — the host no longer fires
@@ -840,7 +1092,9 @@ async function turn(): Promise<TurnEnd> {
 
 transcript.push(
   new MarkdownSection({
-    content: "frances ready. Type `quit` to exit.",
+    content:
+      "frances ready. Describe what you'd like to do and we'll plan it " +
+      "together first. Type `quit` to exit.",
     closed: true,
   }),
 );

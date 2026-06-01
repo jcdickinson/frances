@@ -74,8 +74,9 @@ async fn run_script(deps: StubDeps, script: &str) -> Vec<SectionTranscript> {
 /// payload via a MarkdownSection so tests can parse it.
 const DUMP_RAW: &str = r#"
 import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+import { Editor } from "frances:v1/tools/file";
 import { transcript, MarkdownSection } from "frances:v1/sections";
-const fs = new FileSearch();
+const fs = new FileSearch(new Editor());
 const json = await fs.search(ARGS);
 transcript.push(new MarkdownSection({ content: json }));
 "#;
@@ -137,8 +138,9 @@ async fn empty_paths_without_search_rejects() {
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const fs = new FileSearch();
+        const fs = new FileSearch(new Editor());
         let msg;
         try {
             await fs.search({ paths: [] });
@@ -299,9 +301,10 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const fs = new FileSearch();
+        const fs = new FileSearch(new Editor());
         const vars = new Variables();
         const tool = new Search(fs, vars);
         const r = await tool.handler({
@@ -340,9 +343,10 @@ async fn search_tool_without_into_returns_compact_text() {
     let deps = deps_with_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const tool = new Search(new FileSearch(), new Variables());
+        const tool = new Search(new FileSearch(new Editor()), new Variables());
         const r = await tool.handler({
             call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "hello" } },
@@ -368,8 +372,9 @@ async fn loop_guard_blocks_identical_search() {
     deps.set_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const fs = new FileSearch();
+        const fs = new FileSearch(new Editor());
         await fs.search({ search: "hello" });
         let caught = "no-throw";
         try {
@@ -398,8 +403,8 @@ async fn loop_guard_search_clears_after_edit() {
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const fs = new FileSearch();
         const editor = new Editor();
+        const fs = new FileSearch(editor);
         await fs.search({ search: "hello" });
         const read = await editor.readFile("a.txt");
         const line_b = read.split("\n")[1];
@@ -430,8 +435,9 @@ async fn loop_guard_search_distinguishes_query() {
     deps.set_cwd(dir.path().to_path_buf());
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
         import { transcript, MarkdownSection } from "frances:v1/sections";
-        const fs = new FileSearch();
+        const fs = new FileSearch(new Editor());
         await fs.search({ search: "hello" });
         const second = await fs.search({ search: "world" });
         transcript.push(new MarkdownSection({ content: second }));

@@ -982,7 +982,7 @@ async fn hydrate_active_or_cascade<Io: frances_workflow::WorkflowIo>(
                     "workflow restore failed; tombstoning and trying next"
                 );
                 truncate_at_or_above(db, row.position).await?;
-                }
+            }
         }
     }
 }

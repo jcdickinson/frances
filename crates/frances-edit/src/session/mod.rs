@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use regex::Regex;
 
@@ -23,13 +23,24 @@ pub use types::{EditError, EditResult, LlmEdit, WriteMode};
 const DIFF_CONTEXT: usize = 2;
 
 pub struct EditSession<S: AnchorStore> {
-    engine: EditEngine<S>,
+    /// Shared anchor engine. Every method on it takes `&self`, so contexts
+    /// share one engine freely; the anchor/tombstone state it owns is
+    /// per-workspace, not per-context.
+    engine: Arc<EditEngine<S>>,
+    /// Per-context read cache: which files have been read here, plus the
+    /// anchored snapshot each edit validates against. Empty in a fresh
+    /// context, so an edit again requires a `read_file` in this context.
     open_files: HashMap<PathBuf, WorkingFile>,
+    /// Per-context anti-repeat guard for reads and searches (cleared on edit).
     loop_set: LoopSet,
 }
 
 impl<S: AnchorStore> EditSession<S> {
-    pub fn new(engine: EditEngine<S>) -> Self {
+    /// New read context over a shared anchor engine. The read cache and loop
+    /// guard start empty, so "have I read this here?" tracks the live context
+    /// rather than the whole workflow lifetime; the engine's persistent
+    /// anchor state is shared across contexts.
+    pub fn new(engine: Arc<EditEngine<S>>) -> Self {
         Self {
             engine,
             open_files: HashMap::new(),

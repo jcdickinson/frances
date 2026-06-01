@@ -53,8 +53,19 @@ pub trait WorkflowDeps: WorkflowIo + Clone {
     ) -> impl Future<Output = Result<Arc<WorkflowDb>, WorkflowDbError>> + Send + 'a;
 }
 
-/// Hands out the host's session-scoped `EditSession`.
+/// Hands out fresh per-context edit sessions over the host's shared anchor
+/// engine.
 pub trait EditorFactory: Clone + Send + Sync + 'static {
     type Store: AnchorStore + Send + Sync + 'static;
-    fn session(&self) -> Arc<AsyncMutex<EditSession<Self::Store>>>;
+
+    /// Mint a fresh read context — an empty read cache and loop guard over the
+    /// shared anchor engine. The workflow calls this per context (each `new
+    /// Editor()`), so "have I read this here?" resets when context clears.
+    fn new_session(&self) -> EditSession<Self::Store>;
 }
+
+/// The per-context edit session an `Editor` — and the `FileSearch` bound to
+/// it — operate on. Wrapped in `Arc<AsyncMutex<_>>` for the interior
+/// mutability the JS primitives need across concurrent tool calls.
+pub type EditorSession<D> =
+    Arc<AsyncMutex<EditSession<<<D as WorkflowDeps>::EditorFactory as EditorFactory>::Store>>>;
