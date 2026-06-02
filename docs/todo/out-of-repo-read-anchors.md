@@ -43,28 +43,90 @@ For a path that resolves **outside the editable root**:
   anchors have no reader — and rejecting makes the contract explicit rather
   than letting an edit silently target source that'll be clobbered.
 
-## Open question — how to define "the editable root"
+## Decision — how "the editable root" is defined
 
-This is the real design decision and the reason this isn't already done. Need a
-concrete predicate for in-repo (anchored + editable) vs out-of-repo (plain,
-read-only):
+Settled. The classification is "is this path under any registered **editable
+root**?" — anchored + editable inside, plain + read-only outside.
 
-- **Workspace root of cwd** — find the jj/git workspace root containing cwd;
-  inside → editable, outside → plain. Auto-detected, matches "my project"
-  intuition, costs a root lookup. Leaning this way.
-- **cwd subtree** — anything under cwd is in-repo. Simplest, no VCS lookup, but
-  wrong if you `cd` into a subdir or legitimately edit a sibling path.
-- **Configured writable roots** — explicit allowlist. Most precise, most
-  machinery; probably overkill unless we already need multi-root.
+- **Configurable markers, default `[".jj", ".git"]`.** Discovery walks up from
+  the session's cwd and stops at the first ancestor containing any configured
+  marker. That ancestor is the workspace root.
+- **No marker found → the session's initial cwd is the root.** Keeps the safe
+  bias: you can always edit where you started.
+- **Discover once, from the session's primary cwd — don't chase
+  `current_cwd()` per read.** You opened frances in project X; reading project Y
+  as reference *should* be plain + read-only until you explicitly add it. That
+  matches the future `/add-dir` model and is simpler than recomputing per read.
 
-Tension with the project's simplicity ethos: this adds a path-classification
-branch + a boundary definition to what's currently one uniform render path.
-Worth it (the token/state savings are real and recurring), but keep the
-predicate minimal — auto-detect, ask nothing of the model.
+### Why this predicate (failure-mode asymmetry)
+
+Misclassification is **not** symmetric, so the predicate biases toward
+*editable* when uncertain:
+
+- **False "outside"** (an in-repo file treated as external) → plain render *and
+  edits rejected*. A hard failure on a file you're allowed to edit. Bad.
+- **False "inside"** (an external file treated as in-repo) → over-anchoring,
+  i.e. today's waste. Annoying, not broken.
+
+The VCS workspace root is the right lower bound: everything in the repo stays
+editable; only genuinely-outside paths flip to read-only. The dangerous
+direction is structurally avoided. This is also why "cwd subtree" was rejected —
+`cd` into a subdir would start *rejecting valid edits* on the rest of the repo.
+
+### Plural now, no `/add-dir` machinery yet
+
+`/add-dir` is on the roadmap, so make the primitive plural and build nothing
+else:
+
+- Session holds `editable_roots: Vec<PathBuf>`. Init pushes the discovered root
+  as `roots[0]`.
+- `is_editable(path)` = `roots.iter().any(|r| within(r, path))`.
+- `/add-dir` later is just a `push`; the read/edit classification doesn't
+  change.
+
+Do **not** build now: the command itself, config-file loading of extra dirs, or
+cross-session persistence of the set. No present reader — stays deleted until
+`/add-dir` lands.
+
+## Implementation notes
+
+The mechanism is mostly already present — this is a classification branch, not a
+new renderer.
+
+- **Plain read = `read_raw_inner` + line numbering.** `read_raw_inner`
+  (`crates/frances-workflow/src/modules/file.rs:248`) already does an anchorless
+  disk read, loop-guarded via `sess.is_loop`/`record_loop`, with **no** baseline
+  registration (it's what `into:` mode uses). The out-of-repo path reuses it,
+  adds line numbers (no `Word§`), and honours `ranges`. Anchored in-repo reads
+  (`read_file_inner` → `sess.read_file`) are unchanged.
+- **Edit reject is UX, not load-bearing.** An out-of-repo path never registered
+  a baseline, so an edit already fails with "unknown anchor / read before
+  editing". The explicit `FileToolError::OutsideProject { path }` just makes the
+  contract clear. Shared predicate between read and edit; lives next to
+  `resolve_relative` in `crates/frances-core/src/path_util.rs`.
+- **Canonicalize before the prefix check** — a raw `starts_with` is unsound
+  against `..` and symlinks. Reads can canonicalize the target (it exists, we
+  stat it first); `file_new` targets a non-existent path, so canonicalize the
+  *parent* there.
+
+## Shell integration — export the primary root
+
+Seed `$FRANCES_ROOT` = `roots[0]` at shell spawn so the model can
+`cd "$FRANCES_ROOT"` after wandering the persistent shell. There's precedent:
+the shell already supports exported env (`set_var_inner`,
+`crates/frances-workflow/src/modules/shell.rs:419`, emits `export NAME=…`).
+
+Keep it **decoupled** from the read classification — it's a one-liner at spawn
+time that happens to read the same `roots[0]`. The file/search tools resolve
+against `current_cwd()`, not the shell's cwd, so the shell drifting never
+affects reads/edits; this is purely a navigation convenience. Export only the
+primary root, not the whole set (a `$FRANCES_ROOTS` list is YAGNI until
+`/add-dir` exists).
 
 ## When to pick this up
 
-Alongside [search-outside-cwd](search-outside-cwd.md). That one lets the agent
-*find* external source via `Search`; this one keeps *reading* it cheap and
-honest. Doing the search fix without this just trades `grep` calls for
-token-bloated anchored reads.
+Now. [search-outside-cwd](search-outside-cwd.md) is landing (the `root:` arg +
+`~` expansion are in the working copy), so the agent can already *find* external
+source via `Search`; without this, that just trades `grep` calls for
+token-bloated anchored reads. This keeps *reading* external source cheap and
+honest.

@@ -446,3 +446,162 @@ async fn loop_guard_search_distinguishes_query() {
     let payload = text_of(&frames[0]);
     assert!(payload.contains("a.txt"), "expected hit, got: {payload}");
 }
+
+// ── root parameter integration tests ──────────────────────────────
+
+#[tokio::test]
+async fn root_external_searches_outside_cwd() {
+    // Create an external directory with files — separate from cwd
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join("external.txt"), "data").unwrap();
+    std::fs::create_dir_all(external.path().join("src")).unwrap();
+    std::fs::write(external.path().join("src/lib.rs"), "fn lib() {}").unwrap();
+
+    // cwd is an empty tempdir — proves the walk is rooted at external, not cwd
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let deps = deps_with_cwd(cwd_dir.path().to_path_buf());
+    let root_arg = format!("\"{}\"", external.path().display());
+    let frames = run_script(
+        deps,
+        &dump_raw_script(&format!("{{ root: {root_arg}, paths: [\"**/*.rs\"] }}")),
+    )
+    .await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.iter().any(|p| p.ends_with("lib.rs")),
+        "src/lib.rs not found under external root: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("external.txt")),
+        "non-matching files should be excluded by paths filter: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_hidden_directory_works_without_hidden_flag() {
+    // A hidden-named directory as root should still be entered at depth 0
+    let parent = tempfile::tempdir().unwrap();
+    let hidden_root = parent.path().join(".hidden_project");
+    std::fs::create_dir_all(&hidden_root).unwrap();
+    std::fs::write(hidden_root.join("visible.txt"), "data").unwrap();
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let deps = deps_with_cwd(cwd_dir.path().to_path_buf());
+    let root_arg = format!("\"{}\"", hidden_root.display());
+    let frames = run_script(deps, &dump_raw_script(&format!("{{ root: {root_arg} }}"))).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"visible.txt"),
+        "visible.txt missing from hidden root: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_hidden_children_filtered_by_default() {
+    let external = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(external.path().join(".secrets")).unwrap();
+    std::fs::write(external.path().join(".secrets/key.pem"), "secret").unwrap();
+    std::fs::write(external.path().join("readme.md"), "hello").unwrap();
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let deps = deps_with_cwd(cwd_dir.path().to_path_buf());
+    let root_arg = format!("\"{}\"", external.path().display());
+
+    // Default: hidden children are filtered out
+    let frames = run_script(deps, &dump_raw_script(&format!("{{ root: {root_arg} }}"))).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"readme.md"),
+        "readme.md missing: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("key.pem")),
+        "hidden child leaked through default filter: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_gitignore_respected_in_external_tree() {
+    let external = tempfile::tempdir().unwrap();
+    std::fs::write(external.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(external.path().join("ignored.txt"), "secret").unwrap();
+    std::fs::write(external.path().join("kept.txt"), "public").unwrap();
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let deps = deps_with_cwd(cwd_dir.path().to_path_buf());
+    let root_arg = format!("\"{}\"", external.path().display());
+    let frames = run_script(deps, &dump_raw_script(&format!("{{ root: {root_arg} }}"))).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"kept.txt"), "kept.txt missing: {paths:?}");
+    assert!(
+        !paths.contains(&"ignored.txt"),
+        "gitignored file leaked: {paths:?}"
+    );
+}
+
+#[tokio::test]
+async fn root_tilde_expansion() {
+    // Create a temp directory, set HOME to it, then use ~/... as root
+    let orig_home = std::env::var("HOME").ok();
+    let home_tmp = tempfile::tempdir().unwrap();
+    // SAFETY: test-only; we restore HOME below. Single-threaded test
+    // (--test-threads=1) avoids data races on the process env.
+    unsafe {
+        std::env::set_var("HOME", home_tmp.path());
+    }
+
+    let project = home_tmp.path().join("test_project");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("hello.rs"), "fn main() {}").unwrap();
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let deps = deps_with_cwd(cwd_dir.path().to_path_buf());
+    let frames = run_script(
+        deps,
+        &dump_raw_script(r#"{ root: "~/test_project", paths: ["**/*.rs"] }"#),
+    )
+    .await;
+
+    // Restore HOME
+    // SAFETY: restoring the original HOME; see above.
+    match &orig_home {
+        Some(h) => unsafe { std::env::set_var("HOME", h) },
+        None => unsafe { std::env::remove_var("HOME") },
+    }
+
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let paths: Vec<&str> = v["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(
+        paths.contains(&"hello.rs"),
+        "hello.rs missing with tilde root: {paths:?}"
+    );
+}

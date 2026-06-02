@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use frances_core::JsonRepair;
+use frances_core::{expand_tilde, resolve_relative, JsonRepair};
 use frances_edit::{LoopKey, LoopKind};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcher;
@@ -55,6 +55,7 @@ fn default_true() -> bool {
 #[derive(Deserialize, Debug)]
 #[serde(deny_unknown_fields)]
 struct FileSearchArgs {
+    root: Option<String>,
     paths: Option<Vec<String>>,
     search: Option<String>,
     exclude: Option<Vec<String>>,
@@ -74,6 +75,7 @@ struct FileSearchArgs {
 impl Default for FileSearchArgs {
     fn default() -> Self {
         Self {
+            root: None,
             paths: None,
             search: None,
             exclude: None,
@@ -190,6 +192,10 @@ fn hash_search_args(args: &FileSearchArgs) -> u64 {
     // Discriminator — keeps file_find_or_grep keys from colliding with
     // anything else that might one day land in this hasher.
     hasher.write(&[LoopKind::Search as u8]);
+    if let Some(r) = &args.root {
+        hasher.write(r.as_bytes());
+    }
+    hasher.write(&[0xFE]);
     hash_str_list_sorted(&mut hasher, args.paths.as_deref());
     hasher.write(&[0xFE]);
     if let Some(s) = &args.search {
@@ -256,6 +262,31 @@ struct Payload {
     truncated: Option<Truncated>,
 }
 
+/// Resolve the walk root. When `root_arg` is provided, expand `~`,
+/// resolve against `cwd`, canonicalize, and verify it's an existing
+/// directory. When absent, fall back to `cwd` (or `.`).
+fn resolve_root(root_arg: Option<&str>, cwd: Option<&Path>) -> Result<PathBuf, String> {
+    let root = match root_arg {
+        Some(r) if !r.is_empty() => {
+            let expanded = expand_tilde(Path::new(r));
+            let resolved = resolve_relative(&expanded, cwd);
+            let canonicalized = resolved
+                .canonicalize()
+                .map_err(|e| format!("root {:?}: {e}", resolved.display()))?;
+            if !canonicalized.is_dir() {
+                return Err(format!(
+                    "root {:?} is not a directory",
+                    canonicalized.display()
+                ));
+            }
+            canonicalized
+        }
+        _ => cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
+    };
+    Ok(root)
+}
+
+
 fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String> {
     let (paths, search) = match (args.paths, args.search) {
         // No-args → recursive listing of pwd. Empty `paths` ↦ no
@@ -271,7 +302,7 @@ fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String>
         (p, s) => (p.unwrap_or_default(), s),
     };
 
-    let root = cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let root = resolve_root(args.root.as_deref(), cwd)?;
 
     // Excludes go through `OverrideBuilder` as negations — overrides
     // intentionally win over `.gitignore`, which is what you want for
