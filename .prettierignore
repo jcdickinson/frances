@@ -1,0 +1,5 @@
+# Markdown parser fixtures: the exact bytes ARE the test. Prettier would
+# normalize setext underlines, closed ATX headings, indented code blocks,
+# trailing-space hard breaks, and reference definitions — destroying the
+# syntaxes these tests exist to characterize. Leave them untouched.
+crates/frances-markdown/tests/fixtures/
