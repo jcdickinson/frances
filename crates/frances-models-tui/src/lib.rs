@@ -50,9 +50,9 @@ pub enum Source {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SectionKind {
     /// `MarkdownSection` — streaming text. `source` names the speaker;
-    /// the inline parser runs for `source != User`. The container
-    /// expands the section into many `ParagraphBlock`s as `\n\n`
-    /// boundaries arrive.
+    /// the mdast parser runs for `source != User` with full inline
+    /// styling; User source renders plain text. The container expands
+    /// the section into `MarkdownBlock`s, one per top-level AST node.
     Markdown { source: Source },
     /// `ErrorSection` — one-shot error message.
     Error,

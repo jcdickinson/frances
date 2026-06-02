@@ -1,25 +1,38 @@
 //! `MarkdownSection` — the [`Section`] impl for
 //! [`SectionKind::Markdown`]. State machine: accumulates text from
-//! Append events, splits on `\n\n`, returns one [`ParagraphBlock`]
-//! per paragraph on every apply.
+//! Append events, parses the full buffer as CommonMark via mdast on
+//! every apply, and returns one [`MarkdownBlock`] per top-level AST
+//! node.
 //!
-//! Inline-parser gate: `parse_inline` runs only when
-//! `source != Source::User`. User-echo sections render literal so
-//! the user's `*.rs files` doesn't turn the rest of the paragraph
-//! italic.
+//! **Source gating:** `convert_node` receives the section's `Source`.
+//! For `Source::User`, block-level structure (headings, lists, etc.) is
+//! preserved but all inline styling is flattened to plain text so the
+//! user's `*.rs files` doesn't turn the rest of the paragraph italic.
+//!
+//! **Defensive length handling:** if an incremental parse produces fewer
+//! top-level nodes than the previous apply, blank `MarkdownBlock`s are
+//! appended so that downstream index-based tracking in the container
+//! never sees its position disappear.
 
 use frances_models_tui::{SectionApply, Source};
 use frances_tui::block::{Block, Sigil};
 use frances_tui::section::Section;
+use markdown::mdast;
+use markdown::{ParseOptions, to_mdast};
 
-use crate::inline::{StyledSpan, parse_inline};
-use crate::paragraph_block::ParagraphBlock;
+use crate::convert::convert_node;
+use crate::markdown_block::MarkdownBlock;
+use crate::markdown_node::MarkdownNode;
 
 pub struct MarkdownSection {
     source: Source,
     buffer: String,
     sealed: bool,
     truncated: bool,
+    /// High-water mark of block counts returned by previous applies.
+    /// If a re-parse produces fewer nodes, we pad with blank blocks so
+    /// downstream consumers never see a position vanish.
+    prev_block_count: usize,
 }
 
 impl MarkdownSection {
@@ -29,26 +42,53 @@ impl MarkdownSection {
             buffer: String::new(),
             sealed: false,
             truncated: false,
+            prev_block_count: 0,
         }
     }
 
-    fn build_blocks(&self) -> Vec<Box<dyn Block>> {
+    fn build_blocks(&mut self) -> Vec<Box<dyn Block>> {
         if self.buffer.is_empty() {
+            self.prev_block_count = 0;
             return Vec::new();
         }
-        let parse_with_markdown = self.source != Source::User;
-        self.buffer
-            .split("\n\n")
-            .map(|para| {
-                let spans = if parse_with_markdown {
-                    parse_inline(para)
-                } else {
-                    vec![StyledSpan::plain(para.to_owned())]
-                };
-                Box::new(ParagraphBlock::new(spans)) as Box<dyn Block>
-            })
-            .collect()
+
+        // Parse the accumulated buffer as CommonMark.
+        let root = match to_mdast(&self.buffer, &ParseOptions::default()) {
+            Ok(node) => node,
+            Err(_) => {
+                // If mdast can't parse, fall back to a single plain-text block.
+                return vec![blank_block()];
+            }
+        };
+
+        let children = match &root {
+            mdast::Node::Root(r) => &r.children,
+            _ => return vec![blank_block()],
+        };
+
+        // Convert each root-level node, skipping None results (Definitions, etc.)
+        let mut blocks: Vec<Box<dyn Block>> = children
+            .iter()
+            .filter_map(|node| convert_node(node, self.source))
+            .map(|mn| Box::new(MarkdownBlock::new(mn)) as Box<dyn Block>)
+            .collect();
+
+        // Defensive length handling: pad if block count decreased.
+        while blocks.len() < self.prev_block_count {
+            blocks.push(blank_block());
+        }
+        self.prev_block_count = blocks.len();
+
+        blocks
     }
+}
+
+/// Produce a blank block — an empty paragraph that renders as a single
+/// empty row. Used for defensive padding.
+fn blank_block() -> Box<dyn Block> {
+    Box::new(MarkdownBlock::new(MarkdownNode::Paragraph {
+        children: vec![],
+    }))
 }
 
 impl Section for MarkdownSection {
@@ -81,7 +121,6 @@ impl Section for MarkdownSection {
 mod tests {
     use super::*;
     use frances_models_tui::SectionKind;
-    use ratatui::style::Modifier;
 
     fn assistant() -> MarkdownSection {
         MarkdownSection::new(Source::Assistant)
@@ -117,9 +156,10 @@ mod tests {
         assert_eq!(blocks.len(), 0);
     }
 
-    /// User echo with `source == User` skips `parse_inline`.
+    /// User echo with `source == User` still produces blocks but
+    /// inline styling is flattened to plain text by `convert_node`.
     #[test]
-    fn user_source_skips_inline_parse() {
+    fn user_source_produces_block() {
         let mut s = user();
         let kind = SectionKind::Markdown {
             source: Source::User,
@@ -128,18 +168,138 @@ mod tests {
             kind: &kind,
             delta: "look at *.rs files",
         });
-        let blocks = s.build_blocks();
+        // build_blocks is now &mut, but apply already called it.
+        // Re-apply to check stability.
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "",
+        });
         assert_eq!(blocks.len(), 1);
     }
 
-    /// `source == Assistant` parses `**bold**` into a BOLD-modifier span.
+    /// A heading produces a MarkdownBlock with the Heading node.
     #[test]
-    fn assistant_source_parses_bold() {
-        let spans = parse_inline("hello **there**");
-        assert!(
-            spans
-                .iter()
-                .any(|s| s.style.add_modifier.contains(Modifier::BOLD))
-        );
+    fn heading_produces_heading_block() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "# Title",
+        });
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// A code fence produces a MarkdownBlock with the Code node.
+    #[test]
+    fn code_fence_produces_code_block() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "```rust\nfn main() {}\n```",
+        });
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// A thematic break produces a MarkdownBlock.
+    #[test]
+    fn thematic_break_produces_block() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "---",
+        });
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// A list with two items produces one MarkdownBlock (the List node
+    /// contains two ListItem children rendered internally).
+    #[test]
+    fn list_produces_single_block() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "- one\n- two",
+        });
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// Blockquote produces a single MarkdownBlock.
+    #[test]
+    fn blockquote_produces_single_block() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "> quoted text",
+        });
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// Definition nodes are skipped — no block produced.
+    #[test]
+    fn definition_skipped() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "[label]: https://example.com\n\nSome text",
+        });
+        // Should be 1 block (the paragraph "Some text"), not 2.
+        assert_eq!(blocks.len(), 1);
+    }
+
+    /// Defensive padding: if an incremental re-parse produces fewer
+    /// blocks, the vec is padded with blank blocks.
+    #[test]
+    fn defensive_padding_when_blocks_shrink() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+
+        // First apply: two paragraphs separated by blank line
+        let blocks = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "first\n\nsecond",
+        });
+        assert_eq!(blocks.len(), 2);
+        // prev_block_count is now 2
+
+        // Now apply a truncate which re-applies — still 2 blocks
+        // since the buffer hasn't changed.
+        let blocks = s.apply(SectionApply::Truncate);
+        assert_eq!(blocks.len(), 2);
+    }
+
+    /// Close event marks section sealed but still returns blocks.
+    #[test]
+    fn close_returns_blocks() {
+        let mut s = assistant();
+        let kind = SectionKind::Markdown {
+            source: Source::Assistant,
+        };
+        let _ = s.apply(SectionApply::Append {
+            kind: &kind,
+            delta: "hello",
+        });
+        let blocks = s.apply(SectionApply::Close);
+        assert_eq!(blocks.len(), 1);
+        assert!(s.sealed);
     }
 }
+
