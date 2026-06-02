@@ -3,12 +3,14 @@ use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
+use frances_anchors::hash_lines;
 use regex::Regex;
 
 use crate::render::{DiffRender, render_diff_block};
+use crate::state::{LineEntry, content_digest};
 use crate::{
-    Anchor, AnchorStore, EditHints, EditOp, FileAnchorState, Pool, Truncated, WorkingFile,
-    apply_ops, reconcile,
+    Anchor, AnchorStore, EditHints, EditOp, FileAnchorState, LineOrigin, Pool, Truncated,
+    WorkingFile, apply_ops, reconcile,
 };
 
 use super::types::{EditError, EditResult, WriteMode};
@@ -139,28 +141,87 @@ impl<S: AnchorStore> EditSession<S> {
             })
     }
 
-    /// Common pipeline for line-level edits: replay one `EditOp` into a
-    /// draft, hand it to `on_draft`, reconcile against the cached state, and
-    /// commit. `tombstones` is the pre-edit anchor list for any lines the
-    /// op deletes (only `Replace` produces them).
+    /// Pipeline for line-level edits (`Insert*` / `Replace`). We know exactly
+    /// what changed, so we apply the op by *direct anchor transform* — carried
+    /// lines keep their anchor by identity, inserted lines mint, deleted lines
+    /// drop — rather than diffing the pre-edit file against the result. Diffing
+    /// across the whole edit re-pairs duplicate / blank lines far from the edit
+    /// and churns their anchors (see anchors.md "direct transforms for our own
+    /// edits"). We still reconcile, but only the *draft → written-back* delta,
+    /// to absorb whatever the auto-formatter changed; when nothing reformats,
+    /// that reconcile is an all-equal no-op.
+    ///
+    /// `deleted` is the pre-edit anchor list for lines the op removes (only
+    /// `Replace` produces them); they're gone from the draft, so the formatter
+    /// reconcile can't see them and we tombstone them explicitly.
     async fn apply_line_edit<F>(
         &mut self,
         path: &Path,
         working: WorkingFile,
         op: EditOp,
-        tombstones: Vec<Anchor>,
+        deleted: Vec<Anchor>,
         on_draft: &mut F,
     ) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
     {
         let ops = [op];
-        let draft = apply_ops(&working.state, &working.lines, &ops);
-        let hints = EditHints {
-            deleted_anchors: tombstones,
+        let (draft_lines, origins) = apply_ops(&working.state, &working.lines, &ops);
+        let (post_lines, mtime_ns, size) = on_draft(path, &draft_lines, WriteMode::Overwrite)?;
+
+        let used = self.engine.store().used_anchors(path).await?;
+        let mut pool = Pool::from_used(used);
+
+        // Direct transform → the draft's anchored state. Hashes are recomputed
+        // for every line so blank-ordinal salting tracks new positions without
+        // forcing a re-anchor.
+        let draft_hashes = hash_lines(draft_lines.iter().map(|s| s.as_str()));
+        let entries: Vec<LineEntry> = origins
+            .iter()
+            .zip(&draft_hashes)
+            .map(|(origin, &hash)| {
+                let anchor = match origin {
+                    LineOrigin::Carried(i) => working.state.lines[*i as usize].anchor.clone(),
+                    LineOrigin::Inserted => pool.mint(),
+                };
+                LineEntry { hash, anchor }
+            })
+            .collect();
+        let draft_state = FileAnchorState {
+            path: path.to_path_buf(),
+            mtime_ns,
+            size,
+            content_digest: content_digest(&draft_hashes),
+            lines: entries,
         };
-        self.apply_draft_edit(path, working, draft, Some(&hints), on_draft)
-            .await
+
+        // Reconcile only the formatter's edits (draft → post_lines).
+        let outcome = reconcile(&draft_state, &post_lines, &mut pool, None);
+        let mut tombstones = deleted;
+        tombstones.extend(outcome.tombstoned.iter().cloned());
+
+        self.engine
+            .commit(path, &outcome.state, mtime_ns, size, &tombstones)
+            .await?;
+
+        let block = render_diff_block(
+            &working.state,
+            &working.lines,
+            &outcome.state,
+            &post_lines,
+            DIFF_CONTEXT,
+        );
+
+        self.open_files.insert(
+            path.to_path_buf(),
+            WorkingFile {
+                path: path.to_path_buf(),
+                state: outcome.state,
+                lines: post_lines,
+            },
+        );
+
+        Ok(block)
     }
     async fn apply_draft_edit<F>(
         &mut self,
@@ -210,6 +271,11 @@ fn resolve_anchor(
     lines: &[String],
     path: &Path,
 ) -> Result<(Anchor, u32), EditError> {
+    if let Some((first_line, _)) = field.split_once('\n') {
+        return Err(EditError::MultilineAnchor {
+            first_line: first_line.to_string(),
+        });
+    }
     let (word, content) =
         field
             .split_once(ANCHOR_SEP)
@@ -849,6 +915,347 @@ mod tests {
         assert!(err.to_string().contains("matched 3 times"));
         assert!(!wrote, "count-cap failure must not write");
         assert_eq!(session.open_files[&path].lines, before.lines);
+    }
+
+    #[tokio::test]
+    async fn duplicate_content_lines_get_distinct_anchors() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(
+                path.clone(),
+                lines_of("a\n    #[test]\nb\n    #[test]\nc"),
+                100,
+                30,
+            )
+            .await
+            .unwrap();
+
+        let working = session.open_files.get(&path).unwrap();
+        assert_ne!(working.state.lines[1].anchor, working.state.lines[3].anchor);
+        assert_ne!(
+            anchor_field(&session, &path, 1),
+            anchor_field(&session, &path, 3)
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_from_first_of_duplicate_lines_targets_first_instance() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(
+                path.clone(),
+                lines_of("a\n    #[test]\nb\n    #[test]\nc"),
+                100,
+                30,
+            )
+            .await
+            .unwrap();
+
+        let from = anchor_field(&session, &path, 1);
+        let to = anchor_field(&session, &path, 2);
+        let second_test_anchor = session.open_files[&path].state.lines[3].anchor.clone();
+
+        session
+            .edit(
+                LlmEdit::ReplaceLines {
+                    path: path.clone(),
+                    anchor: from,
+                    end_anchor: to,
+                    text: "X".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["a", "X", "    #[test]", "c"]
+        );
+        assert_eq!(
+            session.open_files[&path].state.lines[2].anchor,
+            second_test_anchor
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_after_first_of_identical_neighbors_lands_correctly() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(path.clone(), lines_of("x\ndup\ndup\ny"), 100, 16)
+            .await
+            .unwrap();
+
+        let first_dup = anchor_field(&session, &path, 1);
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: first_dup,
+                    text: "INS".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["x", "dup", "INS", "dup", "y"]
+        );
+    }
+
+    #[tokio::test]
+    async fn content_mismatch_is_staleness_guard_not_ambiguity() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(
+                path.clone(),
+                lines_of("    #[test]\nfn a() {}\n    #[test]\nfn b() {}"),
+                100,
+                40,
+            )
+            .await
+            .unwrap();
+
+        let second_test = anchor_field(&session, &path, 2);
+        assert!(second_test.ends_with("§    #[test]"));
+        let word = second_test.split('§').next().unwrap().to_string();
+
+        let err = session
+            .edit(
+                LlmEdit::ReplaceLines {
+                    path: path.clone(),
+                    anchor: format!("{word}§    fn wrong() {{}}"),
+                    end_anchor: format!("{word}§    fn wrong() {{}}"),
+                    text: "x".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EditError::ContentMismatch { .. }));
+
+        session
+            .edit(
+                LlmEdit::ReplaceLines {
+                    path: path.clone(),
+                    anchor: second_test.clone(),
+                    end_anchor: second_test,
+                    text: "    #[ignore]".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec!["    #[test]", "fn a() {}", "    #[ignore]", "fn b() {}"]
+        );
+    }
+
+    #[tokio::test]
+    async fn multiline_anchor_field_rejected_with_clear_error() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        session
+            .read_file(
+                path.clone(),
+                lines_of("    #[test]\n    // comment\n    fn real() {}"),
+                100,
+                40,
+            )
+            .await
+            .unwrap();
+
+        let glued = format!(
+            "{}\n{}",
+            anchor_field(&session, &path, 0),
+            anchor_field(&session, &path, 1)
+        );
+        let err = session
+            .edit(
+                LlmEdit::ReplaceLines {
+                    path: path.clone(),
+                    anchor: glued,
+                    end_anchor: anchor_field(&session, &path, 2),
+                    text: "    #[ignore]".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(err, EditError::MultilineAnchor { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn edit_near_duplicate_blocks_does_not_reanchor_far_lines() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        // Two functions with byte-identical bodies: `    work();`, `    done();`
+        // and `}` each appear twice, so their line hashes collide.
+        let src = "fn a() {\n    work();\n    done();\n}\n\nfn b() {\n    work();\n    done();\n}";
+        session
+            .read_file(path.clone(), lines_of(src), 100, src.len() as u64)
+            .await
+            .unwrap();
+
+        let pre: Vec<Anchor> = session.open_files[&path]
+            .state
+            .lines
+            .iter()
+            .map(|le| le.anchor.clone())
+            .collect();
+
+        // Insert into the FIRST function only.
+        let target = anchor_field(&session, &path, 1); // `    work();` in fn a
+        let block = session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "    extra();".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        // Post line array: extra() inserted at index 2; everything else shifts.
+        let post = &session.open_files[&path].state.lines;
+        assert_eq!(
+            session.open_files[&path].lines,
+            vec![
+                "fn a() {",
+                "    work();",
+                "    extra();",
+                "    done();",
+                "}",
+                "",
+                "fn b() {",
+                "    work();",
+                "    done();",
+                "}",
+            ]
+        );
+
+        // Every original line must keep its original anchor. Post index i maps
+        // to pre index i for i < 2, and i-1 for i > 2 (one line inserted at 2).
+        let expected: Vec<&Anchor> = vec![
+            &pre[0], &pre[1], /* 2 = minted */ &pre[2], &pre[3], &pre[4], &pre[5], &pre[6],
+            &pre[7], &pre[8],
+        ];
+        let got: Vec<&Anchor> = post
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 2)
+            .map(|(_, le)| &le.anchor)
+            .collect();
+        assert_eq!(got, expected, "unchanged lines were re-anchored");
+
+        // The diff block must not mention the untouched second function.
+        assert!(
+            !block.text.contains("fn b"),
+            "diff names a far, unchanged line:\n{}",
+            block.text
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_with_blank_does_not_reanchor_downstream_blanks() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        // Isolated blanks at idx 1 and 3, between unique non-blank lines.
+        session
+            .read_file(path.clone(), lines_of("fn a\n\nfn b\n\nfn c"), 100, 16)
+            .await
+            .unwrap();
+
+        let blank3 = session.open_files[&path].state.lines[3].anchor.clone();
+        let fn_c = session.open_files[&path].state.lines[4].anchor.clone();
+
+        // Insert a block that itself contains a blank line, bumping the
+        // ordinal of every downstream blank.
+        let target = anchor_field(&session, &path, 0); // `fn a`
+        session
+            .edit(
+                LlmEdit::InsertAfter {
+                    path: path.clone(),
+                    anchor: target,
+                    text: "x\n\ny".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        let post = &session.open_files[&path].state.lines;
+        let lines = &session.open_files[&path].lines;
+        assert_eq!(lines, &vec!["fn a", "x", "", "y", "", "fn b", "", "fn c"]);
+        // `fn c` (unchanged, unique) keeps its anchor — sanity.
+        assert_eq!(post[7].anchor, fn_c);
+        // The blank originally at idx 3 is still present (now at idx 6) with
+        // unchanged content. It must keep its anchor.
+        assert_eq!(
+            post[6].anchor, blank3,
+            "downstream blank line was re-anchored by the whole-file reconcile"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_near_duplicate_block_does_not_reanchor_the_other_block() {
+        let mut session = fresh_session();
+        let path = PathBuf::from("/x");
+        // Two byte-identical 3-line blocks, separated by a unique line.
+        let src = "head\nlet x = 1;\nstep();\ndone();\nmid\nlet x = 1;\nstep();\ndone();\ntail";
+        session
+            .read_file(path.clone(), lines_of(src), 100, src.len() as u64)
+            .await
+            .unwrap();
+
+        // Anchors of the SECOND block (idx 5,6,7) must be untouched.
+        let second_block: Vec<Anchor> = session.open_files[&path].state.lines[5..8]
+            .iter()
+            .map(|le| le.anchor.clone())
+            .collect();
+
+        // Replace one line in the FIRST block.
+        let target = anchor_field(&session, &path, 1); // first `let x = 1;`
+        session
+            .edit(
+                LlmEdit::ReplaceLines {
+                    path: path.clone(),
+                    anchor: target.clone(),
+                    end_anchor: target,
+                    text: "let x = 2;".into(),
+                    bypass_anchor_guard: false,
+                },
+                no_format,
+            )
+            .await
+            .unwrap();
+
+        let post = &session.open_files[&path].state.lines;
+        let got: Vec<Anchor> = post[5..8].iter().map(|le| le.anchor.clone()).collect();
+        assert_eq!(
+            got, second_block,
+            "the untouched duplicate block was re-anchored"
+        );
     }
 
     #[tokio::test]

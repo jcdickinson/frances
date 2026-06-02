@@ -94,6 +94,10 @@ pub enum EditError {
     #[error("malformed anchor '{field}': expected '<Word>§<content>'")]
     MalformedAnchor { field: String },
     #[error(
+        "anchor field spans multiple lines; pass exactly one rendered '<Word>§<content>' line (first line was '{first_line}')"
+    )]
+    MultilineAnchor { first_line: String },
+    #[error(
         "edit `text` payload looks like pasted-back anchor renders: every \
          non-blank line begins with `Word§`. Anchors are assigned by the \
          engine — `text` should be the bare line content with no anchor \

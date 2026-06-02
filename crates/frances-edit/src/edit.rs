@@ -17,16 +17,29 @@ pub enum EditOp {
     },
 }
 
-/// Apply ops to `original_lines`, producing the new line array.
-/// Anchors in ops must reference lines in `original_lines`'s anchor space —
-/// the caller resolves anchor → original_index via the `FileAnchorState`
-/// they passed to `parse_patch`.
+/// Where an output line of [`apply_ops`] came from. Lets the caller carry the
+/// original line's anchor by identity (no diff) and mint only for inserts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LineOrigin {
+    /// Carried verbatim from this index in `original_state.lines`.
+    Carried(u32),
+    /// Freshly inserted by the edit.
+    Inserted,
+}
+
+/// Apply ops to `original_lines`, producing the new line array alongside a
+/// parallel [`LineOrigin`] for each output line. Anchors in ops must reference
+/// lines in `original_lines`'s anchor space — the caller resolves anchor →
+/// original_index via the `FileAnchorState` they passed to `resolve_anchor`.
 pub fn apply_ops(
     original_state: &crate::state::FileAnchorState,
     original_lines: &[String],
     ops: &[EditOp],
-) -> Vec<String> {
+) -> (Vec<String>, Vec<LineOrigin>) {
     let mut out: Vec<String> = original_lines.to_vec();
+    let mut origins: Vec<LineOrigin> = (0..original_lines.len() as u32)
+        .map(LineOrigin::Carried)
+        .collect();
     // offsets[orig_idx] = current shift of that original index in `out`.
     let mut offsets: Vec<i64> = vec![0; original_lines.len()];
 
@@ -39,7 +52,7 @@ pub fn apply_ops(
                     as usize;
                 let draft_idx = (orig as i64 + offsets[orig]) as usize + 1;
                 let n = lines.len();
-                splice_in(&mut out, draft_idx, lines);
+                splice_in(&mut out, &mut origins, draft_idx, lines);
                 shift_after(&mut offsets, orig, n as i64);
             }
             EditOp::InsertBefore { pin, lines } => {
@@ -49,7 +62,7 @@ pub fn apply_ops(
                     as usize;
                 let draft_idx = (orig as i64 + offsets[orig]) as usize;
                 let n = lines.len();
-                splice_in(&mut out, draft_idx, lines);
+                splice_in(&mut out, &mut origins, draft_idx, lines);
                 // pin itself shifts because the new lines land at its index.
                 for offset in offsets.iter_mut().skip(orig) {
                     *offset += n as i64;
@@ -70,17 +83,25 @@ pub fn apply_ops(
                 let added = lines.len();
                 let delta = added as i64 - removed as i64;
                 out.splice(from_draft..=to_draft, lines.iter().cloned());
+                origins.splice(
+                    from_draft..=to_draft,
+                    std::iter::repeat_n(LineOrigin::Inserted, added),
+                );
                 // Anything originally at position > to_orig shifts by delta.
                 shift_after(&mut offsets, to_orig, delta);
             }
         }
     }
 
-    out
+    (out, origins)
 }
 
-fn splice_in(out: &mut Vec<String>, at: usize, lines: &[String]) {
+fn splice_in(out: &mut Vec<String>, origins: &mut Vec<LineOrigin>, at: usize, lines: &[String]) {
     out.splice(at..at, lines.iter().cloned());
+    origins.splice(
+        at..at,
+        std::iter::repeat_n(LineOrigin::Inserted, lines.len()),
+    );
 }
 
 fn shift_after(offsets: &mut [i64], boundary_orig_idx: usize, delta: i64) {
@@ -128,7 +149,7 @@ mod tests {
             pin: anchors[0].clone(),
             lines: vec!["X".into()],
         }];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "X", "b", "c"]);
     }
 
@@ -140,7 +161,7 @@ mod tests {
             to: anchors[2].clone(),
             lines: vec!["X".into()],
         }];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "X", "d"]);
     }
 
@@ -152,7 +173,7 @@ mod tests {
             to: anchors[1].clone(),
             lines: vec![],
         }];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "c"]);
     }
 
@@ -171,7 +192,7 @@ mod tests {
                 lines: vec!["Y".into()],
             },
         ];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "X", "b", "Y", "c"]);
     }
 
@@ -182,7 +203,7 @@ mod tests {
             pin: anchors[1].clone(),
             lines: vec!["X".into()],
         }];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "X", "b", "c"]);
     }
 
@@ -193,7 +214,7 @@ mod tests {
             pin: anchors[0].clone(),
             lines: vec!["X".into(), "Y".into()],
         }];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["X", "Y", "a", "b"]);
     }
 
@@ -210,7 +231,7 @@ mod tests {
                 lines: vec!["Y".into()],
             },
         ];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["a", "X", "b", "Y", "c"]);
     }
 
@@ -229,7 +250,29 @@ mod tests {
                 lines: vec!["X".into()],
             },
         ];
-        let out = apply_ops(&state, &lines, &ops);
+        let (out, _) = apply_ops(&state, &lines, &ops);
         assert_eq!(out, vec!["A1", "A2", "b", "X", "c"]);
+    }
+
+    #[test]
+    fn origins_track_carried_and_inserted() {
+        use LineOrigin::*;
+        let (state, lines, anchors) = fresh_state(&["a", "b", "c", "d"]);
+        // Replace b..=c with one line, then insert after d.
+        let ops = vec![
+            EditOp::Replace {
+                from: anchors[1].clone(),
+                to: anchors[2].clone(),
+                lines: vec!["X".into()],
+            },
+            EditOp::InsertAfter {
+                pin: anchors[3].clone(),
+                lines: vec!["Y".into()],
+            },
+        ];
+        let (out, origins) = apply_ops(&state, &lines, &ops);
+        assert_eq!(out, vec!["a", "X", "d", "Y"]);
+        // a carried from 0, X inserted, d carried from 3, Y inserted.
+        assert_eq!(origins, vec![Carried(0), Inserted, Carried(3), Inserted]);
     }
 }

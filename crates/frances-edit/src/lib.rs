@@ -10,7 +10,7 @@ mod state;
 mod store;
 
 pub use anchor::{Anchor, AnchorParseError};
-pub use edit::{EditOp, apply_ops};
+pub use edit::{EditOp, LineOrigin, apply_ops};
 pub use engine::{EditEngine, WorkingFile};
 pub use loop_guard::{LoopKey, LoopKind};
 pub use pool::Pool;
