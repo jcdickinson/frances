@@ -795,3 +795,302 @@ async fn loop_guard_distinguishes_ranges() {
     assert!(parts[0].contains("§1"), "first range: {}", parts[0]);
     assert!(parts[1].contains("§5"), "second range: {}", parts[1]);
 }
+
+// ---------------------------------------------------------------------------
+// Out-of-repo read / edit integration tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a `StubDeps` whose editable root is `repo_dir` (so paths
+/// outside that dir are treated as "out-of-repo") and whose cwd is also
+/// `repo_dir`.
+fn deps_with_repo_root(repo_dir: PathBuf) -> StubDeps {
+    let mut deps = StubDeps::default();
+    deps.set_cwd(repo_dir.clone());
+    deps.set_editable_roots(vec![repo_dir]);
+    deps
+}
+
+#[tokio::test]
+async fn out_of_repo_read_returns_plain_line_numbers() {
+    // repo_dir is the editable root; outside_dir is outside it.
+    let repo_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    std::fs::write(outside_dir.path().join("external.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let external_path = outside_dir.path().join("external.txt");
+    let path_str = external_path.to_str().unwrap();
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(&format!(
+        r#"
+        import {{ Editor }} from "frances:v1/tools/file";
+        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        const editor = new Editor();
+        const content = await editor.readFile({path:?});
+        transcript.push(new MarkdownSection({{ content }}));
+        "#,
+        path = path_str,
+    ));
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(lines.len(), 3, "got: {rendered:?}");
+
+    // Out-of-repo: plain "N:content" format, no "§" anchors.
+    assert_eq!(lines[0], "1:alpha", "line 0: {}", lines[0]);
+    assert_eq!(lines[1], "2:beta", "line 1: {}", lines[1]);
+    assert_eq!(lines[2], "3:gamma", "line 2: {}", lines[2]);
+
+    // Verify absolutely no § characters (no anchors).
+    assert!(
+        !rendered.contains('§'),
+        "out-of-repo read should not contain anchors: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn out_of_repo_read_with_ranges_returns_plain_numbered_lines() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        outside_dir.path().join("external.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )
+    .unwrap();
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let external_path = outside_dir.path().join("external.txt");
+    let path_str = external_path.to_str().unwrap();
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(&format!(
+        r#"
+        import {{ Editor, Read }} from "frances:v1/tools/file";
+        import {{ Variables }} from "frances:v1/tools/variable";
+        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        const editor = new Editor();
+        const vars = new Variables();
+        const read = new Read(editor, vars);
+        const r = await read.handler({{
+            call: {{ id: "c1", name: "file_read",
+                     arguments: {{ path: {path:?}, ranges: [[2, 3], [7, 9]] }} }},
+            scope: null,
+        }});
+        transcript.push(new MarkdownSection({{ content: r.content || JSON.stringify(r) }}));
+        "#,
+        path = path_str,
+    ));
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    let lines: Vec<&str> = rendered.lines().collect();
+    // Should have: 2:…, 3:…, separator "…", 7:…, 8:…, 9:…
+    assert_eq!(lines.len(), 6, "got: {rendered:?}");
+    assert_eq!(lines[0], "2:2", "line 0: {}", lines[0]);
+    assert_eq!(lines[1], "3:3", "line 1: {}", lines[1]);
+    assert!(lines[2] == "…", "separator should be plain '…', got: {}", lines[2]);
+    assert_eq!(lines[3], "7:7", "line 3: {}", lines[3]);
+    assert_eq!(lines[4], "8:8", "line 4: {}", lines[4]);
+    assert_eq!(lines[5], "9:9", "line 5: {}", lines[5]);
+
+    assert!(
+        !rendered.contains('§'),
+        "out-of-repo read should not contain anchors: {rendered:?}"
+    );
+}
+
+#[tokio::test]
+async fn out_of_repo_edit_is_rejected() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let external_path = outside_dir.path().join("external.txt");
+    std::fs::write(&external_path, "alpha\nbeta\ngamma\n").unwrap();
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let path_str = external_path.to_str().unwrap();
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(&format!(
+        r#"
+        import {{ Editor }} from "frances:v1/tools/file";
+        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        const editor = new Editor();
+        let caught = "";
+        try {{
+            await editor.edit({{
+                kind: "ReplaceLines",
+                path: {path:?},
+                anchor: "dummy",
+                end_anchor: "dummy",
+                text: "NEW",
+            }});
+            caught = "no-throw";
+        }} catch (e) {{
+            caught = String((e && e.message) || e);
+        }}
+        transcript.push(new MarkdownSection({{ content: caught }}));
+        "#,
+        path = path_str,
+    ));
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let msg = text_of(&frames[0]);
+    assert!(
+        msg.contains("outside the project"),
+        "expected OutsideProject error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn out_of_repo_file_new_is_rejected() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let new_path = outside_dir.path().join("brand_new.txt");
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let path_str = new_path.to_str().unwrap();
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(&format!(
+        r#"
+        import {{ Editor }} from "frances:v1/tools/file";
+        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        const editor = new Editor();
+        let caught = "";
+        try {{
+            await editor.edit({{
+                kind: "New",
+                path: {path:?},
+                text: "hello",
+            }});
+            caught = "no-throw";
+        }} catch (e) {{
+            caught = String((e && e.message) || e);
+        }}
+        transcript.push(new MarkdownSection({{ content: caught }}));
+        "#,
+        path = path_str,
+    ));
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let msg = text_of(&frames[0]);
+    assert!(
+        msg.contains("outside the project"),
+        "expected OutsideProject error, got: {msg}"
+    );
+    // File should NOT have been created.
+    assert!(!new_path.exists(), "file should not have been created");
+}
+
+#[tokio::test]
+async fn in_repo_read_still_gets_anchors_with_explicit_root() {
+    // Set up a repo dir and create a file inside it.
+    let repo_dir = tempfile::tempdir().unwrap();
+    std::fs::write(repo_dir.path().join("inside.txt"), "hello\nworld\n").unwrap();
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const editor = new Editor();
+        const content = await editor.readFile("inside.txt");
+        transcript.push(new MarkdownSection({ content }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let rendered = text_of(&frames[0]);
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(lines.len(), 2, "got: {rendered:?}");
+    // In-repo reads must have § anchors.
+    assert!(lines[0].contains('§'), "in-repo line missing anchor: {:?}", lines[0]);
+    assert!(lines[1].contains('§'), "in-repo line missing anchor: {:?}", lines[1]);
+}
+
+#[tokio::test]
+async fn in_repo_edit_still_works_with_explicit_root() {
+    let repo_dir = tempfile::tempdir().unwrap();
+    let path = repo_dir.path().join("editme.txt");
+    std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+    let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor } from "frances:v1/tools/file";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const editor = new Editor();
+        const read = await editor.readFile("editme.txt");
+        const line_b = read.split("\n")[1];
+        const result = await editor.edit({
+            kind: "ReplaceLines",
+            path: "editme.txt",
+            anchor: line_b,
+            end_anchor: line_b,
+            text: "B2",
+        });
+        transcript.push(new MarkdownSection({ content: result.text }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let diff = text_of(&frames[0]);
+    assert!(diff.contains("§B2"), "diff missing new anchor: {diff}");
+
+    let on_disk = std::fs::read_to_string(&path).unwrap();
+    assert_eq!(on_disk, "a\nB2\nc\n");
+}

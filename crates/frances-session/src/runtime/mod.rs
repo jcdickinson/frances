@@ -82,6 +82,9 @@ pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     /// IO bundle (timer + shell + fs). Production wires `RealIo`;
     /// tests wire a `StubIo` variant.
     pub io: Io,
+    /// Project roots that define which files are editable. Discovered once
+    /// at session start from the initial cwd.
+    pub editable_roots: Vec<PathBuf>,
 }
 
 impl<Io: frances_workflow::WorkflowIo> frances_workflow::WorkflowIo for WorkflowDepsImpl<Io> {
@@ -118,6 +121,10 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
 
     fn current_cwd(&self) -> Option<PathBuf> {
         self.invocation.lock().process.cwd.clone()
+    }
+
+    fn editable_roots(&self) -> &[PathBuf] {
+        &self.editable_roots
     }
 
     async fn workflow_db(
@@ -304,6 +311,17 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         let chat =
             ChatSessionManager::new(chat_deps, config.clone(), default_model, cache.clone())?;
 
+        let root_markers = config
+            .bind::<Vec<PathBuf>>("root_markers")?
+            .get()
+            .map(|r| (*r).clone())
+            .unwrap_or_else(default_root_markers);
+        let editable_root = match invocation.process.cwd.as_ref() {
+            Some(cwd) => discover_root(cwd, &root_markers).await,
+            None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+        };
+        let editable_roots = vec![editable_root];
+
         let invocation = Arc::new(StdMutex::new(invocation));
         let editor_factory = SessionEditorFactory {
             engine: Arc::new(edit_engine),
@@ -315,6 +333,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
             io,
+            editable_roots,
         })?);
 
         let (events, events_rx) = EventsChannel::new();
@@ -472,3 +491,31 @@ fn build_config_providers(
 
     providers
 }
+
+/// Walk up from `cwd` looking for any directory named in `markers`. Returns the
+/// first ancestor (or `cwd` itself) that contains one; falls back to `cwd` when
+/// no marker is found.
+pub async fn discover_root(cwd: &std::path::Path, markers: &[PathBuf]) -> PathBuf {
+    let mut dir = cwd;
+    loop {
+        for marker in markers {
+            if tokio::fs::metadata(dir.join(marker))
+                .await
+                .is_ok_and(|m| m.is_dir())
+            {
+                return dir.to_path_buf();
+            }
+        }
+        match dir.parent() {
+            Some(parent) => dir = parent,
+            None => return cwd.to_path_buf(),
+        }
+    }
+}
+
+/// Default markers used when `root_markers` is not configured.
+pub fn default_root_markers() -> Vec<PathBuf> {
+    vec![PathBuf::from(".jj"), PathBuf::from(".git")]
+}
+
+

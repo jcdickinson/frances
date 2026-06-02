@@ -707,13 +707,27 @@ pub mod test_deps {
     /// determinism construct a different `StubIo` variant themselves.
     type DefaultIo = StubIo;
 
-    #[derive(Clone, Default)]
+    #[derive(Clone)]
     pub struct StubDeps {
         manager: StubManager,
         io: DefaultIo,
         editor_factory: StubEditorFactory,
         cwd: Arc<Mutex<Option<PathBuf>>>,
         storage: StubStorage,
+        editable_roots: Vec<PathBuf>,
+    }
+
+    impl Default for StubDeps {
+        fn default() -> Self {
+            Self {
+                manager: StubManager::default(),
+                io: DefaultIo::default(),
+                editor_factory: StubEditorFactory::default(),
+                cwd: Arc::new(Mutex::new(None)),
+                storage: StubStorage::default(),
+                editable_roots: vec![PathBuf::from("/")],
+            }
+        }
     }
 
     impl StubDeps {
@@ -739,6 +753,12 @@ pub mod test_deps {
         /// shell or any other swappable sub-piece directly.
         pub fn io(&self) -> &DefaultIo {
             &self.io
+        }
+
+        /// Overrides the editable roots. Useful for integration tests that
+        /// need to make certain paths "out-of-repo".
+        pub fn set_editable_roots(&mut self, roots: Vec<PathBuf>) {
+            self.editable_roots = roots;
         }
     }
 
@@ -775,6 +795,10 @@ pub mod test_deps {
 
         fn current_cwd(&self) -> Option<PathBuf> {
             self.cwd.lock().clone()
+        }
+
+        fn editable_roots(&self) -> &[PathBuf] {
+            &self.editable_roots
         }
 
         async fn workflow_db(
@@ -853,6 +877,7 @@ pub mod test_deps {
         io: DefaultIo,
         editor_factory: StubEditorFactory,
         storage: StubStorage,
+        editable_roots: Vec<PathBuf>,
     }
 
     impl Default for StubDepsRealShell {
@@ -862,6 +887,7 @@ pub mod test_deps {
                 io: DefaultIo::with_real_shell(),
                 editor_factory: StubEditorFactory::default(),
                 storage: StubStorage::default(),
+                editable_roots: vec![PathBuf::from("/")],
             }
         }
     }
@@ -899,6 +925,10 @@ pub mod test_deps {
 
         fn current_cwd(&self) -> Option<PathBuf> {
             None
+        }
+
+        fn editable_roots(&self) -> &[PathBuf] {
+            &self.editable_roots
         }
 
         async fn workflow_db(

@@ -41,6 +41,11 @@ pub trait WorkflowDeps: WorkflowIo + Clone {
     /// the invocation context is set.
     fn current_cwd(&self) -> Option<PathBuf>;
 
+    /// The project roots that define which files are "editable" (eligible
+    /// for anchor-based reads and edits). Discovered once at session start
+    /// by walking up from the initial cwd looking for `.git` / `.jj`.
+    fn editable_roots(&self) -> &[PathBuf];
+
     /// Resolve a workflow's per-session SQL handle. On first touch the
     /// host applies `migrations` under `entity` (via the
     /// [`frances_storage`] migrator), caches an [`Arc<WorkflowDb>`],

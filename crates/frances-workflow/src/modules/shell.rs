@@ -77,6 +77,10 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
                         running: false,
                         closed: false,
                         event_tx: Some(event_tx),
+                        editable_root: deps
+                            .editable_roots()
+                            .first()
+                            .map(|p| p.to_string_lossy().into_owned()),
                     })),
                     event_rx: Arc::new(AsyncMutex::new(event_rx)),
                 },
@@ -106,6 +110,9 @@ struct ShellState {
     /// spawn. Dropped on `close()` so the receiver sees the channel
     /// terminate and `nextEvent` resolves to `null`.
     event_tx: Option<UnboundedSender<ReadEvent>>,
+    /// The first editable root, exported as `$FRANCES_ROOT` at shell
+    /// spawn time so subprocesses can discover the project root.
+    editable_root: Option<String>,
 }
 
 impl<'js, F: WorkflowShell> Trace<'js> for ShellJs<F> {
@@ -379,6 +386,31 @@ async fn ensure_shell<F: WorkflowShell>(
         shell.set_output_sink(Some(tx.clone()));
     }
     guard.shell = Some(shell);
+    // Export $FRANCES_ROOT once at spawn so subprocesses can discover
+    // the project root.
+    if let Some(ref root) = guard.editable_root {
+        let cmd = format!("export FRANCES_ROOT={}", shell_quote(root));
+        let shell = guard.shell.as_mut().expect("shell just set");
+        let outcome = shell
+            .run(&cmd, WaitOpts::default())
+            .await
+            .map_err(ShellToolError::Run)?;
+        match outcome {
+            RunOutcome::Done { exit_code, .. } if exit_code != 0 => {
+                return Err(ShellToolError::Spawn(ShellError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("export FRANCES_ROOT failed with exit {exit_code}"),
+                ))));
+            }
+            RunOutcome::Done { .. } => {}
+            RunOutcome::Quiet { output, .. } => {
+                return Err(ShellToolError::WentQuiet { output });
+            }
+            RunOutcome::Dead { output } => {
+                return Err(ShellToolError::Died { output });
+            }
+        }
+    }
     Ok(())
 }
 

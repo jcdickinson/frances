@@ -40,7 +40,9 @@ use rquickjs::{Class, Ctx, Function, IntoJs, JsLifetime, Object, Result as JsRes
 use tokio::sync::Mutex as AsyncMutex;
 use twox_hash::XxHash3_64;
 
-use frances_core::resolve_relative;
+use std::fmt::Write;
+
+use frances_core::{is_within, resolve_relative};
 use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, LoopKind, WriteMode};
 
 use super::throw_js as throw;
@@ -241,6 +243,8 @@ enum FileToolError {
     ReverseRange { start: usize, end: usize },
     #[error("ranges are 1-indexed, got start=0")]
     RangeStartZero,
+    #[error("path is outside the project and cannot be edited: {path}")]
+    OutsideProject { path: String },
 }
 
 /// Disk-only read with no `EditSession` anchor interaction — the path is
@@ -320,48 +324,30 @@ async fn read_file_inner<D: WorkflowDeps>(
         })?;
     let total_lines = lines.len();
 
+    // Out-of-repo: plain line numbers, no anchor registration.
+    let is_editable = deps
+        .editable_roots()
+        .iter()
+        .any(|root| is_within(root, &resolved));
+    if !is_editable {
+        sess.record_loop(key);
+        return render_plain(&lines, args.ranges.as_deref(), total_lines);
+    }
+
+    // In-repo: anchor-based read (unchanged).
     let full_rendered = sess.read_file(resolved, lines, mtime_ns, size).await?;
     sess.record_loop(key);
 
     if let Some(ranges) = args.ranges {
-        let mut final_ranges = Vec::new();
-        for [start, end] in ranges {
-            if end < start {
-                return Err(FileToolError::ReverseRange { start, end });
-            }
-            if start == 0 {
-                return Err(FileToolError::RangeStartZero);
-            }
-            let actual_end = std::cmp::min(end, total_lines);
-            if start > total_lines {
-                continue; // completely out of bounds
-            }
-            final_ranges.push([start, actual_end]);
-        }
-
-        final_ranges.sort_unstable_by_key(|r| r[0]);
-        let mut merged = Vec::new();
-        for r in final_ranges {
-            if merged.is_empty() {
-                merged.push(r);
-            } else {
-                let last = merged.last_mut().unwrap();
-                if r[0] <= last[1] + 1 {
-                    last[1] = std::cmp::max(last[1], r[1]);
-                } else {
-                    merged.push(r);
-                }
-            }
-        }
-
+        let merged = merge_ranges(&ranges, total_lines)?;
         let mut output = String::new();
         let rendered_lines: Vec<_> = full_rendered.lines().collect();
 
-        for (i, [start, end]) in merged.iter().enumerate() {
+        for (i, &[start, end]) in merged.iter().enumerate() {
             if i > 0 {
                 output.push_str("…§\n");
             }
-            for line in &rendered_lines[(*start - 1)..*end] {
+            for line in &rendered_lines[(start - 1)..end] {
                 output.push_str(line);
                 output.push('\n');
             }
@@ -372,6 +358,79 @@ async fn read_file_inner<D: WorkflowDeps>(
     }
 }
 
+/// Validate, clamp, sort, and merge 1-indexed line ranges.
+fn merge_ranges(
+    ranges: &[[usize; 2]],
+    total_lines: usize,
+) -> Result<Vec<[usize; 2]>, FileToolError> {
+    let mut final_ranges = Vec::new();
+    for &[start, end] in ranges {
+        if end < start {
+            return Err(FileToolError::ReverseRange { start, end });
+        }
+        if start == 0 {
+            return Err(FileToolError::RangeStartZero);
+        }
+        let actual_end = std::cmp::min(end, total_lines);
+        if start > total_lines {
+            continue; // completely out of bounds
+        }
+        final_ranges.push([start, actual_end]);
+    }
+
+    final_ranges.sort_unstable_by_key(|r| r[0]);
+    let mut merged = Vec::new();
+    for r in final_ranges {
+        if merged.is_empty() {
+            merged.push(r);
+        } else {
+            let last = merged.last_mut().unwrap();
+            if r[0] <= last[1] + 1 {
+                last[1] = std::cmp::max(last[1], r[1]);
+            } else {
+                merged.push(r);
+            }
+        }
+    }
+    Ok(merged)
+}
+
+/// Render file lines with `line_num:content` formatting for out-of-repo
+/// reads (no anchors). When `ranges` is `None`, all lines are rendered.
+/// When present, only the specified (merged) ranges are shown, separated
+/// by `…`.
+fn render_plain(
+    lines: &[String],
+    ranges: Option<&[[usize; 2]]>,
+    total_lines: usize,
+) -> Result<String, FileToolError> {
+    match ranges {
+        None => {
+            let mut out = String::new();
+            for (i, line) in lines.iter().enumerate() {
+                let _ = writeln!(out, "{}:{}", i + 1, line);
+            }
+            Ok(out)
+        }
+        Some(ranges) => {
+            let merged = merge_ranges(ranges, total_lines)?;
+            if merged.is_empty() {
+                return Ok(String::new());
+            }
+            let mut out = String::new();
+            for (i, &[start, end]) in merged.iter().enumerate() {
+                if i > 0 {
+                    out.push_str("…\n");
+                }
+                for line_num in start..=end {
+                    let _ = writeln!(out, "{}:{}", line_num, lines[line_num - 1]);
+                }
+            }
+            Ok(out)
+        }
+    }
+}
+
 async fn edit_inner<D: WorkflowDeps>(
     deps: &D,
     session: &EditorSession<D>,
@@ -379,8 +438,33 @@ async fn edit_inner<D: WorkflowDeps>(
 ) -> Result<DiffRender, FileToolError> {
     let mut edit: LlmEdit = serde_json::from_value(raw).map_err(FileToolError::ParseEdit)?;
     resolve_edit_path(&mut edit, deps.current_cwd().as_deref());
+
+    // Reject edits on paths outside the project's editable roots.
+    let resolved = edit_path(&edit);
+    let is_editable = deps
+        .editable_roots()
+        .iter()
+        .any(|root| is_within(root, resolved));
+    if !is_editable {
+        return Err(FileToolError::OutsideProject {
+            path: resolved.display().to_string(),
+        });
+    }
+
     let mut sess = session.lock().await;
     Ok(sess.edit(edit, write_draft).await?)
+}
+
+/// Extract the resolved path from an `LlmEdit`.
+fn edit_path(edit: &LlmEdit) -> &Path {
+    match edit {
+        LlmEdit::ReplaceLines { path, .. }
+        | LlmEdit::ReplaceAll { path, .. }
+        | LlmEdit::InsertAfter { path, .. }
+        | LlmEdit::InsertBefore { path, .. }
+        | LlmEdit::New { path, .. }
+        | LlmEdit::Overwrite { path, .. } => Path::new(path),
+    }
 }
 
 fn resolve_edit_path(edit: &mut LlmEdit, cwd: Option<&Path>) {
