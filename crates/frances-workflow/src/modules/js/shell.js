@@ -199,10 +199,17 @@ function _errResult(call_id, err) {
 
 // Run `op` (a `runOnce`/`keepWaiting` invocation) while concurrently
 // pulling discrete `ReadEvent`s off the shell's event stream. Output
-// events go straight to the open frame's writer as they arrive; the
-// terminal event (`done` / `quiet` / `dead`) ends the loop and the
-// matching outcome is resolved by `op`'s promise.
-async function _streamUntilSettled(shell, op) {
+// events go straight to `writer` as they arrive; the terminal event
+// (`done` / `quiet` / `dead`) ends the loop and the matching outcome is
+// resolved by `op`'s promise.
+//
+// `writer` is captured by the caller when it opened (or adopted) the
+// frame — NOT re-read from `shell._writer` per chunk. A command's pump
+// must keep targeting its own frame even if a later command swaps
+// `shell._writer` to a new one (e.g. after an interrupt left this pump
+// dangling); reading the shared slot mid-stream would bleed this
+// command's tail output into the next command's frame.
+async function _streamUntilSettled(shell, op, writer) {
   const opPromise = op();
   // A resolved `op` always emits a terminal event, so on the normal path
   // `nextEvent()` drives the loop and no events are ever dropped. But if
@@ -223,7 +230,6 @@ async function _streamUntilSettled(shell, op) {
       break;
     }
     if (event.kind === "output") {
-      const writer = shell._writer;
       if (writer) {
         try {
           await writer.write(event.data);
@@ -340,7 +346,11 @@ async function _abortRunningShell(shell, scope, notice) {
     // Already settled — fine.
   }
   try {
-    const drained = await _streamUntilSettled(shell, () => shell.keepWaiting());
+    const drained = await _streamUntilSettled(
+      shell,
+      () => shell.keepWaiting(),
+      shell._writer,
+    );
     await _frameOutcome(shell, drained, "\n(killed)");
   } catch (_) {
     // Already idle — close the frame defensively if anyone left it open.
@@ -428,14 +438,17 @@ class Run {
     // `head`/`tail` bound only what we hand back to the model; the frame
     // gets the full stream regardless.
     const view = { head: call.arguments.head, tail: call.arguments.tail };
-    _openShellFrame(this.shell, call.arguments.cmd);
+    const { writer } = _openShellFrame(this.shell, call.arguments.cmd);
     let outcome;
     try {
-      outcome = await _streamUntilSettled(this.shell, () =>
-        this.shell.runOnce(call.arguments.cmd, {
-          quiet: call.arguments.quiet,
-          max: call.arguments.max,
-        }),
+      outcome = await _streamUntilSettled(
+        this.shell,
+        () =>
+          this.shell.runOnce(call.arguments.cmd, {
+            quiet: call.arguments.quiet,
+            max: call.arguments.max,
+          }),
+        writer,
       );
     } catch (err) {
       // The frame is open but the command never produced an outcome;
@@ -544,11 +557,14 @@ class Wait {
 
   handler = async ({ call }) => {
     try {
-      const outcome = await _streamUntilSettled(this.shell, () =>
-        this.shell.keepWaiting({
-          quiet: call.arguments.quiet,
-          max: call.arguments.max,
-        }),
+      const outcome = await _streamUntilSettled(
+        this.shell,
+        () =>
+          this.shell.keepWaiting({
+            quiet: call.arguments.quiet,
+            max: call.arguments.max,
+          }),
+        this.shell._writer,
       );
       await _frameOutcome(this.shell, outcome);
       return _format(call.id, outcome, {
@@ -593,8 +609,10 @@ class Kill {
           break;
         }
         try {
-          final = await _streamUntilSettled(this.shell, () =>
-            this.shell.keepWaiting(),
+          final = await _streamUntilSettled(
+            this.shell,
+            () => this.shell.keepWaiting(),
+            this.shell._writer,
           );
         } catch (_) {
           // Rust says no command in flight — already idle.

@@ -1046,10 +1046,31 @@ async function turn(): Promise<TurnEnd> {
       // wait for it to settle, then roll history back to the clean
       // checkpoint. `pending` is left for `ourLoop` to consume.
       ac.abort(new Error("interrupted"));
+      // Esc means "stop". Aborting only tears down the chat stream — the
+      // shell command runs on its own subprocess, decoupled so it can
+      // survive quiet handoffs. SIGKILL it so its handler settles instead
+      // of streaming into the next command's frame, and so bash returns to
+      // idle rather than rejecting the next shell_run as busy. The kill
+      // also makes the quiet-negotiation loop's `isRunning()` guard false,
+      // so awaiting `r.completed` below can't spin up a stray round.
+      try {
+        await sh.kill();
+      } catch (_) {
+        // Nothing in flight, or the shell is already closed — fine.
+      }
       try {
         await round;
       } catch (_) {
         // Expected: the aborted stream rejects with the abort reason.
+      }
+      // Let the dispatch finish: handlers close their frames and compute
+      // their results. We await it BEFORE rolling back so those orphaned
+      // tool_results are inside the checkpoint window and get discarded,
+      // rather than landing in history after the truncation point.
+      try {
+        await r.completed;
+      } catch (_) {
+        // Aborted before the round settled — nothing dispatched.
       }
       await chat.rollback(cp);
       setStatus(null);
