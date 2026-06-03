@@ -50,6 +50,7 @@ import {
   ShellOutputSection,
 } from "frances:v1/sections";
 import { approve } from "frances:v1/approval";
+import { shellFamily } from "frances:v1/tool-families";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
 
@@ -410,6 +411,7 @@ class Run {
       "`max` (seconds) to tune how long it waits before handing control back — " +
       "raise them for slow or streaming commands so you aren't pinged early.";
     this.parameters = RUN_SCHEMA;
+    this.family = shellFamily;
   }
 
   describe(call) {
@@ -536,6 +538,7 @@ class Wait {
     this.description =
       "Continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
     this.parameters = WAIT_SCHEMA;
+    this.family = shellFamily;
     this.hidden = true;
   }
 
@@ -566,6 +569,7 @@ class Kill {
     this.name = "shell_kill";
     this.description = "SIGKILL the in-flight shell command.";
     this.parameters = KILL_SCHEMA;
+    this.family = shellFamily;
   }
 
   handler = async ({ call }) => {
@@ -695,6 +699,7 @@ class Set {
     this.name = "shell_set";
     this.description = shellDesc.shell_set;
     this.parameters = SET_SCHEMA;
+    this.family = shellFamily;
   }
 
   describe(call) {
@@ -751,6 +756,7 @@ class Capture {
     this.name = "shell_capture";
     this.description = shellDesc.shell_capture;
     this.parameters = CAPTURE_SCHEMA;
+    this.family = shellFamily;
   }
 
   describe(call) {

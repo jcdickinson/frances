@@ -355,6 +355,12 @@ impl WorkflowFs for MockFs {
         self.inner.lock().dirs.insert(path.to_path_buf());
         Ok(())
     }
+
+    async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        // No symlinks in the mock filesystem; return path as-is.
+        Ok(path.to_path_buf())
+    }
+
 }
 
 #[cfg(test)]

@@ -24,10 +24,10 @@
 //!   provider sees only the in-memory `pending` queue drained since
 //!   the last `stream()` call.
 //!
-//! Roles in v1: `"system"`, `"user"`, `"tool"`. Pushing `"assistant"`
-//! throws — assistant messages come from the model. `"system"` may only
-//! be pushed before any `"user"` message; after the first user push the
-//! system slot is locked. `"tool"` carries `{ call_id, content, is_error }`
+//! Roles in v1: `"user"`, `"tool"`. Pushing `"assistant"` throws —
+//! assistant messages come from the model. Pushing `"system"` throws —
+//! system content is assembled from `promptSections` via the internal
+//! `_pushSystem` escape hatch. `"tool"` carries `{ call_id, content, is_error }`
 //! and queues a tool-result that the next `run()` includes in history.
 //!
 //! Tools are attached to the session via `chat.tools`, a plain JS array.
@@ -36,9 +36,10 @@
 //! call and forwards them to the provider; `handler` is JS-only and the
 //! workflow's loop is responsible for invoking it.
 
+use chrono::Local;
 use std::borrow::Cow;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+
 
 use rquickjs::atom::PredefinedAtom;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
@@ -93,13 +94,16 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
                     handle,
                     deps: deps.clone(),
                     usage_tx: ctor_usage_tx.clone(),
-                    system_locked: AtomicBool::new(false),
                 },
             )?;
             // `tools` is a fresh JS array on every instance. Workflows
             // mutate it via `chat.tools.push({ ... })`; the Rust side
             // snapshots it at each `stream()` call.
             instance.set("tools", Array::new(ctx.clone())?)?;
+            // `promptSections` is a fresh JS array for prompt section
+            // objects. Workflows push `{ prompt(ctx) -> string | null }`
+            // objects into it; `stream()` renders them before each round.
+            instance.set("promptSections", Array::new(ctx.clone())?)?;
             Ok(instance)
         },
     )?;
@@ -385,9 +389,6 @@ pub struct ChatSessionJs<D: WorkflowDeps> {
     /// token usage. Independent of the JS-visible event stream so
     /// workflows don't have to remember to forward it.
     usage_tx: UnboundedSender<frances_models_llm::Usage>,
-    /// Flipped once the first `user` message is pushed. After that,
-    /// `system` pushes throw.
-    system_locked: AtomicBool,
 }
 
 impl<'js, D: WorkflowDeps> Trace<'js> for ChatSessionJs<D> {
@@ -445,6 +446,79 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
                 },
             )?,
         )?;
+
+        // `_envInfo()` returns a snapshot of environment data for prompt
+        // section assembly in JS. Fields: { os, shell, platform, repoRoot,
+        // cwd, date }. The `shell` value comes from `$SHELL` in the
+        // invocation's env snapshot; `repoRoot` is the first editable root.
+        proto.set(
+            "_envInfo",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
+                    let borrow = this.0.borrow();
+                    let env = borrow.deps.current_env();
+                    let cwd = borrow.deps.current_cwd();
+                    let editable_roots = borrow.deps.editable_roots();
+
+                    let obj = Object::new(ctx.clone())?;
+                    obj.set("os", std::env::consts::OS)?;
+                    obj.set("platform", std::env::consts::FAMILY)?;
+
+                    // $SHELL from the invocation env snapshot; fall back to
+                    // the process environment.
+                    let shell_key: std::ffi::OsString = "SHELL".into();
+                    let shell_val = env
+                        .get(&shell_key)
+                        .cloned()
+                        .or_else(|| std::env::var_os("SHELL"));
+                    let shell = shell_val
+                        .and_then(|v| v.into_string().ok())
+                        .unwrap_or_else(|| "unknown".to_owned());
+                    obj.set("shell", shell)?;
+
+                    // First editable root, if any.
+                    if let Some(root) = editable_roots.first() {
+                        obj.set("repoRoot", root.to_string_lossy().as_ref())?;
+                    } else {
+                        obj.set("repoRoot", Value::new_null(ctx.clone()))?;
+                    }
+
+                    // Current working directory (mutable — late section).
+                    match cwd {
+                        Some(p) => obj.set("cwd", p.to_string_lossy().as_ref())?,
+                        None => obj.set("cwd", Value::new_null(ctx.clone()))?,
+                    }
+
+                    // Date in ISO 8601 local format.
+                    obj.set("date", Local::now().format("%Y-%m-%d").to_string())?;
+
+                    Ok(obj.into_value())
+                },
+            )?,
+        )?;
+
+        // `_pushSystem(text)` is the internal escape hatch for injecting
+        // system content. The public `push()` rejects `role: "system"` —
+        // this method bypasses that restriction so JS prompt sections can
+        // assemble system content before each round, even after user
+        // messages have been pushed.
+        proto.set(
+            "_pushSystem",
+            Function::new(
+                ctx.clone(),
+                |_ctx: Ctx<'js>,
+                 this: This<Class<'js, ChatSessionJs<D>>>,
+                 text: String| {
+                    let borrow = this.0.borrow();
+                    borrow
+                        .handle
+                        .push(OwnedHistoryInput::System { text });
+                    Ok::<_, rquickjs::Error>(())
+                },
+            )?,
+        )?;
+
 
         Ok(Some(proto))
     }
@@ -550,23 +624,16 @@ fn push_message<'js, D: WorkflowDeps>(
     let borrow = session.borrow();
     let input = match role_str.as_str() {
         "user" => {
-            borrow.system_locked.store(true, Ordering::Release);
             let content: String = obj
                 .get("content")
                 .map_err(|_| throw(ctx, "session.push: missing or non-string `content`"))?;
             OwnedHistoryInput::User { text: content }
         }
         "system" => {
-            if borrow.system_locked.load(Ordering::Acquire) {
-                return Err(throw(
-                    ctx,
-                    "session.push: role `system` is only valid before any user message has been pushed",
-                ));
-            }
-            let content: String = obj
-                .get("content")
-                .map_err(|_| throw(ctx, "session.push: missing or non-string `content`"))?;
-            OwnedHistoryInput::System { text: content }
+            return Err(throw(
+                ctx,
+                "session.push: role `system` is not pushable — use promptSections instead",
+            ));
         }
         "tool" => {
             let call_id: String = obj.get("call_id").map_err(|_| {
@@ -611,7 +678,7 @@ fn push_message<'js, D: WorkflowDeps>(
             return Err(throw(
                 ctx,
                 &format!(
-                    "session.push: unknown role `{other}` (expected `system`, `user`, or `tool`)"
+                    "session.push: unknown role `{other}` (expected `user` or `tool`)"
                 ),
             ));
         }

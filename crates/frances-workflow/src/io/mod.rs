@@ -7,7 +7,7 @@
 //! [`mock::MockIo`] from the `test-utils` feature.
 
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,4 +104,9 @@ pub trait WorkflowFs: Clone + Send + Sync + 'static {
     fn metadata(&self, path: &Path) -> impl Future<Output = std::io::Result<FsMetadata>> + Send;
 
     fn create_dir_all(&self, path: &Path) -> impl Future<Output = std::io::Result<()>> + Send;
+
+    /// Resolve symlinks and return the canonical path. For in-memory
+    /// filesystems that have no symlinks, returning `path` as-is is
+    /// correct.
+    fn canonicalize(&self, path: &Path) -> impl Future<Output = std::io::Result<PathBuf>> + Send;
 }

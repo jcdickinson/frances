@@ -10,7 +10,7 @@ There is no system-prompt assembly today. Messages are forged per input type in
 `crates/frances-llm/src/providers/genai/mod.rs` (`forge_one`); a
 `HistoryInput::System { text }` becomes a `ChatMessage::system(text)`
 (genai/mod.rs:334) pushed via `chat.push()`. Nothing injects the working
-directory, OS, shell, or git state. `WorkflowDeps::current_cwd()` /
+directory, OS, shell. `WorkflowDeps::current_cwd()` /
 `current_env()` exist (`crates/frances-session/src/runtime/mod.rs:115-122`) but
 never reach the model.
 
@@ -65,7 +65,7 @@ single Rust `System` message at build time.
 A workflow that wants a fixed system string registers a section that returns that
 constant — no parallel mechanism. This makes the two-JS-paths invalid state
 unrepresentable, and because sections are recomputed at each build the system
-prompt stays live (current cwd, current git state) instead of being frozen into
+prompt stays live (current cwd) instead of being frozen into
 persisted history.
 
 ### Modes compose sections; sections stay mode-agnostic
@@ -136,8 +136,6 @@ off habits that produce worse results than our anchored tools.)
 - **Working directory** — the real absolute cwd.
 - **OS, shell, platform** — so it doesn't emit shell-isms for the wrong shell.
 - **Date** — so it doesn't guess "now".
-- **Git snapshot** — branch, status, recent commits, flagged as a point-in-time
-  snapshot that won't update.
 
 ### Cache-prefix rule
 

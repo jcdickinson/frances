@@ -19,6 +19,10 @@ mod scope;
 mod shell;
 mod timer;
 mod whatwg;
+mod tool_family;
+mod context_sections;
+mod agents;
+mod agent_sections;
 
 fn write_source(ext: &str, body: &str) -> tempfile::NamedTempFile {
     let mut f = tempfile::Builder::new()

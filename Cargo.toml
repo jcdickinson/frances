@@ -46,6 +46,7 @@ jaq-json = "2"
 jaq-std = "3"
 libc = "0.2"
 genai = "0.6.0-beta.20"
+chrono = "0.4"
 markdown = "1"
 parking_lot = "0.12"
 ratatui = { version = "0.30", features = ["unstable-backend-writer", "unstable-rendered-line-info"] }

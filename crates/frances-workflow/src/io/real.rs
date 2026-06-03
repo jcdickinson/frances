@@ -3,7 +3,7 @@
 
 use std::future::Future;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -111,4 +111,9 @@ impl WorkflowFs for RealFs {
     async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
         tokio::fs::create_dir_all(path).await
     }
+
+    async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        tokio::fs::canonicalize(path).await
+    }
+
 }

@@ -35,6 +35,7 @@
 //   );
 
 import { transcript, DiffSection } from "frances:v1/sections";
+import { editingFamily } from "frances:v1/tool-families";
 
 const { Editor, EditorDescriptions: desc } = globalThis.__frances_v1_stash__;
 
@@ -247,6 +248,7 @@ class ReplaceLines {
     this.name = "file_replace_lines";
     this.description = desc.file_replace_lines;
     this.parameters = REPLACE_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {
@@ -286,6 +288,7 @@ class ReplaceAll {
     this.name = "file_replace_all";
     this.description = desc.file_replace_all;
     this.parameters = REPLACE_ALL_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {
@@ -320,6 +323,7 @@ class InsertAfter {
     this.name = "file_insert_after";
     this.description = desc.file_insert_after;
     this.parameters = INSERT_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {
@@ -357,6 +361,7 @@ class InsertBefore {
     this.name = "file_insert_before";
     this.description = desc.file_insert_before;
     this.parameters = INSERT_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {
@@ -394,6 +399,7 @@ class New {
     this.name = "file_new";
     this.description = desc.file_new;
     this.parameters = WHOLE_FILE_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {
@@ -430,6 +436,7 @@ class Overwrite {
     this.name = "file_overwrite";
     this.description = desc.file_overwrite;
     this.parameters = WHOLE_FILE_SCHEMA;
+    this.family = editingFamily;
   }
 
   describe(call) {

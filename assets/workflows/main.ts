@@ -57,6 +57,13 @@ import {
   Assign as VarAssign,
 } from "frances:v1/tools/variable";
 import { exit, setStatus } from "frances:v1/workflow";
+import { envBlock, cwdBlock } from "frances:v1/context-sections";
+import { toolGuidance } from "frances:v1/tool-family";
+import {
+  globalAgents,
+  localAgents,
+  nestedAgentsInventory,
+} from "frances:v1/agent-sections";
 
 type StepStatus = "pending" | "active" | "completed" | "abandoned";
 type StepOutcome = "succeeded" | "partial" | "failed" | "abandoned";
@@ -148,6 +155,36 @@ const SYSTEM_PROMPT =
   "only the user can decide, call `plan_begin` to return to planning and ask — " +
   "don't guess. Occasionally provide updates on what you are trying to do; " +
   "don't just present the user with a stream of tool calls.";
+
+// Stable section objects for planning and execution prompts.
+// These are mode-specific identity objects referenced by promptSections.
+const planningPromptSection = {
+  name: "planning-prompt",
+  prompt(_ctx: any): string {
+    return PLANNING_PROMPT;
+  },
+};
+
+const executionPromptSection = {
+  name: "execution-prompt",
+  prompt(_ctx: any): string {
+    return SYSTEM_PROMPT;
+  },
+};
+
+// Shared section list: envBlock (immutable, front), mode prompt, toolGuidance,
+// agent discovery sections, cwdBlock (mutable, late). Each mode swaps the
+// mode-specific section; the rest are shared.
+const baseSections = [
+  envBlock,
+  toolGuidance,
+  globalAgents,
+  localAgents,
+  nestedAgentsInventory,
+  cwdBlock,
+];
+const planningSections = [planningPromptSection, ...baseSections];
+const executionSections = [executionPromptSection, ...baseSections];
 
 function _okResult(call_id: string, content: string): ToolResult {
   return { role: "tool", call_id, content, is_error: false };
@@ -265,12 +302,13 @@ async function summarizeStepTranscript(
     model_intents: ["cheap", "chat"],
     ephemeral: true,
   });
-  summarizer.push({
-    role: "system",
-    content:
-      "You summarize one completed workflow step for future agent context. " +
-      "Be concise but specific. Preserve important file paths, commands, tool results, " +
-      "errors, decisions, and facts learned. Do not invent details. Return only the summary.",
+  summarizer.promptSections.push({
+    name: "summarizer",
+    prompt() {
+      return "You summarize one completed workflow step for future agent context. " +
+        "Be concise but specific. Preserve important file paths, commands, tool results, " +
+        "errors, decisions, and facts learned. Do not invent details. Return only the summary.";
+    },
   });
   summarizer.push({
     role: "user",
@@ -879,7 +917,7 @@ function freshContext(): void {
 function newPlanningChat(seed?: string): ChatSession {
   freshContext();
   const session = new ChatSession({ model_intents: ["chat"] });
-  session.push({ role: "system", content: PLANNING_PROMPT });
+  session.promptSections.push(...planningSections);
   session.tools.push(...planningTools);
   if (seed) session.push({ role: "user", content: seed });
   return session;
@@ -888,7 +926,7 @@ function newPlanningChat(seed?: string): ChatSession {
 function newExecutionChat(seed?: string): ChatSession {
   freshContext();
   const session = new ChatSession({ model_intents: ["chat"] });
-  session.push({ role: "system", content: SYSTEM_PROMPT });
+  session.promptSections.push(...executionSections);
   session.tools.push(...executingTools);
   if (seed) session.push({ role: "user", content: seed });
   return session;

@@ -79,6 +79,23 @@ ChatSession.prototype.stream = function stream(opts) {
 async function _streamWithDispatch(chat, opts, getHook) {
   const signal = opts && opts.signal;
   const maxToolCalls = opts && opts.maxToolCalls;
+
+  // Render prompt sections into a system message. Each section is a
+  // `{ prompt(ctx) -> string | null }` object; non-null results are
+  // concatenated and pushed via the internal `_pushSystem` bypass.
+  // Sections may be async (e.g. instruction discovery backed by Rust).
+  if (chat.promptSections && chat.promptSections.length > 0) {
+    const ctx = { ...chat._envInfo(), tools: chat.tools };
+    const parts = [];
+    for (const section of chat.promptSections) {
+      const result = await section.prompt(ctx);
+      if (result != null) parts.push(result);
+    }
+    if (parts.length > 0) {
+      chat._pushSystem(parts.join("\n\n"));
+    }
+  }
+
   const inner = await _innerStream.call(chat, { maxToolCalls });
 
   let streamController;

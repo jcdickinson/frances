@@ -56,6 +56,16 @@
 //!   plus `grep-searcher`).
 //! - `frances:v1/tools/variable` — pure-JS `Variables` JSON store +
 //!   `Get`/`Set` tool classes.
+//! - `frances:v1/tool-family`   — pure-JS `defineToolFamily` + `defineTool`
+//!   + `toolGuidance` section. Identity-based family dedup, tool construction,
+//!   and the prompt section that renders family guidance.
+//! - `frances:v1/context-sections` — pure-JS `envBlock` + `cwdBlock` prompt
+//!   sections for environment info and working directory.
+//! - `frances:v1/agents` — Rust-backed `discoverGlobalAgents`,
+//!   `discoverLocalAgents`, `discoverNestedAgents` for instruction
+//!   file discovery (AGENTS.md / CLAUDE.md).
+//! - `frances:v1/agent-sections` — `globalAgents`, `localAgents`,
+//!   `nestedAgentsInventory` prompt sections backed by the agents module.
 //! - `whatwg:web-streams`        — `ReadableStream`, `WritableStream`,
 //!   `TransformStream` and friends from web-streams-polyfill.
 //! - `whatwg:abortcontroller`    — `AbortController`, `AbortSignal`
@@ -63,6 +73,9 @@
 //!   the stash's sleep primitive.
 //! - `whatwg:dom`                — minimal DOM Standard surface
 //!   (currently just `DOMException`).
+//! - `frances:v1/tool-families` — predefined `editingFamily` and
+//!   `shellFamily` ToolFamily instances for dedup-by-identity.
+
 
 use std::sync::Arc;
 
@@ -80,6 +93,7 @@ pub mod chat;
 pub mod file;
 pub mod file_find_or_grep;
 pub mod inbox;
+pub mod agents;
 pub mod io;
 pub mod jaq;
 pub mod lifecycle;
@@ -232,6 +246,12 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 
     let db_instance = storage::build_storage(ctx, workflow_db)?;
     stash.set("db", db_instance)?;
+    let (discover_global, discover_local, discover_nested) =
+        agents::build_agents_functions(ctx, deps.clone())?;
+    stash.set("_discoverGlobalAgents", discover_global)?;
+    stash.set("_discoverLocalAgents", discover_local)?;
+    stash.set("_discoverNestedAgents", discover_nested)?;
+
 
     ctx.globals().set(STASH_KEY, stash)?;
     Ok(lifecycle_obj)
@@ -260,10 +280,17 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
     declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
     declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tool-family", TOOL_FAMILY_SRC)?;
+    declare_and_eval(ctx, "frances:v1/tool-families", TOOL_FAMILIES_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file_find_or_grep", FILE_SEARCH_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
+
+    declare_and_eval(ctx, "frances:v1/context-sections", CONTEXT_SECTIONS_SRC)?;
+    declare_and_eval(ctx, "frances:v1/agents", AGENTS_SRC)?;
+    declare_and_eval(ctx, "frances:v1/agent-sections", AGENT_SECTIONS_SRC)?;
+
     Ok(())
 }
 
@@ -369,6 +396,11 @@ const SHELL_SRC: &str = include_str!("js/shell.js");
 const FILE_SRC: &str = include_str!("js/file.js");
 const FILE_SEARCH_SRC: &str = include_str!("js/file_find_or_grep.js");
 const VARIABLE_SRC: &str = include_str!("js/variable.js");
+const TOOL_FAMILY_SRC: &str = include_str!("js/tool-family.js");
+const CONTEXT_SECTIONS_SRC: &str = include_str!("js/context-sections.js");
+const AGENTS_SRC: &str = include_str!("js/agents.js");
+const AGENT_SECTIONS_SRC: &str = include_str!("js/agent-sections.js");
+const TOOL_FAMILIES_SRC: &str = include_str!("js/tool-families.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be
 // refreshed by `modules/whatwg/update.sh` without touching this crate.

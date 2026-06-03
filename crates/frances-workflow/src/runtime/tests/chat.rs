@@ -9,7 +9,7 @@ async fn chat_session_accepts_system_and_user_roles() {
         import { ChatSession } from "frances:v1/chat";
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["summarize"] });
-        s.push({ role: "system", content: "you are a summariser" });
+        s._pushSystem("you are a summariser");
         s.push({ role: "user", content: "hi" });
         transcript.push(new MarkdownSection({ content: "ok" }));
         "#,
@@ -114,15 +114,14 @@ async fn chat_session_ephemeral_rejects_non_bool() {
 }
 
 #[tokio::test]
-async fn chat_session_rejects_system_after_user() {
+async fn chat_session_rejects_system_role() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
         const s = new ChatSession({ model_intents: ["x"] });
-        s.push({ role: "user", content: "hi" });
-        s.push({ role: "system", content: "too late" });
+        s.push({ role: "system", content: "not allowed" });
         "#,
     );
     let mut handle = rt
@@ -142,7 +141,7 @@ async fn chat_session_rejects_system_after_user() {
 }
 
 #[tokio::test]
-async fn chat_session_allows_multiple_consecutive_system_messages() {
+async fn chat_session_push_system_bypass_allows_multiple() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
@@ -150,8 +149,8 @@ async fn chat_session_allows_multiple_consecutive_system_messages() {
         import { ChatSession } from "frances:v1/chat";
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
-        s.push({ role: "system", content: "be terse" });
-        s.push({ role: "system", content: "answer in english" });
+        s._pushSystem("be terse");
+        s._pushSystem("answer in english");
         s.push({ role: "user", content: "hi" });
         transcript.push(new MarkdownSection({ content: "ok" }));
         "#,
@@ -266,11 +265,12 @@ async fn chat_session_raw_inner_stream_is_not_exposed() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))));
     // Only the public prototype methods (`push`, `checkpoint`,
-    // `rollback`) plus the JS-installed `stream` should appear; the
-    // inner raw stream function must not.
+    // `rollback`), the internal escape hatches (`_envInfo`,
+    // `_pushSystem`), plus the JS-installed `stream` should appear;
+    // the inner raw stream function must not.
     assert_eq!(
         text_of(&frames[0]),
-        "proto=checkpoint,push,rollback,stream stash=true"
+        "proto=_envInfo,_pushSystem,checkpoint,push,rollback,stream stash=true"
     );
 }
 
@@ -494,7 +494,7 @@ async fn chat_tools_array_is_per_instance_and_initially_empty() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
         const a = new ChatSession({ model_intents: ["x"] });
         const b = new ChatSession({ model_intents: ["x"] });
-        const shape = `a=${Array.isArray(a.tools)} len=${a.tools.length} distinct=${a.tools !== b.tools}`;
+        const shape = `a=${Array.isArray(a.tools)} len=${a.tools.length} distinct=${a.tools !== b.tools} ps=${Array.isArray(a.promptSections)} psLen=${a.promptSections.length} psDistinct=${a.promptSections !== b.promptSections}`;
         transcript.push(new MarkdownSection({ content: shape }));
         "#,
     );
@@ -508,7 +508,7 @@ async fn chat_tools_array_is_per_instance_and_initially_empty() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    assert_eq!(text_of(&frames[0]), "a=true len=0 distinct=true");
+    assert_eq!(text_of(&frames[0]), "a=true len=0 distinct=true ps=true psLen=0 psDistinct=true");
 }
 
 #[tokio::test]
@@ -1169,4 +1169,580 @@ async fn scope_tool_call_hook_isolated_to_nested_stream() {
             .any(|(_, c)| c == "outer-done; scopeHookCalls=1"),
         "expected outer tool result with scopeHookCalls=1, got {results:?}"
     );
+}
+
+#[tokio::test]
+async fn chat_push_system_bypass_works_after_user_message() {
+    // `_pushSystem(text)` pushes OwnedHistoryInput::System directly,
+    // bypassing the public push() restriction on role "system".
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.push({ role: "user", content: "hi" });
+        // Regular push({ role: "system" }) would throw here, but
+        // _pushSystem bypasses the guard.
+        s._pushSystem("injected by section assembly");
+        s._pushSystem("second system message");
+        transcript.push(new MarkdownSection({ content: "ok" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    // Inspect the underlying stub session's pending queue.
+    let sessions = deps.sessions();
+    assert_eq!(sessions.len(), 1);
+    let pending = sessions[0].pending();
+    // Expected: user, system, system (in that order).
+    assert_eq!(pending.len(), 3);
+    assert!(matches!(
+        &pending[0],
+        frances_models_llm::chat::OwnedHistoryInput::User { text } if text == "hi"
+    ));
+    match &pending[1] {
+        frances_models_llm::chat::OwnedHistoryInput::System { text } => {
+            assert_eq!(text, "injected by section assembly");
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+    match &pending[2] {
+        frances_models_llm::chat::OwnedHistoryInput::System { text } => {
+            assert_eq!(text, "second system message");
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn chat_push_system_bypass_works_before_user_message() {
+    // `_pushSystem` also works before user messages, like normal system push.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s._pushSystem("early system");
+        s.push({ role: "user", content: "hi" });
+        transcript.push(new MarkdownSection({ content: "ok" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    assert_eq!(pending.len(), 2);
+    match &pending[0] {
+        frances_models_llm::chat::OwnedHistoryInput::System { text } => {
+            assert_eq!(text, "early system");
+        }
+        other => panic!("expected System, got {other:?}"),
+    }
+    assert!(matches!(
+        &pending[1],
+        frances_models_llm::chat::OwnedHistoryInput::User { text } if text == "hi"
+    ));
+}
+
+
+// ---------------------------------------------------------------------------
+// _envInfo() tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_env_info_returns_correct_shape() {
+    let mut deps = StubDeps::default();
+    deps.set_editable_roots(vec![PathBuf::from("/my/repo")]);
+    deps.set_cwd(PathBuf::from("/my/repo/src"));
+
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        const info = s._envInfo();
+        const keys = Object.keys(info).sort();
+        const hasOs = typeof info.os === "string" && info.os.length > 0;
+        const hasShell = typeof info.shell === "string" && info.shell.length > 0;
+        const hasPlatform = typeof info.platform === "string" && info.platform.length > 0;
+        const hasRepoRoot = info.repoRoot === "/my/repo";
+        const hasCwd = info.cwd === "/my/repo/src";
+        const hasDate = /^\d{4}-\d{2}-\d{2}$/.test(info.date);
+        transcript.push(new MarkdownSection({ content: JSON.stringify({
+            keys, hasOs, hasShell, hasPlatform, hasRepoRoot, hasCwd, hasDate,
+        }) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    assert_eq!(
+        result["keys"],
+        serde_json::json!(["cwd", "date", "os", "platform", "repoRoot", "shell"]),
+        "unexpected keys"
+    );
+    assert_eq!(result["hasOs"], true, "os should be non-empty string");
+    assert_eq!(result["hasShell"], true, "shell should be non-empty string");
+    assert_eq!(result["hasPlatform"], true, "platform should be non-empty string");
+    assert_eq!(result["hasRepoRoot"], true, "repoRoot should be /my/repo");
+    assert_eq!(result["hasCwd"], true, "cwd should be /my/repo/src");
+    assert_eq!(result["hasDate"], true, "date should be YYYY-MM-DD");
+}
+
+#[tokio::test]
+async fn chat_env_info_null_repo_root_and_cwd_when_missing() {
+    // default editable_roots is vec!["/"] which is set, but let's use empty
+    // to get null repoRoot. And don't set cwd to get null.
+    // Actually, default editable_roots is vec!["/"] so repoRoot will be "/".
+    // Let's use empty vec to get null repoRoot.
+    let mut deps2 = StubDeps::default();
+    deps2.set_editable_roots(vec![]);
+    // cwd unset → null
+
+    let rt = Runtime::new(deps2).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        const info = s._envInfo();
+        transcript.push(new MarkdownSection({ content: JSON.stringify({
+            repoRoot: info.repoRoot,
+            cwd: info.cwd,
+        }) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    assert_eq!(result["repoRoot"], serde_json::Value::Null, "repoRoot should be null with empty roots");
+    assert_eq!(result["cwd"], serde_json::Value::Null, "cwd should be null when not set");
+}
+
+// ---------------------------------------------------------------------------
+// Prompt section rendering tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn chat_prompt_sections_render_before_stream() {
+    // Sections pushed into promptSections are rendered and injected via
+    // _pushSystem before the provider stream starts. We verify by inspecting
+    // the stub session's pending queue — system content from sections should
+    // appear before the user message.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.promptSections.push({
+            name: "test-section",
+            prompt(ctx) { return "test-instruction: be brief"; },
+        });
+        s.push({ role: "user", content: "hi" });
+        // Trigger section rendering by calling stream (will error on stub,
+        // but sections are rendered before the provider call).
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    // The system message from section rendering should be present.
+    let system_entries: Vec<_> = pending
+        .iter()
+        .filter_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::System { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        system_entries.iter().any(|t| t.contains("test-instruction: be brief")),
+        "expected section content in system messages, got: {system_entries:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_skip_null_results() {
+    // Sections returning null are skipped; only non-null results are
+    // concatenated into the system message.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.promptSections.push({
+            name: "null-section",
+            prompt(ctx) { return null; },
+        });
+        s.promptSections.push({
+            name: "active-section",
+            prompt(ctx) { return "active instruction"; },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let system_text: Vec<_> = pending
+        .iter()
+        .filter_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::System { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    // Should have one system message containing only the active section
+    assert!(
+        system_text.iter().any(|t| t == "active instruction"),
+        "expected only active instruction, got: {system_text:?}"
+    );
+    assert!(
+        !system_text.iter().any(|t| t.contains("null")),
+        "null section should not produce content, got: {system_text:?}"
+    );
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_all_null_no_system_push() {
+    // When all sections return null, no system message is pushed at all.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.promptSections.push({
+            name: "null-a",
+            prompt(ctx) { return null; },
+        });
+        s.promptSections.push({
+            name: "null-b",
+            prompt(ctx) { return null; },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let has_system = pending.iter().any(|p| matches!(
+        p,
+        frances_models_llm::chat::OwnedHistoryInput::System { .. }
+    ));
+    assert!(!has_system, "no system message should be pushed when all sections return null");
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_render_in_push_order() {
+    // Sections are rendered in the order they were pushed. The concatenated
+    // system message should reflect that ordering.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.promptSections.push({
+            name: "first",
+            prompt(ctx) { return "AAA"; },
+        });
+        s.promptSections.push({
+            name: "second",
+            prompt(ctx) { return "BBB"; },
+        });
+        s.promptSections.push({
+            name: "third",
+            prompt(ctx) { return "CCC"; },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let system_text: Vec<_> = pending
+        .iter()
+        .filter_map(|p| match p {
+            frances_models_llm::chat::OwnedHistoryInput::System { text } => Some(text.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(system_text.len(), 1, "expected one system message, got {system_text:?}");
+    let text = &system_text[0];
+    let aaa_pos = text.find("AAA").expect("should contain AAA");
+    let bbb_pos = text.find("BBB").expect("should contain BBB");
+    let ccc_pos = text.find("CCC").expect("should contain CCC");
+    assert!(aaa_pos < bbb_pos, "AAA should appear before BBB");
+    assert!(bbb_pos < ccc_pos, "BBB should appear before CCC");
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_ctx_includes_tools() {
+    // The ctx passed to section.prompt() includes the tools array from the
+    // chat session, allowing sections like toolGuidance to inspect tools.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.tools.push({ name: "my_tool", description: "test", parameters: {}, handler: async () => ({}) });
+        let capturedCtx = null;
+        s.promptSections.push({
+            name: "ctx-capture",
+            prompt(ctx) { capturedCtx = ctx; return "captured"; },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        // capturedCtx is populated synchronously before the stream errors
+        const hasTools = Array.isArray(capturedCtx.tools) && capturedCtx.tools.length === 1;
+        const hasTool = capturedCtx && capturedCtx.tools[0].name === "my_tool";
+        transcript.push(new MarkdownSection({ content: JSON.stringify({ hasTools, hasTool }) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    assert_eq!(result["hasTools"], true, "ctx.tools should be an array with 1 element");
+    assert_eq!(result["hasTool"], true, "ctx.tools[0].name should be my_tool");
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_ctx_includes_env_info() {
+    // The ctx passed to section.prompt() includes the env info fields
+    // from _envInfo() (os, shell, platform, repoRoot, cwd, date).
+    let deps = StubDeps::default();
+    deps.set_cwd(PathBuf::from("/test/dir"));
+
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        let capturedCtx = null;
+        s.promptSections.push({
+            name: "env-capture",
+            prompt(ctx) { capturedCtx = ctx; return "captured"; },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        const hasOs = typeof capturedCtx.os === "string";
+        const hasShell = typeof capturedCtx.shell === "string";
+        const hasPlatform = typeof capturedCtx.platform === "string";
+        const hasDate = typeof capturedCtx.date === "string";
+        const hasCwd = capturedCtx.cwd === "/test/dir";
+        transcript.push(new MarkdownSection({ content: JSON.stringify({
+            hasOs, hasShell, hasPlatform, hasDate, hasCwd,
+        }) }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    assert_eq!(result["hasOs"], true, "ctx should have os");
+    assert_eq!(result["hasShell"], true, "ctx should have shell");
+    assert_eq!(result["hasPlatform"], true, "ctx should have platform");
+    assert_eq!(result["hasDate"], true, "ctx should have date");
+    assert_eq!(result["hasCwd"], true, "ctx should have cwd from _envInfo");
+}
+
+#[tokio::test]
+async fn chat_prompt_sections_support_async_prompt() {
+    // Sections may return promises (async prompt functions). The rendering
+    // loop should await each section's result.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        s.promptSections.push({
+            name: "async-section",
+            async prompt(ctx) {
+                await Promise.resolve();
+                return "async-result";
+            },
+        });
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let has_async = pending.iter().any(|p| matches!(
+        p,
+        frances_models_llm::chat::OwnedHistoryInput::System { text } if text.contains("async-result")
+    ));
+    assert!(has_async, "async section result should appear in system messages");
+}
+
+#[tokio::test]
+async fn chat_empty_prompt_sections_no_system_push() {
+    // When promptSections is an empty array, no system message is pushed.
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        // promptSections is [] by default — no sections pushed
+        s.push({ role: "user", content: "hi" });
+        try { await s.stream(); } catch (_) {}
+        transcript.push(new MarkdownSection({ content: "done" }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let has_system = pending.iter().any(|p| matches!(
+        p,
+        frances_models_llm::chat::OwnedHistoryInput::System { .. }
+    ));
+    assert!(!has_system, "no system message should be pushed with empty promptSections");
 }
