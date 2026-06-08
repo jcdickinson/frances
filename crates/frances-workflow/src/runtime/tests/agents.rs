@@ -267,8 +267,12 @@ async fn agents_discover_global_agents_null_then_found() {
     // Phase 1: empty HOME → null
     {
         let home_dir = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("HOME", home_dir.path()); };
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", home_dir.path().join(".config")); };
+        unsafe {
+            std::env::set_var("HOME", home_dir.path());
+        };
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", home_dir.path().join(".config"));
+        };
 
         let deps = StubDeps::default();
         let rt = Runtime::new(deps).unwrap();
@@ -300,8 +304,12 @@ async fn agents_discover_global_agents_null_then_found() {
     {
         let home_dir = tempfile::tempdir().unwrap();
         fs::write(home_dir.path().join("AGENTS.md"), "home agents").unwrap();
-        unsafe { std::env::set_var("HOME", home_dir.path()); };
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", home_dir.path().join(".config")); };
+        unsafe {
+            std::env::set_var("HOME", home_dir.path());
+        };
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", home_dir.path().join(".config"));
+        };
 
         let deps = StubDeps::default();
         let rt = Runtime::new(deps).unwrap();
@@ -386,10 +394,20 @@ async fn agents_local_candidates_cover_claude_and_agents_and_local() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    let names: Vec<&str> = result.as_array().unwrap().iter().map(|v| v.as_str().unwrap()).collect();
+    let names: Vec<&str> = result
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
     assert_eq!(
         names,
-        &["CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "AGENTS.local.md", "AGENTS.md"]
+        &[
+            "CLAUDE.md",
+            "CLAUDE.local.md",
+            "AGENTS.md",
+            "AGENTS.local.md",
+            "AGENTS.md"
+        ]
     );
 }
-

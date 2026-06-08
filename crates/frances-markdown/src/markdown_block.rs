@@ -152,16 +152,10 @@ fn build_leaf_paragraph(node: &MarkdownNode) -> Paragraph<'static> {
                 )));
             }
             for line in value.lines() {
-                lines.push(Line::from(Span::styled(
-                    line.to_owned(),
-                    Style::default(),
-                )));
+                lines.push(Line::from(Span::styled(line.to_owned(), Style::default())));
             }
             if lines.is_empty() {
-                lines.push(Line::from(Span::styled(
-                    String::new(),
-                    Style::default(),
-                )));
+                lines.push(Line::from(Span::styled(String::new(), Style::default())));
             }
             // No wrapping — code lines are left as-is, clipped by the buffer.
             Paragraph::new(Text::from(lines))
@@ -275,13 +269,7 @@ fn list_marker(ordered: bool, num: u32) -> String {
 // Rendering
 // ═══════════════════════════════════════════════════════════════════════
 
-fn render_node(
-    node: &MarkdownNode,
-    area: Rect,
-    buf: &mut Buffer,
-    src_y: u16,
-    theme: &Theme,
-) {
+fn render_node(node: &MarkdownNode, area: Rect, buf: &mut Buffer, src_y: u16, theme: &Theme) {
     match node {
         MarkdownNode::Paragraph { .. }
         | MarkdownNode::Heading { .. }
@@ -329,12 +317,7 @@ fn render_node(
 /// Render a [`Paragraph`] with the src_y shift trick — paint into a
 /// taller virtual rect above the visible area so the buffer clips the
 /// top rows.
-fn render_shifted_paragraph(
-    para: &Paragraph<'static>,
-    area: Rect,
-    buf: &mut Buffer,
-    src_y: u16,
-) {
+fn render_shifted_paragraph(para: &Paragraph<'static>, area: Rect, buf: &mut Buffer, src_y: u16) {
     let shifted = Rect::new(
         area.x,
         area.y.saturating_sub(src_y),
@@ -468,7 +451,6 @@ fn render_list(
 // ═══════════════════════════════════════════════════════════════════════
 // Tests
 // ═══════════════════════════════════════════════════════════════════════
-
 
 #[cfg(test)]
 mod tests {

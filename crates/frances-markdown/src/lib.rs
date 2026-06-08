@@ -18,4 +18,3 @@ pub mod markdown_node;
 pub use markdown_block::MarkdownBlock;
 pub use markdown_node::MarkdownNode;
 pub use section::MarkdownSection;
-

@@ -115,5 +115,4 @@ impl WorkflowFs for RealFs {
     async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         tokio::fs::canonicalize(path).await
     }
-
 }

@@ -40,7 +40,6 @@ use chrono::Local;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-
 use rquickjs::atom::PredefinedAtom;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
@@ -507,18 +506,13 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
             "_pushSystem",
             Function::new(
                 ctx.clone(),
-                |_ctx: Ctx<'js>,
-                 this: This<Class<'js, ChatSessionJs<D>>>,
-                 text: String| {
+                |_ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, text: String| {
                     let borrow = this.0.borrow();
-                    borrow
-                        .handle
-                        .push(OwnedHistoryInput::System { text });
+                    borrow.handle.push(OwnedHistoryInput::System { text });
                     Ok::<_, rquickjs::Error>(())
                 },
             )?,
         )?;
-
 
         Ok(Some(proto))
     }
@@ -677,9 +671,7 @@ fn push_message<'js, D: WorkflowDeps>(
         other => {
             return Err(throw(
                 ctx,
-                &format!(
-                    "session.push: unknown role `{other}` (expected `user` or `tool`)"
-                ),
+                &format!("session.push: unknown role `{other}` (expected `user` or `tool`)"),
             ));
         }
     };

@@ -35,13 +35,22 @@ async fn context_sections_env_block_emits_environment_info() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let output = text_of(&frames[0]);
-    assert!(output.contains("Environment:"), "missing Environment header");
+    assert!(
+        output.contains("Environment:"),
+        "missing Environment header"
+    );
     assert!(output.contains("- OS: linux"), "missing OS");
     assert!(output.contains("- Shell: /bin/bash"), "missing Shell");
     assert!(output.contains("- Platform: unix"), "missing Platform");
-    assert!(output.contains("- Repo root: /home/user/project"), "missing Repo root");
+    assert!(
+        output.contains("- Repo root: /home/user/project"),
+        "missing Repo root"
+    );
     assert!(output.contains("- Date: 2024-01-15"), "missing Date");
-    assert!(output.contains("Shell behavior:"), "missing Shell behavior section");
+    assert!(
+        output.contains("Shell behavior:"),
+        "missing Shell behavior section"
+    );
     assert!(
         output.contains("persistent"),
         "missing persistent shell rule"
@@ -125,9 +134,7 @@ async fn context_sections_cwd_block_emits_cwd() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let output = text_of(&frames[0]);
-    assert_eq!(
-        output, "Current working directory: /home/user/project/src"
-    );
+    assert_eq!(output, "Current working directory: /home/user/project/src");
 }
 
 #[tokio::test]
@@ -245,4 +252,3 @@ async fn context_sections_env_block_always_returns_string() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     assert_eq!(text_of(&frames[0]), "string");
 }
-

@@ -68,7 +68,10 @@ pub fn convert_node(node: &mdast::Node, source: Source) -> Option<MarkdownNode> 
 // ── Block children (Root, Blockquote, ListItem, List) ─────────────
 
 fn convert_block_children(nodes: &[mdast::Node], source: Source) -> Vec<MarkdownNode> {
-    nodes.iter().filter_map(|n| convert_node(n, source)).collect()
+    nodes
+        .iter()
+        .filter_map(|n| convert_node(n, source))
+        .collect()
 }
 
 // ── Inline children (Paragraph, Heading) ──────────────────────────
@@ -185,7 +188,9 @@ mod tests {
     fn paragraph() {
         let node = convert_first("hello world", Source::Assistant).unwrap();
         assert!(matches!(node, MarkdownNode::Paragraph { .. }));
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert_eq!(children.len(), 1);
         assert_eq!(
             children[0],
@@ -204,18 +209,23 @@ mod tests {
     #[test]
     fn heading_inline_children() {
         let node = convert_first("# Hello *world*", Source::Assistant).unwrap();
-        let MarkdownNode::Heading { children, depth: _ } = node else { unreachable!() };
+        let MarkdownNode::Heading { children, depth: _ } = node else {
+            unreachable!()
+        };
         // Should have Text("Hello ") and Emphasis
-        assert!(children.iter().any(|c| matches!(
-            c,
-            MarkdownNode::Emphasis { .. }
-        )));
+        assert!(
+            children
+                .iter()
+                .any(|c| matches!(c, MarkdownNode::Emphasis { .. }))
+        );
     }
 
     #[test]
     fn code_block_with_lang() {
         let node = convert_first("```rust\nfn main() {}\n```", Source::Assistant).unwrap();
-        let MarkdownNode::Code { lang, value } = node else { unreachable!() };
+        let MarkdownNode::Code { lang, value } = node else {
+            unreachable!()
+        };
         assert_eq!(lang.as_deref(), Some("rust"));
         assert_eq!(value, "fn main() {}");
     }
@@ -223,7 +233,9 @@ mod tests {
     #[test]
     fn code_block_without_lang() {
         let node = convert_first("```\nsome code\n```", Source::Assistant).unwrap();
-        let MarkdownNode::Code { lang, value } = node else { unreachable!() };
+        let MarkdownNode::Code { lang, value } = node else {
+            unreachable!()
+        };
         assert!(lang.is_none());
         assert_eq!(value, "some code");
     }
@@ -231,14 +243,18 @@ mod tests {
     #[test]
     fn html_node() {
         let node = convert_first("<div>\nhello\n</div>", Source::Assistant).unwrap();
-        let MarkdownNode::Html { value } = node else { unreachable!() };
+        let MarkdownNode::Html { value } = node else {
+            unreachable!()
+        };
         assert!(value.contains("<div>"));
     }
 
     #[test]
     fn blockquote_with_paragraph() {
         let node = convert_first("> hello", Source::Assistant).unwrap();
-        let MarkdownNode::Blockquote { children } = node else { unreachable!() };
+        let MarkdownNode::Blockquote { children } = node else {
+            unreachable!()
+        };
         assert_eq!(children.len(), 1);
         assert!(matches!(children[0], MarkdownNode::Paragraph { .. }));
     }
@@ -257,7 +273,11 @@ mod tests {
         assert!(!ordered);
         assert!(start.is_none());
         assert_eq!(children.len(), 2);
-        assert!(children.iter().all(|c| matches!(c, MarkdownNode::ListItem { .. })));
+        assert!(
+            children
+                .iter()
+                .all(|c| matches!(c, MarkdownNode::ListItem { .. }))
+        );
     }
 
     #[test]
@@ -297,21 +317,27 @@ mod tests {
     #[test]
     fn strong_inline() {
         let node = convert_first("**bold**", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert!(matches!(children[0], MarkdownNode::Strong { .. }));
     }
 
     #[test]
     fn emphasis_inline() {
         let node = convert_first("*italic*", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert!(matches!(children[0], MarkdownNode::Emphasis { .. }));
     }
 
     #[test]
     fn inline_code() {
         let node = convert_first("`code`", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert_eq!(
             children[0],
             MarkdownNode::InlineCode {
@@ -323,7 +349,9 @@ mod tests {
     #[test]
     fn link_inline() {
         let node = convert_first("[text](https://example.com)", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert!(matches!(
             &children[0],
             MarkdownNode::Link { url, .. } if url == "https://example.com"
@@ -333,7 +361,9 @@ mod tests {
     #[test]
     fn image_inline() {
         let node = convert_first("![alt](img.png)", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert!(matches!(
             &children[0],
             MarkdownNode::Image { url, alt, .. } if url == "img.png" && alt == "alt"
@@ -343,7 +373,9 @@ mod tests {
     #[test]
     fn break_inline() {
         let node = convert_first("line1\\\nline2", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert!(children.iter().any(|c| matches!(c, MarkdownNode::Break)));
     }
 
@@ -352,7 +384,9 @@ mod tests {
     #[test]
     fn user_source_flattens_strong_to_text() {
         let node = convert_first("**bold** text", Source::User).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         // Should be a single Text node with no styling
         assert_eq!(children.len(), 1);
         assert_eq!(
@@ -366,7 +400,9 @@ mod tests {
     #[test]
     fn user_source_flattens_emphasis_to_text() {
         let node = convert_first("*italic*", Source::User).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert_eq!(children.len(), 1);
         assert_eq!(
             children[0],
@@ -379,7 +415,9 @@ mod tests {
     #[test]
     fn user_source_flattens_inline_code_to_text() {
         let node = convert_first("`code`", Source::User).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert_eq!(children.len(), 1);
         assert_eq!(
             children[0],
@@ -392,7 +430,9 @@ mod tests {
     #[test]
     fn user_source_flattens_link_to_text() {
         let node = convert_first("[click](url)", Source::User).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         assert_eq!(children.len(), 1);
         assert_eq!(
             children[0],
@@ -418,7 +458,9 @@ mod tests {
     #[test]
     fn user_source_heading_inline_flattened() {
         let node = convert_first("# **Bold** title", Source::User).unwrap();
-        let MarkdownNode::Heading { children, depth } = node else { unreachable!() };
+        let MarkdownNode::Heading { children, depth } = node else {
+            unreachable!()
+        };
         assert_eq!(depth, 1);
         // Inline children should be flattened to plain text
         assert_eq!(children.len(), 1);
@@ -435,7 +477,9 @@ mod tests {
     #[test]
     fn nested_blockquote() {
         let node = convert_first("> > nested", Source::Assistant).unwrap();
-        let MarkdownNode::Blockquote { children } = node else { unreachable!() };
+        let MarkdownNode::Blockquote { children } = node else {
+            unreachable!()
+        };
         let MarkdownNode::Blockquote { children: inner } = &children[0] else {
             unreachable!()
         };
@@ -445,8 +489,13 @@ mod tests {
     #[test]
     fn list_with_nested_paragraphs() {
         let node = convert_first("- para1\n\n  para2", Source::Assistant).unwrap();
-        let MarkdownNode::List { children, .. } = node else { unreachable!() };
-        let MarkdownNode::ListItem { children: li_children } = &children[0] else {
+        let MarkdownNode::List { children, .. } = node else {
+            unreachable!()
+        };
+        let MarkdownNode::ListItem {
+            children: li_children,
+        } = &children[0]
+        else {
             unreachable!()
         };
         // ListItem has two paragraph children (spread)
@@ -456,16 +505,28 @@ mod tests {
     #[test]
     fn heading_with_mixed_inline() {
         let node = convert_first("# Hello **world** and `code`", Source::Assistant).unwrap();
-        let MarkdownNode::Heading { children, .. } = node else { unreachable!() };
+        let MarkdownNode::Heading { children, .. } = node else {
+            unreachable!()
+        };
         // Should contain Text, Strong, Text, InlineCode, Text
-        assert!(children.iter().any(|c| matches!(c, MarkdownNode::Strong { .. })));
-        assert!(children.iter().any(|c| matches!(c, MarkdownNode::InlineCode { .. })));
+        assert!(
+            children
+                .iter()
+                .any(|c| matches!(c, MarkdownNode::Strong { .. }))
+        );
+        assert!(
+            children
+                .iter()
+                .any(|c| matches!(c, MarkdownNode::InlineCode { .. }))
+        );
     }
 
     #[test]
     fn link_with_inline_children() {
         let node = convert_first("[**bold** link](url)", Source::Assistant).unwrap();
-        let MarkdownNode::Paragraph { children } = node else { unreachable!() };
+        let MarkdownNode::Paragraph { children } = node else {
+            unreachable!()
+        };
         let MarkdownNode::Link { children, url, .. } = &children[0] else {
             unreachable!()
         };
@@ -473,4 +534,3 @@ mod tests {
         assert!(matches!(children[0], MarkdownNode::Strong { .. }));
     }
 }
-

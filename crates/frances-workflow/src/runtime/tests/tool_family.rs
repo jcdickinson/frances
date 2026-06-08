@@ -157,7 +157,10 @@ async fn tool_family_dedupe_by_identity() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["familyCount"], 1, "one unique family across two tools");
+    assert_eq!(
+        result["familyCount"], 1,
+        "one unique family across two tools"
+    );
     assert_eq!(result["hasEditing"], true);
 }
 
@@ -227,7 +230,6 @@ async fn tool_family_define_tool_rejects_bad_family() {
     assert!(text_of(&frames[0]).contains("family must be a ToolFamily"));
 }
 
-
 #[tokio::test]
 async fn tool_guidance_folds_families_from_tools() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
@@ -261,7 +263,10 @@ async fn tool_guidance_folds_families_from_tools() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let output = text_of(&frames[0]);
-    assert!(output.contains("editing preamble"), "missing editing preamble");
+    assert!(
+        output.contains("editing preamble"),
+        "missing editing preamble"
+    );
     assert!(output.contains("shell preamble"), "missing shell preamble");
     // editing appears only once even though two tools share it
     assert_eq!(
@@ -298,7 +303,11 @@ async fn tool_guidance_returns_null_when_no_families() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    assert_eq!(text_of(&frames[0]), "null", "expected null when no families");
+    assert_eq!(
+        text_of(&frames[0]),
+        "null",
+        "expected null when no families"
+    );
 }
 
 #[tokio::test]
@@ -402,7 +411,6 @@ async fn tool_guidance_skips_family_returning_null() {
     assert_eq!(output, "visible", "only the non-null family should appear");
 }
 
-
 // ---- frances:v1/tool-families tests -----------------------------------------
 
 #[tokio::test]
@@ -411,7 +419,8 @@ async fn tool_families_editing_family_exists_and_is_frozen() {
     let file = write_source(
         "js",
         r#"
-        import { editingFamily, shellFamily } from "frances:v1/tool-families";
+        import { editingFamily } from "frances:v1/tools/file";
+        import { shellFamily } from "frances:v1/tools/shell";
 
         let editFrozen = Object.isFrozen(editingFamily);
         let shellFrozen = Object.isFrozen(shellFamily);
@@ -449,7 +458,7 @@ async fn tool_families_editing_family_emits_preamble() {
     let file = write_source(
         "js",
         r#"
-        import { editingFamily } from "frances:v1/tool-families";
+        import { editingFamily } from "frances:v1/tools/file";
         import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const text = editingFamily.prompt({});
@@ -475,8 +484,14 @@ async fn tool_families_editing_family_emits_preamble() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
     assert_eq!(result["hasCritical"], true, "should have CRITICAL warning");
-    assert_eq!(result["hasWrongRight"], true, "should have WRONG/RIGHT example");
-    assert_eq!(result["hasAnchorProtocol"], true, "should have anchor protocol");
+    assert_eq!(
+        result["hasWrongRight"], true,
+        "should have WRONG/RIGHT example"
+    );
+    assert_eq!(
+        result["hasAnchorProtocol"], true,
+        "should have anchor protocol"
+    );
     assert_eq!(result["hasFormatter"], true, "should have formatter note");
 }
 
@@ -486,7 +501,7 @@ async fn tool_families_shell_family_emits_preamble() {
     let file = write_source(
         "js",
         r#"
-        import { shellFamily } from "frances:v1/tool-families";
+        import { shellFamily } from "frances:v1/tools/shell";
         import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const text = shellFamily.prompt({});
@@ -521,9 +536,10 @@ async fn tool_families_identity_is_stable_across_imports() {
     let file = write_source(
         "js",
         r#"
-        import { editingFamily as e1 } from "frances:v1/tool-families";
-        import { editingFamily as e2, shellFamily as s1 } from "frances:v1/tool-families";
-        import { shellFamily as s2 } from "frances:v1/tool-families";
+        import { editingFamily as e1 } from "frances:v1/tools/file";
+        import { editingFamily as e2 } from "frances:v1/tools/file";
+        import { shellFamily as s1 } from "frances:v1/tools/shell";
+        import { shellFamily as s2 } from "frances:v1/tools/shell";
         import { transcript, MarkdownSection } from "frances:v1/sections";
 
         let editingStable = e1 === e2;
@@ -545,8 +561,14 @@ async fn tool_families_identity_is_stable_across_imports() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["editingStable"], true, "editing family identity should be stable");
-    assert_eq!(result["shellStable"], true, "shell family identity should be stable");
+    assert_eq!(
+        result["editingStable"], true,
+        "editing family identity should be stable"
+    );
+    assert_eq!(
+        result["shellStable"], true,
+        "shell family identity should be stable"
+    );
 }
 
 #[tokio::test]
@@ -555,7 +577,8 @@ async fn tool_families_work_with_tool_guidance_dedup() {
     let file = write_source(
         "js",
         r#"
-        import { editingFamily, shellFamily } from "frances:v1/tool-families";
+        import { editingFamily } from "frances:v1/tools/file";
+        import { shellFamily } from "frances:v1/tools/shell";
         import { defineTool, toolGuidance } from "frances:v1/tool-family";
         import { transcript, MarkdownSection } from "frances:v1/sections";
 
@@ -607,8 +630,14 @@ async fn tool_families_work_with_tool_guidance_dedup() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["editCount"], 1, "editing family should appear exactly once");
-    assert_eq!(result["shellCount"], 1, "shell family should appear exactly once");
+    assert_eq!(
+        result["editCount"], 1,
+        "editing family should appear exactly once"
+    );
+    assert_eq!(
+        result["shellCount"], 1,
+        "shell family should appear exactly once"
+    );
 }
 
 #[tokio::test]
@@ -646,11 +675,26 @@ async fn tool_family_shell_tools_import_shell_family() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["runHas"], true, "Run constructor should reference shellFamily");
-    assert_eq!(result["waitHas"], true, "Wait constructor should reference shellFamily");
-    assert_eq!(result["killHas"], true, "Kill constructor should reference shellFamily");
-    assert_eq!(result["setHas"], true, "Set constructor should reference shellFamily");
-    assert_eq!(result["captureHas"], true, "Capture constructor should reference shellFamily");
+    assert_eq!(
+        result["runHas"], true,
+        "Run constructor should reference shellFamily"
+    );
+    assert_eq!(
+        result["waitHas"], true,
+        "Wait constructor should reference shellFamily"
+    );
+    assert_eq!(
+        result["killHas"], true,
+        "Kill constructor should reference shellFamily"
+    );
+    assert_eq!(
+        result["setHas"], true,
+        "Set constructor should reference shellFamily"
+    );
+    assert_eq!(
+        result["captureHas"], true,
+        "Capture constructor should reference shellFamily"
+    );
 }
 
 #[tokio::test]
@@ -688,11 +732,29 @@ async fn tool_family_file_tools_import_editing_family() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["readNoFamily"], true, "Read should NOT reference editingFamily");
-    assert_eq!(result["replaceHas"], true, "ReplaceLines should reference editingFamily");
-    assert_eq!(result["replaceAllHas"], true, "ReplaceAll should reference editingFamily");
-    assert_eq!(result["insertAfterHas"], true, "InsertAfter should reference editingFamily");
-    assert_eq!(result["insertBeforeHas"], true, "InsertBefore should reference editingFamily");
+    assert_eq!(
+        result["readNoFamily"], true,
+        "Read should NOT reference editingFamily"
+    );
+    assert_eq!(
+        result["replaceHas"], true,
+        "ReplaceLines should reference editingFamily"
+    );
+    assert_eq!(
+        result["replaceAllHas"], true,
+        "ReplaceAll should reference editingFamily"
+    );
+    assert_eq!(
+        result["insertAfterHas"], true,
+        "InsertAfter should reference editingFamily"
+    );
+    assert_eq!(
+        result["insertBeforeHas"], true,
+        "InsertBefore should reference editingFamily"
+    );
     assert_eq!(result["newHas"], true, "New should reference editingFamily");
-    assert_eq!(result["overwriteHas"], true, "Overwrite should reference editingFamily");
+    assert_eq!(
+        result["overwriteHas"], true,
+        "Overwrite should reference editingFamily"
+    );
 }

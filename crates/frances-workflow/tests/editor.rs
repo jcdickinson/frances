@@ -815,7 +815,11 @@ async fn out_of_repo_read_returns_plain_line_numbers() {
     // repo_dir is the editable root; outside_dir is outside it.
     let repo_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
-    std::fs::write(outside_dir.path().join("external.txt"), "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(
+        outside_dir.path().join("external.txt"),
+        "alpha\nbeta\ngamma\n",
+    )
+    .unwrap();
 
     let deps = deps_with_repo_root(repo_dir.path().to_path_buf());
     let external_path = outside_dir.path().join("external.txt");
@@ -906,7 +910,11 @@ async fn out_of_repo_read_with_ranges_returns_plain_numbered_lines() {
     assert_eq!(lines.len(), 6, "got: {rendered:?}");
     assert_eq!(lines[0], "2:2", "line 0: {}", lines[0]);
     assert_eq!(lines[1], "3:3", "line 1: {}", lines[1]);
-    assert!(lines[2] == "…", "separator should be plain '…', got: {}", lines[2]);
+    assert!(
+        lines[2] == "…",
+        "separator should be plain '…', got: {}",
+        lines[2]
+    );
     assert_eq!(lines[3], "7:7", "line 3: {}", lines[3]);
     assert_eq!(lines[4], "8:8", "line 4: {}", lines[4]);
     assert_eq!(lines[5], "9:9", "line 5: {}", lines[5]);
@@ -1048,8 +1056,16 @@ async fn in_repo_read_still_gets_anchors_with_explicit_root() {
     let lines: Vec<&str> = rendered.lines().collect();
     assert_eq!(lines.len(), 2, "got: {rendered:?}");
     // In-repo reads must have § anchors.
-    assert!(lines[0].contains('§'), "in-repo line missing anchor: {:?}", lines[0]);
-    assert!(lines[1].contains('§'), "in-repo line missing anchor: {:?}", lines[1]);
+    assert!(
+        lines[0].contains('§'),
+        "in-repo line missing anchor: {:?}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains('§'),
+        "in-repo line missing anchor: {:?}",
+        lines[1]
+    );
 }
 
 #[tokio::test]

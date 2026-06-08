@@ -517,5 +517,3 @@ pub async fn discover_root(cwd: &std::path::Path, markers: &[PathBuf]) -> PathBu
 pub fn default_root_markers() -> Vec<PathBuf> {
     vec![PathBuf::from(".jj"), PathBuf::from(".git")]
 }
-
-

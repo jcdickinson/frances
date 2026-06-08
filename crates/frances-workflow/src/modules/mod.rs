@@ -73,9 +73,6 @@
 //!   the stash's sleep primitive.
 //! - `whatwg:dom`                — minimal DOM Standard surface
 //!   (currently just `DOMException`).
-//! - `frances:v1/tool-families` — predefined `editingFamily` and
-//!   `shellFamily` ToolFamily instances for dedup-by-identity.
-
 
 use std::sync::Arc;
 
@@ -89,11 +86,11 @@ use crate::closed::WorkflowClosed;
 use crate::deps::WorkflowDeps;
 use crate::runtime::{InboxItem, OutputSenders, caught};
 
+pub mod agents;
 pub mod chat;
 pub mod file;
 pub mod file_find_or_grep;
 pub mod inbox;
-pub mod agents;
 pub mod io;
 pub mod jaq;
 pub mod lifecycle;
@@ -252,7 +249,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("_discoverLocalAgents", discover_local)?;
     stash.set("_discoverNestedAgents", discover_nested)?;
 
-
     ctx.globals().set(STASH_KEY, stash)?;
     Ok(lifecycle_obj)
 }
@@ -281,7 +277,6 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
     declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tool-family", TOOL_FAMILY_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tool-families", TOOL_FAMILIES_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
     declare_and_eval(ctx, "frances:v1/tools/file_find_or_grep", FILE_SEARCH_SRC)?;
@@ -400,7 +395,6 @@ const TOOL_FAMILY_SRC: &str = include_str!("js/tool-family.js");
 const CONTEXT_SECTIONS_SRC: &str = include_str!("js/context-sections.js");
 const AGENTS_SRC: &str = include_str!("js/agents.js");
 const AGENT_SECTIONS_SRC: &str = include_str!("js/agent-sections.js");
-const TOOL_FAMILIES_SRC: &str = include_str!("js/tool-families.js");
 
 // `whatwg:*` polyfills live at the workspace root so they can be
 // refreshed by `modules/whatwg/update.sh` without touching this crate.

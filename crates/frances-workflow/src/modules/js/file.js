@@ -35,9 +35,57 @@
 //   );
 
 import { transcript, DiffSection } from "frances:v1/sections";
-import { editingFamily } from "frances:v1/tool-families";
+import { defineToolFamily } from "frances:v1/tool-family";
 
 const { Editor, EditorDescriptions: desc } = globalThis.__frances_v1_stash__;
+
+// Build the editing preamble from a plain array to avoid
+// backtick-escaping headaches in a template literal.
+const editingFamily = defineToolFamily({
+  prompt() {
+    return [
+      "## Editing tools — shared protocol",
+      "",
+      "Files must be read via `file_read` (without `into`) before editing.",
+      "`file_new` creates new files (no prior read needed); all other editing",
+      "tools require a prior read. `file_new` and `file_overwrite` echo back",
+      "fresh anchors for subsequent edits.",
+      "",
+      "CRITICAL: `text` must NEVER contain a `Word§` prefix unless you",
+      "genuinely want those literal characters in the file (editing the anchor",
+      "engine itself, a test fixture, prose with `Word§`). Anchors are",
+      "read-only metadata the engine assigns — they're not part of line",
+      "content. If you paste back the rendered prefixes from a `file_read`,",
+      "they get written verbatim and your edit is broken.",
+      "",
+      '  WRONG → text: "Apple§def hello():\\nBanana§    print(\\"hi\\")"',
+      '  RIGHT → text: "def hello():\\n    print(\\"hi\\")"',
+      "",
+      "All write tools accept `text` or `from` (exactly one):",
+      "  text:  the raw content and NOTHING ELSE. Use `\\n` for newlines.",
+      "         Multi-line is fine.",
+      "  from:  a Frances variable name. Its value is used as the content",
+      "         (string values pass through verbatim; non-string values are",
+      "         JSON-encoded). Use this when the content was prepared via",
+      "         `variable_set` / `variable_assign` / `file_read into:` /",
+      "         `shell_capture`, to avoid re-emitting a long payload in a",
+      "         tool-call.",
+      "",
+      "Anchor protocol: every line in a `file_read` (or post-edit diff) is",
+      "rendered as `Word§content` — a stable per-line anchor word, then `§`,",
+      "then the line's content. The rendered string of each line is exactly",
+      "what you pass back as the `anchor` (and `end_anchor`) field of an",
+      "edit call. `anchor` and `end_anchor` are each a single rendered line",
+      "— never glue several `Word§content` lines into one field. A newline",
+      "in an anchor field is rejected. On a content mismatch the call fails",
+      "and you should re-read the file before retrying.",
+      "",
+      "After every edit the file is run through the project formatter and",
+      "written to disk; the returned diff block reflects the post-format",
+      "content.",
+    ].join("\n");
+  },
+});
 
 // Ship the structured diff portion of `editor.edit()`'s result to the
 // TUI as a one-shot `DiffSection`. The string portion is returned to the
@@ -59,7 +107,8 @@ const READ_SCHEMA = {
     path: { type: "string" },
     ranges: {
       type: "array",
-      description: "Optional list of 1-indexed, inclusive [start, end] pairs. Returned output concatenates the requested ranges with separator `…§`. Muxually exclusive with `into`.",
+      description:
+        "Optional list of 1-indexed, inclusive [start, end] pairs. Returned output concatenates the requested ranges with separator `…§`. Muxually exclusive with `into`.",
       items: {
         type: "array",
         items: { type: "integer" },
@@ -220,7 +269,10 @@ class Read {
     const { path, into, ranges } = call.arguments;
     try {
       if (into && ranges) {
-        return _errResult(call.id, new Error("provide exactly one of `into` or `ranges`, not both"));
+        return _errResult(
+          call.id,
+          new Error("provide exactly one of `into` or `ranges`, not both"),
+        );
       }
       if (into) {
         const raw = await this.editor.readRaw(path);
@@ -277,7 +329,6 @@ class ReplaceLines {
     }
   };
 }
-
 
 class ReplaceAll {
   static schema = REPLACE_ALL_SCHEMA;
@@ -473,4 +524,5 @@ export {
   InsertBefore,
   New,
   Overwrite,
+  editingFamily,
 };

@@ -50,9 +50,23 @@ import {
   ShellOutputSection,
 } from "frances:v1/sections";
 import { approve } from "frances:v1/approval";
-import { shellFamily } from "frances:v1/tool-families";
+import { defineToolFamily } from "frances:v1/tool-family";
 
 const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
+
+const shellFamily = defineToolFamily({
+  prompt() {
+    return [
+      "## Shell tools — persistent session",
+      "",
+      "You have a persistent bash session. State (cwd, env, functions,",
+      "aliases) persists across calls — do not prefix commands with",
+      "`cd ... && `. Prefer dedicated tools (`file_read`,",
+      "`file_replace_lines`, `variable_*`) over shell equivalents",
+      "(`cat`, `echo`, `jq`) when available.",
+    ].join("\n");
+  },
+});
 
 // Shared wait-tuning fields for shell_run / shell_wait. Both are in
 // seconds and optional; omitting them uses the defaults (10s quiet,
@@ -366,10 +380,7 @@ async function _abortRunningShell(shell, scope, notice) {
 async function _askApproval(call) {
   const cmd = call.arguments.cmd;
   const prompt =
-    "Allow Frances to run this bash command?\n\n" +
-    "```bash\n" +
-    cmd +
-    "\n```";
+    "Allow Frances to run this bash command?\n\n" + "```bash\n" + cmd + "\n```";
   let choice;
   try {
     choice = await approve({
@@ -401,7 +412,10 @@ async function _askApproval(call) {
 class Run {
   static schema = RUN_SCHEMA;
 
-  constructor(shell, { wait, kill, maxScolds = 2, approve: approveOpt = true } = {}) {
+  constructor(
+    shell,
+    { wait, kill, maxScolds = 2, approve: approveOpt = true } = {},
+  ) {
     this.shell = shell;
     this.wait = wait;
     this.kill = kill;
@@ -693,8 +707,7 @@ const CAPTURE_SCHEMA = {
   properties: {
     name: {
       type: "string",
-      description:
-        "Frances variable name to store the captured value into.",
+      description: "Frances variable name to store the captured value into.",
     },
     from: {
       type: "string",
@@ -751,7 +764,11 @@ class Set {
     const bashName = hasSet ? args.set : args.export;
     const exported = hasExport;
     try {
-      await this.shell.setVar(bashName, _stringify(this.vars.get(from)), exported);
+      await this.shell.setVar(
+        bashName,
+        _stringify(this.vars.get(from)),
+        exported,
+      );
     } catch (err) {
       return _errResult(call.id, err);
     }
@@ -801,4 +818,4 @@ class Capture {
   };
 }
 
-export { Shell, Run, Wait, Kill, Set, Capture };
+export { Shell, Run, Wait, Kill, Set, Capture, shellFamily };

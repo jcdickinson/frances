@@ -15,6 +15,7 @@
 //! is hoisted back into each adapter's wire format on subsequent
 //! requests, so the next-turn prefix matches the prompt cache.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,6 +33,7 @@ use serde_json::Value;
 use thiserror::Error as ThisError;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, trace, warn};
+use uuid::Uuid;
 
 use frances_config::{ConfigBinding, ConfigHandle};
 use frances_core::Truncated;
@@ -253,6 +255,7 @@ impl provider::Provider for Provider {
                 .map_err(|source| Error::DecodeHistory { index: i, source })?;
             messages.push(msg);
         }
+        remap_tool_call_ids(&mut messages);
 
         let chat_req = build_chat_request(messages, req.tools, req.tool_choice);
         let chat_options = build_chat_options(&plan, req.tool_choice);
@@ -339,34 +342,12 @@ impl provider::Provider for Provider {
                             thought_signatures.push(chunk.content);
                         }
                         ChatStreamEvent::ThoughtSignatureChunk(_) => {}
-                        ChatStreamEvent::ToolCallChunk(tc) => {
-                            let mut call = map_tool_call(tc.tool_call);
-                            if qwen_quirks {
-                                frances_models_llm::tool_args::repair_qwen_quirks(&mut call, req.tools);
-                            }
-                            trace!(
-                                call_id = %call.id,
-                                name = %call.name,
-                                arguments = %call.arguments,
-                                "tool call from model",
-                            );
-                            emitted = true;
-                            on_event(StreamEvent::ToolCall(call.clone()))?;
-                            tool_calls.push(call);
-                            if let Some(cap) = max_tool_calls
-                                && tool_calls.len() >= cap
-                            {
-                                let assistant = build_assistant_payload(
-                                    &text,
-                                    &tool_calls,
-                                    &reasoning_text,
-                                    &thought_signatures,
-                                )
-                                .map_err(Error::EncodeHistory)?;
-                                on_event(StreamEvent::History(assistant))?;
-                                return Ok(CompletionOutcome { text, tool_calls });
-                            }
-                        }
+                        // genai accumulates per-chunk argument deltas
+                        // internally (capture_tool_calls); the complete calls
+                        // are taken from `End` below. Emitting per chunk would
+                        // surface fragments to the UI and pin `emitted`,
+                        // blocking otherwise-safe retries.
+                        ChatStreamEvent::ToolCallChunk(_) => {}
                         ChatStreamEvent::End(end) => {
                             if let Some(u) = end.captured_usage.as_ref() {
                                 final_usage = Some(map_usage(u));
@@ -379,6 +360,23 @@ impl provider::Provider for Provider {
                                 // post-hoc extraction). Honour it.
                                 reasoning_text.push_str(rc);
                             }
+                            // Take the full tool calls genai assembled across
+                            // all chunks. `captured_into_tool_calls` consumes
+                            // `end`, so it must come after the borrows above.
+                            if let Some(captured) = end.captured_into_tool_calls() {
+                                for genai_call in captured {
+                                    let mut call = map_tool_call(genai_call);
+                                    if qwen_quirks {
+                                        frances_models_llm::tool_args::repair_qwen_quirks(
+                                            &mut call, req.tools,
+                                        );
+                                    }
+                                    tool_calls.push(call);
+                                }
+                                if let Some(cap) = max_tool_calls {
+                                    tool_calls.truncate(cap);
+                                }
+                            }
                         }
                     }
                 }
@@ -386,6 +384,15 @@ impl provider::Provider for Provider {
                 // Stream completed cleanly; any failure past this point is in
                 // our own post-processing, not a retryable network fault.
                 emitted = true;
+                for call in &tool_calls {
+                    trace!(
+                        call_id = %call.id,
+                        name = %call.name,
+                        arguments = %call.arguments,
+                        "tool call from model",
+                    );
+                    on_event(StreamEvent::ToolCall(call.clone()))?;
+                }
                 if let Some(u) = final_usage {
                     on_event(StreamEvent::Usage(u))?;
                 }
@@ -494,6 +501,7 @@ fn build_chat_options(plan: &RequestPlan, tool_choice: Option<&ToolChoice>) -> C
     }
     opts.capture_usage = Some(true);
     opts.capture_reasoning_content = Some(true);
+    opts.capture_tool_calls = Some(true);
     if !plan.extra_headers.is_empty() {
         opts.extra_headers = Some(genai::Headers::from(plan.extra_headers.clone()));
     }
@@ -563,6 +571,46 @@ fn map_usage(u: &genai::chat::Usage) -> Usage {
                     .map(|n| n.max(0) as u32)
             })
             .unwrap_or(0),
+    }
+}
+
+/// Rewrite every tool-call id in the assembled request to a request-unique
+/// GUID, propagating each rewrite to the matching tool result.
+///
+/// genai synthesises ids from a per-response index (`call_0`, `call_1`) for
+/// providers that omit them (e.g. DeepSeek), so the same id recurs every
+/// turn; replaying the full history then sends duplicate `tool_call_id`s in
+/// one request and the provider rejects it. The GUID is derived from the
+/// call's ordinal position, which is stable across turns (history is
+/// append-only), so the rewritten ids are identical request-to-request and
+/// the prompt-cache prefix doesn't shift.
+fn remap_tool_call_ids(messages: &mut [ChatMessage]) {
+    // Fixed namespace for deterministic v5 derivation.
+    const TOOL_CALL_NS: Uuid = Uuid::from_u128(0x6f3c_2b1a_8d4e_4f7a_9b2c_1e5d_7a9f_0c3b);
+    let mut ordinal: u32 = 0;
+    let mut rename: HashMap<String, String> = HashMap::new();
+    for message in messages.iter_mut() {
+        for part in message.content.iter_mut() {
+            match part {
+                ContentPart::ToolCall(call) => {
+                    let guid = Uuid::new_v5(&TOOL_CALL_NS, ordinal.to_string().as_bytes());
+                    ordinal += 1;
+                    let guid = guid.to_string();
+                    // A result always follows its call, and a given old id is
+                    // reused only in a later turn — so overwriting an earlier
+                    // mapping here is safe: that turn's result was already
+                    // rewritten before we reach this point.
+                    rename.insert(call.call_id.clone(), guid.clone());
+                    call.call_id = guid;
+                }
+                ContentPart::ToolResponse(response) => {
+                    if let Some(guid) = rename.get(&response.call_id) {
+                        response.call_id = guid.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
     }
 }
 
@@ -688,6 +736,69 @@ mod tests {
         .unwrap();
         let back: ChatMessage = serde_json::from_value(v).unwrap();
         assert!(matches!(back.role, ChatRole::Tool));
+    }
+
+    #[test]
+    fn remap_dedupes_recurring_call_ids_and_repairs_results() {
+        // Two turns whose tool calls both carry genai's synthetic `call_0`
+        // (the DeepSeek case). Replaying both in one request collides; remap
+        // must make them unique and follow the rename onto each result.
+        let args = json!({});
+        let mut messages = vec![
+            forge_one(&HistoryInput::ToolCall {
+                id: "call_0",
+                name: "first",
+                arguments: &args,
+            }),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "call_0",
+                content: "r1",
+                is_error: false,
+            }),
+            forge_one(&HistoryInput::ToolCall {
+                id: "call_0",
+                name: "second",
+                arguments: &args,
+            }),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "call_0",
+                content: "r2",
+                is_error: false,
+            }),
+        ];
+        remap_tool_call_ids(&mut messages);
+
+        let call_a = messages[0].content.tool_calls()[0].call_id.clone();
+        let result_a = messages[1].content.tool_responses()[0].call_id.clone();
+        let call_b = messages[2].content.tool_calls()[0].call_id.clone();
+        let result_b = messages[3].content.tool_responses()[0].call_id.clone();
+
+        // Each result still points at its own call...
+        assert_eq!(call_a, result_a);
+        assert_eq!(call_b, result_b);
+        // ...but the two calls no longer collide.
+        assert_ne!(call_a, call_b);
+    }
+
+    #[test]
+    fn remap_is_deterministic_across_runs() {
+        // Stable ids turn-over-turn are what keeps the prompt cache warm.
+        let args = json!({});
+        let build = || {
+            vec![forge_one(&HistoryInput::ToolCall {
+                id: "whatever",
+                name: "t",
+                arguments: &args,
+            })]
+        };
+        let mut a = build();
+        let mut b = build();
+        remap_tool_call_ids(&mut a);
+        remap_tool_call_ids(&mut b);
+        assert_eq!(
+            a[0].content.tool_calls()[0].call_id,
+            b[0].content.tool_calls()[0].call_id,
+        );
     }
 
     #[test]

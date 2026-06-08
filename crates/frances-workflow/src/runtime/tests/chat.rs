@@ -508,7 +508,10 @@ async fn chat_tools_array_is_per_instance_and_initially_empty() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    assert_eq!(text_of(&frames[0]), "a=true len=0 distinct=true ps=true psLen=0 psDistinct=true");
+    assert_eq!(
+        text_of(&frames[0]),
+        "a=true len=0 distinct=true ps=true psLen=0 psDistinct=true"
+    );
 }
 
 #[tokio::test]
@@ -1268,7 +1271,6 @@ async fn chat_push_system_bypass_works_before_user_message() {
     ));
 }
 
-
 // ---------------------------------------------------------------------------
 // _envInfo() tests
 // ---------------------------------------------------------------------------
@@ -1317,7 +1319,10 @@ async fn chat_env_info_returns_correct_shape() {
     );
     assert_eq!(result["hasOs"], true, "os should be non-empty string");
     assert_eq!(result["hasShell"], true, "shell should be non-empty string");
-    assert_eq!(result["hasPlatform"], true, "platform should be non-empty string");
+    assert_eq!(
+        result["hasPlatform"], true,
+        "platform should be non-empty string"
+    );
     assert_eq!(result["hasRepoRoot"], true, "repoRoot should be /my/repo");
     assert_eq!(result["hasCwd"], true, "cwd should be /my/repo/src");
     assert_eq!(result["hasDate"], true, "date should be YYYY-MM-DD");
@@ -1358,8 +1363,16 @@ async fn chat_env_info_null_repo_root_and_cwd_when_missing() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["repoRoot"], serde_json::Value::Null, "repoRoot should be null with empty roots");
-    assert_eq!(result["cwd"], serde_json::Value::Null, "cwd should be null when not set");
+    assert_eq!(
+        result["repoRoot"],
+        serde_json::Value::Null,
+        "repoRoot should be null with empty roots"
+    );
+    assert_eq!(
+        result["cwd"],
+        serde_json::Value::Null,
+        "cwd should be null when not set"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1413,7 +1426,9 @@ async fn chat_prompt_sections_render_before_stream() {
         })
         .collect();
     assert!(
-        system_entries.iter().any(|t| t.contains("test-instruction: be brief")),
+        system_entries
+            .iter()
+            .any(|t| t.contains("test-instruction: be brief")),
         "expected section content in system messages, got: {system_entries:?}"
     );
 }
@@ -1511,11 +1526,16 @@ async fn chat_prompt_sections_all_null_no_system_push() {
 
     let sessions = deps.sessions();
     let pending = sessions[0].pending();
-    let has_system = pending.iter().any(|p| matches!(
-        p,
-        frances_models_llm::chat::OwnedHistoryInput::System { .. }
-    ));
-    assert!(!has_system, "no system message should be pushed when all sections return null");
+    let has_system = pending.iter().any(|p| {
+        matches!(
+            p,
+            frances_models_llm::chat::OwnedHistoryInput::System { .. }
+        )
+    });
+    assert!(
+        !has_system,
+        "no system message should be pushed when all sections return null"
+    );
 }
 
 #[tokio::test]
@@ -1567,7 +1587,11 @@ async fn chat_prompt_sections_render_in_push_order() {
             _ => None,
         })
         .collect();
-    assert_eq!(system_text.len(), 1, "expected one system message, got {system_text:?}");
+    assert_eq!(
+        system_text.len(),
+        1,
+        "expected one system message, got {system_text:?}"
+    );
     let text = &system_text[0];
     let aaa_pos = text.find("AAA").expect("should contain AAA");
     let bbb_pos = text.find("BBB").expect("should contain BBB");
@@ -1613,8 +1637,14 @@ async fn chat_prompt_sections_ctx_includes_tools() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["hasTools"], true, "ctx.tools should be an array with 1 element");
-    assert_eq!(result["hasTool"], true, "ctx.tools[0].name should be my_tool");
+    assert_eq!(
+        result["hasTools"], true,
+        "ctx.tools should be an array with 1 element"
+    );
+    assert_eq!(
+        result["hasTool"], true,
+        "ctx.tools[0].name should be my_tool"
+    );
 }
 
 #[tokio::test]
@@ -1707,7 +1737,10 @@ async fn chat_prompt_sections_support_async_prompt() {
         p,
         frances_models_llm::chat::OwnedHistoryInput::System { text } if text.contains("async-result")
     ));
-    assert!(has_async, "async section result should appear in system messages");
+    assert!(
+        has_async,
+        "async section result should appear in system messages"
+    );
 }
 
 #[tokio::test]
@@ -1740,9 +1773,14 @@ async fn chat_empty_prompt_sections_no_system_push() {
 
     let sessions = deps.sessions();
     let pending = sessions[0].pending();
-    let has_system = pending.iter().any(|p| matches!(
-        p,
-        frances_models_llm::chat::OwnedHistoryInput::System { .. }
-    ));
-    assert!(!has_system, "no system message should be pushed with empty promptSections");
+    let has_system = pending.iter().any(|p| {
+        matches!(
+            p,
+            frances_models_llm::chat::OwnedHistoryInput::System { .. }
+        )
+    });
+    assert!(
+        !has_system,
+        "no system message should be pushed with empty promptSections"
+    );
 }

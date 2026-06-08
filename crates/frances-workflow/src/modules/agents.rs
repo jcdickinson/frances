@@ -22,10 +22,9 @@ use rquickjs::promise::Promised;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Result as JsResult, Value};
 use twox_hash::XxHash64;
 
+use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
 use crate::io::WorkflowFs;
-use crate::WorkflowError;
-
 
 // ---------------------------------------------------------------------------
 // Public entry point — called from `install_stash`
@@ -91,14 +90,17 @@ fn build_discover_global<'js, D: WorkflowDeps>(
     deps: D,
 ) -> Result<Function<'js>, WorkflowError> {
     let ctx = ctx.clone();
-    let f = Function::new(ctx, move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
-        let deps = deps.clone();
-        let promised = Promised::from(async move {
-            let candidates = global_candidates();
-            ContentResults(discover_with_content(&deps, candidates).await)
-        });
-        promised.into_js(&ctx)
-    })?;
+    let f = Function::new(
+        ctx,
+        move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
+            let deps = deps.clone();
+            let promised = Promised::from(async move {
+                let candidates = global_candidates();
+                ContentResults(discover_with_content(&deps, candidates).await)
+            });
+            promised.into_js(&ctx)
+        },
+    )?;
     Ok(f)
 }
 
@@ -155,17 +157,20 @@ fn build_discover_local<'js, D: WorkflowDeps>(
     deps: D,
 ) -> Result<Function<'js>, WorkflowError> {
     let ctx = ctx.clone();
-    let f = Function::new(ctx, move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
-        let deps = deps.clone();
-        let promised = Promised::from(async move {
-            let Some(root) = deps.editable_roots().first().cloned() else {
-                return ContentResults(Vec::new());
-            };
-            let candidates = local_candidates(&root);
-            ContentResults(discover_with_content(&deps, candidates).await)
-        });
-        promised.into_js(&ctx)
-    })?;
+    let f = Function::new(
+        ctx,
+        move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
+            let deps = deps.clone();
+            let promised = Promised::from(async move {
+                let Some(root) = deps.editable_roots().first().cloned() else {
+                    return ContentResults(Vec::new());
+                };
+                let candidates = local_candidates(&root);
+                ContentResults(discover_with_content(&deps, candidates).await)
+            });
+            promised.into_js(&ctx)
+        },
+    )?;
     Ok(f)
 }
 
@@ -184,9 +189,7 @@ fn local_candidates(root: &Path) -> Vec<PathBuf> {
         root.join("AGENTS.md"),
         root.join("AGENTS.local.md"),
         root.join(".agents").join("frances").join("AGENTS.md"),
-        root.join(".agents")
-            .join("frances")
-            .join("AGENTS.local.md"),
+        root.join(".agents").join("frances").join("AGENTS.local.md"),
     ]
 }
 
@@ -199,13 +202,14 @@ fn build_discover_nested<'js, D: WorkflowDeps>(
     deps: D,
 ) -> Result<Function<'js>, WorkflowError> {
     let ctx = ctx.clone();
-    let f = Function::new(ctx, move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
-        let deps = deps.clone();
-        let promised = Promised::from(async move {
-            PathResults(discover_nested(&deps).await)
-        });
-        promised.into_js(&ctx)
-    })?;
+    let f = Function::new(
+        ctx,
+        move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| -> JsResult<Value<'js>> {
+            let deps = deps.clone();
+            let promised = Promised::from(async move { PathResults(discover_nested(&deps).await) });
+            promised.into_js(&ctx)
+        },
+    )?;
     Ok(f)
 }
 

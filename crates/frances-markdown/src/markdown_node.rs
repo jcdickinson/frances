@@ -16,7 +16,6 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum MarkdownNode {
     // ── Block-level ──────────────────────────────────────────────
-
     /// A paragraph of inline content.
     Paragraph { children: Vec<MarkdownNode> },
 
@@ -54,7 +53,6 @@ pub enum MarkdownNode {
     ThematicBreak,
 
     // ── Inline ──────────────────────────────────────────────────
-
     /// Plain text.
     Text { value: String },
 
@@ -84,4 +82,3 @@ pub enum MarkdownNode {
     /// A hard line break (`\` or two trailing spaces).
     Break,
 }
-

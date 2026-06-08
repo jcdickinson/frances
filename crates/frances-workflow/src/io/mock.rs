@@ -360,7 +360,6 @@ impl WorkflowFs for MockFs {
         // No symlinks in the mock filesystem; return path as-is.
         Ok(path.to_path_buf())
     }
-
 }
 
 #[cfg(test)]

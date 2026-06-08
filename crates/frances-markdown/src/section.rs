@@ -302,4 +302,3 @@ mod tests {
         assert!(s.sealed);
     }
 }
-

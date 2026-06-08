@@ -9,8 +9,11 @@ pub(crate) use crate::permission::PermissionResponse;
 
 use std::io::Write;
 
+mod agent_sections;
+mod agents;
 mod chat;
 mod complete;
+mod context_sections;
 mod drive;
 mod frames;
 mod inbox;
@@ -18,11 +21,8 @@ mod permission;
 mod scope;
 mod shell;
 mod timer;
-mod whatwg;
 mod tool_family;
-mod context_sections;
-mod agents;
-mod agent_sections;
+mod whatwg;
 
 fn write_source(ext: &str, body: &str) -> tempfile::NamedTempFile {
     let mut f = tempfile::Builder::new()

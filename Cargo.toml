@@ -73,5 +73,5 @@ turso = { version = "0.6.0-pre.26", default-features = false }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
 unicode-width = "0.2"
 url = { version = "2", features = ["serde"] }
-uuid = { version = "1", features = ["serde", "v4"] }
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
 xdg = "3"

@@ -140,10 +140,22 @@ async fn agent_sections_global_agents_section_shape() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["isNullOrString"], true, "prompt should return null or string");
-    assert_eq!(result["hasCorrectName"], true, "section name should be global-agents");
-    assert_eq!(result["hasHeader"], true, "non-null output should contain header");
-    assert_eq!(result["hasPrecedence"], true, "non-null output should contain precedence note");
+    assert_eq!(
+        result["isNullOrString"], true,
+        "prompt should return null or string"
+    );
+    assert_eq!(
+        result["hasCorrectName"], true,
+        "section name should be global-agents"
+    );
+    assert_eq!(
+        result["hasHeader"], true,
+        "non-null output should contain header"
+    );
+    assert_eq!(
+        result["hasPrecedence"], true,
+        "non-null output should contain precedence note"
+    );
 }
 
 #[tokio::test]

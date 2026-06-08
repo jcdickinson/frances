@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
-use frances_core::{expand_tilde, resolve_relative, JsonRepair};
+use frances_core::{JsonRepair, expand_tilde, resolve_relative};
 use frances_edit::{LoopKey, LoopKind};
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use grep_regex::RegexMatcher;
@@ -285,7 +285,6 @@ fn resolve_root(root_arg: Option<&str>, cwd: Option<&Path>) -> Result<PathBuf, S
     };
     Ok(root)
 }
-
 
 fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String> {
     let (paths, search) = match (args.paths, args.search) {

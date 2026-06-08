@@ -528,10 +528,7 @@ async fn root_hidden_children_filtered_by_default() {
         .iter()
         .map(|e| e["path"].as_str().unwrap())
         .collect();
-    assert!(
-        paths.contains(&"readme.md"),
-        "readme.md missing: {paths:?}"
-    );
+    assert!(paths.contains(&"readme.md"), "readme.md missing: {paths:?}");
     assert!(
         !paths.iter().any(|p| p.contains("key.pem")),
         "hidden child leaked through default filter: {paths:?}"

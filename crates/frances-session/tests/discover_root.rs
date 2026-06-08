@@ -43,4 +43,3 @@ async fn discover_root_cwd_is_root() {
     let root = discover_root(dir.path(), &markers).await;
     assert_eq!(root, dir.path());
 }
-

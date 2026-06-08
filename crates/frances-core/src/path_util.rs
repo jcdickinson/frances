@@ -2,7 +2,6 @@
 
 use std::path::{Path, PathBuf};
 
-
 /// Return `true` when `descendant` is located inside `ancestor` (or is the same
 /// path). Both sides are canonicalized via [`std::fs::canonicalize`] before the
 /// prefix check so that symlinks are resolved. When `descendant` does not yet
@@ -185,8 +184,6 @@ mod tests {
         ));
     }
 
-
-
     #[test]
     fn is_within_nonexistent_descendant_with_existing_parent() {
         let dir = tempfile::tempdir().unwrap();
@@ -204,6 +201,4 @@ mod tests {
         assert!(!child.exists());
         assert!(is_within(dir.path(), &child));
     }
-
-
 }
