@@ -10,7 +10,7 @@ use std::cell::Cell;
 use crossterm::event::{KeyCode, KeyEventKind};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Widget, Wrap};
 
@@ -113,7 +113,15 @@ impl Block for MarkdownBlock {
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Convert inline children into styled lines, splitting on [`MarkdownNode::Break`].
-fn inline_to_lines(children: &[MarkdownNode]) -> Vec<Line<'static>> {
+fn inline_to_lines(children: &[MarkdownNode], theme: &Theme) -> Vec<Line<'static>> {
+    inline_to_lines_with_base(children, Style::default(), theme)
+}
+
+fn inline_to_lines_with_base(
+    children: &[MarkdownNode],
+    base: Style,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut current: Vec<Span<'static>> = Vec::new();
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -122,7 +130,7 @@ fn inline_to_lines(children: &[MarkdownNode]) -> Vec<Line<'static>> {
             MarkdownNode::Break => {
                 lines.push(Line::from(std::mem::take(&mut current)));
             }
-            other => collect_inline_spans(other, &mut current, Style::default()),
+            other => collect_inline_spans(other, &mut current, base, theme),
         }
     }
 
@@ -133,7 +141,12 @@ fn inline_to_lines(children: &[MarkdownNode]) -> Vec<Line<'static>> {
 }
 
 /// Recursively push styled spans for one inline node into `out`.
-fn collect_inline_spans(node: &MarkdownNode, out: &mut Vec<Span<'static>>, base: Style) {
+fn collect_inline_spans(
+    node: &MarkdownNode,
+    out: &mut Vec<Span<'static>>,
+    base: Style,
+    theme: &Theme,
+) {
     match node {
         MarkdownNode::Text { value } => {
             out.push(Span::styled(value.clone(), base));
@@ -141,30 +154,53 @@ fn collect_inline_spans(node: &MarkdownNode, out: &mut Vec<Span<'static>>, base:
         MarkdownNode::Strong { children } => {
             let s = base.add_modifier(Modifier::BOLD);
             for c in children {
-                collect_inline_spans(c, out, s);
+                collect_inline_spans(c, out, s, theme);
             }
         }
         MarkdownNode::Emphasis { children } => {
             let s = base.add_modifier(Modifier::ITALIC);
             for c in children {
-                collect_inline_spans(c, out, s);
+                collect_inline_spans(c, out, s, theme);
             }
         }
         MarkdownNode::InlineCode { value } => {
-            out.push(Span::styled(value.clone(), base));
+            out.push(Span::styled(value.clone(), inline_code_style(base)));
         }
         MarkdownNode::Link { url, children, .. } => {
+            let link_style = link_text_style(base);
             for c in children {
-                collect_inline_spans(c, out, base);
+                collect_inline_spans(c, out, link_style, theme);
             }
-            out.push(Span::styled(format!(" ({url})"), base));
+            out.push(Span::styled(format!(" ({url})"), dim_style(base, theme)));
         }
         MarkdownNode::Image { alt, .. } => {
-            out.push(Span::styled(format!("[{alt}]"), base));
+            out.push(Span::styled(format!("[{alt}]"), dim_style(base, theme)));
         }
         MarkdownNode::Break => { /* handled by caller */ }
         _ => {}
     }
+}
+
+fn inline_code_style(base: Style) -> Style {
+    base.fg(Color::Yellow)
+}
+
+fn link_text_style(base: Style) -> Style {
+    base.fg(Color::Blue).add_modifier(Modifier::UNDERLINED)
+}
+
+fn dim_style(base: Style, theme: &Theme) -> Style {
+    base.patch(theme.dim)
+}
+
+fn heading_style() -> Style {
+    Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn chrome_style(theme: &Theme) -> Style {
+    theme.dim
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -174,22 +210,20 @@ fn collect_inline_spans(node: &MarkdownNode, out: &mut Vec<Span<'static>>, base:
 /// Build a [`Paragraph`] for a leaf-level node that ratatui can render
 /// directly.  Paragraphs and headings use word-wrapping; code, HTML and
 /// thematic breaks do not.
-fn build_leaf_paragraph(node: &MarkdownNode) -> Paragraph<'static> {
+fn build_leaf_paragraph(node: &MarkdownNode, theme: &Theme) -> Paragraph<'static> {
     match node {
         MarkdownNode::Paragraph { children } => {
-            let lines = inline_to_lines(children);
+            let lines = inline_to_lines(children, theme);
             Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false })
         }
 
         MarkdownNode::Heading { depth, children } => {
+            let heading_style = heading_style();
             let prefix = "#".repeat(*depth as usize) + " ";
-            let mut lines = inline_to_lines(children);
+            let mut lines = inline_to_lines_with_base(children, heading_style, theme);
             // Prepend heading prefix to the first line.
             if let Some(first) = lines.first_mut() {
-                let mut prefixed = vec![Span::styled(
-                    prefix,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )];
+                let mut prefixed = vec![Span::styled(prefix, heading_style)];
                 prefixed.append(&mut first.spans);
                 first.spans = prefixed;
             }
@@ -199,10 +233,7 @@ fn build_leaf_paragraph(node: &MarkdownNode) -> Paragraph<'static> {
         MarkdownNode::Code { lang, value } => {
             let mut lines: Vec<Line<'static>> = Vec::new();
             if let Some(l) = lang {
-                lines.push(Line::from(Span::styled(
-                    l.clone(),
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
+                lines.push(Line::from(Span::styled(l.clone(), chrome_style(theme))));
             }
             for line in value.lines() {
                 lines.push(Line::from(Span::styled(line.to_owned(), Style::default())));
@@ -226,7 +257,7 @@ fn build_leaf_paragraph(node: &MarkdownNode) -> Paragraph<'static> {
             Paragraph::new(Text::from(lines))
         }
 
-        MarkdownNode::Table(table) => build_table_paragraph(table),
+        MarkdownNode::Table(table) => build_table_paragraph(table, theme),
 
         // ThematicBreak is handled specially in `render_node`; this is a
         // fallback that should never be reached.
@@ -241,8 +272,8 @@ fn build_leaf_paragraph(node: &MarkdownNode) -> Paragraph<'static> {
 // Table builder
 // ═══════════════════════════════════════════════════════════════════════
 
-fn build_table_paragraph(table: &MarkdownTable) -> Paragraph<'static> {
-    let lines = render_table_lines(table, TableCellBreaks::Spaces);
+fn build_table_paragraph(table: &MarkdownTable, theme: &Theme) -> Paragraph<'static> {
+    let lines = render_table_lines(table, TableCellBreaks::Spaces, theme);
     Paragraph::new(Text::from(lines))
 }
 
@@ -252,7 +283,11 @@ enum TableCellBreaks {
     Lines,
 }
 
-fn render_table_lines(table: &MarkdownTable, breaks: TableCellBreaks) -> Vec<Line<'static>> {
+fn render_table_lines(
+    table: &MarkdownTable,
+    breaks: TableCellBreaks,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if table.rows.is_empty() {
         return vec![Line::from(Span::styled(String::new(), Style::default()))];
     }
@@ -265,7 +300,7 @@ fn render_table_lines(table: &MarkdownTable, breaks: TableCellBreaks) -> Vec<Lin
     let rendered_rows: Vec<Vec<Vec<Vec<Span<'static>>>>> = table
         .rows
         .iter()
-        .map(|row| render_table_row_cells(row, columns, breaks))
+        .map(|row| render_table_row_cells(row, columns, breaks, theme))
         .collect();
     let widths = table_column_widths(&rendered_rows, columns);
 
@@ -274,11 +309,17 @@ fn render_table_lines(table: &MarkdownTable, breaks: TableCellBreaks) -> Vec<Lin
         &rendered_rows[0],
         &widths,
         &table.alignments,
+        theme,
     ));
-    lines.push(render_table_separator(&widths, &table.alignments));
+    lines.push(render_table_separator(&widths, &table.alignments, theme));
 
     for row in rendered_rows.iter().skip(1) {
-        lines.extend(render_table_row_lines(row, &widths, &table.alignments));
+        lines.extend(render_table_row_lines(
+            row,
+            &widths,
+            &table.alignments,
+            theme,
+        ));
     }
 
     lines
@@ -298,18 +339,23 @@ fn render_table_row_cells(
     row: &TableRow,
     columns: usize,
     breaks: TableCellBreaks,
+    theme: &Theme,
 ) -> Vec<Vec<Vec<Span<'static>>>> {
     (0..columns)
         .map(|column| {
             row.cells
                 .get(column)
-                .map(|cell| render_table_cell_lines(cell, breaks))
+                .map(|cell| render_table_cell_lines(cell, breaks, theme))
                 .unwrap_or_else(|| vec![Vec::new()])
         })
         .collect()
 }
 
-fn render_table_cell_lines(cell: &TableCell, breaks: TableCellBreaks) -> Vec<Vec<Span<'static>>> {
+fn render_table_cell_lines(
+    cell: &TableCell,
+    breaks: TableCellBreaks,
+    theme: &Theme,
+) -> Vec<Vec<Span<'static>>> {
     let mut lines = vec![Vec::new()];
     for child in &cell.children {
         match child {
@@ -326,6 +372,7 @@ fn render_table_cell_lines(cell: &TableCell, breaks: TableCellBreaks) -> Vec<Vec
                     .last_mut()
                     .expect("table cell lines are always non-empty"),
                 Style::default(),
+                theme,
             ),
         }
     }
@@ -348,10 +395,11 @@ fn render_table_row_lines(
     cells: &[Vec<Vec<Span<'static>>>],
     widths: &[usize],
     alignments: &[TableAlignment],
+    theme: &Theme,
 ) -> Vec<Line<'static>> {
     let height = cells.iter().map(Vec::len).max().unwrap_or(1).max(1);
     (0..height)
-        .map(|line_index| render_table_row_line(cells, widths, alignments, line_index))
+        .map(|line_index| render_table_row_line(cells, widths, alignments, line_index, theme))
         .collect()
 }
 
@@ -360,8 +408,10 @@ fn render_table_row_line(
     widths: &[usize],
     alignments: &[TableAlignment],
     line_index: usize,
+    theme: &Theme,
 ) -> Line<'static> {
-    let mut spans = vec![Span::styled("|".to_string(), Style::default())];
+    let chrome = chrome_style(theme);
+    let mut spans = vec![Span::styled("|".to_string(), chrome)];
 
     for (column, width) in widths.iter().enumerate() {
         let cell_line = cells
@@ -370,24 +420,29 @@ fn render_table_row_line(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let alignment = table_alignment(alignments, column);
-        spans.push(Span::styled(" ".to_string(), Style::default()));
-        spans.extend(pad_table_cell(cell_line, *width, alignment));
-        spans.push(Span::styled(" |".to_string(), Style::default()));
+        spans.push(Span::styled(" ".to_string(), chrome));
+        spans.extend(pad_table_cell(cell_line, *width, alignment, theme));
+        spans.push(Span::styled(" |".to_string(), chrome));
     }
 
     Line::from(spans)
 }
 
-fn render_table_separator(widths: &[usize], alignments: &[TableAlignment]) -> Line<'static> {
-    let mut spans = vec![Span::styled("|".to_string(), Style::default())];
+fn render_table_separator(
+    widths: &[usize],
+    alignments: &[TableAlignment],
+    theme: &Theme,
+) -> Line<'static> {
+    let chrome = chrome_style(theme);
+    let mut spans = vec![Span::styled("|".to_string(), chrome)];
 
     for (column, width) in widths.iter().enumerate() {
-        spans.push(Span::styled(" ".to_string(), Style::default()));
+        spans.push(Span::styled(" ".to_string(), chrome));
         spans.push(Span::styled(
             table_separator_cell(*width, table_alignment(alignments, column)),
-            Style::default(),
+            chrome,
         ));
-        spans.push(Span::styled(" |".to_string(), Style::default()));
+        spans.push(Span::styled(" |".to_string(), chrome));
     }
 
     Line::from(spans)
@@ -414,6 +469,7 @@ fn pad_table_cell(
     cell: &[Span<'static>],
     width: usize,
     alignment: TableAlignment,
+    theme: &Theme,
 ) -> Vec<Span<'static>> {
     let content_width = spans_width(cell);
     let padding = width.saturating_sub(content_width);
@@ -423,13 +479,14 @@ fn pad_table_cell(
         TableAlignment::None | TableAlignment::Left => (0, padding),
     };
 
+    let chrome = chrome_style(theme);
     let mut spans = Vec::new();
     if left > 0 {
-        spans.push(Span::styled(" ".repeat(left), Style::default()));
+        spans.push(Span::styled(" ".repeat(left), chrome));
     }
     spans.extend(cell.iter().cloned());
     if right > 0 {
-        spans.push(Span::styled(" ".repeat(right), Style::default()));
+        spans.push(Span::styled(" ".repeat(right), chrome));
     }
     spans
 }
@@ -511,7 +568,7 @@ fn measure_node(node: &MarkdownNode, width: u16, selected: bool, theme: &Theme) 
     match node {
         // Wrapped leaf nodes
         MarkdownNode::Paragraph { .. } | MarkdownNode::Heading { .. } => {
-            build_leaf_paragraph(node).line_count(width) as u16
+            build_leaf_paragraph(node, theme).line_count(width) as u16
         }
 
         // Unwrapped leaf nodes — raw line count
@@ -527,7 +584,7 @@ fn measure_node(node: &MarkdownNode, width: u16, selected: bool, theme: &Theme) 
             } else {
                 TableCellBreaks::Spaces
             };
-            render_table_lines(table, breaks).len() as u16
+            render_table_lines(table, breaks, theme).len() as u16
         }
 
         // Container nodes — recursive sum
@@ -619,19 +676,19 @@ fn render_node(
         | MarkdownNode::Heading { .. }
         | MarkdownNode::Code { .. }
         | MarkdownNode::Html { .. } => {
-            let para = build_leaf_paragraph(node);
+            let para = build_leaf_paragraph(node, theme);
             render_shifted_paragraph(&para, area, buf, src_y);
         }
 
         MarkdownNode::Table(table) if table_selected => {
-            let lines = render_table_lines(table, TableCellBreaks::Lines);
+            let lines = render_table_lines(table, TableCellBreaks::Lines, theme);
             let lines = slice_table_lines(&lines, scroll_x, area.width);
             let para = Paragraph::new(Text::from(lines));
             render_shifted_paragraph(&para, area, buf, src_y);
         }
 
         MarkdownNode::Table(_) => {
-            let para = build_leaf_paragraph(node);
+            let para = build_leaf_paragraph(node, theme);
             render_shifted_paragraph(&para, area, buf, src_y);
         }
 
@@ -807,7 +864,7 @@ fn render_list(
             if vis > 0 {
                 // Paint the marker on the item's first visible row.
                 if item_src_y == 0 && top < area.height {
-                    buf.set_string(area.x, area.y + top, &marker, Style::default());
+                    buf.set_string(area.x, area.y + top, &marker, chrome_style(theme));
                 }
 
                 let child_area = Rect::new(area.x + mw, area.y + top, inner_width, vis);
@@ -966,6 +1023,30 @@ mod tests {
             .join("")
             .trim_end()
             .to_string()
+    }
+
+    fn style_at(buf: &Buffer, x: u16, y: u16) -> Style {
+        buf.cell((x, y)).unwrap().style()
+    }
+
+    fn style_for_text(buf: &Buffer, y: u16, text: &str) -> Style {
+        let row = row_text(buf, y);
+        let x = row
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} not found in {row:?}"));
+        style_at(buf, x as u16, y)
+    }
+
+    fn assert_modifier(style: Style, modifier: Modifier) {
+        assert!(
+            style.add_modifier.contains(modifier),
+            "expected {style:?} to contain {modifier:?}"
+        );
+    }
+
+    fn assert_plain_style(style: Style) {
+        assert_eq!(style.fg, Some(Color::Reset));
+        assert!(style.add_modifier.is_empty());
     }
 
     // ── Measure tests ─────────────────────────────────────────────
@@ -1489,5 +1570,135 @@ mod tests {
         };
         let buf = render_at(node, 80, 1);
         assert!(row_text(&buf, 0).contains("[a diagram]"));
+    }
+
+    #[test]
+    fn render_inline_styles_use_ratatui_cell_styles() {
+        let node = MarkdownNode::Paragraph {
+            children: vec![
+                MarkdownNode::Strong {
+                    children: vec![MarkdownNode::Text {
+                        value: "bold".into(),
+                    }],
+                },
+                MarkdownNode::Text { value: " ".into() },
+                MarkdownNode::Emphasis {
+                    children: vec![MarkdownNode::Text {
+                        value: "italic".into(),
+                    }],
+                },
+                MarkdownNode::Text { value: " ".into() },
+                MarkdownNode::InlineCode {
+                    value: "code".into(),
+                },
+            ],
+        };
+
+        let buf = render_at(node, 80, 1);
+
+        assert_modifier(style_for_text(&buf, 0, "bold"), Modifier::BOLD);
+        assert_modifier(style_for_text(&buf, 0, "italic"), Modifier::ITALIC);
+        assert_eq!(style_for_text(&buf, 0, "code").fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn render_link_styles_text_and_url_suffix() {
+        let node = MarkdownNode::Paragraph {
+            children: vec![MarkdownNode::Link {
+                url: "https://example.com".into(),
+                title: None,
+                children: vec![MarkdownNode::Text {
+                    value: "click".into(),
+                }],
+            }],
+        };
+
+        let buf = render_at(node, 80, 1);
+        let link = style_for_text(&buf, 0, "click");
+        let suffix = style_for_text(&buf, 0, "https://example.com");
+
+        assert_eq!(link.fg, Some(Color::Blue));
+        assert_modifier(link, Modifier::UNDERLINED);
+        assert_eq!(suffix.fg, Some(Color::DarkGray));
+    }
+
+    #[test]
+    fn render_heading_styles_prefix_and_text() {
+        let node = MarkdownNode::Heading {
+            depth: 2,
+            children: vec![MarkdownNode::Text {
+                value: "Title".into(),
+            }],
+        };
+
+        let buf = render_at(node, 80, 1);
+        let prefix = style_at(&buf, 0, 0);
+        let title = style_for_text(&buf, 0, "Title");
+
+        assert_eq!(prefix.fg, Some(Color::Cyan));
+        assert_modifier(prefix, Modifier::BOLD);
+        assert_eq!(title.fg, Some(Color::Cyan));
+        assert_modifier(title, Modifier::BOLD);
+    }
+
+    #[test]
+    fn render_block_chrome_uses_dim_style() {
+        let quote = MarkdownNode::Blockquote {
+            children: vec![MarkdownNode::Paragraph {
+                children: vec![MarkdownNode::Text {
+                    value: "quoted".into(),
+                }],
+            }],
+        };
+        let list = MarkdownNode::List {
+            ordered: false,
+            start: None,
+            children: vec![MarkdownNode::ListItem {
+                children: vec![li_para("item")],
+            }],
+        };
+        let rule = MarkdownNode::ThematicBreak;
+
+        let quote_buf = render_at(quote, 80, 1);
+        let list_buf = render_at(list, 80, 1);
+        let rule_buf = render_at(rule, 80, 1);
+
+        assert_eq!(style_at(&quote_buf, 0, 0).fg, Some(Color::DarkGray));
+        assert_eq!(style_at(&list_buf, 0, 0).fg, Some(Color::DarkGray));
+        assert_eq!(style_at(&rule_buf, 0, 0).fg, Some(Color::DarkGray));
+        assert_plain_style(style_for_text(&quote_buf, 0, "quoted"));
+        assert_plain_style(style_for_text(&list_buf, 0, "item"));
+    }
+
+    #[test]
+    fn render_code_language_label_is_dim_but_body_is_default() {
+        let node = MarkdownNode::Code {
+            lang: Some("rust".into()),
+            value: "fn main() {}".into(),
+        };
+
+        let buf = render_at(node, 80, 2);
+
+        assert_eq!(style_for_text(&buf, 0, "rust").fg, Some(Color::DarkGray));
+        assert_plain_style(style_for_text(&buf, 1, "fn main()"));
+    }
+
+    #[test]
+    fn render_table_chrome_is_dim_but_cell_content_keeps_inline_style() {
+        let node = table_node(
+            vec![TableAlignment::None],
+            vec![
+                vec![table_text("Name")],
+                vec![table_cell(vec![MarkdownNode::InlineCode {
+                    value: "code".into(),
+                }])],
+            ],
+        );
+
+        let buf = render_at(node, 80, 3);
+
+        assert_eq!(style_at(&buf, 0, 0).fg, Some(Color::DarkGray));
+        assert_eq!(style_at(&buf, 2, 1).fg, Some(Color::DarkGray));
+        assert_eq!(style_for_text(&buf, 2, "code").fg, Some(Color::Yellow));
     }
 }

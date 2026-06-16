@@ -15,8 +15,7 @@
 //! never sees its position disappear.
 
 use frances_models_tui::{SectionApply, Source};
-use frances_tui::block::{Block, BlockMeasureContext, BlockRenderContext, Sigil};
-use frances_tui::widget::{EventContext, EventOutcome, Input};
+use frances_tui::block::{Block, Sigil};
 use frances_tui::section::Section;
 use markdown::mdast;
 use markdown::{ParseOptions, to_mdast};

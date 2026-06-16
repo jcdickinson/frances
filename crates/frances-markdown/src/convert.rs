@@ -204,6 +204,12 @@ mod tests {
     use super::*;
     use markdown::{ParseOptions, to_mdast};
 
+    use crate::markdown_block::MarkdownBlock;
+    use frances_tui::block::{Block, BlockRenderContext};
+    use frances_tui::widget::{FrameTime, Theme};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::{Color, Style};
     fn parse(text: &str) -> mdast::Node {
         to_mdast(text, &ParseOptions::gfm()).unwrap()
     }
@@ -218,6 +224,51 @@ mod tests {
     fn convert_first(text: &str, source: Source) -> Option<MarkdownNode> {
         let children = root_children(text);
         children.first().and_then(|n| convert_node(n, source))
+    }
+
+    struct StubFrameTime;
+
+    impl FrameTime for StubFrameTime {
+        fn get_frame(&self) -> f64 {
+            0.0
+        }
+    }
+
+    fn render_node(node: MarkdownNode, width: u16, height: u16) -> Buffer {
+        let block = MarkdownBlock::new(node);
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        let theme = Theme::default();
+        let ft = StubFrameTime;
+        let mut render_ctx = BlockRenderContext {
+            area,
+            buf: &mut buf,
+            src_y: 0,
+            truncated: false,
+            alt_view: false,
+            selected: false,
+            selected_part: None,
+            theme: &theme,
+            frame_time: &ft,
+        };
+        block.render(&mut render_ctx);
+        buf
+    }
+
+    fn rendered_style_for_text(buf: &Buffer, y: u16, text: &str) -> Style {
+        let row = (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().symbol().to_string())
+            .collect::<Vec<_>>()
+            .join("");
+        let x = row
+            .find(text)
+            .unwrap_or_else(|| panic!("{text:?} not found in {row:?}"));
+        buf.cell((x as u16, y)).unwrap().style()
+    }
+
+    fn assert_plain_style(style: Style) {
+        assert_eq!(style.fg, Some(Color::Reset));
+        assert!(style.add_modifier.is_empty());
     }
 
     // ── Block-level conversions ────────────────────────────────────
@@ -573,6 +624,17 @@ mod tests {
                 value: "Bold title".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn user_source_inline_styles_render_as_default_text() {
+        let node = convert_first("**bold** *italic* `code` [link](url)", Source::User).unwrap();
+        let buf = render_node(node, 80, 1);
+
+        assert_plain_style(rendered_style_for_text(&buf, 0, "bold"));
+        assert_plain_style(rendered_style_for_text(&buf, 0, "italic"));
+        assert_plain_style(rendered_style_for_text(&buf, 0, "code"));
+        assert_plain_style(rendered_style_for_text(&buf, 0, "link"));
     }
 
     // ── Nested structures ──────────────────────────────────────────
