@@ -21,7 +21,7 @@ use unicode_width::UnicodeWidthChar;
 /// collapsed into a single `… [N earlier lines]` marker so the visible
 /// tail tracks the action.
 const TAIL_LINES: usize = 10;
-
+const DIFF_LINE_NUMBER_WIDTH: usize = 4;
 /// Expanded tail height when a tailed block is the alt-view inspector's
 /// selection. Doubles the visible body so the user has room to see more
 /// of the source while paging with `j`/`k`/`u`/`d`.
@@ -72,18 +72,34 @@ impl Input for DiffBlock {
     }
 }
 
+struct DiffDisplayLine {
+    text: String,
+    style: Style,
+}
+
+fn diff_display_line(line: &frances_session::events::DiffLine) -> DiffDisplayLine {
+    match line {
+        frances_session::events::DiffLine::Context { text, line } => DiffDisplayLine {
+            text: format!("{:width$} {}", line, text, width = DIFF_LINE_NUMBER_WIDTH),
+            style: Style::default(),
+        },
+        frances_session::events::DiffLine::Added(text) => DiffDisplayLine {
+            text: format!("+{:width$}{}", "", text, width = DIFF_LINE_NUMBER_WIDTH),
+            style: Style::default().bg(Color::Green).fg(Color::Black),
+        },
+        frances_session::events::DiffLine::Removed(text) => DiffDisplayLine {
+            text: format!("-{:width$}{}", "", text, width = DIFF_LINE_NUMBER_WIDTH),
+            style: Style::default().bg(Color::Red).fg(Color::Black),
+        },
+    }
+}
+
 impl Block for DiffBlock {
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         let max = ctx.width.max(1) as usize;
         let mut count = 0;
         for line in &self.lines {
-            let content = match line {
-                frances_session::events::DiffLine::Context { text: c, line: l } => {
-                    format!("{:4} {}", l, c)
-                }
-                frances_session::events::DiffLine::Added(a) => a.to_string(),
-                frances_session::events::DiffLine::Removed(r) => r.to_string(),
-            };
+            let content = diff_display_line(line).text;
             let mut sink = CountingSink(0);
             wrap_rows(&content, 0, max, &mut sink);
             count += sink.0 as u16;
@@ -95,26 +111,13 @@ impl Block for DiffBlock {
         let max = ctx.area.width.max(1) as usize;
         let mut row_writer = RowWriter::new(ctx);
         for line in &self.lines {
-            let (content, style) = match line {
-                frances_session::events::DiffLine::Context { text: c, line: l } => {
-                    let formatted = format!("{:4} {}", l, c);
-                    (formatted, Style::default())
-                }
-                frances_session::events::DiffLine::Added(a) => (
-                    a.to_string(),
-                    Style::default().bg(Color::Green).fg(Color::Black),
-                ),
-                frances_session::events::DiffLine::Removed(r) => (
-                    r.to_string(),
-                    Style::default().bg(Color::Red).fg(Color::Black),
-                ),
-            };
+            let display = diff_display_line(line);
 
             let mut out = Vec::new();
-            wrap_into("", &content, max, &mut out);
+            wrap_into("", &display.text, max, &mut out);
 
             for wrapped_line in out {
-                let written = row_writer.write_styled(&wrapped_line, style);
+                let written = row_writer.write_styled(&wrapped_line, display.style);
                 if !written && row_writer.finished() {
                     paint_truncation_marker_if_set(row_writer.ctx);
                     return Sigil::blank();
@@ -1009,6 +1012,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn diff_display_line_reserves_sign_and_line_number_gutters() {
+        let context = diff_display_line(&DiffLine::Context {
+            text: "context".into(),
+            line: 12,
+        });
+        let added = diff_display_line(&DiffLine::Added("added".into()));
+        let removed = diff_display_line(&DiffLine::Removed("removed".into()));
+
+        assert_eq!(context.text, "  12 context");
+        assert_eq!(added.text, "+    added");
+        assert_eq!(removed.text, "-    removed");
+
+        let content_start = DIFF_LINE_NUMBER_WIDTH + 1;
+        assert_eq!(&context.text[content_start..], "context");
+        assert_eq!(&added.text[content_start..], "added");
+        assert_eq!(&removed.text[content_start..], "removed");
+
+        assert_eq!(context.style, Style::default());
+        assert_eq!(
+            added.style,
+            Style::default().bg(Color::Green).fg(Color::Black)
+        );
+        assert_eq!(
+            removed.style,
+            Style::default().bg(Color::Red).fg(Color::Black)
+        );
+    }
+
     /// One round-trip-serde test per serializable block variant.
     mod serde_roundtrip {
         use super::*;
@@ -1414,13 +1446,7 @@ mod tests {
                 let max = width.max(1) as usize;
                 let mut rendered = 0usize;
                 for line in &b.lines {
-                    let content = match line {
-                        frances_session::events::DiffLine::Context { text: c, line: l } => {
-                            format!("{:4} {}", l, c)
-                        }
-                        frances_session::events::DiffLine::Added(a) => a.to_string(),
-                        frances_session::events::DiffLine::Removed(r) => r.to_string(),
-                    };
+                    let content = diff_display_line(line).text;
                     let mut out = Vec::new();
                     wrap_into("", &content, max, &mut out);
                     rendered += out.len();
