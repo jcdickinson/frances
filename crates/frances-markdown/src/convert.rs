@@ -12,7 +12,7 @@
 use frances_models_tui::Source;
 use markdown::mdast;
 
-use crate::markdown_node::MarkdownNode;
+use crate::markdown_node::{MarkdownNode, MarkdownTable, TableAlignment, TableCell, TableRow};
 
 // ── Public entry point ─────────────────────────────────────────────
 
@@ -57,6 +57,11 @@ pub fn convert_node(node: &mdast::Node, source: Source) -> Option<MarkdownNode> 
 
         mdast::Node::ThematicBreak(_) => Some(MarkdownNode::ThematicBreak),
 
+        mdast::Node::Table(table) => Some(MarkdownNode::Table(MarkdownTable {
+            alignments: table.align.iter().map(convert_table_alignment).collect(),
+            rows: convert_table_rows(&table.children, source),
+        })),
+
         // ── Explicitly skipped ─────────────────────────────────────
         mdast::Node::Definition(_) => None,
 
@@ -71,6 +76,39 @@ fn convert_block_children(nodes: &[mdast::Node], source: Source) -> Vec<Markdown
     nodes
         .iter()
         .filter_map(|n| convert_node(n, source))
+        .collect()
+}
+
+fn convert_table_alignment(align: &mdast::AlignKind) -> TableAlignment {
+    match align {
+        mdast::AlignKind::None => TableAlignment::None,
+        mdast::AlignKind::Left => TableAlignment::Left,
+        mdast::AlignKind::Right => TableAlignment::Right,
+        mdast::AlignKind::Center => TableAlignment::Center,
+    }
+}
+
+fn convert_table_rows(nodes: &[mdast::Node], source: Source) -> Vec<TableRow> {
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            mdast::Node::TableRow(row) => Some(TableRow {
+                cells: convert_table_cells(&row.children, source),
+            }),
+            _ => None,
+        })
+        .collect()
+}
+
+fn convert_table_cells(nodes: &[mdast::Node], source: Source) -> Vec<TableCell> {
+    nodes
+        .iter()
+        .filter_map(|node| match node {
+            mdast::Node::TableCell(cell) => Some(TableCell {
+                children: convert_inline_children(&cell.children, source),
+            }),
+            _ => None,
+        })
         .collect()
 }
 
@@ -167,7 +205,7 @@ mod tests {
     use markdown::{ParseOptions, to_mdast};
 
     fn parse(text: &str) -> mdast::Node {
-        to_mdast(text, &ParseOptions::default()).unwrap()
+        to_mdast(text, &ParseOptions::gfm()).unwrap()
     }
 
     fn root_children(text: &str) -> Vec<mdast::Node> {
@@ -300,6 +338,71 @@ mod tests {
     fn thematic_break() {
         let node = convert_first("---", Source::Assistant).unwrap();
         assert_eq!(node, MarkdownNode::ThematicBreak);
+    }
+
+    #[test]
+    fn table_node() {
+        let node = convert_first(
+            "| Name | Value |\n| --- | --- |\n| one | two |",
+            Source::Assistant,
+        )
+        .unwrap();
+        let MarkdownNode::Table(table) = node else {
+            unreachable!()
+        };
+        assert_eq!(
+            table.alignments,
+            vec![TableAlignment::None, TableAlignment::None]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0].cells.len(), 2);
+        assert_eq!(
+            table.rows[0].cells[0].children,
+            vec![MarkdownNode::Text {
+                value: "Name".to_owned()
+            }]
+        );
+        assert_eq!(
+            table.rows[1].cells[1].children,
+            vec![MarkdownNode::Text {
+                value: "two".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn table_alignments_preserved() {
+        let node = convert_first(
+            "| A | B | C | D |\n| --- | :--- | ---: | :---: |\n| a | b | c | d |",
+            Source::Assistant,
+        )
+        .unwrap();
+        let MarkdownNode::Table(table) = node else {
+            unreachable!()
+        };
+        assert_eq!(
+            table.alignments,
+            vec![
+                TableAlignment::None,
+                TableAlignment::Left,
+                TableAlignment::Right,
+                TableAlignment::Center,
+            ]
+        );
+    }
+
+    #[test]
+    fn user_source_table_cells_flatten_inline_styling() {
+        let node = convert_first("| A |\n| --- |\n| **bold** [link](url) |", Source::User).unwrap();
+        let MarkdownNode::Table(table) = node else {
+            unreachable!()
+        };
+        assert_eq!(
+            table.rows[1].cells[0].children,
+            vec![MarkdownNode::Text {
+                value: "bold link".to_owned()
+            }]
+        );
     }
 
     #[test]
@@ -499,7 +602,7 @@ mod tests {
             unreachable!()
         };
         // ListItem has two paragraph children (spread)
-        assert!(li_children.len() >= 1);
+        assert!(!li_children.is_empty());
     }
 
     #[test]

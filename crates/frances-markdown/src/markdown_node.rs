@@ -8,6 +8,34 @@
 //! Rendering (step 4) matches on the discriminant and controls the full
 //! interior layout of a `MarkdownBlock`.
 
+/// A markdown table.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MarkdownTable {
+    pub alignments: Vec<TableAlignment>,
+    pub rows: Vec<TableRow>,
+}
+
+/// A single markdown table row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRow {
+    pub cells: Vec<TableCell>,
+}
+
+/// A single markdown table cell.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableCell {
+    pub children: Vec<MarkdownNode>,
+}
+
+/// Column alignment for a markdown table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableAlignment {
+    None,
+    Left,
+    Right,
+    Center,
+}
+
 /// A single node in our markdown tree.
 ///
 /// Each variant carries exactly the data its mdast counterpart provides —
@@ -51,6 +79,9 @@ pub enum MarkdownNode {
 
     /// A horizontal rule (`---`, `***`, `___`).
     ThematicBreak,
+
+    /// A GFM pipe table.
+    Table(MarkdownTable),
 
     // ── Inline ──────────────────────────────────────────────────
     /// Plain text.

@@ -11,5 +11,6 @@ frances-models-tui.workspace = true
 frances-tui.workspace = true
 ratatui.workspace = true
 markdown.workspace = true
+unicode-width.workspace = true
 
 [dev-dependencies]

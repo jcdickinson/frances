@@ -1567,6 +1567,7 @@ dependencies = [
  "frances-tui",
  "markdown",
  "ratatui",
+ "unicode-width 0.2.2",
 ]
 
 [[package]]

@@ -1,6 +1,6 @@
 //! `MarkdownSection` — the [`Section`] impl for
 //! [`SectionKind::Markdown`]. State machine: accumulates text from
-//! Append events, parses the full buffer as CommonMark via mdast on
+//! Append events, parses the full buffer as GFM via mdast on
 //! every apply, and returns one [`MarkdownBlock`] per top-level AST
 //! node.
 //!
@@ -52,8 +52,8 @@ impl MarkdownSection {
             return Vec::new();
         }
 
-        // Parse the accumulated buffer as CommonMark.
-        let root = match to_mdast(&self.buffer, &ParseOptions::default()) {
+        // Parse the accumulated buffer as GFM.
+        let root = match to_mdast(&self.buffer, &ParseOptions::gfm()) {
             Ok(node) => node,
             Err(_) => {
                 // If mdast can't parse, fall back to a single plain-text block.
