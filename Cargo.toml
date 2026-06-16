@@ -27,6 +27,7 @@ frances-workflow = { path = "crates/frances-workflow" }
 anyhow = "1"
 arc-swap = "1"
 async-trait = "0.1"
+base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = { version = "0.29", features = ["event-stream"] }

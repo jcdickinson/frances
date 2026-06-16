@@ -118,6 +118,18 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         self.inner.pending.lock().push(input);
     }
 
+    fn push_system_internal(&self, input: OwnedHistoryInput) {
+        let mut pending = self.inner.pending.lock();
+        // After the last pending system input, else the front. Keeps
+        // system messages clustered and leading, ahead of the user/tool
+        // inputs the host already queued.
+        let pos = pending
+            .iter()
+            .rposition(|m| matches!(m, OwnedHistoryInput::System { .. }))
+            .map_or(0, |i| i + 1);
+        pending.insert(pos, input);
+    }
+
     /// Ensure the `chat_sessions` row exists. Idempotent. Used by
     /// `run` on the first call.
     ///
@@ -147,6 +159,10 @@ impl<D: ChatManagerDeps> ChatSession<D> {
 impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
     fn push(&self, input: OwnedHistoryInput) {
         self.push_internal(input);
+    }
+
+    fn push_system(&self, input: OwnedHistoryInput) {
+        self.push_system_internal(input);
     }
 
     async fn run(
@@ -489,6 +505,38 @@ mod tests {
             )
             .await
             .expect("run should succeed");
+    }
+
+    #[tokio::test]
+    async fn push_system_lands_ahead_of_already_queued_user() {
+        let (manager, _store, _stub) = build_manager().await;
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+
+        // Production order: the host queues the user message first, then the
+        // workflow renders and pushes its system prompt sections.
+        session.push(OwnedHistoryInput::User {
+            text: "hi".to_owned(),
+        });
+        session.push_system(OwnedHistoryInput::System {
+            text: "sys".to_owned(),
+        });
+        session.push_system(OwnedHistoryInput::System {
+            text: "more".to_owned(),
+        });
+
+        let pending = session.inner.pending.lock();
+        let roles: Vec<&str> = pending
+            .iter()
+            .map(|m| match m {
+                OwnedHistoryInput::System { .. } => "system",
+                OwnedHistoryInput::User { .. } => "user",
+                _ => "other",
+            })
+            .collect();
+        // Both system messages cluster at the front in push order, ahead of
+        // the user message — so the leading-system hoist fills `instructions`.
+        assert_eq!(roles, vec!["system", "system", "user"]);
+        assert!(matches!(&pending[0], OwnedHistoryInput::System { text } if text == "sys"));
     }
 
     #[tokio::test]

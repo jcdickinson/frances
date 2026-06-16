@@ -24,6 +24,15 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
     /// Sync — DB persistence happens inside `run`.
     fn push(&self, input: OwnedHistoryInput);
 
+    /// Insert a system input directly after the last system input already
+    /// pending (or at the front if there are none yet), ahead of the
+    /// user/tool inputs the host queued first. The host pushes the user
+    /// message before the workflow renders its prompt sections, so the
+    /// system prompt must jump ahead to lead the request — a leading
+    /// system message is what becomes the Responses API `instructions`
+    /// field downstream. Multiple sections stay in push order.
+    fn push_system(&self, input: OwnedHistoryInput);
+
     /// Drive one provider call: drain pending, write primitives, load
     /// history, stream, persist `History` payloads + the assistant reply.
     ///

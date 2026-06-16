@@ -76,6 +76,10 @@ pub fn install_logging(session: &Session) -> Result<()> {
         .try_init()
         .map_err(RuntimeError::InstallSubscriber)?;
 
+    // Dump each outgoing LLM request to `<session.dir>/request.json` for
+    // debugging the exact payload (messages + system/instructions + tools).
+    frances_llm::providers::genai::set_request_dump_dir(session.dir.clone());
+
     info!(session_id = %session.id, log = %main_path.display(), "session runtime logging installed");
     if env_flag("TUI_TRACE") {
         info!(

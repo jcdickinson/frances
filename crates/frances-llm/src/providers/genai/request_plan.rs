@@ -16,6 +16,8 @@ use url::Url;
 
 use frances_models_llm::config::{AuthMethod, ModelConfig, ProviderConfig};
 
+use super::codex_auth;
+
 #[derive(Debug, ThisError)]
 pub enum Error {
     #[error(
@@ -31,6 +33,8 @@ pub enum Error {
     },
     #[error("command-backed auth is not implemented yet")]
     AuthCommandUnimplemented,
+    #[error(transparent)]
+    Codex(#[from] codex_auth::Error),
     #[error("expand header {name}: {source}")]
     ExpandHeader {
         name: String,
@@ -50,24 +54,38 @@ pub(super) struct RequestPlan {
 }
 
 impl RequestPlan {
-    pub(super) fn build(
+    pub(super) async fn build(
         provider_config: &ProviderConfig,
         model: &ModelConfig,
         env: &HashMap<OsString, OsString>,
+        http: &reqwest::Client,
     ) -> Result<Self, Error> {
-        let api_key = resolve_bearer(&provider_config.auth, env)?;
-        let extra_headers = expand_headers(&provider_config.http_headers, env)?;
+        let auth = resolve_auth(&provider_config.auth, env, http).await?;
+        let mut extra_headers = expand_headers(&provider_config.http_headers, env)?;
+        extra_headers.extend(auth.headers);
         Ok(RequestPlan {
             base_url: provider_config.base_url.clone(),
-            api_key,
+            api_key: auth.bearer,
             extra_headers,
             model: model.clone(),
         })
     }
 }
 
-fn resolve_bearer(auth: &AuthMethod, env: &HashMap<OsString, OsString>) -> Result<String, Error> {
-    match auth {
+/// A resolved bearer plus any headers that must travel with it. Static
+/// auth methods carry no extra headers; Codex auth carries the
+/// `ChatGPT-Account-ID` it read alongside the token.
+struct ResolvedAuth {
+    bearer: String,
+    headers: Vec<(String, String)>,
+}
+
+async fn resolve_auth(
+    auth: &AuthMethod,
+    env: &HashMap<OsString, OsString>,
+    http: &reqwest::Client,
+) -> Result<ResolvedAuth, Error> {
+    let bearer = match auth {
         AuthMethod::EnvKey {
             env_key,
             env_key_instructions,
@@ -77,16 +95,31 @@ fn resolve_bearer(auth: &AuthMethod, env: &HashMap<OsString, OsString>) -> Resul
             .ok_or_else(|| Error::MissingEnvVar {
                 var: env_key.clone(),
                 hint: env_key_instructions.clone(),
-            }),
-        AuthMethod::Token { token } => Ok(token.clone()),
+            })?,
+        AuthMethod::Token { token } => token.clone(),
         AuthMethod::File { file } => std::fs::read_to_string(file)
             .map(|s| s.trim().to_owned())
             .map_err(|source| Error::ReadAuthFile {
                 path: file.clone(),
                 source,
-            }),
-        AuthMethod::Command { .. } => Err(Error::AuthCommandUnimplemented),
-    }
+            })?,
+        AuthMethod::Codex { codex_home, .. } => {
+            let creds = codex_auth::resolve(codex_home.as_deref(), env, http).await?;
+            let headers = creds
+                .account_id
+                .map(|id| vec![("ChatGPT-Account-ID".to_string(), id)])
+                .unwrap_or_default();
+            return Ok(ResolvedAuth {
+                bearer: creds.access_token,
+                headers,
+            });
+        }
+        AuthMethod::Command { .. } => return Err(Error::AuthCommandUnimplemented),
+    };
+    Ok(ResolvedAuth {
+        bearer,
+        headers: Vec::new(),
+    })
 }
 
 fn expand_headers(

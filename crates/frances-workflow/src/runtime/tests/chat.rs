@@ -1175,9 +1175,12 @@ async fn scope_tool_call_hook_isolated_to_nested_stream() {
 }
 
 #[tokio::test]
-async fn chat_push_system_bypass_works_after_user_message() {
+async fn chat_push_system_leads_even_when_pushed_after_user() {
     // `_pushSystem(text)` pushes OwnedHistoryInput::System directly,
-    // bypassing the public push() restriction on role "system".
+    // bypassing the public push() restriction on role "system". Even when
+    // called after the user message is queued, the system content jumps
+    // ahead of it (and multiple sections cluster in push order) so a
+    // leading system message can become the Responses `instructions`.
     let deps = StubDeps::default();
     let rt = Runtime::new(deps.clone()).unwrap();
     let file = write_source(
@@ -1209,24 +1212,25 @@ async fn chat_push_system_bypass_works_after_user_message() {
     let sessions = deps.sessions();
     assert_eq!(sessions.len(), 1);
     let pending = sessions[0].pending();
-    // Expected: user, system, system (in that order).
+    // Expected: system, system, user — systems lead in push order despite
+    // the user message having been queued first.
     assert_eq!(pending.len(), 3);
-    assert!(matches!(
-        &pending[0],
-        frances_models_llm::chat::OwnedHistoryInput::User { text } if text == "hi"
-    ));
-    match &pending[1] {
+    match &pending[0] {
         frances_models_llm::chat::OwnedHistoryInput::System { text } => {
             assert_eq!(text, "injected by section assembly");
         }
         other => panic!("expected System, got {other:?}"),
     }
-    match &pending[2] {
+    match &pending[1] {
         frances_models_llm::chat::OwnedHistoryInput::System { text } => {
             assert_eq!(text, "second system message");
         }
         other => panic!("expected System, got {other:?}"),
     }
+    assert!(matches!(
+        &pending[2],
+        frances_models_llm::chat::OwnedHistoryInput::User { text } if text == "hi"
+    ));
 }
 
 #[tokio::test]

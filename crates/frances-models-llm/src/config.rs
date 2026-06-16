@@ -45,6 +45,15 @@ pub enum AuthMethod {
     Command {
         command: AuthCommand,
     },
+    /// Reuse the credentials the OpenAI Codex CLI wrote via `codex login`.
+    /// Selected by `auth = { codex = true }`; the access token is read
+    /// from `auth.json` and refreshed on demand. `codex_home` overrides
+    /// the credential directory (default `$CODEX_HOME`, then `~/.codex`).
+    Codex {
+        codex: CodexEnabled,
+        #[serde(default)]
+        codex_home: Option<PathBuf>,
+    },
     EnvKey {
         env_key: String,
         #[serde(default)]
@@ -56,6 +65,25 @@ pub enum AuthMethod {
     Token {
         token: String,
     },
+}
+
+/// Discriminator for [`AuthMethod::Codex`]. Deserializes only from the
+/// literal `true`, so `auth = { codex = false }` is a parse error rather
+/// than a representable "codex auth, but off" no-op.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(try_from = "bool")]
+pub struct CodexEnabled;
+
+impl TryFrom<bool> for CodexEnabled {
+    type Error = &'static str;
+
+    fn try_from(value: bool) -> Result<Self, Self::Error> {
+        if value {
+            Ok(CodexEnabled)
+        } else {
+            Err("codex auth marker must be `true`")
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,4 +154,47 @@ fn default_auth_timeout_ms() -> u64 {
 }
 fn default_model_stream_idle_timeout_ms() -> u64 {
     120_000
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_true_selects_codex_variant() {
+        let auth: AuthMethod =
+            serde_json::from_value(serde_json::json!({ "codex": true })).unwrap();
+        assert!(matches!(
+            auth,
+            AuthMethod::Codex {
+                codex_home: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn codex_with_home_override() {
+        let auth: AuthMethod = serde_json::from_value(
+            serde_json::json!({ "codex": true, "codex_home": "/tmp/codex" }),
+        )
+        .unwrap();
+        let AuthMethod::Codex { codex_home, .. } = auth else {
+            panic!("expected codex variant");
+        };
+        assert_eq!(codex_home, Some(PathBuf::from("/tmp/codex")));
+    }
+
+    #[test]
+    fn codex_false_is_a_parse_error() {
+        let err = serde_json::from_value::<AuthMethod>(serde_json::json!({ "codex": false }));
+        assert!(err.is_err(), "codex = false must not deserialize");
+    }
+
+    #[test]
+    fn token_string_still_parses() {
+        let auth: AuthMethod =
+            serde_json::from_value(serde_json::json!({ "token": "secret" })).unwrap();
+        assert!(matches!(auth, AuthMethod::Token { token } if token == "secret"));
+    }
 }

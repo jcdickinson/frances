@@ -1081,6 +1081,15 @@ pub mod test_deps {
             self.pending.lock().push(input);
         }
 
+        fn push_system(&self, input: OwnedHistoryInput) {
+            let mut pending = self.pending.lock();
+            let pos = pending
+                .iter()
+                .rposition(|m| matches!(m, OwnedHistoryInput::System { .. }))
+                .map_or(0, |i| i + 1);
+            pending.insert(pos, input);
+        }
+
         async fn run(
             &self,
             _env: Arc<HashMap<OsString, OsString>>,

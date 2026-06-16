@@ -500,15 +500,19 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
         // `_pushSystem(text)` is the internal escape hatch for injecting
         // system content. The public `push()` rejects `role: "system"` —
         // this method bypasses that restriction so JS prompt sections can
-        // assemble system content before each round, even after user
-        // messages have been pushed.
+        // assemble system content each round. It front-inserts: the host
+        // queues the user message before the workflow renders its prompt,
+        // so the system message must jump ahead of it to lead the request
+        // (a leading system message becomes the Responses `instructions`).
         proto.set(
             "_pushSystem",
             Function::new(
                 ctx.clone(),
                 |_ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, text: String| {
                     let borrow = this.0.borrow();
-                    borrow.handle.push(OwnedHistoryInput::System { text });
+                    borrow
+                        .handle
+                        .push_system(OwnedHistoryInput::System { text });
                     Ok::<_, rquickjs::Error>(())
                 },
             )?,

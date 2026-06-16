@@ -122,12 +122,19 @@ impl<'de, 'a> Deserializer<'de> for ConfigDeserializer<'a> {
         V: Visitor<'de>,
     {
         let path = self.path.clone();
-        let result = if self.config.value().is_some() {
-            self.deserialize_str(visitor)
-        } else if self.is_seq() {
-            self.deserialize_seq(visitor)
-        } else {
-            self.deserialize_map(visitor)
+        // Dispatch on the real scalar type. `deserialize_any` is what serde
+        // uses to buffer untagged-enum variants, so collapsing every scalar
+        // to a string here would lose `bool`/`int`/`float` typing and break
+        // any untagged variant with a non-string field. Clone the scalar so
+        // the borrow ends before the seq/map arms consume `self`.
+        let result = match self.config.value().cloned() {
+            Some(Value::Null) => visitor.visit_unit(),
+            Some(Value::Bool(b)) => visitor.visit_bool(b),
+            Some(Value::Int(i)) => visitor.visit_i64(i),
+            Some(Value::Float(f)) => visitor.visit_f64(f),
+            Some(Value::String(s)) => visitor.visit_str(&s),
+            None if self.is_seq() => self.deserialize_seq(visitor),
+            None => self.deserialize_map(visitor),
         };
         result.map_err(|e| e.add_path(&path))
     }
@@ -443,5 +450,65 @@ fn join_path(parent: &str, segment: &str) -> Arc<str> {
         Arc::from(segment)
     } else {
         Arc::from(format!("{parent}{SEPARATOR}{segment}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde::Deserialize;
+
+    use crate::config::Configuration;
+    use crate::event::ConfigEvent;
+    use crate::value::{Path, Value};
+
+    fn ev(path: &str, value: impl Into<Value>) -> ConfigEvent {
+        ConfigEvent::new(Path::parse(path), value)
+    }
+
+    /// Marker that only deserializes from the literal `true` — mirrors the
+    /// `CodexEnabled` discriminator in frances-models-llm. Exercises the
+    /// `try_from = "bool"` path through the untagged buffer.
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(try_from = "bool")]
+    struct Enabled;
+
+    impl TryFrom<bool> for Enabled {
+        type Error = &'static str;
+        fn try_from(value: bool) -> Result<Self, Self::Error> {
+            if value {
+                Ok(Enabled)
+            } else {
+                Err("must be true")
+            }
+        }
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(untagged, deny_unknown_fields)]
+    enum Auth {
+        Flag { flag: Enabled },
+        Named { name: String },
+    }
+
+    // Untagged enums buffer through `deserialize_any`. A bool field must keep
+    // its type through that buffer, otherwise the `Flag` variant can never
+    // match. Regression for the codex-login auth (`auth = { codex = true }`).
+    #[test]
+    fn untagged_variant_with_bool_field_matches() {
+        let cfg = Configuration::default().applied(ev("auth::flag", true));
+        let auth = cfg.get("auth").bind::<Auth>().unwrap().get().unwrap();
+        assert_eq!(*auth, Auth::Flag { flag: Enabled });
+    }
+
+    #[test]
+    fn untagged_variant_with_string_field_still_matches() {
+        let cfg = Configuration::default().applied(ev("auth::name", "openai"));
+        let auth = cfg.get("auth").bind::<Auth>().unwrap().get().unwrap();
+        assert_eq!(
+            *auth,
+            Auth::Named {
+                name: "openai".to_string()
+            }
+        );
     }
 }
