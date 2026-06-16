@@ -28,6 +28,7 @@ use crate::markdown_node::{MarkdownNode, MarkdownTable, TableAlignment, TableCel
 pub struct MarkdownBlock {
     pub node: MarkdownNode,
     scroll_x: Cell<usize>,
+    trailing_blank: bool,
 }
 
 impl MarkdownBlock {
@@ -35,7 +36,13 @@ impl MarkdownBlock {
         Self {
             node,
             scroll_x: Cell::new(0),
+            trailing_blank: false,
         }
+    }
+
+    pub fn with_trailing_blank(mut self) -> Self {
+        self.trailing_blank = true;
+        self
     }
 }
 
@@ -84,6 +91,7 @@ impl Block for MarkdownBlock {
 
     fn measure(&self, ctx: &BlockMeasureContext<'_>) -> u16 {
         measure_node(&self.node, ctx.width, ctx.selected, ctx.theme)
+            .saturating_add(self.trailing_blank as u16)
     }
 
     fn render(&self, ctx: &mut BlockRenderContext<'_>) -> Sigil {

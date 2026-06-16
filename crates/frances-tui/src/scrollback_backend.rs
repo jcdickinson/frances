@@ -26,6 +26,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, ClearType, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
+use ratatui::style::Modifier;
 
 pub struct ScrollbackBackend<B: Backend<Error = io::Error> + Write> {
     inner: B,
@@ -112,7 +113,7 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
     where
         I: Iterator<Item = &'a Cell>,
     {
-        use crossterm::style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+        use crossterm::style::Print;
         use unicode_width::UnicodeWidthStr;
         let mut skip_continuation = 0;
         for cell in cells {
@@ -120,14 +121,11 @@ impl<B: Backend<Error = io::Error> + Write> ScrollbackBackend<B> {
                 skip_continuation -= 1;
                 continue;
             }
-            self.inner
-                .queue(SetForegroundColor(to_crossterm_color(cell.fg)))?;
-            self.inner
-                .queue(SetBackgroundColor(to_crossterm_color(cell.bg)))?;
+            queue_cell_style(&mut self.inner, cell)?;
             self.inner.queue(Print(cell.symbol()))?;
             skip_continuation = UnicodeWidthStr::width(cell.symbol()).saturating_sub(1);
         }
-        self.inner.queue(ResetColor)?;
+        reset_terminal_style(&mut self.inner)?;
         Ok(())
     }
 
@@ -206,6 +204,47 @@ fn to_crossterm_color(c: ratatui::style::Color) -> crossterm::style::Color {
     }
 }
 
+fn queue_cell_style<W: Write>(writer: &mut W, cell: &Cell) -> io::Result<()> {
+    reset_terminal_style(writer)?;
+    writer.queue(crossterm::style::SetForegroundColor(to_crossterm_color(
+        cell.fg,
+    )))?;
+    writer.queue(crossterm::style::SetBackgroundColor(to_crossterm_color(
+        cell.bg,
+    )))?;
+    queue_modifier(writer, cell.modifier)
+}
+
+fn reset_terminal_style<W: Write>(writer: &mut W) -> io::Result<()> {
+    writer.queue(crossterm::style::ResetColor)?;
+    writer.queue(crossterm::style::SetAttribute(
+        crossterm::style::Attribute::Reset,
+    ))?;
+    Ok(())
+}
+
+fn queue_modifier<W: Write>(writer: &mut W, modifier: Modifier) -> io::Result<()> {
+    use crossterm::style::{Attribute, SetAttribute};
+
+    for (flag, attribute) in [
+        (Modifier::BOLD, Attribute::Bold),
+        (Modifier::DIM, Attribute::Dim),
+        (Modifier::ITALIC, Attribute::Italic),
+        (Modifier::UNDERLINED, Attribute::Underlined),
+        (Modifier::SLOW_BLINK, Attribute::SlowBlink),
+        (Modifier::RAPID_BLINK, Attribute::RapidBlink),
+        (Modifier::REVERSED, Attribute::Reverse),
+        (Modifier::HIDDEN, Attribute::Hidden),
+        (Modifier::CROSSED_OUT, Attribute::CrossedOut),
+    ] {
+        if modifier.contains(flag) {
+            writer.queue(SetAttribute(attribute))?;
+        }
+    }
+
+    Ok(())
+}
+
 impl<B: Backend<Error = io::Error> + Write> Write for ScrollbackBackend<B> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         self.inner.write(buf)
@@ -233,7 +272,7 @@ impl<B: Backend<Error = io::Error> + Write> Backend for ScrollbackBackend<B> {
         // wire, (b) keeping a single emission path lets the test mock
         // (which carries a no-op `Backend::draw` but a real `Write`
         // impl that feeds an alacritty parser) see footer cells.
-        use crossterm::style::{Print, ResetColor, SetBackgroundColor, SetForegroundColor};
+        use crossterm::style::Print;
         let dy = match self.mode {
             BackendMode::Scrollback => 0,
             BackendMode::Footer => self.footer_anchor_y,
@@ -246,13 +285,10 @@ impl<B: Backend<Error = io::Error> + Write> Backend for ScrollbackBackend<B> {
                 self.inner.queue(MoveTo(x, y))?;
             }
             last_pos = Some((x, y));
-            self.inner
-                .queue(SetForegroundColor(to_crossterm_color(cell.fg)))?;
-            self.inner
-                .queue(SetBackgroundColor(to_crossterm_color(cell.bg)))?;
+            queue_cell_style(&mut self.inner, cell)?;
             self.inner.queue(Print(cell.symbol()))?;
         }
-        self.inner.queue(ResetColor)?;
+        reset_terminal_style(&mut self.inner)?;
         Ok(())
     }
 
@@ -451,6 +487,68 @@ mod tests {
                 height: 24,
             },
         )
+    }
+
+    fn styled_cell(symbol: &str, modifier: Modifier) -> Cell {
+        let mut cell = Cell::default();
+        cell.set_symbol(symbol);
+        cell.set_style(ratatui::style::Style::default().add_modifier(modifier));
+        cell
+    }
+
+    fn ansi_output(backend: &ScrollbackBackend<RecorderBackend>) -> &str {
+        std::str::from_utf8(&backend.inner().buf).unwrap()
+    }
+
+    #[test]
+    fn write_row_preserves_cell_modifiers() {
+        let mut backend = make();
+        let cells = vec![
+            styled_cell("B", Modifier::BOLD),
+            styled_cell("I", Modifier::ITALIC),
+            styled_cell("R", Modifier::REVERSED | Modifier::CROSSED_OUT),
+        ];
+
+        backend.write_row(cells.iter()).unwrap();
+
+        let ansi = ansi_output(&backend);
+        assert!(ansi.contains("\x1b[1mB"), "expected bold B, got {ansi:?}");
+        assert!(ansi.contains("\x1b[3mI"), "expected italic I, got {ansi:?}");
+        assert!(
+            ansi.contains("\x1b[7m\x1b[9mR"),
+            "expected reversed + crossed-out R, got {ansi:?}",
+        );
+        assert!(
+            ansi.ends_with("\x1b[0m"),
+            "expected trailing attribute reset, got {ansi:?}",
+        );
+    }
+
+    #[test]
+    fn draw_preserves_cell_modifiers() {
+        let mut backend = make();
+        backend.set_footer_rect(10, 2);
+        backend.set_mode(BackendMode::Footer);
+        let bold = styled_cell("B", Modifier::BOLD);
+        let dim_reversed = styled_cell("R", Modifier::DIM | Modifier::REVERSED);
+        let cells = vec![(0u16, 0u16, &bold), (1u16, 0u16, &dim_reversed)];
+
+        backend.draw(cells.into_iter()).unwrap();
+
+        let ansi = ansi_output(&backend);
+        assert!(
+            ansi.contains("\x1b[11;1H"),
+            "expected footer-relative MoveTo before styled cells, got {ansi:?}",
+        );
+        assert!(ansi.contains("\x1b[1mB"), "expected bold B, got {ansi:?}");
+        assert!(
+            ansi.contains("\x1b[2m\x1b[7mR"),
+            "expected dim + reversed R, got {ansi:?}",
+        );
+        assert!(
+            ansi.ends_with("\x1b[0m"),
+            "expected trailing attribute reset, got {ansi:?}",
+        );
     }
 
     #[test]

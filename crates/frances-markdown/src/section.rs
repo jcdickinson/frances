@@ -15,7 +15,8 @@
 //! never sees its position disappear.
 
 use frances_models_tui::{SectionApply, Source};
-use frances_tui::block::{Block, Sigil};
+use frances_tui::block::{Block, BlockMeasureContext, BlockRenderContext, Sigil};
+use frances_tui::widget::{EventContext, EventOutcome, Input};
 use frances_tui::section::Section;
 use markdown::mdast;
 use markdown::{ParseOptions, to_mdast};
@@ -67,10 +68,23 @@ impl MarkdownSection {
         };
 
         // Convert each root-level node, skipping None results (Definitions, etc.)
-        let mut blocks: Vec<Box<dyn Block>> = children
+        let mut nodes: Vec<MarkdownNode> = children
             .iter()
             .filter_map(|node| convert_node(node, self.source))
-            .map(|mn| Box::new(MarkdownBlock::new(mn)) as Box<dyn Block>)
+            .collect();
+        let node_count = nodes.len();
+        let mut blocks: Vec<Box<dyn Block>> = nodes
+            .drain(..)
+            .enumerate()
+            .map(|(i, mn)| {
+                let block = MarkdownBlock::new(mn);
+                let block = if i + 1 < node_count {
+                    block.with_trailing_blank()
+                } else {
+                    block
+                };
+                Box::new(block) as Box<dyn Block>
+            })
             .collect();
 
         // Defensive length handling: pad if block count decreased.
