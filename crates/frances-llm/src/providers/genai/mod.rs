@@ -149,6 +149,13 @@ fn genai_transient(e: &genai::Error) -> bool {
         // a string here, so we can't see the status — but a stream that
         // died before emitting anything is exactly what we want to retry.
         G::WebStream { .. } => true,
+        // The OpenAIResp adapter surfaces a server `response.failed` event as
+        // StreamParse (genai reuses the variant via serde::de::Error::custom).
+        // Genuine stream-parse failures are silently skipped by that adapter,
+        // never raised — so StreamParse here is exclusively a server-side
+        // fault (e.g. OpenAI's "An error occurred while processing your
+        // request. You can retry…"), which is exactly what we want to retry.
+        G::StreamParse { .. } => true,
         G::WebModelCall { webc_error, .. } | G::WebAdapterCall { webc_error, .. } => {
             webc_transient(webc_error)
         }
