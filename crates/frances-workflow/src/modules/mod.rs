@@ -58,7 +58,7 @@
 //!   `Get`/`Set` tool classes.
 //! - `frances:v1/tool-family`   — pure-JS `defineToolFamily` + `defineTool`
 //!   + `toolGuidance` section. Identity-based family dedup, tool construction,
-//!   and the prompt section that renders family guidance.
+//!     and the prompt section that renders family guidance.
 //! - `frances:v1/context-sections` — pure-JS `envBlock` + `cwdBlock` prompt
 //!   sections for environment info and working directory.
 //! - `frances:v1/agents` — Rust-backed `discoverGlobalAgents`,
