@@ -32,7 +32,7 @@ jobs:
             runner: macos-14
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # musl needs a C toolchain for the bundled QuickJS (rquickjs). On the
       # native arm64 runner, musl-gcc from musl-tools targets aarch64.
@@ -61,7 +61,7 @@ jobs:
           tar czf "$name.tar.gz" "$staging"
           echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: frances-${{ matrix.target }}
           path: ${{ steps.package.outputs.asset }}
