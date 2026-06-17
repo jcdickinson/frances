@@ -19,23 +19,24 @@ completions stream through a configurable set of model providers.
 # 1. Get the toolchain: either the dev shell (adds rust-analyzer, jq, cargo machete, ...)
 nix develop                    # or: rustup install 1.95.0
 
-# 2. Build the binary.
-cargo build -p frances
+# 2. Build, then run the installer. It asks a few questions, writes a starter
+#    config.toml, and drops the `main` workflow into ~/.config/frances.
+cargo run -p frances -- install            # copies the workflow into the config dir
+cargo run -p frances -- install --local    # instead points the config at the in-repo workflow
 
-# 3. Write a config with at least one provider + a `default` model.
-mkdir -p ~/.config/frances
-$EDITOR ~/.config/frances/config.toml      # see "Configuration" below
-
-# 4. Drop in whatever credentials your provider's `auth` points at.
-echo "sk-your-key" > ~/.config/frances/ds.txt   # e.g. for auth = { file = "...ds.txt" }
-
-# 5. Run it.
+# 3. Run it.
 ./target/debug/frances        # opens the TUI for this terminal's session
 ```
 
+`install` always (re)installs the `main` workflow; it only runs the
+questionnaire when `config.toml` doesn't already exist, so re-running it
+refreshes the workflow without clobbering a config you've since edited. The
+questionnaire offers your Codex (ChatGPT) login, or any other provider — for
+which it writes the token you paste to `~/.config/frances/<provider>.txt`.
+
 Once the TUI is up, type `/main` to kick off the `main` workflow.
 
-Minimum viable `config.toml`:
+If you'd rather write the config by hand, a minimum viable `config.toml`:
 
 ```toml
 [model_providers.deepseek]

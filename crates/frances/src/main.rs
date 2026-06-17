@@ -1,3 +1,4 @@
+mod install;
 mod tty;
 mod tui;
 mod ui;
@@ -25,6 +26,14 @@ enum Command {
     /// a fresh session. The old session's state on disk is left intact;
     /// only the TTY → session link is removed.
     New,
+    /// Write a starter config (asking a few questions if config.toml is
+    /// absent) and install the `main` workflow into the config dir.
+    Install {
+        /// Point the config at the in-repo workflow script instead of
+        /// copying the embedded one into the config dir.
+        #[arg(long)]
+        local: bool,
+    },
 }
 
 #[tokio::main]
@@ -37,6 +46,10 @@ async fn main() {
 
 async fn real_main() -> Result<()> {
     let cli = Cli::parse();
+
+    if let Some(Command::Install { local }) = cli.command {
+        return install::run(local);
+    }
 
     let tty_key = tty::controlling_tty_key()?;
     let paths = Paths::discover()?;

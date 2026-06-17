@@ -1474,6 +1474,7 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-width 0.2.2",
+ "xdg",
 ]
 
 [[package]]

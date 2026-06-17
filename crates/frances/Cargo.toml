@@ -26,6 +26,7 @@ frances-session.workspace = true
 frances-tui.workspace = true
 ratatui.workspace = true
 serde.workspace = true
+xdg.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
