@@ -23,7 +23,7 @@ jobs:
           - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
             runner: macos-14
 
@@ -37,8 +37,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y musl-tools
-          echo "CC_${{ matrix.target }}=musl-gcc" | tr '-' '_' >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          key=$(echo '${{ matrix.target }}' | tr '-' '_')
+          echo "CC_${key}=musl-gcc" >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_${key^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
