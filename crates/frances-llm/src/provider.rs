@@ -28,8 +28,10 @@ use frances_models_llm::{
 /// `history` is the already-forged wire JSON from prior turns (whatever the
 /// provider previously emitted as `StreamEvent::History`, in order).
 /// `new_inputs` is the delta since last call — primitives the provider
-/// should forge inline (emitting one `StreamEvent::History` per output) and
-/// include in the request body.
+/// should forge into the request body. The provider emits one
+/// `StreamEvent::History` per output for persistence, *except* for
+/// `System` inputs: those are the transient per-turn prompt (the host
+/// re-pushes them every run) and must not accumulate in history.
 pub struct ProviderRequest<'a> {
     pub session_id: &'a str,
     /// The toml binding key the resolved model came from (e.g.

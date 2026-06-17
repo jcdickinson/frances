@@ -187,6 +187,13 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         if let Some(id) = id {
             let mut batch = HistoryBatch::default();
             for input in &drained {
+                // System inputs are the per-turn prompt, re-pushed every
+                // run by the host. Persisting them would pile up one stale
+                // copy per turn (and a model-swap reforge would replay the
+                // pile), so they live only in this run's `new_inputs`.
+                if matches!(input, OwnedHistoryInput::System { .. }) {
+                    continue;
+                }
                 batch.primitive(input)?;
             }
             store.flush(id, batch).await?;

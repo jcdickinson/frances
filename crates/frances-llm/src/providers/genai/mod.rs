@@ -272,7 +272,16 @@ impl provider::Provider for Provider {
         let forged_new = self
             .forge_history(req.new_inputs)
             .map_err(Error::EncodeHistory)?;
-        for payload in &forged_new {
+        // Forge every new input into the request body, but only emit the
+        // non-system ones for persistence. The host re-renders and pushes
+        // the system prompt every turn (chat.js `_pushSystem`); persisting
+        // it would accumulate one stale copy per turn in `loaded_history`.
+        // It still reaches the model here and `hoist_system` routes it to
+        // the instructions field.
+        for (input, payload) in req.new_inputs.iter().zip(&forged_new) {
+            if matches!(input, HistoryInput::System { .. }) {
+                continue;
+            }
             on_event(StreamEvent::History(payload.clone()))?;
         }
 
@@ -527,7 +536,7 @@ fn build_chat_request(
     tools: &[ToolDef],
     _tool_choice: Option<&ToolChoice>,
 ) -> ChatRequest {
-    let (system, messages) = hoist_leading_system(messages);
+    let (system, messages) = hoist_system(messages);
     let mut req = ChatRequest::new(messages);
     req.system = system;
     if !tools.is_empty() {
@@ -536,29 +545,28 @@ fn build_chat_request(
     req
 }
 
-/// Pull the leading run of system messages out of `messages` and join
-/// them into `ChatRequest.system`. genai routes that field to each
-/// adapter's canonical system slot — the Responses API `instructions`
-/// field (which the ChatGPT/codex backend *requires*; an inline system
-/// message in `input` is not enough), or a leading `system` message for
-/// the chat-completions adapters. Non-leading system messages (unusual)
-/// are left untouched.
-fn hoist_leading_system(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
-    let split = messages
-        .iter()
-        .position(|m| !matches!(m.role, ChatRole::System))
-        .unwrap_or(messages.len());
-    if split == 0 {
-        return (None, messages);
+/// Pull every system message out of `messages` and join them into
+/// `ChatRequest.system`. genai routes that field to each adapter's
+/// canonical system slot — the Responses API `instructions` field (which
+/// the ChatGPT/codex backend *requires*; an inline system message in
+/// `input` is not enough), or a leading `system` message for the
+/// chat-completions adapters.
+///
+/// The host re-pushes the prompt every turn (it's transient, not
+/// persisted history — see the system skip in `stream`), so the current
+/// turn's system message arrives *after* the loaded history rather than
+/// leading. Gathering all of them, position-independent, keeps it landing
+/// in `instructions` regardless.
+fn hoist_system(messages: Vec<ChatMessage>) -> (Option<String>, Vec<ChatMessage>) {
+    let mut systems = Vec::new();
+    let mut rest = Vec::with_capacity(messages.len());
+    for m in messages {
+        match m.role {
+            ChatRole::System => systems.extend(m.content.into_joined_texts()),
+            _ => rest.push(m),
+        }
     }
-    let mut rest = messages;
-    let leading: Vec<ChatMessage> = rest.drain(..split).collect();
-    let system = leading
-        .into_iter()
-        .filter_map(|m| m.content.into_joined_texts())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    ((!system.is_empty()).then_some(system), rest)
+    ((!systems.is_empty()).then(|| systems.join("\n\n")), rest)
 }
 
 fn build_chat_options(plan: &RequestPlan, tool_choice: Option<&ToolChoice>) -> ChatOptions {
@@ -777,7 +785,9 @@ mod tests {
     fn web_stream_http_4xx_is_not_retried() {
         // The malformed-request 400 that motivated this: retrying it just
         // burns attempts on a request that fails identically.
-        assert!(!is_transient(&web_stream_http(reqwest::StatusCode::BAD_REQUEST)));
+        assert!(!is_transient(&web_stream_http(
+            reqwest::StatusCode::BAD_REQUEST
+        )));
     }
 
     #[test]
@@ -816,24 +826,32 @@ mod tests {
     }
 
     #[test]
-    fn hoist_leading_system_concats_into_system_field() {
+    fn hoist_system_concats_into_system_field() {
         let msgs = vec![
             ChatMessage::system("you are a test"),
             ChatMessage::system("be terse"),
             ChatMessage::user("hi"),
         ];
-        let (system, rest) = hoist_leading_system(msgs);
+        let (system, rest) = hoist_system(msgs);
         assert_eq!(system.as_deref(), Some("you are a test\n\nbe terse"));
         assert_eq!(rest.len(), 1);
         assert!(matches!(rest[0].role, ChatRole::User));
     }
 
     #[test]
-    fn hoist_leading_system_noop_without_leading_system() {
-        let msgs = vec![ChatMessage::user("hi"), ChatMessage::system("late")];
-        let (system, rest) = hoist_leading_system(msgs);
-        assert_eq!(system, None);
-        assert_eq!(rest.len(), 2);
+    fn hoist_system_gathers_non_leading_system() {
+        // The current turn's system prompt lands after the loaded history,
+        // so it is never leading from turn 2 on — it must still hoist.
+        let msgs = vec![
+            ChatMessage::user("earlier"),
+            ChatMessage::assistant("reply"),
+            ChatMessage::system("be terse"),
+            ChatMessage::user("hi"),
+        ];
+        let (system, rest) = hoist_system(msgs);
+        assert_eq!(system.as_deref(), Some("be terse"));
+        assert_eq!(rest.len(), 3);
+        assert!(rest.iter().all(|m| !matches!(m.role, ChatRole::System)));
     }
 
     #[test]
