@@ -16,7 +16,7 @@ use crate::{CompletionOutcome, HistoryInput, OwnedHistoryInput, StreamEvent, Too
 use super::builder::ChatSessionBuilder;
 use super::complete::{CompleteRequest, Demand, EnforceError};
 use super::error::ChatError;
-use super::types::{ChatCheckpoint, ChatSessionId};
+use super::types::ChatSessionId;
 
 #[async_trait]
 pub trait ChatSession: Clone + Send + Sync + 'static {
@@ -52,18 +52,6 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
         max_tool_calls: Option<usize>,
         on_event: Box<dyn FnMut(StreamEvent) -> Result<(), ChatError> + Send>,
     ) -> Result<CompletionOutcome, ChatError>;
-
-    /// Snapshot the session's history position. Pair with
-    /// [`rollback`](Self::rollback) to discard everything appended
-    /// since — used by workflows to drop a partial round (e.g. an
-    /// assistant turn whose tool calls never got results) when an
-    /// interjection/interrupt aborts mid-flight.
-    async fn checkpoint(&self) -> Result<ChatCheckpoint, ChatError>;
-
-    /// Roll history back to a [`ChatCheckpoint`]: truncate the
-    /// un-drained pending queue and delete persisted rows appended
-    /// after the marker.
-    async fn rollback(&self, checkpoint: ChatCheckpoint) -> Result<(), ChatError>;
 }
 
 #[async_trait]

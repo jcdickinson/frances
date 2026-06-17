@@ -145,10 +145,15 @@ fn genai_transient(e: &genai::Error) -> bool {
     match e {
         G::HttpError { status, .. } => transient_status(*status),
         // A broken stream is safe to retry *before any output* (the only
-        // place `is_transient` is consulted). genai collapses the cause to
-        // a string here, so we can't see the status — but a stream that
-        // died before emitting anything is exactly what we want to retry.
-        G::WebStream { .. } => true,
+        // place `is_transient` is consulted). genai stringifies the cause
+        // for Display, but keeps the underlying error boxed: a non-2xx
+        // initial response is a boxed `HttpError`, so classify it by status
+        // (a 4xx like a malformed-request 400 fails identically on retry).
+        // Any other cause — a connection dropped mid-stream — is retryable.
+        G::WebStream { error, .. } => match error.downcast_ref::<genai::Error>() {
+            Some(G::HttpError { status, .. }) => transient_status(*status),
+            _ => true,
+        },
         // The OpenAIResp adapter surfaces a server `response.failed` event as
         // StreamParse (genai reuses the variant via serde::de::Error::custom).
         // Genuine stream-parse failures are silently skipped by that adapter,
@@ -752,6 +757,49 @@ fn build_assistant_payload(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A streaming non-2xx response: genai boxes an `HttpError` inside a
+    /// `WebStream`, mirroring `web_stream.rs`.
+    fn web_stream_http(status: reqwest::StatusCode) -> Error {
+        let http = genai::Error::HttpError {
+            status,
+            canonical_reason: status.canonical_reason().unwrap_or("Unknown").to_owned(),
+            body: String::new(),
+        };
+        Error::GenAI(genai::Error::WebStream {
+            model_iden: ModelIden::new(AdapterKind::OpenAI, "test-model"),
+            cause: http.to_string(),
+            error: Box::new(http),
+        })
+    }
+
+    #[test]
+    fn web_stream_http_4xx_is_not_retried() {
+        // The malformed-request 400 that motivated this: retrying it just
+        // burns attempts on a request that fails identically.
+        assert!(!is_transient(&web_stream_http(reqwest::StatusCode::BAD_REQUEST)));
+    }
+
+    #[test]
+    fn web_stream_http_5xx_is_retried() {
+        assert!(is_transient(&web_stream_http(
+            reqwest::StatusCode::SERVICE_UNAVAILABLE
+        )));
+    }
+
+    #[test]
+    fn web_stream_dropped_connection_is_retried() {
+        // A non-HTTP cause (connection dropped mid-stream) stays retryable.
+        let err = Error::GenAI(genai::Error::WebStream {
+            model_iden: ModelIden::new(AdapterKind::OpenAI, "test-model"),
+            cause: "connection reset".to_owned(),
+            error: Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset",
+            )),
+        });
+        assert!(is_transient(&err));
+    }
 
     #[test]
     fn forge_user_round_trips_through_chat_message() {

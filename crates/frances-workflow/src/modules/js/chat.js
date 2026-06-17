@@ -153,34 +153,66 @@ async function _streamWithDispatch(chat, opts, getHook) {
       nextFinishIdx: 0,
     };
 
-    await Promise.all(
+    const dispatch = Promise.all(
       raw.tool_calls.map((call, idx) =>
         _dispatchSlot(chat, call, hook, session, idx),
       ),
     );
 
-    // Push initial tool_results in tool_calls order.
+    // Race dispatch against the abort signal. On interrupt we stop waiting
+    // for in-flight handlers and answer every tool call that hasn't settled
+    // with an "Interrupted by user" result. A tool_call left with no result
+    // makes the next provider request a 400, so the ChatSession must never
+    // emit a dangling one — regardless of what the caller does next.
+    let interrupted = false;
+    if (signal) {
+      const aborted = new Promise((resolve) => {
+        if (signal.aborted) return resolve();
+        signal.addEventListener("abort", () => resolve(), { once: true });
+      });
+      interrupted = await Promise.race([
+        dispatch.then(() => false),
+        aborted.then(() => true),
+      ]);
+    } else {
+      await dispatch;
+    }
+    if (interrupted) {
+      for (let i = 0; i < session.slots.length; i++) {
+        if (session.slots[i].result === undefined) {
+          session.slots[i].result = _errorResult(
+            raw.tool_calls[i].id,
+            "Interrupted by user",
+          );
+        }
+      }
+    }
+
+    // Push tool_results in tool_calls order.
     for (let i = 0; i < session.slots.length; i++) {
       chat.push(session.slots[i].result);
     }
 
-    // Run registered turns in finish order.
-    const turns = session.slots
-      .map((slot, idx) => ({ slot, idx }))
-      .filter((e) => e.slot.turn !== null)
-      .sort((a, b) => a.slot.finishedAt - b.slot.finishedAt);
-    for (const e of turns) {
-      try {
-        await e.slot.turn();
-      } catch (err) {
-        // Turn fn threw — surface a synthetic user message so the
-        // conversation can continue, but don't crash the stream.
-        chat.push({
-          role: "user",
-          content:
-            `(internal: post-batch turn for tool_call ${raw.tool_calls[e.idx].id} threw: ` +
-            `${String((err && err.message) || err)})`,
-        });
+    // Run registered turns in finish order. Skipped on interrupt — they
+    // drive further rounds, which is exactly the work the user asked to stop.
+    if (!interrupted) {
+      const turns = session.slots
+        .map((slot, idx) => ({ slot, idx }))
+        .filter((e) => e.slot.turn !== null)
+        .sort((a, b) => a.slot.finishedAt - b.slot.finishedAt);
+      for (const e of turns) {
+        try {
+          await e.slot.turn();
+        } catch (err) {
+          // Turn fn threw — surface a synthetic user message so the
+          // conversation can continue, but don't crash the stream.
+          chat.push({
+            role: "user",
+            content:
+              `(internal: post-batch turn for tool_call ${raw.tool_calls[e.idx].id} threw: ` +
+              `${String((err && err.message) || err)})`,
+          });
+        }
       }
     }
     return raw;

@@ -56,9 +56,9 @@ use tokio_util::sync::CancellationToken;
 
 use frances_core::Truncated;
 use frances_models_llm::chat::{
-    ChatCheckpoint, ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
+    ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
     ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, EnforceError,
-    ModelIntents, OwnedHistoryInput, RowId,
+    ModelIntents, OwnedHistoryInput,
 };
 use frances_models_llm::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
 
@@ -414,34 +414,6 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
                 ctx.clone(),
                 |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, msg: Value<'js>| {
                     push_message::<D>(&ctx, &this.0, msg)
-                },
-            )?,
-        )?;
-
-        // `checkpoint()` snapshots the session's history position; the
-        // returned token is handed back to `rollback(token)` to discard
-        // everything appended since (e.g. a partial assistant round
-        // whose tool calls never got results after an interrupt).
-        proto.set(
-            "checkpoint",
-            Function::new(ctx.clone(), |this: This<Class<'js, ChatSessionJs<D>>>| {
-                let handle = this.0.borrow().handle.clone();
-                Ok::<_, rquickjs::Error>(Promised::from(async move {
-                    CheckpointResult(handle.checkpoint().await)
-                }))
-            })?,
-        )?;
-
-        proto.set(
-            "rollback",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, token: Value<'js>| {
-                    let cp = parse_checkpoint(&ctx, &token)?;
-                    let handle = this.0.borrow().handle.clone();
-                    Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        UnitResult(handle.rollback(cp).await)
-                    }))
                 },
             )?,
         )?;
@@ -1090,77 +1062,6 @@ fn usage_into_js<'js>(ctx: &Ctx<'js>, usage: &frances_models_llm::Usage) -> JsRe
     u.set("totalTokens", usage.total_tokens)?;
     u.set("cachedInputTokens", usage.cached_input_tokens)?;
     Ok(u)
-}
-
-/// Promise payload for `chat.checkpoint()`. Resolves to an opaque token
-/// `{ persisted: number | null, pendingLen: number }` (round-tripped
-/// back through `parse_checkpoint` in `rollback`), or rejects with the
-/// error message.
-struct CheckpointResult(Result<ChatCheckpoint, ChatError>);
-
-impl<'js> IntoJs<'js> for CheckpointResult {
-    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
-        match self.0 {
-            Ok(cp) => {
-                let obj = Object::new(ctx.clone())?;
-                match cp.persisted {
-                    Some(row) => obj.set("persisted", row.0)?,
-                    None => obj.set("persisted", Value::new_null(ctx.clone()))?,
-                }
-                obj.set("pendingLen", cp.pending_len as i64)?;
-                Ok(obj.into_value())
-            }
-            Err(e) => Err(throw(ctx, &format!("chat.checkpoint: {e}"))),
-        }
-    }
-}
-
-/// Promise payload that resolves to `undefined` or rejects with the error message.
-struct UnitResult(Result<(), ChatError>);
-
-impl<'js> IntoJs<'js> for UnitResult {
-    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
-        match self.0 {
-            Ok(()) => Ok(Value::new_undefined(ctx.clone())),
-            Err(e) => Err(throw(ctx, &format!("chat.rollback: {e}"))),
-        }
-    }
-}
-
-/// Parse the opaque token produced by `CheckpointResult` back into a
-/// [`ChatCheckpoint`].
-fn parse_checkpoint<'js>(ctx: &Ctx<'js>, token: &Value<'js>) -> JsResult<ChatCheckpoint> {
-    let Some(obj) = token.as_object() else {
-        return Err(throw(
-            ctx,
-            "chat.rollback: expected a checkpoint token from chat.checkpoint()",
-        ));
-    };
-    let persisted_val: Value<'js> = obj
-        .get("persisted")
-        .map_err(|_| throw(ctx, "chat.rollback: token missing `persisted`"))?;
-    let persisted = if persisted_val.is_null() || persisted_val.is_undefined() {
-        None
-    } else {
-        let n: i64 = persisted_val
-            .as_int()
-            .map(i64::from)
-            .or_else(|| persisted_val.as_float().map(|f| f as i64))
-            .ok_or_else(|| throw(ctx, "chat.rollback: `persisted` must be a number or null"))?;
-        Some(RowId(n))
-    };
-    let pending_len_val: Value<'js> = obj
-        .get("pendingLen")
-        .map_err(|_| throw(ctx, "chat.rollback: token missing `pendingLen`"))?;
-    let pending_len = pending_len_val
-        .as_int()
-        .map(|i| i as usize)
-        .or_else(|| pending_len_val.as_float().map(|f| f as usize))
-        .ok_or_else(|| throw(ctx, "chat.rollback: `pendingLen` must be a number"))?;
-    Ok(ChatCheckpoint {
-        persisted,
-        pending_len,
-    })
 }
 
 struct IterResult {

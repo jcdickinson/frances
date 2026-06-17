@@ -264,13 +264,12 @@ async fn chat_session_raw_inner_stream_is_not_exposed() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))));
-    // Only the public prototype methods (`push`, `checkpoint`,
-    // `rollback`), the internal escape hatches (`_envInfo`,
-    // `_pushSystem`), plus the JS-installed `stream` should appear;
-    // the inner raw stream function must not.
+    // Only the public prototype method (`push`), the internal escape
+    // hatches (`_envInfo`, `_pushSystem`), plus the JS-installed `stream`
+    // should appear; the inner raw stream function must not.
     assert_eq!(
         text_of(&frames[0]),
-        "proto=_envInfo,_pushSystem,checkpoint,push,rollback,stream stash=true"
+        "proto=_envInfo,_pushSystem,push,stream stash=true"
     );
 }
 
@@ -846,6 +845,93 @@ async fn stream_dispatches_tool_calls_internally() {
     assert_eq!(
         tool_result,
         Some(("c1".to_owned(), "echoed:from round 1".to_owned(), false))
+    );
+}
+
+#[tokio::test]
+async fn stream_interrupt_during_dispatch_answers_pending_tool_calls() {
+    // When the signal aborts after the round streamed its tool calls but
+    // while a handler is still running, dispatch must answer the unfinished
+    // call with an "Interrupted by user" result. A tool_call left with no
+    // result makes the next provider request a 400, so the ChatSession can
+    // never emit a dangling one.
+    use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
+    use serde_json::json;
+
+    let deps = StubDeps::default();
+    deps.script_next_run(
+        vec![StreamEvent::ToolCall(ToolCall {
+            error: None,
+            id: "h1".to_owned(),
+            name: "hang".to_owned(),
+            arguments: json!({}),
+        })],
+        CompletionOutcome {
+            text: String::new(),
+            tool_calls: vec![ToolCall {
+                error: None,
+                id: "h1".to_owned(),
+                name: "hang".to_owned(),
+                arguments: json!({}),
+            }],
+        },
+    );
+
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        import { AbortController } from "whatwg:abortcontroller";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const s = new ChatSession({ model_intents: ["x"] });
+        // Handler never settles on its own — only the interrupt resolves it.
+        s.tools.push({
+            name: "hang",
+            description: "never returns",
+            parameters: { type: "object" },
+            handler: () => new Promise(() => {}),
+        });
+        s.push({ role: "user", content: "go" });
+
+        const ac = new AbortController();
+        const r = await s.stream({ signal: ac.signal });
+        // Drain events so the round settles and dispatch begins.
+        const reader = r.events.getReader();
+        while (true) { const { done } = await reader.read(); if (done) break; }
+        reader.releaseLock();
+        // Abort mid-dispatch — the hang handler is still in flight.
+        ac.abort("stop");
+        const { tool_calls } = await r.completed;
+        transcript.push(new MarkdownSection({ content: `calls=${tool_calls.length}` }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    assert_eq!(text_of(frames.last().expect("a frame")), "calls=1");
+
+    // The unfinished call was answered with an interrupted error result.
+    let sessions = deps.sessions();
+    let pending = sessions[0].pending();
+    let tool_result = pending.iter().find_map(|p| match p {
+        frances_models_llm::chat::OwnedHistoryInput::ToolResult {
+            call_id,
+            content,
+            is_error,
+        } => Some((call_id.clone(), content.clone(), *is_error)),
+        _ => None,
+    });
+    assert_eq!(
+        tool_result,
+        Some(("h1".to_owned(), "Interrupted by user".to_owned(), true))
     );
 }
 

@@ -10,7 +10,7 @@ pub mod tool_args;
 
 pub use chat::{
     ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager, ChatSessionRow,
-    HistoryError, RowId, RowSeq,
+    HistoryError,
 };
 pub use completion::{CompletionOutcome, StreamEvent, ToolCall, ToolCallError, Usage};
 pub use config::{

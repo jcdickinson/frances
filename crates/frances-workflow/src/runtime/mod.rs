@@ -681,8 +681,8 @@ pub mod test_deps {
     use dashmap::DashMap;
     use frances_edit::{EditEngine, EditSession, FakeStore};
     use frances_models_llm::chat::{
-        ChatCheckpoint, ChatError, ChatSession, ChatSessionBuilder, ChatSessionId,
-        ChatSessionManager, HistoryError, OwnedHistoryInput,
+        ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
+        HistoryError, OwnedHistoryInput,
     };
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
     use frances_storage::{EntitySchema, Migration};
@@ -1117,21 +1117,6 @@ pub mod test_deps {
                     "stub session: no provider wired in tests".to_owned(),
                 )),
             }
-        }
-
-        async fn checkpoint(&self) -> Result<ChatCheckpoint, ChatError> {
-            Ok(ChatCheckpoint {
-                persisted: None,
-                pending_len: self.pending.lock().len(),
-            })
-        }
-
-        async fn rollback(&self, checkpoint: ChatCheckpoint) -> Result<(), ChatError> {
-            let mut pending = self.pending.lock();
-            if checkpoint.pending_len < pending.len() {
-                pending.truncate(checkpoint.pending_len);
-            }
-            Ok(())
         }
     }
 }

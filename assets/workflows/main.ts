@@ -986,16 +986,24 @@ async function handlePendingCompletion(): Promise<boolean> {
 let pending = inbox.next();
 
 // Why the turn ended. `idle` = the model stopped calling tools (done
-// for now); `interjected` = a new inbox item arrived mid-turn and is
-// sitting in `pending` for `ourLoop` to handle next.
-type TurnEnd = "idle" | "interjected";
+// for now); `interjected` = a user message arrived mid-turn and is sitting
+// in `pending` for `ourLoop` to handle as the next turn; `interrupted` =
+// the user pressed Esc and we stopped the round.
+type TurnEnd = "idle" | "interjected" | "interrupted";
 
 // Drive the agentic loop for one user turn, racing each model round
 // against the live inbox so the user can interrupt or interject
-// mid-stream. On a mid-round inbox event we abort the in-flight stream
-// and roll chat history back to a clean boundary (dropping the partial
-// assistant turn + any orphaned tool_calls — keeping the OpenAI
-// contract that tool_calls are immediately answered).
+// mid-stream.
+//
+//   - Esc (INTERRUPT): abort the stream and kill the shell. Dispatch then
+//     answers every still-running tool call with an "Interrupted by user"
+//     result (see chat.js), so the partial assistant turn stays in history
+//     well-formed — the conversation records the interruption rather than
+//     discarding it.
+//   - A user message mid-round (interjection): let the round finish so its
+//     tool calls complete with real results, then hand back to `ourLoop`.
+//     The message is still in `pending` and becomes the next turn, so the
+//     model sees the tool results and the new message together.
 async function turn(): Promise<TurnEnd> {
   // Bound the automatic loop: every context reset (step advance / retry) and
   // every nudge counts against the same budget. Returns true once the budget
@@ -1015,7 +1023,6 @@ async function turn(): Promise<TurnEnd> {
 
   while (true) {
     setStatus(mode === "planning" ? "planning…" : "working…");
-    const cp = await chat.checkpoint();
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
     // Push the `frances:` frame eagerly with no content — the TUI tracks
@@ -1038,41 +1045,49 @@ async function turn(): Promise<TurnEnd> {
 
     const winner = await Promise.race([
       round.then((completed) => ({ kind: "round" as const, completed })),
-      pending.then(() => ({ kind: "inbox" as const })),
+      pending.then((p) => ({ kind: "inbox" as const, item: p.value })),
     ]);
 
     if (winner.kind === "inbox") {
-      // Interrupt or interjection arrived mid-round. Abort the stream,
-      // wait for it to settle, then roll history back to the clean
-      // checkpoint. `pending` is left for `ourLoop` to consume.
-      ac.abort(new Error("interrupted"));
-      // Esc means "stop". Aborting only tears down the chat stream — the
-      // shell command runs on its own subprocess, decoupled so it can
-      // survive quiet handoffs. SIGKILL it so its handler settles instead
-      // of streaming into the next command's frame, and so bash returns to
-      // idle rather than rejecting the next shell_run as busy. The kill
-      // also makes the quiet-negotiation loop's `isRunning()` guard false,
-      // so awaiting `r.completed` below can't spin up a stray round.
-      try {
-        await sh.kill();
-      } catch (_) {
-        // Nothing in flight, or the shell is already closed — fine.
+      if (winner.item === INTERRUPT) {
+        // Esc means "stop". Abort the chat stream and SIGKILL the shell —
+        // the shell command runs on its own subprocess, decoupled so it can
+        // survive quiet handoffs, so killing it settles its handler instead
+        // of streaming into the next command's frame and leaving bash busy.
+        // The kill also makes the quiet-negotiation loop's `isRunning()`
+        // guard false, so awaiting `r.completed` can't spin up a stray
+        // round. We then let dispatch settle (chat.js answers any tool call
+        // the kill left unfinished with an "Interrupted by user" result)
+        // and DON'T roll back: the assistant turn and its tool results stay
+        // in history, recording the interruption and keeping the next
+        // request well-formed.
+        ac.abort(new Error("interrupted"));
+        try {
+          await sh.kill();
+        } catch (_) {
+          // Nothing in flight, or the shell is already closed — fine.
+        }
+        try {
+          await round;
+        } catch (_) {
+          // Expected: the aborted stream rejects with the abort reason.
+        }
+        try {
+          await r.completed;
+        } catch (_) {
+          // Aborted before the round settled — nothing was dispatched.
+        }
+        setStatus(null);
+        return "interrupted";
       }
+      // A user message arrived mid-round. Let the round finish so its tool
+      // calls complete with real results; the message stays in `pending`
+      // for `ourLoop` to handle as the next turn.
       try {
         await round;
       } catch (_) {
-        // Expected: the aborted stream rejects with the abort reason.
+        // The round failed on its own; `ourLoop` surfaces the error.
       }
-      // Let the dispatch finish: handlers close their frames and compute
-      // their results. We await it BEFORE rolling back so those orphaned
-      // tool_results are inside the checkpoint window and get discarded,
-      // rather than landing in history after the truncation point.
-      try {
-        await r.completed;
-      } catch (_) {
-        // Aborted before the round settled — nothing dispatched.
-      }
-      await chat.rollback(cp);
       setStatus(null);
       return "interjected";
     }
