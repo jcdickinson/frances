@@ -1,0 +1,68 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # musl needs a C toolchain for the bundled QuickJS (rquickjs). On the
+      # native arm64 runner, musl-gcc from musl-tools targets aarch64.
+      - name: Install musl toolchain
+        if: contains(matrix.target, '-linux-musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          echo "CC_${{ matrix.target }}=musl-gcc" | tr '-' '_' >> "$GITHUB_ENV"
+          echo "CARGO_TARGET_$(echo '${{ matrix.target }}' | tr 'a-z-' 'A-Z_')_LINKER=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked -p frances --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        run: |
+          name="frances-${{ matrix.target }}"
+          staging="$name"
+          mkdir "$staging"
+          cp "target/${{ matrix.target }}/release/frances" "$staging/"
+          tar czf "$name.tar.gz" "$staging"
+          echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frances-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ steps.package.outputs.asset }}
