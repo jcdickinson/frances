@@ -3,9 +3,13 @@ name: build
 on:
   push:
     branches: [main]
-    tags: ["v*"]
   pull_request:
   workflow_dispatch:
+    inputs:
+      release:
+        description: "Tag to publish a draft release for (leave empty to skip)"
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -63,7 +67,9 @@ jobs:
           path: ${{ steps.package.outputs.asset }}
 
       - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: inputs.release != ''
         uses: softprops/action-gh-release@v2
         with:
           files: ${{ steps.package.outputs.asset }}
+          tag_name: ${{ inputs.release }}
+          draft: true
