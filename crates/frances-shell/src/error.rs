@@ -27,8 +27,11 @@ pub enum ShellError {
     #[error("no command is currently running")]
     NoRunningCommand,
 
-    #[error("could not locate bash's child process: {0}")]
-    NoChild(#[source] io::Error),
+    #[error("a command is already running")]
+    CommandRunning,
+
+    #[error("failed to signal shell process group: {0}")]
+    Signal(#[source] io::Error),
 }
 
 /// What went wrong during [`Shell::spawn`](crate::Shell::spawn)'s startup

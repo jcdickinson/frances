@@ -3,7 +3,7 @@
 // Two stable section objects for `session.promptSections`:
 //
 //   - `envBlock` (immutable, front of prompt): OS, shell, platform, repo root,
-//     date, and the persistent-shell guidance rule. Always emits a string.
+//     date, and the quasi-persistent shell guidance rule. Always emits a string.
 //   - `cwdBlock` (mutable, late in prompt): the live working directory.
 //     Returns null when cwd is unavailable.
 
@@ -27,7 +27,13 @@ export const envBlock = {
     lines.push("");
     lines.push("Shell behavior:");
     lines.push(
-      "- The shell is persistent: the working directory and environment persist across shell_run calls.",
+      "- Shell tools use quasi-persistent shell state: the working directory always persists across completed shell_run calls.",
+    );
+    lines.push(
+      "- Exported environment variables persist only when a shell_run call includes them in `persist`; `persist` applies to that one run and is not a durable watch list.",
+    );
+    lines.push(
+      "- `FRANCES_ROOT` is reserved and Frances-managed. Persisted environment cannot override it.",
     );
     lines.push(
       '- You are already in the working directory shown below. Do not prefix commands with `cd` to an absolute path.',
@@ -41,6 +47,7 @@ export const envBlock = {
     lines.push(
       "- Prefer the dedicated tools over shell equivalents: `file_read` instead of `cat`/`head`/`tail`, `file_find_or_grep` instead of shell `grep`/`find`. Use `shell_run` for actually running programs.",
     );
+
     return lines.join("\n");
   },
 };

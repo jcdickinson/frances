@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
 
@@ -54,10 +55,13 @@ impl Sentinel {
             }
             let digits_start = i + 1 + self.prefix.len();
             let mut digits_end = digits_start;
+            if digits_end < buf.len() && buf[digits_end] == b'-' {
+                digits_end += 1;
+            }
             while digits_end < buf.len() && buf[digits_end].is_ascii_digit() {
                 digits_end += 1;
             }
-            if digits_end == digits_start {
+            if digits_end == digits_start || &buf[digits_start..digits_end] == b"-" {
                 i += 1;
                 continue;
             }
@@ -77,13 +81,53 @@ impl Sentinel {
     }
 }
 
-pub fn wrapper_bytes(cmd_path: &Path, nonce: &str) -> Vec<u8> {
-    let quoted = shell_single_quote(&cmd_path.to_string_lossy());
-    format!(". {quoted}\nprintf '\\n__F_{nonce}_%d__\\n' \"$?\"\n").into_bytes()
-}
+pub fn wrapper_script(
+    user_path: &Path,
+    cwd_path: &Path,
+    env_path: &Path,
+    cwd: &Path,
+    env: &BTreeMap<String, String>,
+    nonce: &str,
+) -> String {
+    let mut script = String::new();
+    script.push_str("exec 2>&1\n");
+    script.push_str("set +e\n");
+    writeln!(
+        script,
+        "cd -- {} || exit_code=$?",
+        shell_single_quote(&cwd.to_string_lossy())
+    )
+    .unwrap();
+    script.push_str("if [ -z \"${exit_code+x}\" ]; then\n");
+    for (name, value) in env {
+        if !is_bash_name(name) {
+            continue;
+        }
 
-pub fn handshake_bytes(nonce: &str) -> Vec<u8> {
-    format!("exec 2>&1\nprintf '\\n__F_{nonce}_%d__\\n' \"$?\"\n").into_bytes()
+        writeln!(script, "export {name}={}", shell_single_quote(value)).unwrap();
+    }
+    writeln!(
+        script,
+        ". {}",
+        shell_single_quote(&user_path.to_string_lossy())
+    )
+    .unwrap();
+    script.push_str("exit_code=$?\n");
+    script.push_str("fi\n");
+    writeln!(
+        script,
+        "pwd > {}",
+        shell_single_quote(&cwd_path.to_string_lossy())
+    )
+    .unwrap();
+    writeln!(
+        script,
+        "env -0 > {}",
+        shell_single_quote(&env_path.to_string_lossy())
+    )
+    .unwrap();
+    writeln!(script, "printf '\\n__F_{nonce}_%d__\\n' \"$exit_code\"").unwrap();
+    script
 }
 
 pub fn shell_single_quote(s: &str) -> String {
@@ -98,6 +142,17 @@ pub fn shell_single_quote(s: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+fn is_bash_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 #[cfg(test)]
@@ -132,20 +187,22 @@ mod tests {
     }
 
     #[test]
-    fn wrapper_uses_literal_nonce() {
-        let bytes = wrapper_bytes(&PathBuf::from("/tmp/x/cmd.sh"), "deadbeef00112233");
-        let s = String::from_utf8(bytes).unwrap();
-        assert!(s.contains(". '/tmp/x/cmd.sh'"));
-        assert!(s.contains("__F_deadbeef00112233_%d__"));
-        assert!(!s.contains("$__F_NONCE"));
-    }
-
-    #[test]
-    fn handshake_uses_literal_nonce() {
-        let bytes = handshake_bytes("cafebabe12345678");
-        let s = String::from_utf8(bytes).unwrap();
-        assert!(s.starts_with("exec 2>&1\n"));
-        assert!(s.contains("__F_cafebabe12345678_%d__"));
+    fn wrapper_restores_state_and_emits_literal_nonce() {
+        let mut env = BTreeMap::new();
+        env.insert("FOO".to_string(), "bar baz".to_string());
+        let script = wrapper_script(
+            &PathBuf::from("/tmp/user.sh"),
+            &PathBuf::from("/tmp/cwd.txt"),
+            &PathBuf::from("/tmp/env.nul"),
+            &PathBuf::from("/tmp/project"),
+            &env,
+            "deadbeef00112233",
+        );
+        assert!(script.contains("cd -- '/tmp/project'"));
+        assert!(script.contains("export FOO='bar baz'"));
+        assert!(script.contains(". '/tmp/user.sh'"));
+        assert!(script.contains("env -0 > '/tmp/env.nul'"));
+        assert!(script.contains("__F_deadbeef00112233_%d__"));
     }
 
     #[test]
@@ -168,6 +225,13 @@ mod tests {
     }
 
     #[test]
+    fn sentinel_finds_negative_exit() {
+        let s = Sentinel::new("abc");
+        let m = s.find(b"\n__F_abc_-9__\n").unwrap();
+        assert_eq!(m.exit_code, -9);
+    }
+
+    #[test]
     fn sentinel_no_match() {
         let s = Sentinel::new("abc");
         assert!(s.find(b"hello world\n").is_none());
@@ -176,7 +240,6 @@ mod tests {
     #[test]
     fn sentinel_partial_match_returns_none() {
         let s = Sentinel::new("abc");
-        // Has the prefix and digits but no closing __\n yet.
         assert!(s.find(b"\n__F_abc_12").is_none());
         assert!(s.find(b"\n__F_abc_12_").is_none());
         assert!(s.find(b"\n__F_abc_12__").is_none());

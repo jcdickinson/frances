@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -5,15 +6,14 @@ use std::time::Duration;
 
 use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc::UnboundedSender;
 
 use frances_core::Truncated;
 
-use crate::child::{list_children, signal_pid};
+use crate::child::signal_pgid;
 use crate::error::{HandshakeFailure, ShellError, ShellResult};
-use crate::proto::{Sentinel, handshake_bytes, make_nonce, wrapper_bytes};
+use crate::proto::{Sentinel, make_nonce, wrapper_script};
 pub use crate::reader::QuietReason;
 use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
 
@@ -22,54 +22,78 @@ use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
 /// Higher-level callers that want a wall-clock ceiling (e.g. the shell
 /// tool) layer their own default and any quiet/max relationship on top.
 pub const DEFAULT_QUIET: Duration = Duration::from_secs(10);
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A long-lived bash subprocess.
+/// A quasi-persistent bash execution context.
 ///
-/// State (env vars, current directory, shell functions, aliases, sourced
-/// scripts) survives across calls to [`Shell::run`]. Each command is written
-/// to a per-shell tmpfile and dot-sourced into the same bash process; there
-/// is no fresh `bash -c '...'` per call. Callers can write *anything* bash
-/// supports — multi-line `if`/`for`, pipelines, subshells, heredocs, function
-/// definitions, redirections — exactly as they would type it at a real bash
-/// prompt. No escaping or wrapping is required.
+/// Each [`Shell::run`] spawns a fresh bash process for one user script.
+/// Only state captured by Frances is carried between runs: logical cwd always
+/// persists, and exported environment variables named in a run's
+/// [`RunOpts::persist`] are copied into the stored snapshot after that run's
+/// teardown completes. Shell functions, aliases, non-exported variables, traps,
+/// and other in-process bash state intentionally do not survive the process.
 ///
 /// Pipes-only: stdin/stdout are connected by anonymous pipes, no PTY.
 /// Interactive apps that hard-require a TTY (`vim`, `top`, `psql` without
 /// `-c`) will not work in this mode. Non-interactive equivalents (`psql -c
 /// "SELECT 1"`, `ssh host cmd`) work fine.
 pub struct Shell {
-    // Field declaration order is load-bearing for drop: fields drop
-    // top-to-bottom, so `stdin` closes before `_child`. Closing stdin asks
-    // bash to exit gracefully (it sees EOF); the Command's `kill_on_drop`
-    // is the backstop when `_child` drops a moment later.
-    stdin: ChildStdin,
-    reader: OutputReader<ChildStdout>,
-    // Held only for its `kill_on_drop` side effect; never read after spawn.
-    _child: Child,
-    bash_pid: u32,
+    state: ShellSnapshot,
+    in_flight: Option<InFlight>,
+    output_sink: Option<UnboundedSender<ReadEvent>>,
     nonce: String,
-    // Held for RAII cleanup of the per-shell tmpdir on drop.
-    _tmpdir: TempDir,
-    cmd_path: PathBuf,
+    tmpdir: TempDir,
+    next_run_id: u64,
     alive: bool,
-    running: bool,
+}
+
+struct InFlight {
+    child: Child,
+    reader: OutputReader<ChildStdout>,
+    pgid: u32,
+    capture: RunCapture,
+}
+
+struct RunCapture {
+    cwd_path: PathBuf,
+    env_path: PathBuf,
+    persist: Vec<String>,
+}
+
+/// Stored shell state that callers may persist outside `frances-shell`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellSnapshot {
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+}
+
+impl ShellSnapshot {
+    pub fn new(cwd: PathBuf, env: BTreeMap<String, String>) -> Self {
+        Self { cwd, env }
+    }
 }
 
 /// Configuration for [`Shell::spawn`].
 #[derive(Debug, Clone, Default)]
 pub struct ShellOptions {
-    /// Working directory for the bash process. `None` inherits from the
-    /// parent.
+    /// Initial logical working directory. `None` inherits from the parent.
     pub cwd: Option<PathBuf>,
-    /// Environment overrides applied at spawn. Inherited env is preserved
-    /// for keys not listed here.
+    /// Initial exported environment overrides. Inherited env is preserved for
+    /// child processes, but only values stored here are part of Frances'
+    /// snapshot surface.
     pub env: Vec<(OsString, OsString)>,
-    /// Bash code dot-sourced after the startup handshake completes —
-    /// useful for loading secrets or setting up shell functions once. Treated
-    /// as a normal command: a non-zero exit aborts spawn with
-    /// [`ShellError::Handshake`].
+    /// Bash code run once during construction. It is executed through the same
+    /// one-shot machinery as a normal command; a non-zero exit aborts spawn.
     pub init_script: Option<String>,
+}
+
+/// Per-run execution options.
+#[derive(Debug, Clone, Default)]
+pub struct RunOpts {
+    /// Bytes delivered to fd 0 for this invocation. When absent, stdin is EOF.
+    pub stdin: Option<Vec<u8>>,
+    /// Exported environment names to copy back into the stored snapshot after
+    /// this invocation's teardown. This is one-shot, not a durable watch list.
+    pub persist: Vec<String>,
 }
 
 /// How long [`Shell::run`] / [`Shell::keep_waiting`] are willing to block
@@ -94,102 +118,44 @@ pub struct WaitOpts {
 #[derive(Debug)]
 pub enum RunOutcome {
     /// Sentinel arrived: the command is done. `output` is everything
-    /// produced (stdout + stderr merged), `exit_code` is the command's
+    /// produced (stdout + stderr merged), `exit_code` is the user script's
     /// status.
     Done { exit_code: i32, output: String },
-    /// One of the wait thresholds tripped. The shell is still alive and
-    /// the command is still running — call [`Shell::keep_waiting`] again
-    /// (or [`Shell::interrupt`] / [`Shell::kill_running`] to stop it).
+    /// One of the wait thresholds tripped. The invocation is still alive —
+    /// call [`Shell::keep_waiting`] again (or [`Shell::interrupt`] /
+    /// [`Shell::kill_running`] to stop it).
     Quiet { output: String, reason: QuietReason },
-    /// EOF on bash's stdout: the bash subprocess is gone (e.g., the user
-    /// ran `exit`). [`Shell::is_alive`] is now `false`. Caller must spawn
-    /// a fresh [`Shell`].
+    /// EOF before the sentinel: the invocation died before Frances could run
+    /// teardown and frame the result. Stored state is left unchanged.
     Dead { output: String },
 }
 
 impl Shell {
-    /// Spawn a fresh bash subprocess and complete the startup handshake.
+    /// Create a fresh quasi-persistent shell state holder.
     pub async fn spawn(opts: ShellOptions) -> ShellResult<Self> {
-        let nonce = make_nonce();
-        let tmpdir = TempDir::new()?;
-        let cmd_path = tmpdir.path().join("cmd.sh");
-
-        let mut cmd = Command::new("bash");
-        cmd.arg("--norc")
-            .arg("--noprofile")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        // Plain-output hygiene: the TUI shows shell stdout as text, so
-        // ANSI colour sequences are noise at best and broken at worst.
-        // `TERM=dumb` makes terminfo-aware tools emit no escapes;
-        // `NO_COLOR=1` is the no-color.org standard honoured by ripgrep,
-        // cargo, bat, jq, gcc, ls --color=auto, etc.; `CLICOLOR=0` and
-        // `FORCE_COLOR=0` cover the BSD- and Node-flavoured holdouts;
-        // `PAGER=cat` keeps less from grabbing the pty for things like
-        // `git log`. Applied before `opts.env` so callers can override
-        // any of them per-shell.
-        cmd.env("TERM", "dumb")
-            .env("NO_COLOR", "1")
-            .env("CLICOLOR", "0")
-            .env("FORCE_COLOR", "0")
-            .env("PAGER", "cat");
-        if let Some(cwd) = &opts.cwd {
-            cmd.current_dir(cwd);
-        }
-        for (k, v) in &opts.env {
-            cmd.env(k, v);
-        }
-
-        let mut child = cmd.spawn().map_err(ShellError::Spawn)?;
-        let bash_pid = child
-            .id()
-            .ok_or(ShellError::Handshake(HandshakeFailure::MissingPid))?;
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdin))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdout))?;
-
-        let mut reader = OutputReader::new(stdout, Sentinel::new(&nonce));
-
-        stdin
-            .write_all(&handshake_bytes(&nonce))
-            .await
-            .map_err(|e| ShellError::Handshake(HandshakeFailure::WriteFailed(e)))?;
-        stdin
-            .flush()
-            .await
-            .map_err(|e| ShellError::Handshake(HandshakeFailure::FlushFailed(e)))?;
-
-        match reader
-            .read_until_sentinel(None, Some(HANDSHAKE_TIMEOUT))
-            .await
-            .map_err(|e| ShellError::Handshake(HandshakeFailure::ReadFailed(e)))?
-        {
-            ReadOutcome::Done { .. } => {}
-            ReadOutcome::Quiet { .. } => {
-                return Err(ShellError::Handshake(HandshakeFailure::SentinelTimedOut));
-            }
-            ReadOutcome::Eof { .. } => {
-                return Err(ShellError::Handshake(HandshakeFailure::ExitedDuringStartup));
-            }
-        }
+        let cwd = match opts.cwd {
+            Some(cwd) => cwd,
+            None => std::env::current_dir()?,
+        };
+        let env = opts
+            .env
+            .into_iter()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
 
         let mut shell = Shell {
-            stdin,
-            reader,
-            _child: child,
-            bash_pid,
-            nonce,
-            _tmpdir: tmpdir,
-            cmd_path,
+            state: ShellSnapshot { cwd, env },
+            in_flight: None,
+            output_sink: None,
+            nonce: make_nonce(),
+            tmpdir: TempDir::new()?,
+            next_run_id: 0,
             alive: true,
-            running: false,
         };
 
         if let Some(script) = opts.init_script {
@@ -217,104 +183,190 @@ impl Shell {
         Ok(shell)
     }
 
-    /// Whether bash is still alive. Once `false`, every method returns
-    /// [`ShellError::Dead`]; spawn a new [`Shell`] to recover.
+    /// Whether this state holder can accept new runs. A `Dead` outcome marks
+    /// it unusable to preserve the existing public lifecycle contract.
     pub fn is_alive(&self) -> bool {
         self.alive
     }
 
-    /// Attach (or detach) a streaming event sink. While set, every
-    /// `run` / `keep_waiting` ships safe-not-sentinel output bytes
-    /// through the channel as [`ReadEvent::Output`] events, and emits
-    /// exactly one terminal [`ReadEvent::Done`] / `Quiet` / `Dead`
-    /// before returning. `RunOutcome::*` payloads still carry the
-    /// full output bytes so direct callers don't need to consume the
-    /// channel.
-    pub fn set_output_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>) {
-        self.reader.set_sink(sink);
+    /// Return a clone of the persisted cwd/exported-env snapshot.
+    pub fn snapshot(&self) -> ShellSnapshot {
+        self.state.clone()
     }
 
-    /// Submit `cmd` to the shell and read until the sentinel, an output
-    /// silence of `wait.quiet`, or `wait.max` wall-clock — whichever fires
-    /// first.
-    ///
-    /// `cmd` is bash code, written verbatim into the per-shell tmpfile and
-    /// dot-sourced. Pipelines, redirections, subshells, multi-line
-    /// `if`/`for`/`while`, function definitions, heredocs, `set -e`,
-    /// `trap`, etc. all work as they would in a real interactive bash —
-    /// the caller does not need to wrap anything in `bash -c`, escape
-    /// special characters, or single-line their script.
-    ///
-    /// State changes (env vars, `cd`, function defs, sourced files,
-    /// `shopt`s) persist into the next `run`.
-    ///
-    /// If a previous call returned [`RunOutcome::Quiet`], the same command
-    /// is still running; passing a new `cmd` here is a logic error — call
-    /// [`Shell::keep_waiting`] instead.
+    /// Replace the stored cwd/exported-env snapshot.
+    pub fn update_snapshot(&mut self, snapshot: ShellSnapshot) -> ShellResult<()> {
+        if self.in_flight.is_some() {
+            return Err(ShellError::CommandRunning);
+        }
+        self.state = snapshot;
+        Ok(())
+    }
+
+    /// Attach (or detach) a streaming event sink.
+    pub fn set_output_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>) {
+        self.output_sink = sink.clone();
+        if let Some(in_flight) = self.in_flight.as_mut() {
+            in_flight.reader.set_sink(sink);
+        }
+    }
+
+    /// Submit `cmd` to a fresh bash process and read until the sentinel, an
+    /// output silence of `wait.quiet`, or `wait.max` wall-clock — whichever
+    /// fires first.
     pub async fn run(&mut self, cmd: &str, wait: WaitOpts) -> ShellResult<RunOutcome> {
+        self.run_with_opts(cmd, RunOpts::default(), wait).await
+    }
+
+    /// Like [`Shell::run`], with fd-0 input and per-run env persistence names.
+    pub async fn run_with_opts(
+        &mut self,
+        cmd: &str,
+        opts: RunOpts,
+        wait: WaitOpts,
+    ) -> ShellResult<RunOutcome> {
         if !self.alive {
             return Err(ShellError::Dead);
         }
-        if !self.running {
-            tokio::fs::write(&self.cmd_path, cmd).await?;
-            let bytes = wrapper_bytes(&self.cmd_path, &self.nonce);
-            self.stdin.write_all(&bytes).await?;
-            self.stdin.flush().await?;
-            self.running = true;
+        if self.in_flight.is_some() {
+            return Err(ShellError::CommandRunning);
         }
+
+        self.start_run(cmd, opts).await?;
         self.read_outcome(wait).await
     }
 
-    /// Continue waiting on the in-flight command. Returns the same shape
-    /// as [`Shell::run`]. Errors with [`ShellError::NoRunningCommand`] if
-    /// no command is currently in flight.
+    /// Continue waiting on the in-flight command. Returns the same shape as
+    /// [`Shell::run`]. Errors with [`ShellError::NoRunningCommand`] if no
+    /// command is currently in flight.
     pub async fn keep_waiting(&mut self, wait: WaitOpts) -> ShellResult<RunOutcome> {
         if !self.alive {
             return Err(ShellError::Dead);
         }
-        if !self.running {
+        if self.in_flight.is_none() {
             return Err(ShellError::NoRunningCommand);
         }
         self.read_outcome(wait).await
     }
 
-    /// Send `SIGINT` to bash's foreground child(ren). Bash itself is
-    /// untouched, so the shell stays alive: the running command dies, the
-    /// sentinel fires from the post-source line, and the next
-    /// [`Shell::keep_waiting`] returns [`RunOutcome::Done`] with a non-zero
-    /// exit. No-op if no command is currently running.
+    /// Send `SIGINT` to the in-flight process group. No-op if no command is
+    /// currently running.
     pub async fn interrupt(&mut self) -> ShellResult<()> {
         self.signal_running(libc::SIGINT)
     }
 
-    /// Like [`Shell::interrupt`] but `SIGKILL`. Used when a command
-    /// ignores `SIGINT`.
+    /// Like [`Shell::interrupt`] but `SIGKILL`. Used when a command ignores
+    /// `SIGINT`.
     pub async fn kill_running(&mut self) -> ShellResult<()> {
         self.signal_running(libc::SIGKILL)
+    }
+
+    async fn start_run(&mut self, cmd: &str, opts: RunOpts) -> ShellResult<()> {
+        let run_id = self.next_run_id;
+        self.next_run_id = self.next_run_id.wrapping_add(1);
+
+        let user_path = self.tmpdir.path().join(format!("user-{run_id}.sh"));
+        let wrapper_path = self.tmpdir.path().join(format!("wrapper-{run_id}.sh"));
+        let cwd_path = self.tmpdir.path().join(format!("cwd-{run_id}.txt"));
+        let env_path = self.tmpdir.path().join(format!("env-{run_id}.nul"));
+
+        tokio::fs::write(&user_path, cmd).await?;
+        let wrapper = wrapper_script(
+            &user_path,
+            &cwd_path,
+            &env_path,
+            &self.state.cwd,
+            &self.state.env,
+            &self.nonce,
+        );
+        tokio::fs::write(&wrapper_path, wrapper).await?;
+
+        let mut command = Command::new("bash");
+        command
+            .arg("--norc")
+            .arg("--noprofile")
+            .arg(&wrapper_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        if opts.stdin.is_some() {
+            command.stdin(Stdio::piped());
+        } else {
+            command.stdin(Stdio::null());
+        }
+        apply_output_env(&mut command);
+        for (name, value) in &self.state.env {
+            command.env(name, value);
+        }
+        unsafe {
+            command.pre_exec(|| {
+                let rc = libc::setsid();
+                if rc == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+
+        let mut child = command.spawn().map_err(ShellError::Spawn)?;
+        let pgid = child
+            .id()
+            .ok_or(ShellError::Handshake(HandshakeFailure::MissingPid))?;
+        if let Some(stdin) = opts.stdin {
+            let mut child_stdin = child
+                .stdin
+                .take()
+                .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdin))?;
+            child_stdin.write_all(&stdin).await?;
+            child_stdin.flush().await?;
+        }
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdout))?;
+        let mut reader = OutputReader::new(stdout, Sentinel::new(&self.nonce));
+        reader.set_sink(self.output_sink.clone());
+
+        self.in_flight = Some(InFlight {
+            child,
+            reader,
+            pgid,
+            capture: RunCapture {
+                cwd_path,
+                env_path,
+                persist: opts.persist,
+            },
+        });
+        Ok(())
     }
 
     fn signal_running(&self, sig: libc::c_int) -> ShellResult<()> {
         if !self.alive {
             return Err(ShellError::Dead);
         }
-        if !self.running {
+        let Some(in_flight) = self.in_flight.as_ref() else {
             return Ok(());
-        }
-        let kids = list_children(self.bash_pid).map_err(ShellError::NoChild)?;
-        for pid in kids {
-            let _ = signal_pid(pid, sig);
-        }
-        Ok(())
+        };
+        signal_pgid(in_flight.pgid, sig).map_err(ShellError::Signal)
     }
 
     async fn read_outcome(&mut self, wait: WaitOpts) -> ShellResult<RunOutcome> {
-        let outcome = self
-            .reader
-            .read_until_sentinel(Some(wait.quiet.unwrap_or(DEFAULT_QUIET)), wait.max)
-            .await?;
-        Ok(match outcome {
+        let read = {
+            let in_flight = self
+                .in_flight
+                .as_mut()
+                .ok_or(ShellError::NoRunningCommand)?;
+            in_flight
+                .reader
+                .read_until_sentinel(Some(wait.quiet.unwrap_or(DEFAULT_QUIET)), wait.max)
+                .await?
+        };
+
+        Ok(match read {
             ReadOutcome::Done { output, exit_code } => {
-                self.running = false;
+                let mut in_flight = self.in_flight.take().expect("in_flight exists after read");
+                let _ = in_flight.child.wait().await;
+                self.apply_capture(&in_flight.capture).await?;
                 RunOutcome::Done {
                     exit_code,
                     output: String::from_utf8_lossy(&output).into_owned(),
@@ -325,12 +377,67 @@ impl Shell {
                 reason,
             },
             ReadOutcome::Eof { output } => {
+                let mut in_flight = self.in_flight.take().expect("in_flight exists after read");
+                let _ = in_flight.child.wait().await;
                 self.alive = false;
-                self.running = false;
                 RunOutcome::Dead {
                     output: String::from_utf8_lossy(&output).into_owned(),
                 }
             }
         })
     }
+
+    async fn apply_capture(&mut self, capture: &RunCapture) -> ShellResult<()> {
+        let cwd = tokio::fs::read_to_string(&capture.cwd_path).await?;
+        let cwd = cwd.trim_end_matches('\n');
+        if !cwd.is_empty() {
+            self.state.cwd = PathBuf::from(cwd);
+        }
+
+        if capture.persist.is_empty() {
+            return Ok(());
+        }
+        let env_bytes = tokio::fs::read(&capture.env_path).await?;
+        let exported = parse_env_nul(&env_bytes);
+        for name in &capture.persist {
+            if name == "FRANCES_ROOT" {
+                continue;
+            }
+            match exported.get(name) {
+                Some(value) => {
+                    self.state.env.insert(name.clone(), value.clone());
+                }
+                None => {
+                    self.state.env.remove(name);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn apply_output_env(cmd: &mut Command) {
+    // Plain-output hygiene: the TUI shows shell stdout as text, so ANSI colour
+    // sequences are noise at best and broken at worst.
+    cmd.env("TERM", "dumb")
+        .env("NO_COLOR", "1")
+        .env("CLICOLOR", "0")
+        .env("FORCE_COLOR", "0")
+        .env("PAGER", "cat");
+}
+
+fn parse_env_nul(bytes: &[u8]) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    for entry in bytes.split(|b| *b == 0) {
+        if entry.is_empty() {
+            continue;
+        }
+        let Some(eq) = entry.iter().position(|b| *b == b'=') else {
+            continue;
+        };
+        let name = String::from_utf8_lossy(&entry[..eq]).into_owned();
+        let value = String::from_utf8_lossy(&entry[eq + 1..]).into_owned();
+        env.insert(name, value);
+    }
+    env
 }

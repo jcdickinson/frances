@@ -1,8 +1,10 @@
 // `frances:v1/tools/shell` — bash primitive + Run/Wait/Kill tool
 // classes for `chat.tools.push(...)`.
 //
-// The `Shell` class (Rust-backed) owns one bash subprocess. The
-// `Run`/`Wait`/`Kill` classes are thin JS wrappers around it, shaped
+// The `Shell` class (Rust-backed) owns quasi-persistent shell state. Each
+// `Run` starts one bash invocation; cwd always persists after completed
+// runs, and selected exported env vars persist when nominated by `persist`.
+// The `Run`/`Wait`/`Kill` classes are thin JS wrappers around it, shaped
 // for the LLM tool API: each exposes `name`, `description`,
 // `parameters` (with a static `.schema` so workflows can compose their
 // own variants) and a `handler({call, scope})`.
@@ -57,13 +59,15 @@ const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
 const shellFamily = defineToolFamily({
   prompt() {
     return [
-      "## Shell tools — persistent session",
+      "## Shell tools — quasi-persistent state",
       "",
-      "You have a persistent bash session. State (cwd, env, functions,",
-      "aliases) persists across calls — do not prefix commands with",
-      "`cd ... && `. Prefer dedicated tools (`file_read`,",
-      "`file_replace_lines`, `variable_*`) over shell equivalents",
-      "(`cat`, `echo`, `jq`) when available.",
+      "Commands use quasi-persistent bash state. The working directory always",
+      "persists after completed shell_run calls. Exported environment variables",
+      "persist only when a shell_run call includes their names in `persist`;",
+      "that `persist` list applies to that one run and is not a durable watch list.",
+      "FRANCES_ROOT is reserved and Frances-managed; persisted environment cannot",
+      "override it. Prefer dedicated tools (`file_read`, `file_replace_lines`,",
+      "`variable_*`) over shell equivalents (`cat`, `echo`, `jq`) when available.",
     ].join("\n");
   },
 });
@@ -116,6 +120,24 @@ const RUN_SCHEMA = {
     max: MAX_PROP,
     head: HEAD_PROP,
     tail: TAIL_PROP,
+    stdin: {
+      type: "string",
+      description:
+        "Optional bytes/text delivered to bash on fd 0 for this invocation. " +
+        "The wrapper/user script is passed separately, not through stdin. " +
+        "When omitted, fd 0 is EOF/null so commands waiting for input do not " +
+        "accidentally hang on Frances' own stdin.",
+    },
+    persist: {
+      type: "array",
+      items: { type: "string" },
+      description:
+        "Exported environment variable names to capture after this command " +
+        "finishes. Cwd always persists; persist applies only to this run, is " +
+        "not a durable watch list, and tracks exported env vars only. Names " +
+        "must be plain bash identifiers. FRANCES_ROOT is reserved and " +
+        "Frances-managed, so attempts to persist it error before execution.",
+    },
   },
   required: ["cmd"],
 };
@@ -429,11 +451,15 @@ class Run {
     this.requireApproval = approveOpt;
     this.name = "shell_run";
     this.description =
-      "Run a bash command. State (cwd, env, functions) persists across calls. " +
-      "If output goes quiet before the command finishes, the result will say so — " +
-      "call shell_wait to keep waiting or shell_kill to stop. Set `quiet` and " +
-      "`max` (seconds) to tune how long it waits before handing control back — " +
-      "raise them for slow or streaming commands so you aren't pinged early.";
+      "Run a bash command in quasi-persistent shell state. Cwd always persists " +
+      "after completed runs; exported env vars persist only when listed in " +
+      "`persist` for that run, and `persist` is not a durable watch list. " +
+      "Optional `stdin` is delivered to fd 0 for that invocation. " +
+      "FRANCES_ROOT is reserved and Frances-managed. If output goes quiet " +
+      "before the command finishes, the result will say so — call shell_wait " +
+      "to keep waiting or shell_kill to stop. Set `quiet` and `max` (seconds) " +
+      "to tune how long it waits before handing control back — raise them for " +
+      "slow or streaming commands so you aren't pinged early.";
     this.parameters = RUN_SCHEMA;
     this.family = shellFamily;
   }
@@ -461,6 +487,8 @@ class Run {
           this.shell.runOnce(call.arguments.cmd, {
             quiet: call.arguments.quiet,
             max: call.arguments.max,
+            stdin: call.arguments.stdin,
+            persist: call.arguments.persist,
           }),
         writer,
       );

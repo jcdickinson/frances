@@ -1,6 +1,6 @@
 //! `frances:v1/tools/shell` — bash primitive for workflow tool handlers.
 //!
-//! `new Shell()` represents one long-lived bash subprocess. Spawning is
+//! `new Shell()` represents quasi-persistent shell state. Spawning remains
 //! lazy (deferred until the first `runOnce` so the JS constructor stays
 //! sync), and all in-flight operations serialise on a per-Shell async
 //! mutex — parallel tool calls that hit the same Shell queue up instead
@@ -9,7 +9,10 @@
 //!
 //! Methods on the JS side:
 //!
-//! - `runOnce(cmd)` — start a command, await its first stopping point.
+//! - `runOnce(cmd, opts)` — start a command, await its first stopping point.
+//!   `opts` may contain wait tuning plus `stdin` bytes/text for fd 0 and
+//!   `persist` exported-env names to capture after this run. Cwd always
+//!   persists; `persist` is per-run, not a durable watch list.
 //!   Resolves to `{ kind: "done", exit_code, output }`,
 //!   `{ kind: "quiet", output, reason }`, or `{ kind: "dead", output }`.
 //!   Throws if a command is already in flight on this Shell.
@@ -49,7 +52,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use frances_shell::{
-    QuietReason, ReadEvent, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts,
+    QuietReason, ReadEvent, RunOpts as ShellRunOpts, RunOutcome, Shell, ShellError, ShellOptions,
+    WaitOpts,
 };
 
 use super::throw_js as throw;
@@ -139,9 +143,9 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
                     let state = borrow.state.clone();
                     let factory = borrow.factory.clone();
                     drop(borrow);
-                    let wait = parse_wait_opts(opts);
+                    let opts = parse_run_opts(opts);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        ShellOpResult(run_once_inner(&factory, &state, cmd, wait).await)
+                        ShellOpResult(run_once_inner(&factory, &state, cmd, opts).await)
                     }))
                 },
             )?,
@@ -324,14 +328,45 @@ fn secs_to_duration(secs: f64) -> Option<Duration> {
     (secs.is_finite() && secs >= 0.0).then(|| Duration::from_secs_f64(secs))
 }
 
+/// Accepted JS options for `Shell.runOnce`.
+///
+/// `stdin` and `persist` are parsed at this boundary now so the JS API shape is
+/// explicit. The lower-level shell engine consumes them in the quasi-persistent
+/// execution refactor.
+struct RunOpts {
+    wait: WaitOpts,
+    stdin: Option<String>,
+    persist: Vec<String>,
+}
+
 /// Resolve the model-facing `{ quiet, max }` (seconds, both optional) into
 /// the concrete `WaitOpts` the shell runs with. Quiet falls back to
 /// `frances_shell::DEFAULT_QUIET`, max to [`DEFAULT_MAX`], and max is
 /// clamped up to at least `quiet + MAX_MARGIN` so the ceiling can never
 /// fire before the silence window.
 fn parse_wait_opts(opts: Opt<Object<'_>>) -> WaitOpts {
+    parse_wait_opts_from_obj(opts.0.as_ref())
+}
+
+fn parse_run_opts(opts: Opt<Object<'_>>) -> RunOpts {
+    let obj = opts.0;
+    let stdin = obj
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<String>>("stdin").ok().flatten());
+    let persist = obj
+        .as_ref()
+        .and_then(|o| o.get::<_, Option<Vec<String>>>("persist").ok().flatten())
+        .unwrap_or_default();
+    RunOpts {
+        wait: parse_wait_opts_from_obj(obj.as_ref()),
+        stdin,
+        persist,
+    }
+}
+
+fn parse_wait_opts_from_obj(obj: Option<&Object<'_>>) -> WaitOpts {
     let (mut quiet, mut max) = (None, None);
-    if let Some(obj) = opts.0 {
+    if let Some(obj) = obj {
         if let Ok(Some(q)) = obj.get::<_, Option<f64>>("quiet") {
             quiet = secs_to_duration(q);
         }
@@ -351,8 +386,13 @@ async fn run_once_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: String,
-    wait: WaitOpts,
+    opts: RunOpts,
 ) -> Result<Outcome, ShellToolError> {
+    let RunOpts {
+        wait,
+        stdin,
+        persist,
+    } = opts;
     let mut guard = state.lock().await;
     if guard.closed {
         return Err(ShellToolError::Closed);
@@ -363,7 +403,17 @@ async fn run_once_inner<F: WorkflowShell>(
     ensure_shell(&mut guard, factory).await?;
     let outcome = {
         let shell = guard.shell.as_mut().expect("shell is Some");
-        shell.run(&cmd, wait).await.map_err(ShellToolError::Run)?
+        shell
+            .run_with_opts(
+                &cmd,
+                ShellRunOpts {
+                    stdin: stdin.map(String::into_bytes),
+                    persist,
+                },
+                wait,
+            )
+            .await
+            .map_err(ShellToolError::Run)?
     };
     Ok(absorb_outcome(&mut guard, outcome))
 }
@@ -378,39 +428,23 @@ async fn ensure_shell<F: WorkflowShell>(
     if guard.shell.is_some() {
         return Ok(());
     }
+    let env = guard
+        .editable_root
+        .as_ref()
+        .map(|root| vec![("FRANCES_ROOT".into(), root.clone().into())])
+        .unwrap_or_default();
     let mut shell = factory
-        .spawn(ShellOptions::default())
+        .spawn(ShellOptions {
+            env,
+            ..ShellOptions::default()
+        })
         .await
         .map_err(ShellToolError::Spawn)?;
     if let Some(tx) = guard.event_tx.as_ref() {
         shell.set_output_sink(Some(tx.clone()));
     }
     guard.shell = Some(shell);
-    // Export $FRANCES_ROOT once at spawn so subprocesses can discover
-    // the project root.
-    if let Some(ref root) = guard.editable_root {
-        let cmd = format!("export FRANCES_ROOT={}", shell_quote(root));
-        let shell = guard.shell.as_mut().expect("shell just set");
-        let outcome = shell
-            .run(&cmd, WaitOpts::default())
-            .await
-            .map_err(ShellToolError::Run)?;
-        match outcome {
-            RunOutcome::Done { exit_code, .. } if exit_code != 0 => {
-                return Err(ShellToolError::Spawn(ShellError::Io(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("export FRANCES_ROOT failed with exit {exit_code}"),
-                ))));
-            }
-            RunOutcome::Done { .. } => {}
-            RunOutcome::Quiet { output, .. } => {
-                return Err(ShellToolError::WentQuiet { output });
-            }
-            RunOutcome::Dead { output } => {
-                return Err(ShellToolError::Died { output });
-            }
-        }
-    }
+
     Ok(())
 }
 

@@ -1,4 +1,4 @@
-use frances_shell::{RunOutcome, Shell, ShellOptions, WaitOpts};
+use frances_shell::{RunOpts, RunOutcome, Shell, ShellOptions, WaitOpts};
 
 fn opts() -> ShellOptions {
     ShellOptions::default()
@@ -20,12 +20,41 @@ async fn echo_hello() {
 }
 
 #[tokio::test]
-async fn env_survives_across_calls() {
+async fn selected_exported_env_survives_across_calls() {
     let mut shell = Shell::spawn(opts()).await.unwrap();
-    let (code, _) = run_done(&mut shell, "X=42").await;
-    assert_eq!(code, 0);
+    let outcome = shell
+        .run_with_opts(
+            "export X=42",
+            RunOpts {
+                stdin: None,
+                persist: vec!["X".into()],
+            },
+            WaitOpts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RunOutcome::Done { exit_code: 0, .. }));
     let (_, out) = run_done(&mut shell, "echo $X").await;
     assert_eq!(out, "42\n");
+}
+
+#[tokio::test]
+async fn non_exported_env_does_not_survive_across_calls() {
+    let mut shell = Shell::spawn(opts()).await.unwrap();
+    let outcome = shell
+        .run_with_opts(
+            "X=42",
+            RunOpts {
+                stdin: None,
+                persist: vec!["X".into()],
+            },
+            WaitOpts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(outcome, RunOutcome::Done { exit_code: 0, .. }));
+    let (_, out) = run_done(&mut shell, "echo ${X-unset}").await;
+    assert_eq!(out, "unset\n");
 }
 
 #[tokio::test]
@@ -71,22 +100,23 @@ async fn multi_line_script_works() {
 }
 
 #[tokio::test]
-async fn function_definitions_persist() {
+async fn function_definitions_do_not_persist() {
     let mut shell = Shell::spawn(opts()).await.unwrap();
     run_done(&mut shell, "greet() { echo \"hi $1\"; }").await;
-    let (_, out) = run_done(&mut shell, "greet world").await;
-    assert_eq!(out, "hi world\n");
+    let (code, out) = run_done(&mut shell, "greet world").await;
+    assert_ne!(code, 0);
+    assert!(out.contains("greet: command not found"));
 }
 
 #[tokio::test]
-async fn init_script_runs_at_spawn() {
+async fn init_script_runs_at_spawn_without_persisting_process_state() {
     let opts = ShellOptions {
         init_script: Some("export FOO=bar".into()),
         ..ShellOptions::default()
     };
     let mut shell = Shell::spawn(opts).await.unwrap();
-    let (_, out) = run_done(&mut shell, "echo $FOO").await;
-    assert_eq!(out, "bar\n");
+    let (_, out) = run_done(&mut shell, "echo ${FOO-unset}").await;
+    assert_eq!(out, "unset\n");
 }
 
 #[tokio::test]

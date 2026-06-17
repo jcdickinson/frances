@@ -1,4 +1,4 @@
-use frances_shell::{RunOutcome, Shell, ShellOptions, WaitOpts};
+use frances_shell::{RunOpts, RunOutcome, Shell, ShellOptions, WaitOpts};
 
 async fn run_done_str(shell: &mut Shell, cmd: &str) -> String {
     match shell.run(cmd, WaitOpts::default()).await.unwrap() {
@@ -14,8 +14,30 @@ async fn two_shells_have_independent_state() {
         async { Shell::spawn(ShellOptions::default()).await.unwrap() },
     );
 
-    run_done_str(&mut a, "cd /tmp; X=alpha").await;
-    run_done_str(&mut b, "cd /; X=beta").await;
+    let out_a = a
+        .run_with_opts(
+            "cd /tmp; export X=alpha",
+            RunOpts {
+                stdin: None,
+                persist: vec!["X".into()],
+            },
+            WaitOpts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out_a, RunOutcome::Done { exit_code: 0, .. }));
+    let out_b = b
+        .run_with_opts(
+            "cd /; export X=beta",
+            RunOpts {
+                stdin: None,
+                persist: vec!["X".into()],
+            },
+            WaitOpts::default(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(out_b, RunOutcome::Done { exit_code: 0, .. }));
 
     let (cwd_a, cwd_b) = tokio::join!(run_done_str(&mut a, "pwd"), run_done_str(&mut b, "pwd"));
     assert_eq!(cwd_a, "/tmp\n");

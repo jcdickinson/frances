@@ -505,12 +505,13 @@ async fn tool_families_shell_family_emits_preamble() {
         import { transcript, MarkdownSection } from "frances:v1/sections";
 
         const text = shellFamily.prompt({});
-        let hasPersistent = text.includes("persistent");
-        let hasNoCd = text.includes("cd");
+        let hasQuasiPersistent = text.includes("quasi-persistent");
+        let hasPersist = text.includes("persist");
+        let hasFrancesRoot = text.includes("FRANCES_ROOT");
         let hasPrefer = text.includes("Prefer dedicated tools");
 
         transcript.push(new MarkdownSection({ content: JSON.stringify({
-            hasPersistent, hasNoCd, hasPrefer,
+            hasQuasiPersistent, hasPersist, hasFrancesRoot, hasPrefer,
         }) }));
         "#,
     );
@@ -525,8 +526,9 @@ async fn tool_families_shell_family_emits_preamble() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
-    assert_eq!(result["hasPersistent"], true);
-    assert_eq!(result["hasNoCd"], true);
+    assert_eq!(result["hasQuasiPersistent"], true);
+    assert_eq!(result["hasPersist"], true);
+    assert_eq!(result["hasFrancesRoot"], true);
     assert_eq!(result["hasPrefer"], true);
 }
 

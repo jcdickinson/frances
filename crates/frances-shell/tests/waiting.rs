@@ -85,11 +85,8 @@ async fn keep_waiting_resumes_after_quiet() {
 }
 
 #[tokio::test]
-async fn interrupt_kills_running_command_keeps_shell_alive() {
+async fn interrupt_ends_in_flight_invocation() {
     let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
-    // Use `&&` so that when sleep is killed (non-zero exit), the echo is
-    // skipped — bash's `;` would run both statements regardless, since
-    // interrupt only stops the currently-running command.
     let first = shell
         .run(
             "sleep 60 && echo too late",
@@ -118,10 +115,12 @@ async fn interrupt_kills_running_command_keeps_shell_alive() {
                 "echo after sleep must not have run",
             );
         }
-        other => panic!("expected Done after interrupt, got {other:?}"),
+        RunOutcome::Dead { output } => {
+            assert!(
+                !output.contains("too late"),
+                "echo after sleep must not have run",
+            );
+        }
+        other => panic!("expected Done or Dead after interrupt, got {other:?}"),
     }
-    assert!(shell.is_alive());
-
-    let res = shell.run("echo alive", WaitOpts::default()).await.unwrap();
-    assert!(matches!(res, RunOutcome::Done { exit_code: 0, .. }));
 }
