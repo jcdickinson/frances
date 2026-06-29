@@ -293,6 +293,7 @@ impl provider::Provider for Provider {
             messages.push(msg);
         }
         remap_tool_call_ids(&mut messages);
+        normalize_tool_results(&mut messages);
 
         let chat_req = build_chat_request(messages, req.tools, req.tool_choice);
         let chat_options = build_chat_options(&plan, req.tool_choice);
@@ -689,6 +690,65 @@ fn remap_tool_call_ids(messages: &mut [ChatMessage]) {
     }
 }
 
+/// Canonicalise tool-result placement so every run of tool calls is followed,
+/// immediately and in call order, by exactly one result per call.
+///
+/// Two things go wrong otherwise. A turn interrupted mid-tool-call — the
+/// stream is cancelled before a result is recorded, or the handler never
+/// settles — persists the assistant's `ToolCall` with no matching
+/// `ToolResponse`; replaying that to the OpenAI Responses API is a hard 400
+/// ("No tool output found for function call ..."). And even when every call
+/// *is* answered, a result recorded out of order (or a synthetic one spliced
+/// in carelessly) shifts every later item, so the prompt-cache prefix no
+/// longer matches and the cache goes cold.
+///
+/// So we rebuild: pull every recorded result aside, then walk the history and
+/// re-emit each run's results right after it, in the order the calls were
+/// requested, synthesizing a "cancelled" result for any the caller never
+/// produced. The layout is now a pure function of the call sequence — a
+/// resumed-after-interrupt history lands byte-identical to one that never
+/// stalled, up to the first synthetic result — which is what keeps the cache
+/// warm. The provider is the single chokepoint every request passes through,
+/// so doing it here means no caller has to.
+///
+/// Runs after [`remap_tool_call_ids`], so every call id is already unique and
+/// the result lookup is unambiguous.
+fn normalize_tool_results(messages: &mut Vec<ChatMessage>) {
+    let mut results: HashMap<String, ToolResponse> = HashMap::new();
+    for message in messages.iter() {
+        for response in message.content.tool_responses() {
+            results.insert(response.call_id.clone(), response.clone());
+        }
+    }
+
+    let mut rebuilt: Vec<ChatMessage> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        // Result messages are dropped here and re-emitted in call order below.
+        if message.role == ChatRole::Tool {
+            continue;
+        }
+        let call_ids: Vec<String> = message
+            .content
+            .tool_calls()
+            .iter()
+            .map(|call| call.call_id.clone())
+            .collect();
+        rebuilt.push(message);
+        for call_id in call_ids {
+            let response = results.remove(&call_id).unwrap_or_else(|| {
+                ToolResponse::new(
+                    call_id,
+                    "Tool call did not complete (probably cancelled).".to_owned(),
+                )
+            });
+            rebuilt.push(ChatMessage::tool(MessageContent::from_parts(vec![
+                ContentPart::ToolResponse(response),
+            ])));
+        }
+    }
+    *messages = rebuilt;
+}
+
 /// Map one `HistoryInput` primitive to a `ChatMessage`.
 fn forge_one(input: &HistoryInput<'_>) -> ChatMessage {
     match input {
@@ -938,6 +998,130 @@ mod tests {
         assert_eq!(call_b, result_b);
         // ...but the two calls no longer collide.
         assert_ne!(call_a, call_b);
+    }
+
+    #[test]
+    fn normalize_answers_dangling_tool_call() {
+        // First call is answered; the second is interrupted mid-flight and
+        // the next thing in history is a user message — no result for it.
+        let args = json!({});
+        let mut messages = vec![
+            forge_one(&HistoryInput::ToolCall {
+                id: "call_0",
+                name: "first",
+                arguments: &args,
+            }),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "call_0",
+                content: "r1",
+                is_error: false,
+            }),
+            forge_one(&HistoryInput::ToolCall {
+                id: "call_1",
+                name: "second",
+                arguments: &args,
+            }),
+            forge_one(&HistoryInput::User { text: "next" }),
+        ];
+        remap_tool_call_ids(&mut messages);
+        normalize_tool_results(&mut messages);
+
+        // A synthetic result was placed right after the dangling call, ahead
+        // of the user message — so the call/result pairing the Responses API
+        // requires is intact.
+        assert_eq!(messages.len(), 5);
+        let dangling_call = messages[2].content.tool_calls()[0].call_id.clone();
+        let filled = messages[3].content.tool_responses()[0].call_id.clone();
+        assert_eq!(dangling_call, filled);
+        // The already-answered call did not get a duplicate result.
+        assert_eq!(messages[1].content.tool_responses().len(), 1);
+    }
+
+    #[test]
+    fn normalize_keeps_real_results_in_call_order_around_a_dangling_one() {
+        // One run of three parallel calls. The middle one never came back; the
+        // outer two did. The synthetic result must slot into the *middle* so
+        // the run reads result(a), <cancelled>, result(c) — real results keep
+        // their order and position, which is what keeps the cache warm.
+        let args = json!({});
+        let calls = vec![
+            GenaiToolCall {
+                call_id: "a".to_owned(),
+                fn_name: "fa".to_owned(),
+                fn_arguments: args.clone(),
+                thought_signatures: None,
+            },
+            GenaiToolCall {
+                call_id: "b".to_owned(),
+                fn_name: "fb".to_owned(),
+                fn_arguments: args.clone(),
+                thought_signatures: None,
+            },
+            GenaiToolCall {
+                call_id: "c".to_owned(),
+                fn_name: "fc".to_owned(),
+                fn_arguments: args.clone(),
+                thought_signatures: None,
+            },
+        ];
+        let mut messages = vec![
+            ChatMessage::assistant_tool_calls_with_thoughts(calls, Vec::new()),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "a",
+                content: "ra",
+                is_error: false,
+            }),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "c",
+                content: "rc",
+                is_error: false,
+            }),
+            forge_one(&HistoryInput::User { text: "next" }),
+        ];
+        remap_tool_call_ids(&mut messages);
+        normalize_tool_results(&mut messages);
+
+        // assistant, result(a), result(b synthetic), result(c), user.
+        assert_eq!(messages.len(), 5);
+        let calls = messages[0].content.tool_calls();
+        assert_eq!(
+            messages[1].content.tool_responses()[0].call_id,
+            calls[0].call_id
+        );
+        assert_eq!(messages[1].content.tool_responses()[0].content, "ra");
+        assert_eq!(
+            messages[2].content.tool_responses()[0].call_id,
+            calls[1].call_id
+        );
+        assert_eq!(
+            messages[2].content.tool_responses()[0].content,
+            "Tool call did not complete (probably cancelled)."
+        );
+        assert_eq!(
+            messages[3].content.tool_responses()[0].call_id,
+            calls[2].call_id
+        );
+        assert_eq!(messages[3].content.tool_responses()[0].content, "rc");
+    }
+
+    #[test]
+    fn normalize_leaves_fully_answered_history_untouched() {
+        let args = json!({});
+        let mut messages = vec![
+            forge_one(&HistoryInput::ToolCall {
+                id: "call_0",
+                name: "t",
+                arguments: &args,
+            }),
+            forge_one(&HistoryInput::ToolResult {
+                call_id: "call_0",
+                content: "r",
+                is_error: false,
+            }),
+        ];
+        remap_tool_call_ids(&mut messages);
+        normalize_tool_results(&mut messages);
+        assert_eq!(messages.len(), 2);
     }
 
     #[test]

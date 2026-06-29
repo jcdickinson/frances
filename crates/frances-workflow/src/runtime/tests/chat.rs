@@ -849,12 +849,12 @@ async fn stream_dispatches_tool_calls_internally() {
 }
 
 #[tokio::test]
-async fn stream_interrupt_during_dispatch_answers_pending_tool_calls() {
+async fn stream_interrupt_during_dispatch_leaves_dangling_call_for_provider() {
     // When the signal aborts after the round streamed its tool calls but
-    // while a handler is still running, dispatch must answer the unfinished
-    // call with an "Interrupted by user" result. A tool_call left with no
-    // result makes the next provider request a 400, so the ChatSession can
-    // never emit a dangling one.
+    // while a handler is still running, dispatch stops waiting and leaves the
+    // unfinished call unanswered. Validity is the provider's job now: it
+    // backfills a synthetic "cancelled" result for any dangling tool call when
+    // it assembles the request, so the ChatSession itself emits no result here.
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolCall};
     use serde_json::json;
 
@@ -918,7 +918,8 @@ async fn stream_interrupt_during_dispatch_answers_pending_tool_calls() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
     assert_eq!(text_of(frames.last().expect("a frame")), "calls=1");
 
-    // The unfinished call was answered with an interrupted error result.
+    // The unfinished call is left dangling — no tool result is pushed. The
+    // provider synthesizes one when it next assembles the request.
     let sessions = deps.sessions();
     let pending = sessions[0].pending();
     let tool_result = pending.iter().find_map(|p| match p {
@@ -929,10 +930,7 @@ async fn stream_interrupt_during_dispatch_answers_pending_tool_calls() {
         } => Some((call_id.clone(), content.clone(), *is_error)),
         _ => None,
     });
-    assert_eq!(
-        tool_result,
-        Some(("h1".to_owned(), "Interrupted by user".to_owned(), true))
-    );
+    assert_eq!(tool_result, None);
 }
 
 #[tokio::test]

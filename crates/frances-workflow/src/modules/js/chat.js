@@ -159,11 +159,12 @@ async function _streamWithDispatch(chat, opts, getHook) {
       ),
     );
 
-    // Race dispatch against the abort signal. On interrupt we stop waiting
-    // for in-flight handlers and answer every tool call that hasn't settled
-    // with an "Interrupted by user" result. A tool_call left with no result
-    // makes the next provider request a 400, so the ChatSession must never
-    // emit a dangling one — regardless of what the caller does next.
+    // Race dispatch against the abort signal so an interrupt stops us
+    // waiting on in-flight handlers. Slots that never settled are left
+    // unanswered here: a tool_call with no result would make the next
+    // provider request a 400, so the provider backfills a synthetic
+    // "cancelled" result for any dangling call when it assembles the
+    // request. Validity is guaranteed there, not here.
     let interrupted = false;
     if (signal) {
       const aborted = new Promise((resolve) => {
@@ -177,20 +178,13 @@ async function _streamWithDispatch(chat, opts, getHook) {
     } else {
       await dispatch;
     }
-    if (interrupted) {
-      for (let i = 0; i < session.slots.length; i++) {
-        if (session.slots[i].result === undefined) {
-          session.slots[i].result = _errorResult(
-            raw.tool_calls[i].id,
-            "Interrupted by user",
-          );
-        }
-      }
-    }
 
-    // Push tool_results in tool_calls order.
+    // Push the results that settled, in tool_calls order. Interrupted
+    // slots have no result and are skipped — the provider answers them.
     for (let i = 0; i < session.slots.length; i++) {
-      chat.push(session.slots[i].result);
+      if (session.slots[i].result !== undefined) {
+        chat.push(session.slots[i].result);
+      }
     }
 
     // Run registered turns in finish order. Skipped on interrupt — they
