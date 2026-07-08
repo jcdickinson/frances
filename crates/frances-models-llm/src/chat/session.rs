@@ -20,6 +20,14 @@ use super::types::ChatSessionId;
 
 #[async_trait]
 pub trait ChatSession: Clone + Send + Sync + 'static {
+    /// Return the persisted chat session id, if this session has one.
+    fn id(&self) -> Option<ChatSessionId>;
+
+    /// Ensure this session has a durable row and return its id.
+    ///
+    /// Ephemeral sessions return `Ok(None)` and never touch storage.
+    async fn ensure_persisted(&self) -> Result<Option<ChatSessionId>, ChatError>;
+
     /// Append a pending input that will be drained by the next `run` call.
     /// Sync — DB persistence happens inside `run`.
     fn push(&self, input: OwnedHistoryInput);

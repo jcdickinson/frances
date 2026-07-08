@@ -88,6 +88,39 @@ async fn chat_session_ephemeral_flag_threads_to_builder() {
 }
 
 #[tokio::test]
+async fn chat_session_can_be_persisted_and_loaded_by_id() {
+    let rt = Runtime::new(StubDeps::default()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession, loadChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+
+        const created = new ChatSession({ model_intents: ["x"] });
+        if (created.id() !== null) throw new Error("fresh chat should not have id yet");
+        const id = await created.ensurePersisted();
+        if (id !== 1) throw new Error(`expected persisted id 1, got ${id}`);
+        if (created.id() !== 1) throw new Error(`expected id() to return 1, got ${created.id()}`);
+
+        const loaded = await loadChatSession(id);
+        if (loaded.id() !== id) throw new Error(`loaded wrong id ${loaded.id()}`);
+        transcript.push(new MarkdownSection({ content: `loaded ${loaded.id()}` }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    assert_eq!(text_of(&frames[0]), "loaded 1");
+}
+
+#[tokio::test]
 async fn chat_session_ephemeral_rejects_non_bool() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
@@ -264,12 +297,12 @@ async fn chat_session_raw_inner_stream_is_not_exposed() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))));
-    // Only the public prototype method (`push`), the internal escape
-    // hatches (`_envInfo`, `_pushSystem`), plus the JS-installed `stream`
+    // Only public prototype methods, the internal escape hatches
+    // (`_envInfo`, `_pushSystem`), plus the JS-installed `stream`
     // should appear; the inner raw stream function must not.
     assert_eq!(
         text_of(&frames[0]),
-        "proto=_envInfo,_pushSystem,push,stream stash=true"
+        "proto=_envInfo,_pushSystem,ensurePersisted,id,push,stream stash=true"
     );
 }
 

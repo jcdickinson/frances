@@ -684,7 +684,7 @@ pub mod test_deps {
     use frances_edit::{EditEngine, EditSession, FakeStore};
     use frances_models_llm::chat::{
         ChatError, ChatSession, ChatSessionBuilder, ChatSessionId, ChatSessionManager,
-        HistoryError, OwnedHistoryInput,
+        OwnedHistoryInput,
     };
     use frances_models_llm::{CompletionOutcome, StreamEvent, ToolChoice, ToolDef};
     use frances_storage::{EntitySchema, Migration};
@@ -1031,6 +1031,7 @@ pub mod test_deps {
         fn create(&self, builder: ChatSessionBuilder) -> Self::Session {
             self.builders.lock().push(builder);
             let session = StubSession {
+                id: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(Vec::new())),
                 next_script: self.next_script.clone(),
             };
@@ -1038,10 +1039,14 @@ pub mod test_deps {
             session
         }
 
-        async fn load(&self, _id: ChatSessionId) -> Result<Self::Session, ChatError> {
-            Err(ChatError::History(HistoryError::ChatSessionNotFound(
-                ChatSessionId(0),
-            )))
+        async fn load(&self, id: ChatSessionId) -> Result<Self::Session, ChatError> {
+            let session = StubSession {
+                id: Arc::new(Mutex::new(Some(id))),
+                pending: Arc::new(Mutex::new(Vec::new())),
+                next_script: self.next_script.clone(),
+            };
+            self.sessions.lock().push(session.clone());
+            Ok(session)
         }
 
         async fn complete(
@@ -1064,9 +1069,9 @@ pub mod test_deps {
             }
         }
     }
-
     #[derive(Clone)]
     pub struct StubSession {
+        id: Arc<Mutex<Option<ChatSessionId>>>,
         pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
         next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
     }
@@ -1079,6 +1084,18 @@ pub mod test_deps {
 
     #[async_trait]
     impl ChatSession for StubSession {
+        fn id(&self) -> Option<ChatSessionId> {
+            *self.id.lock()
+        }
+
+        async fn ensure_persisted(&self) -> Result<Option<ChatSessionId>, ChatError> {
+            let mut id = self.id.lock();
+            if id.is_none() {
+                *id = Some(ChatSessionId(1));
+            }
+            Ok(*id)
+        }
+
         fn push(&self, input: OwnedHistoryInput) {
             self.pending.lock().push(input);
         }

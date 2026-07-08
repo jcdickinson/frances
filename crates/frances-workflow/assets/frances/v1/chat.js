@@ -65,8 +65,12 @@
 
 import { ReadableStream, TransformStream } from "whatwg:web-streams";
 
-const { ChatSession, __chat_inner_stream: _innerStream, __complete: complete } =
-  globalThis.__frances_v1_stash__;
+const {
+  ChatSession,
+  __chat_inner_stream: _innerStream,
+  __chat_load_session: _loadSession,
+  __complete: complete,
+} = globalThis.__frances_v1_stash__;
 
 ChatSession.prototype.stream = function stream(opts) {
   return _streamWithDispatch(this, opts, () => this.toolCall);
@@ -334,4 +338,8 @@ function _createScope(chat, session, idx) {
 //
 // `requireToolCall`/`toolChoice` route to the enforced path (force the
 // tool, scold + retry); otherwise it's a plain completion.
-export { ChatSession, complete };
+async function loadChatSession(id) {
+  return await _loadSession(id);
+}
+
+export { ChatSession, complete, loadChatSession };

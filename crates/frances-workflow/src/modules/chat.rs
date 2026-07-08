@@ -56,7 +56,7 @@ use tokio_util::sync::CancellationToken;
 
 use frances_core::Truncated;
 use frances_models_llm::chat::{
-    ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder,
+    ChatError, ChatSession as ChatSessionTrait, ChatSessionBuilder, ChatSessionId,
     ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, EnforceError,
     ModelIntents, OwnedHistoryInput,
 };
@@ -77,8 +77,9 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
     usage_tx: UnboundedSender<frances_models_llm::Usage>,
-) -> JsResult<(Constructor<'js>, Function<'js>)> {
+) -> JsResult<(Constructor<'js>, Function<'js>, Function<'js>)> {
     let ctor_usage_tx = usage_tx.clone();
+    let ctor_deps = deps.clone();
     let ctor = Constructor::new_class::<ChatSessionJs<D>, _, _>(
         ctx.clone(),
         move |ctx: Ctx<'js>, arg: Value<'js>| -> JsResult<Class<'js, ChatSessionJs<D>>> {
@@ -86,24 +87,8 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
             let builder = ChatSessionBuilder::new()
                 .with_model_intents(opts.intents)
                 .with_ephemeral(opts.ephemeral);
-            let handle = deps.chat_session_manager().create(builder);
-            let instance = Class::instance(
-                ctx.clone(),
-                ChatSessionJs::<D> {
-                    handle,
-                    deps: deps.clone(),
-                    usage_tx: ctor_usage_tx.clone(),
-                },
-            )?;
-            // `tools` is a fresh JS array on every instance. Workflows
-            // mutate it via `chat.tools.push({ ... })`; the Rust side
-            // snapshots it at each `stream()` call.
-            instance.set("tools", Array::new(ctx.clone())?)?;
-            // `promptSections` is a fresh JS array for prompt section
-            // objects. Workflows push `{ prompt(ctx) -> string | null }`
-            // objects into it; `stream()` renders them before each round.
-            instance.set("promptSections", Array::new(ctx.clone())?)?;
-            Ok(instance)
+            let handle = ctor_deps.chat_session_manager().create(builder);
+            build_chat_session_instance(&ctx, handle, ctor_deps.clone(), ctor_usage_tx.clone())
         },
     )?;
 
@@ -118,7 +103,74 @@ pub(crate) fn build_chat_session_ctor<'js, D: WorkflowDeps>(
         },
     )?;
 
-    Ok((ctor, inner_stream))
+    let load_session = Function::new(ctx.clone(), {
+        let deps = deps.clone();
+        let usage_tx = usage_tx.clone();
+        move |ctx: Ctx<'js>, id: i64| -> JsResult<Value<'js>> {
+            let manager = deps.chat_session_manager().clone();
+            let deps = deps.clone();
+            let usage_tx = usage_tx.clone();
+            let promised = Promised::from(async move {
+                match manager.load(ChatSessionId(id)).await {
+                    Ok(handle) => LoadedChatSession::Loaded {
+                        handle,
+                        deps,
+                        usage_tx,
+                    },
+                    Err(e) => LoadedChatSession::Failed(e),
+                }
+            });
+            promised.into_js(&ctx)
+        }
+    })?;
+
+    Ok((ctor, inner_stream, load_session))
+}
+
+fn build_chat_session_instance<'js, D: WorkflowDeps>(
+    ctx: &Ctx<'js>,
+    handle: Session<D>,
+    deps: D,
+    usage_tx: UnboundedSender<frances_models_llm::Usage>,
+) -> JsResult<Class<'js, ChatSessionJs<D>>> {
+    let instance = Class::instance(
+        ctx.clone(),
+        ChatSessionJs::<D> {
+            handle,
+            deps,
+            usage_tx,
+        },
+    )?;
+    // `tools` is a fresh JS array on every instance. Workflows mutate it via
+    // `chat.tools.push({ ... })`; the Rust side snapshots it at each `stream()` call.
+    instance.set("tools", Array::new(ctx.clone())?)?;
+    // `promptSections` is a fresh JS array for prompt section objects. Workflows push
+    // `{ prompt(ctx) -> string | null }` objects into it; `stream()` renders them before
+    // each round.
+    instance.set("promptSections", Array::new(ctx.clone())?)?;
+    Ok(instance)
+}
+
+enum LoadedChatSession<D: WorkflowDeps> {
+    Loaded {
+        handle: Session<D>,
+        deps: D,
+        usage_tx: UnboundedSender<frances_models_llm::Usage>,
+    },
+    Failed(ChatError),
+}
+
+impl<'js, D: WorkflowDeps> IntoJs<'js> for LoadedChatSession<D> {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self {
+            LoadedChatSession::Loaded {
+                handle,
+                deps,
+                usage_tx,
+            } => build_chat_session_instance(ctx, handle, deps, usage_tx).map(|c| c.into_value()),
+            LoadedChatSession::Failed(e) => Err(throw(ctx, &e.to_string())),
+        }
+    }
 }
 
 /// Build the standalone `complete` export: a one-shot, ephemeral LLM
@@ -334,6 +386,27 @@ fn parse_message_obj<'js>(
     }
 }
 
+enum ChatSessionIdResult {
+    Ready(Option<ChatSessionId>),
+    Failed(ChatError),
+}
+
+impl<'js> IntoJs<'js> for ChatSessionIdResult {
+    fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
+        match self {
+            ChatSessionIdResult::Ready(id) => chat_session_id_into_js(ctx, id),
+            ChatSessionIdResult::Failed(e) => Err(throw(ctx, &e.to_string())),
+        }
+    }
+}
+
+fn chat_session_id_into_js<'js>(ctx: &Ctx<'js>, id: Option<ChatSessionId>) -> JsResult<Value<'js>> {
+    match id {
+        Some(id) => id.0.into_js(ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
 fn get_optional_bool<'js>(ctx: &Ctx<'js>, obj: &Object<'js>, key: &str) -> JsResult<Option<bool>> {
     let v: Value<'js> = get_or_undefined(ctx, obj, key);
     if v.is_undefined() || v.is_null() {
@@ -414,6 +487,34 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
                 ctx.clone(),
                 |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, msg: Value<'js>| {
                     push_message::<D>(&ctx, &this.0, msg)
+                },
+            )?,
+        )?;
+
+        proto.set(
+            "id",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
+                    let borrow = this.0.borrow();
+                    chat_session_id_into_js(&ctx, borrow.handle.id())
+                },
+            )?,
+        )?;
+
+        proto.set(
+            "ensurePersisted",
+            Function::new(
+                ctx.clone(),
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| -> JsResult<Value<'js>> {
+                    let handle = this.0.borrow().handle.clone();
+                    let promised = Promised::from(async move {
+                        match handle.ensure_persisted().await {
+                            Ok(id) => ChatSessionIdResult::Ready(id),
+                            Err(e) => ChatSessionIdResult::Failed(e),
+                        }
+                    });
+                    promised.into_js(&ctx)
                 },
             )?,
         )?;

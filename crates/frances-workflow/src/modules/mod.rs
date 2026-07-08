@@ -288,10 +288,11 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("ToolUseSection", tool_use_ctor)?;
     stash.set("DiffSection", diff_ctor)?;
 
-    let (chat_ctor, chat_inner_stream) =
+    let (chat_ctor, chat_inner_stream, chat_load_session) =
         chat::build_chat_session_ctor(ctx, deps.clone(), senders.usage.clone())?;
     stash.set("ChatSession", chat_ctor)?;
     stash.set("__chat_inner_stream", chat_inner_stream)?;
+    stash.set("__chat_load_session", chat_load_session)?;
     stash.set("__complete", chat::build_complete_fn(ctx, deps.clone())?)?;
 
     let shell_ctor = shell::build_shell_ctor(ctx, deps.clone())?;

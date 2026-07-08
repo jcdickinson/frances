@@ -160,6 +160,13 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
     fn push(&self, input: OwnedHistoryInput) {
         self.push_internal(input);
     }
+    fn id(&self) -> Option<ChatSessionId> {
+        self.id()
+    }
+
+    async fn ensure_persisted(&self) -> Result<Option<ChatSessionId>, ChatError> {
+        self.ensure_row().await.map_err(ChatError::from)
+    }
 
     fn push_system(&self, input: OwnedHistoryInput) {
         self.push_system_internal(input);

@@ -31,7 +31,8 @@ import {
   ReasoningSection,
   ToolUseSection,
 } from "frances:v1/sections";
-import { ChatSession, complete } from "frances:v1/chat";
+import { ChatSession, complete, loadChatSession } from "frances:v1/chat";
+import { db } from "frances:v1/storage";
 import {
   Shell,
   Run,
@@ -104,6 +105,40 @@ type ToolResult = {
   content: string;
   is_error: boolean;
 };
+
+type PersistedChat = {
+  id: number | null;
+  mode: Mode;
+  pendingSeed: string | null;
+};
+
+type PersistedStepTranscript = {
+  entries: string[];
+  summary: string | null;
+};
+
+type PersistedState = {
+  schemaVersion: 1;
+  instanceId: string;
+  mode: Mode;
+  plan: Plan;
+  nextStepId: number;
+  currentChat: PersistedChat;
+  variables: Array<[string, unknown]>;
+  stepTranscript: PersistedStepTranscript;
+  pending: {
+    completion: CompletionSignal | null;
+    planExit: boolean;
+    planBegin: PlanBeginRequest | null;
+  };
+};
+
+const STATE_SCHEMA_VERSION = 1;
+const INSTANCE_ID = String(import.meta.instance);
+const STATE_TABLE = "main_workflow_state";
+
+let currentChatId: number | null = null;
+let currentChatPendingSeed: string | null = null;
 
 let plan: Plan = {
   title: "Untitled plan",
@@ -202,6 +237,94 @@ function _errResult(call_id: string, err: unknown): ToolResult {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+
+async function ensureStateTable(): Promise<void> {
+  await db.exec(
+    `CREATE TABLE IF NOT EXISTS ${STATE_TABLE} (` +
+      "instance_id TEXT PRIMARY KEY, " +
+      "version INTEGER NOT NULL, " +
+      "state_json TEXT NOT NULL, " +
+      "updated_at TEXT NOT NULL" +
+      ")",
+  );
+}
+
+function makePersistedState(): PersistedState {
+  return {
+    schemaVersion: STATE_SCHEMA_VERSION,
+    instanceId: INSTANCE_ID,
+    mode,
+    plan,
+    nextStepId,
+    currentChat: {
+      id: currentChatId,
+      mode,
+      pendingSeed: currentChatPendingSeed,
+    },
+    variables: vars.entries(),
+    stepTranscript: {
+      entries: [...stepTranscriptEntries],
+      summary: stepTranscriptSummary,
+    },
+    pending: {
+      completion: pendingCompletion,
+      planExit: pendingPlanExit,
+      planBegin: pendingPlanBegin,
+    },
+  };
+}
+
+async function saveState(): Promise<void> {
+  await ensureCurrentChatPersisted();
+  const state = makePersistedState();
+  await db.exec(
+    `INSERT INTO ${STATE_TABLE} (instance_id, version, state_json, updated_at) ` +
+      "VALUES (?, ?, ?, ?) " +
+      "ON CONFLICT(instance_id) DO UPDATE SET " +
+      "version = excluded.version, " +
+      "state_json = excluded.state_json, " +
+      "updated_at = excluded.updated_at",
+    [INSTANCE_ID, STATE_SCHEMA_VERSION, JSON.stringify(state), now()],
+  );
+}
+
+async function loadPersistedState(): Promise<PersistedState | null> {
+  await ensureStateTable();
+  const rows = await db.query(
+    `SELECT state_json FROM ${STATE_TABLE} WHERE instance_id = ?`,
+    [INSTANCE_ID],
+  );
+  if (!rows || rows.length === 0) return null;
+  const raw = JSON.parse(rows[0].state_json);
+  if (raw?.schemaVersion !== STATE_SCHEMA_VERSION) {
+    throw new Error(`unsupported main workflow state schema: ${raw?.schemaVersion}`);
+  }
+  return raw as PersistedState;
+}
+
+function restorePersistedState(state: PersistedState): void {
+  mode = state.mode === "executing" ? "executing" : "planning";
+  plan = state.plan;
+  nextStepId = typeof state.nextStepId === "number" ? state.nextStepId : 1;
+  currentChatId = typeof state.currentChat?.id === "number" ? state.currentChat.id : null;
+  currentChatPendingSeed =
+    typeof state.currentChat?.pendingSeed === "string"
+      ? state.currentChat.pendingSeed
+      : null;
+  vars.replace(Array.isArray(state.variables) ? state.variables : []);
+  stepTranscriptEntries.length = 0;
+  if (Array.isArray(state.stepTranscript?.entries)) {
+    stepTranscriptEntries.push(...state.stepTranscript.entries);
+  }
+  stepTranscriptSummary =
+    typeof state.stepTranscript?.summary === "string"
+      ? state.stepTranscript.summary
+      : null;
+  pendingCompletion = state.pending?.completion || null;
+  pendingPlanExit = Boolean(state.pending?.planExit);
+  pendingPlanBegin = state.pending?.planBegin || null;
 }
 
 function normalizeStep(raw: any, idx: number): PlanStep {
@@ -597,6 +720,7 @@ class PlanUpdate {
           closed: true,
         }),
       );
+      await saveState();
       return _okResult(call.id, renderPlan());
     } catch (err) {
       return _errResult(call.id, err);
@@ -664,6 +788,7 @@ class TaskComplete {
           : undefined,
       artifacts: args.artifacts,
     };
+    await saveState();
     return _okResult(
       call.id,
       "Task-completion signal recorded; awaiting referee approval.",
@@ -691,6 +816,7 @@ class PlanExit {
       );
     }
     pendingPlanExit = true;
+    await saveState();
     return _okResult(call.id, "Planning complete; beginning execution.");
   };
 }
@@ -732,6 +858,7 @@ class PlanBegin {
       goal: typeof args.goal === "string" ? args.goal.trim() : "",
       context: typeof args.context === "string" ? args.context.trim() : "",
     };
+    await saveState();
     return _okResult(call.id, "Returning to planning to resolve with the user.");
   };
 }
@@ -838,12 +965,14 @@ function wrapTool(tool: any): void {
       `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,
       4000,
     );
+    await saveState();
     const result = await original({ call, scope });
     recordStepTranscript(
       `Tool result: ${call.name}`,
       `id: ${call.id}\nis_error: ${Boolean(result?.is_error)}\ncontent:\n${textToString(result?.content)}`,
       8000,
     );
+    await saveState();
     return result;
   };
 }
@@ -915,30 +1044,77 @@ function freshContext(): void {
   executingTools = [...explore, ...editTools, planUpdate, taskComplete, planBegin];
 }
 
-function newPlanningChat(seed?: string): ChatSession {
+function attachPlanningChat(session: ChatSession): ChatSession {
   freshContext();
-  const session = new ChatSession({ model_intents: ["chat"] });
   session.promptSections.push(...planningSections);
   session.tools.push(...planningTools);
-  if (seed) session.push({ role: "user", content: seed });
   return session;
 }
 
-function newExecutionChat(seed?: string): ChatSession {
+function attachExecutionChat(session: ChatSession): ChatSession {
   freshContext();
-  const session = new ChatSession({ model_intents: ["chat"] });
   session.promptSections.push(...executionSections);
   session.tools.push(...executingTools);
-  if (seed) session.push({ role: "user", content: seed });
   return session;
 }
 
-let chat = newPlanningChat();
+async function ensureCurrentChatPersisted(): Promise<void> {
+  if (currentChatId !== null || !chat) return;
+  const id = await chat.ensurePersisted();
+  currentChatId = typeof id === "number" ? id : null;
+}
+
+async function setChat(session: ChatSession, seed?: string | null): Promise<void> {
+  chat = session;
+  currentChatId = null;
+  currentChatPendingSeed = seed || null;
+  if (seed) chat.push({ role: "user", content: seed });
+  await saveState();
+}
+
+async function newPlanningChat(seed?: string): Promise<void> {
+  const session = attachPlanningChat(new ChatSession({ model_intents: ["chat"] }));
+  await setChat(session, seed);
+}
+
+async function newExecutionChat(seed?: string): Promise<void> {
+  const session = attachExecutionChat(new ChatSession({ model_intents: ["chat"] }));
+  await setChat(session, seed);
+}
+
+let chat: ChatSession;
+
+async function loadChatForState(state: PersistedState): Promise<ChatSession> {
+  const loaded = state.currentChat.id === null
+    ? new ChatSession({ model_intents: ["chat"] })
+    : await loadChatSession(state.currentChat.id);
+  const session = state.mode === "executing"
+    ? attachExecutionChat(loaded)
+    : attachPlanningChat(loaded);
+  if (currentChatPendingSeed) {
+    session.push({ role: "user", content: currentChatPendingSeed });
+  }
+  return session;
+}
+
+async function initializeWorkflow(): Promise<boolean> {
+  const state = await loadPersistedState();
+  if (state) {
+    restorePersistedState(state);
+    chat = await loadChatForState(state);
+    return true;
+  }
+
+  chat = attachPlanningChat(new ChatSession({ model_intents: ["chat"] }));
+  currentChatId = null;
+  currentChatPendingSeed = null;
+  await ensureCurrentChatPersisted();
+  return false;
+}
 
 async function handlePendingCompletion(): Promise<boolean> {
   if (!pendingCompletion) return false;
   const signal = pendingCompletion;
-  pendingCompletion = null;
   const judgement = await referee(signal);
   if (judgement.type === "decline") {
     // Ralph Wiggum retry: clear context and restart the step from the plan,
@@ -947,7 +1123,8 @@ async function handlePendingCompletion(): Promise<boolean> {
     // keeps accumulating across the retry (so the eventual summary covers it).
     const msg = `Referee declined task completion: ${judgement.message}`;
     transcript.push(new MarkdownSection({ content: msg, closed: true }));
-    chat = newExecutionChat(declineSeed(judgement.message));
+    pendingCompletion = null;
+    await newExecutionChat(declineSeed(judgement.message));
     return true;
   }
 
@@ -962,6 +1139,7 @@ async function handlePendingCompletion(): Promise<boolean> {
         `Internal plan error while completing the task: ${String(err)}. ` +
         "Call plan_update to repair the plan, then continue.",
     });
+    await saveState();
     return false;
   }
   transcript.push(
@@ -976,7 +1154,8 @@ async function handlePendingCompletion(): Promise<boolean> {
     }),
   );
   resetStepTranscript();
-  chat = newExecutionChat(contextAfterCompletion(completed));
+  pendingCompletion = null;
+  await newExecutionChat(contextAfterCompletion(completed));
   return true;
 }
 
@@ -1022,7 +1201,50 @@ async function turn(): Promise<TurnEnd> {
     return true;
   }
 
+
+  async function consumePendingSignals(): Promise<boolean> {
+    if (pendingPlanExit) {
+      pendingPlanExit = false;
+      mode = "executing";
+      resetStepTranscript();
+      transcript.push(
+        new MarkdownSection({
+          content: "Planning complete — beginning execution.",
+          source: "assistant",
+          closed: true,
+        }),
+      );
+      await saveState();
+      await newExecutionChat(executionSeed());
+      return true;
+    }
+    if (pendingPlanBegin) {
+      const req = pendingPlanBegin;
+      pendingPlanBegin = null;
+      if (overBudget()) return false;
+      mode = "planning";
+      transcript.push(
+        new MarkdownSection({
+          content: "Returning to planning to resolve a question with the user.",
+          source: "assistant",
+          closed: true,
+        }),
+      );
+      await saveState();
+      await newPlanningChat(planBeginSeed(req));
+      return true;
+    }
+    if (pendingCompletion) {
+      const reset = await handlePendingCompletion();
+      if (reset) {
+        if (overBudget()) return false;
+        return true;
+      }
+    }
+    return false;
+  }
   while (true) {
+    if (await consumePendingSignals()) continue;
     setStatus(mode === "planning" ? "planning…" : "working…");
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
@@ -1086,6 +1308,8 @@ async function turn(): Promise<TurnEnd> {
       // for `ourLoop` to handle as the next turn.
       try {
         await round;
+        currentChatPendingSeed = null;
+        await saveState();
       } catch (_) {
         // The round failed on its own; `ourLoop` surfaces the error.
       }
@@ -1093,48 +1317,10 @@ async function turn(): Promise<TurnEnd> {
       return "interjected";
     }
 
+    currentChatPendingSeed = null;
+    await saveState();
     const { tool_calls } = winner.completed;
-    if (pendingPlanExit) {
-      pendingPlanExit = false;
-      mode = "executing";
-      resetStepTranscript();
-      transcript.push(
-        new MarkdownSection({
-          content: "Planning complete — beginning execution.",
-          source: "assistant",
-          closed: true,
-        }),
-      );
-      chat = newExecutionChat(executionSeed());
-      continue;
-    }
-    if (pendingPlanBegin) {
-      // Execution agent dropped back into planning to ask the user. Clear
-      // context and switch toolsets; the plan (with its completion statuses)
-      // is preserved, so `plan_exit` later just resumes from the active step.
-      // Counting this against the budget bounds any plan_begin/plan_exit
-      // ping-pong (only one side needs to count to bound the round-trip).
-      const req = pendingPlanBegin;
-      pendingPlanBegin = null;
-      if (overBudget()) break;
-      mode = "planning";
-      transcript.push(
-        new MarkdownSection({
-          content: "Returning to planning to resolve a question with the user.",
-          source: "assistant",
-          closed: true,
-        }),
-      );
-      chat = newPlanningChat(planBeginSeed(req));
-      continue;
-    }
-    if (pendingCompletion) {
-      const reset = await handlePendingCompletion();
-      if (reset) {
-        if (overBudget()) break;
-        continue;
-      }
-    }
+    if (await consumePendingSignals()) continue;
     if (!tool_calls || tool_calls.length === 0) {
       // The only clean way out of a step is `task_complete`. If the model went
       // idle while a step is still active, it stopped prematurely — nudge it
@@ -1152,6 +1338,7 @@ async function turn(): Promise<TurnEnd> {
             "blocked; I MUST call `plan_update` if the plan needs to change, or " +
             "I MUST call `plan_begin` if I need to ask the user something.",
         });
+        await saveState();
         continue;
       }
       break;
@@ -1165,14 +1352,18 @@ async function turn(): Promise<TurnEnd> {
   return "idle";
 }
 
-transcript.push(
-  new MarkdownSection({
-    content:
-      "frances ready. Describe what you'd like to do and we'll plan it " +
-      "together first. Type `quit` to exit.",
-    closed: true,
-  }),
-);
+const restored = await initializeWorkflow();
+if (!restored) {
+  transcript.push(
+    new MarkdownSection({
+      content:
+        "frances ready. Describe what you'd like to do and we'll plan it " +
+        "together first. Type `quit` to exit.",
+      closed: true,
+    }),
+  );
+  await saveState();
+}
 
 // Top-level loop. `pending` is always exactly one outstanding inbox
 // read; we await it, immediately re-arm, then act. `turn()` may also
@@ -1196,6 +1387,7 @@ async function ourLoop(): Promise<void> {
       new MarkdownSection({ content: msg, source: "user", closed: true }),
     );
     recordStepTranscript("User", msg);
+    await saveState();
     if (msg === "quit") {
       transcript.push(
         new MarkdownSection({ content: "bye", source: "assistant", closed: true }),
@@ -1204,7 +1396,9 @@ async function ourLoop(): Promise<void> {
       break;
     }
 
+    currentChatPendingSeed = msg;
     chat.push({ role: "user", content: msg });
+    await saveState();
     try {
       await turn();
     } catch (e) {

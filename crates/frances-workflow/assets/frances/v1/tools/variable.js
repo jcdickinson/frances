@@ -118,6 +118,14 @@ class Variables {
   has(name) {
     return this._store.has(name);
   }
+
+  entries() {
+    return Array.from(this._store.entries());
+  }
+
+  replace(entries) {
+    this._store = new Map(entries || []);
+  }
 }
 
 // ---- tool classes ---------------------------------------------------------

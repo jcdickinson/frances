@@ -17,11 +17,13 @@ mod context_sections;
 mod drive;
 mod frames;
 mod inbox;
+mod main_workflow;
 mod permission;
 mod scope;
 mod shell;
 mod timer;
 mod tool_family;
+
 mod whatwg;
 
 fn write_source(ext: &str, body: &str) -> tempfile::NamedTempFile {
