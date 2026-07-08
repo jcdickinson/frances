@@ -118,13 +118,13 @@ Change 3, but the content is what matters):
 
 - The shell is **persistent**: the working directory and environment persist
   across `shell_run` calls.
-- You are already in the working directory shown below. **Do not** prefix
+- I am already in the working directory shown below. **I do not** prefix
   commands with `cd` to an absolute path.
-- To change directory for subsequent commands, run `cd <dir>` as its own command;
+- To change directory for subsequent commands, I run `cd <dir>` as its own command;
   it persists.
-- Use paths relative to the working directory, or absolute paths.
+- I use paths relative to the working directory, or absolute paths.
 - Prefer the dedicated tools over shell equivalents: `file_read` instead of
-  `cat`/`head`/`tail`, `file_find_or_grep` instead of shell `grep`/`find`. Use
+  `cat`/`head`/`tail`, `file_find_or_grep` instead of shell `grep`/`find`. I use
   `shell_run` for actually running programs.
 
 (That last line is the same class of guidance a good harness gives — "don't

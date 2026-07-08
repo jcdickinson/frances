@@ -19,7 +19,7 @@ Shell commands this replaces:
 
 Args: `{ root?, paths?, search?, exclude?, ignore?, hidden?, depth?, paths_only?, into? }`
 
-  root: optional string. Changes the walk root directory. By default the walk starts at the client's working directory; set `root` to search a different tree (e.g. a dependency source directory). Supports `~` expansion (e.g. `"~/.cargo/registry/..."`). Relative roots are resolved against cwd. The root must exist and be a directory. `paths` globs are matched relative to `root`. When searching outside the project, you will typically also want `ignore: false` and/or `hidden: true`.
+  root: optional string. Changes the walk root directory. By default the walk starts at the client's working directory; I set `root` to search a different tree (e.g. a dependency source directory). Supports `~` expansion (e.g. `"~/.cargo/registry/..."`). Relative roots are resolved against cwd. The root must exist and be a directory. `paths` globs are matched relative to `root`. When searching outside the project, I will typically also want `ignore: false` and/or `hidden: true`.
 
   paths: list of include globs (ripgrep dialect — `**` for recursive, `{a,b}` for alternation). Omit to match everything under cwd.
   search: optional regex (Rust regex dialect). When set, results are filtered to files containing at least one match. Binary files are skipped.
@@ -30,9 +30,9 @@ Args: `{ root?, paths?, search?, exclude?, ignore?, hidden?, depth?, paths_only?
   paths_only: bool, default `false`. When `search` is given, suppresses `first_match` but keeps `match_count` per file (useful for ranking by hit density).
   into: optional Frances variable name. When set, the full structured result lands in that variable AND an inline summary (count + first 5 paths/matches) is returned.
 
-Omitting both `paths` and `search` is valid — `{}`, `{ depth: 1 }`, `{ depth: 1, ignore: false }`, `{ hidden: true }`, etc. all list files under cwd subject to whatever filters you set. The only rejected shape is an explicit `paths: []` with no `search` — an empty list is treated as a likely bug, not a wildcard; send `{}` if you really mean "everything."
+Omitting both `paths` and `search` is valid — `{}`, `{ depth: 1 }`, `{ depth: 1, ignore: false }`, `{ hidden: true }`, etc. all list files under cwd subject to whatever filters I set. The only rejected shape is an explicit `paths: []` with no `search` — an empty list is treated as a likely bug, not a wildcard; I send `{}` if I really mean "everything."
 
-Result entries are sorted alphabetically by path. Each entry is `{ path, size, mtime, binary, match_count?, first_match? }`. The output is capped at 1000 entries; if more would have matched, a `truncated` field is included so you know to narrow the query.
+Result entries are sorted alphabetically by path. Each entry is `{ path, size, mtime, binary, match_count?, first_match? }`. The output is capped at 1000 entries; if more would have matched, a `truncated` field is included so I know to narrow the query.
 
 Examples:
 

@@ -48,13 +48,14 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = [
+          packages = with pkgs; [
             rustToolchain
-            pkgs.rust-analyzer
-            pkgs.jq
-            pkgs.python3
-            pkgs.cargo-nextest
-            pkgs.cargo-machete
+            rust-analyzer
+            jq
+            python3
+            cargo-nextest
+            cargo-machete
+            just
           ];
         };
       });

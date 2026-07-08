@@ -51,12 +51,12 @@ const editingFamily = defineToolFamily({
       "tools require a prior read. `file_new` and `file_overwrite` echo back",
       "fresh anchors for subsequent edits.",
       "",
-      "CRITICAL: `text` must NEVER contain a `Word§` prefix unless you",
+      "CRITICAL: `text` must NEVER contain a `Word§` prefix unless I",
       "genuinely want those literal characters in the file (editing the anchor",
       "engine itself, a test fixture, prose with `Word§`). Anchors are",
       "read-only metadata the engine assigns — they're not part of line",
-      "content. If you paste back the rendered prefixes from a `file_read`,",
-      "they get written verbatim and your edit is broken.",
+      "content. If I paste back the rendered prefixes from a `file_read`,",
+      "they get written verbatim and my edit is broken.",
       "",
       '  WRONG → text: "Apple§def hello():\\nBanana§    print(\\"hi\\")"',
       '  RIGHT → text: "def hello():\\n    print(\\"hi\\")"',
@@ -66,7 +66,7 @@ const editingFamily = defineToolFamily({
       "         Multi-line is fine.",
       "  from:  a Frances variable name. Its value is used as the content",
       "         (string values pass through verbatim; non-string values are",
-      "         JSON-encoded). Use this when the content was prepared via",
+      "         JSON-encoded). I use this when the content was prepared via",
       "         `variable_set` / `variable_assign` / `file_read into:` /",
       "         `shell_capture`, to avoid re-emitting a long payload in a",
       "         tool-call.",
@@ -74,11 +74,11 @@ const editingFamily = defineToolFamily({
       "Anchor protocol: every line in a `file_read` (or post-edit diff) is",
       "rendered as `Word§content` — a stable per-line anchor word, then `§`,",
       "then the line's content. The rendered string of each line is exactly",
-      "what you pass back as the `anchor` (and `end_anchor`) field of an",
+      "what I pass back as the `anchor` (and `end_anchor`) field of an",
       "edit call. `anchor` and `end_anchor` are each a single rendered line",
       "— never glue several `Word§content` lines into one field. A newline",
       "in an anchor field is rejected. On a content mismatch the call fails",
-      "and you should re-read the file before retrying.",
+      "and I should re-read the file before retrying.",
       "",
       "After every edit the file is run through the project formatter and",
       "written to disk; the returned diff block reflects the post-format",
@@ -120,8 +120,8 @@ const READ_SCHEMA = {
       type: "string",
       description:
         "Optional Frances variable name to store the file's raw bytes into. " +
-        "Bypasses anchors and does NOT count as a read for editing — call " +
-        "file_read without `into` if you intend to edit the file afterwards. Mutually exclusive with `ranges`.",
+        "Bypasses anchors and does NOT count as a read for editing — I MUST call " +
+        "file_read without `into` if I intend to edit the file afterwards. Mutually exclusive with `ranges`.",
     },
   },
   required: ["path"],
@@ -213,10 +213,10 @@ function _resolveText(args, vars) {
   const hasFrom =
     args.from !== undefined && args.from !== null && args.from !== "";
   if (hasText && hasFrom) {
-    throw new Error("provide exactly one of `text` or `from`, not both");
+    throw new Error("I provide exactly one of `text` or `from`, not both");
   }
   if (!hasText && !hasFrom) {
-    throw new Error("provide exactly one of `text` or `from`");
+    throw new Error("I provide exactly one of `text` or `from`");
   }
   if (hasFrom) {
     if (!vars.has(args.from)) {
@@ -271,7 +271,7 @@ class Read {
       if (into && ranges) {
         return _errResult(
           call.id,
-          new Error("provide exactly one of `into` or `ranges`, not both"),
+          new Error("I provide exactly one of `into` or `ranges`, not both"),
         );
       }
       if (into) {

@@ -56,7 +56,7 @@ async fn context_sections_env_block_emits_environment_info() {
         "missing persistent shell rule"
     );
     assert!(
-        output.contains("Do not prefix commands with `cd`"),
+        output.contains("I do not prefix commands with `cd`"),
         "missing cd guidance"
     );
     assert!(

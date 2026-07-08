@@ -5,7 +5,7 @@ Args: `{ name, from }`
   name:  Frances variable name to store the captured value into.
   from:  bash variable name to read (`[A-Za-z_][A-Za-z0-9_]*`).
 
-Mechanism: bash runs `( set -u; printf '%s' "$<from>" > 'tmpfile' )` and Rust reads the file back. The captured value is always stored as a string in Frances; use `variable_assign` with `filter: "fromjson"` if you know the content is JSON-encoded.
+Mechanism: bash runs `( set -u; printf '%s' "$<from>" > 'tmpfile' )` and Rust reads the file back. The captured value is always stored as a string in Frances; I use `variable_assign` with `filter: "fromjson"` if I know the content is JSON-encoded.
 
 Errors if the bash variable is unset (the `set -u` subshell makes "unset" distinguishable from "empty"). To capture command output instead of a variable, redirect with `shell_run` first (e.g. `RESULT=$(some-cmd)`) then `shell_capture` from `RESULT`.
 

@@ -36,7 +36,7 @@ export const envBlock = {
       "- `FRANCES_ROOT` is reserved and Frances-managed. Persisted environment cannot override it.",
     );
     lines.push(
-      '- You are already in the working directory shown below. Do not prefix commands with `cd` to an absolute path.',
+      '- I am already in the working directory shown below. I do not prefix commands with `cd` to an absolute path.',
     );
     lines.push(
       '- To change directory for subsequent commands, run `cd <dir>` as its own command; it persists.',
@@ -65,4 +65,3 @@ export const cwdBlock = {
     return `Current working directory: ${ctx.cwd}`;
   },
 };
-

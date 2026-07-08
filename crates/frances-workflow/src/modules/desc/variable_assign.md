@@ -3,10 +3,10 @@ Evaluate a jq filter and store the result into a variable. The destination's pri
 Args: `{ name, filter, inputs? }`
 
   name:    destination variable. Read in as `.` and overwritten by the filter's result.
-  filter:  a jq filter expression. Must produce exactly one output — wrap with `[...]` if you want an array.
+  filter:  a jq filter expression. Must produce exactly one output — wrap with `[...]` if I want an array.
   inputs:  optional array of variable names to expose inside the filter as `$name` bindings. Each must already be set.
 
-Use this to:
+I use this to:
 
 - create / overwrite values, including constructing objects and arrays from scratch (e.g. `'{"steps": ["a","b"], "done": false}'`).
 - mutate a stored value (`'. + 1'`, `'.done = true'`, `'.steps += ["c"]'`).
@@ -32,4 +32,4 @@ List the keys of another variable:
 
   { "name": "plan_keys", "filter": "$plan | keys", "inputs": ["plan"] }
 
-The response reports only the stored type (e.g. `plan = object(2 keys)`, `obj_keys = array(2 items)`, `counter = number`) — NOT the value. Call `variable_get` if you need to see it. If the type isn't what you expected (e.g. `string` when you wrote a filter that should yield an object), the filter or the input shape is wrong.
+The response reports only the stored type (e.g. `plan = object(2 keys)`, `obj_keys = array(2 items)`, `counter = number`) — NOT the value. I will call `variable_get` if I need to see it. If the type isn't what I expected (e.g. `string` when I wrote a filter that should yield an object), the filter or the input shape is wrong.

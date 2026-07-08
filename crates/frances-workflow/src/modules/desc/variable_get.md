@@ -7,7 +7,7 @@ Args: `{ name, filter? }`
 
 Without `filter`, returns the whole stored JSON value rendered as text (objects/arrays pretty-printed with two-space indent). With `filter`, returns the filter's result rendered the same way. Errors if no variable with that name has been set, or if the filter fails to compile/run.
 
-The variable's value is `.` — NOT `$name`. Unlike `variable_assign`, there are no `$name` bindings here. If you need to combine multiple variables in one filter, use `variable_assign` (which writes a destination).
+The variable's value is `.` — NOT `$name`. Unlike `variable_assign`, there are no `$name` bindings here. If I need to combine multiple variables in one filter, I use `variable_assign` (which writes a destination).
 
 WORKED EXAMPLES.
 

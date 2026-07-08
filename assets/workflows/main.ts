@@ -126,35 +126,36 @@ let mode: Mode = "planning";
 // The planning interview is adapted from Matt Pocock's "grill-me" skill:
 // https://github.com/mattpocock/skills/blob/main/skills/productivity/grill-me/SKILL.md
 const PLANNING_PROMPT =
-  "You are an agentic coding assistant, currently in the PLANNING phase. Your " +
+  "I am an agentic coding assistant, currently in the PLANNING phase. My " +
   "job here is not to do the work — it is to reach a shared understanding with " +
   "the user and capture it as a typed plan.\n\n" +
-  "Interview the user relentlessly about every aspect of this plan until you " +
-  "reach a shared understanding. Walk down each branch of the design tree, " +
+  "I will interview the user relentlessly about every aspect of this plan until I " +
+  "reach a shared understanding. I will walk down each branch of the design tree, " +
   "resolving dependencies between decisions one-by-one. For each question, " +
-  "provide your recommended answer.\n\n" +
-  "Ask the questions one at a time.\n\n" +
-  "If a question can be answered by exploring the codebase, explore the " +
-  "codebase instead (you have read and search tools).\n\n" +
-  "As understanding crystallises, record it with the `plan_update` tool: a " +
+  "I will provide my recommended answer.\n\n" +
+  "I will ask the questions one at a time.\n\n" +
+  "If a question can be answered by exploring the codebase, I will explore the " +
+  "codebase instead (I have read and search tools).\n\n" +
+  "As understanding crystallises, I will record it with the `plan_update` tool: a " +
   "title, a prelude capturing durable context and the decisions reached, and " +
-  "an ordered list of steps. The plan should read like an ADR. When you and " +
-  "the user share a clear understanding and the plan has concrete steps, call " +
-  "`plan_exit` to leave planning and begin execution.";
+  "an ordered list of steps. I write the plan like an ADR and in first person: " +
+  "the prelude records what I know, and each step says what I will do. " +
+  "When the user and I share a clear understanding and the plan has concrete " +
+  "steps, I MUST call `plan_exit` to leave planning and begin execution.";
 
 const SYSTEM_PROMPT =
-  "You are an agentic coding assistant in the EXECUTION phase of a structured " +
+  "I am an agentic coding assistant in the EXECUTION phase of a structured " +
   "agentic loop. A plan has already been agreed with the user. The plan is " +
-  "living state: keep it accurate with the `plan_update` tool whenever reality " +
-  "changes, but don't re-plan from scratch. No work should happen outside an " +
-  "active step. When the active step is complete, call `task_complete` with an " +
+  "living state: I will keep it accurate with the `plan_update` tool whenever reality " +
+  "changes, but I won't re-plan from scratch. I will work only on the " +
+  "active step. When the active step is complete, I MUST call `task_complete` with an " +
   "outcome, summary, and concrete proof. A separate referee model will approve " +
-  "or decline the completion. On approval, your conversation context is cleared " +
-  "and you are restarted with the whole plan (each step title, body, and " +
-  "completed proof) plus the current location. If you are blocked on something " +
-  "only the user can decide, call `plan_begin` to return to planning and ask — " +
-  "don't guess. Occasionally provide updates on what you are trying to do; " +
-  "don't just present the user with a stream of tool calls.";
+  "or decline the completion. On approval, my conversation context is cleared " +
+  "and I am restarted with the whole plan (each step title, body, and " +
+  "completed proof) plus the current location. If I am blocked on something " +
+  "only the user can decide, I MUST call `plan_begin` to return to planning and ask — " +
+  "I won't guess. I will occasionally provide updates on what I am trying to do; " +
+  "I won't just present the user with a stream of tool calls.";
 
 // Stable section objects for planning and execution prompts.
 // These are mode-specific identity objects referenced by promptSections.
@@ -305,9 +306,9 @@ async function summarizeStepTranscript(
   summarizer.promptSections.push({
     name: "summarizer",
     prompt() {
-      return "You summarize one completed workflow step for future agent context. " +
+      return "I will summarize one completed workflow step for future agent context. " +
         "Be concise but specific. Preserve important file paths, commands, tool results, " +
-        "errors, decisions, and facts learned. Do not invent details. Return only the summary.";
+        "errors, decisions, and facts learned. I will not invent details. I will return only the summary.";
     },
   });
   summarizer.push({
@@ -473,16 +474,16 @@ function contextAfterCompletion(completed: PlanStep): string {
     `The referee approved completion of step ${stepNumber(completed)}: ` +
     `${completed.title}. The prior conversation context has been cleared.\n\n` +
     "Here is the full living plan state. It includes all steps with title, " +
-    "body, and proof for completed steps, plus the current location. Continue " +
-    "from there. If the plan is finished, report the final result to the user.\n\n" +
+    "body, and proof for completed steps, plus the current location. I will continue " +
+    "from there. If the plan is finished, I report the final result to the user.\n\n" +
     renderPlan()
   );
 }
 
 function executionSeed(): string {
   return (
-    "Planning is complete. The agreed plan is below. Begin executing from the " +
-    "active step. Work only that step; when it is done call `task_complete` " +
+    "Planning is complete. The agreed plan is below. I will begin executing from the " +
+    "active step. I will work only that step; when it is done I MUST call `task_complete` " +
     "with an outcome, summary, and concrete proof.\n\n" +
     renderPlan()
   );
@@ -491,17 +492,17 @@ function executionSeed(): string {
 function planBeginSeed(req: PlanBeginRequest): string {
   const goal = req.goal || "(no goal stated)";
   const context = req.context
-    ? `Context you carried forward:\n\n${req.context}\n\n`
+    ? `Context I carried forward:\n\n${req.context}\n\n`
     : "";
   return (
-    "You have returned to PLANNING from execution to resolve something with " +
-    "the user. Your execution context has been cleared.\n\n" +
-    `What you need to resolve:\n\n${goal}\n\n` +
+    "I have returned to PLANNING from execution to resolve something with " +
+    "the user. My execution context has been cleared.\n\n" +
+    `What I need to resolve:\n\n${goal}\n\n` +
     context +
-    "Interview the user to resolve it. Record the resolution in the plan with " +
+    "I will interview the user to resolve it. I will record the resolution in the plan with " +
     "`plan_update` (in the prelude or the relevant step body) so it survives " +
-    "the context clear; completed steps keep their proof, so do not redo or " +
-    "discard them. When the plan is right, call `plan_exit` to resume " +
+    "the context clear; completed steps keep their proof, so I will not redo or " +
+    "discard them. When the plan is right, I MUST call `plan_exit` to resume " +
     "execution from the active step.\n\n" +
     renderPlan()
   );
@@ -509,11 +510,11 @@ function planBeginSeed(req: PlanBeginRequest): string {
 
 function declineSeed(reason: string): string {
   return (
-    "A referee reviewed your `task_complete` signal for the active step and " +
-    "DECLINED it. Your conversation context has been cleared. Reason given:\n\n" +
+    "A referee reviewed my `task_complete` signal for the active step and " +
+    "DECLINED it. My conversation context has been cleared. Reason given:\n\n" +
     reason +
-    "\n\nThe full plan and your current position are below. Do the missing " +
-    "work for the active step, then call `task_complete` again only once the " +
+    "\n\nThe full plan and my current position are below. I will do the missing " +
+    "work for the active step, then I MUST call `task_complete` again only once the " +
     "proof is adequate.\n\n" +
     renderPlan()
   );
@@ -530,7 +531,7 @@ const PLAN_UPDATE_SCHEMA = {
     steps: {
       type: "array",
       description:
-        "Full ordered replacement list of steps. Each step is {id?, title, body, status?, summary?, outcome?, proof?, transcript_summary?}.",
+        "Full ordered replacement list of steps. Each step is {id?, title, body, status?, summary?, outcome?, proof?, transcript_summary?}; step bodies should be written in first person.",
       items: {
         type: "object",
         properties: {
@@ -566,8 +567,8 @@ const PLAN_UPDATE_SCHEMA = {
 class PlanUpdate {
   name = "plan_update";
   description =
-    "Create or update the living typed plan. The plan is in-memory for this workflow. " +
-    "Call this before doing work if there is no active step, and any time the plan should change.";
+    "I create or update the living typed plan. The plan is in-memory for this workflow. " +
+    "I MUST call this before doing work if there is no active step, and any time the plan should change.";
   parameters = PLAN_UPDATE_SCHEMA;
 
   describe(call: any) {
@@ -635,7 +636,7 @@ const TASK_COMPLETE_SCHEMA = {
 class TaskComplete {
   name = "task_complete";
   description =
-    "Signal that the active plan step is complete. Include outcome, summary, and proof. " +
+    "I signal that the active plan step is complete. I include outcome, summary, and proof. " +
     "This does not directly advance the plan; a referee model must approve it first.";
   parameters = TASK_COMPLETE_SCHEMA;
 
@@ -647,7 +648,7 @@ class TaskComplete {
   handler = async ({ call }: any) => {
     const args = call.arguments || {};
     if (!currentStep()) {
-      return _errResult(call.id, "no active step; call plan_update first");
+      return _errResult(call.id, "no active step; I MUST call plan_update first");
     }
     pendingCompletion = {
       step_id: typeof args.step_id === "string" ? args.step_id : undefined,
@@ -673,8 +674,8 @@ class TaskComplete {
 class PlanExit {
   name = "plan_exit";
   description =
-    "Leave the planning phase and begin executing the plan. Call this only " +
-    "once you and the user share a clear understanding and the plan has " +
+    "I leave the planning phase and begin executing the plan. I MUST call this only " +
+    "once the user and I share a clear understanding and the plan has " +
     "concrete steps.";
   parameters = { type: "object", properties: {} };
 
@@ -686,7 +687,7 @@ class PlanExit {
     if (plan.steps.length === 0) {
       return _errResult(
         call.id,
-        "cannot exit planning with an empty plan; call plan_update to add steps first",
+        "cannot exit planning with an empty plan; I MUST call plan_update to add steps first",
       );
     }
     pendingPlanExit = true;
@@ -700,13 +701,13 @@ const PLAN_BEGIN_SCHEMA = {
     goal: {
       type: "string",
       description:
-        "What you need to resolve with the user, and why it blocks the current step.",
+        "What I need to resolve with the user, and why it blocks the current step.",
     },
     context: {
       type: "string",
       description:
-        "Self-context to carry across the context clear: what you have " +
-        "discovered, tried, or decided so far that your planning self will need.",
+        "Self-context to carry across the context clear: what I have " +
+        "discovered, tried, or decided so far that my planning self will need.",
     },
   },
 };
@@ -714,10 +715,10 @@ const PLAN_BEGIN_SCHEMA = {
 class PlanBegin {
   name = "plan_begin";
   description =
-    "Return to the planning phase to ask the user questions or reshape the " +
-    "plan when you are blocked on something only the user can resolve. Your " +
-    "execution context is cleared, so state the `goal` and any `context` worth " +
-    "keeping. Call `plan_exit` to resume execution once it is resolved.";
+    "I return to the planning phase to ask the user questions or reshape the " +
+    "plan when I am blocked on something only the user can resolve. My " +
+    "execution context is cleared, so I state the `goal` and any `context` worth " +
+    "keeping. I MUST call `plan_exit` to resume execution once it is resolved.";
   parameters = PLAN_BEGIN_SCHEMA;
 
   describe(call: any) {
@@ -767,11 +768,11 @@ async function referee(
         {
           role: "system",
           content:
-            "You are a strict but lightweight referee for an agentic coding loop. " +
-            "Decide whether the submitted task-completion signal satisfies the " +
-            "current step. Call the `decide` tool exactly once: verdict " +
+            "I am a strict but lightweight referee for an agentic coding loop. " +
+            "I will decide whether the submitted task-completion signal satisfies the " +
+            "current step. I MUST call the `decide` tool exactly once: verdict " +
             '"approve", or "decline" with a concise `message` telling the main ' +
-            "agent what to do next. Do not ask the user.",
+            "agent what to do next. I will not ask the user.",
         },
         {
           role: "user",
@@ -798,7 +799,7 @@ async function referee(
     // loop continues rather than falsely approving.
     return {
       type: "decline",
-      message: `referee unavailable (${String((e && e.message) || e)}); continue and provide clearer proof`,
+      message: `referee unavailable (${String((e && e.message) || e)}); I will continue and provide clearer proof`,
     };
   }
 
@@ -813,7 +814,7 @@ async function referee(
   }
   return {
     type: "decline",
-    message: "referee did not produce a verdict; continue and provide clearer proof",
+    message: "referee did not produce a verdict; I will continue and provide clearer proof",
   };
 }
 
@@ -1145,11 +1146,11 @@ async function turn(): Promise<TurnEnd> {
         chat.push({
           role: "user",
           content:
-            "You stopped without finishing the active step. Continue working " +
-            "on it. Call `task_complete` with an outcome (succeeded / partial " +
-            "/ failed), a summary, and concrete proof once it is done or you " +
-            "are blocked; call `plan_update` if the plan needs to change, or " +
-            "`plan_begin` if you need to ask the user something.",
+            "I stopped without finishing the active step. I MUST continue working " +
+            "on it. I MUST call `task_complete` with an outcome (succeeded / partial " +
+            "/ failed), a summary, and concrete proof once it is done or I am " +
+            "blocked; I MUST call `plan_update` if the plan needs to change, or " +
+            "I MUST call `plan_begin` if I need to ask the user something.",
         });
         continue;
       }

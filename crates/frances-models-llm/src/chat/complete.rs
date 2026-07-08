@@ -78,12 +78,12 @@ impl Demand {
     pub(crate) fn scold(&self, outcome: &CompletionOutcome) -> String {
         let base = match self {
             Demand::Required => {
-                "Your last response didn't call any tool. Respond with exactly one tool call."
+                "My last response didn't call any tool. I MUST respond with exactly one tool call."
                     .to_owned()
             }
             Demand::Function(name) => format!(
-                "Your last response didn't call the required `{name}` tool. \
-                 Respond with exactly one call to `{name}`."
+                "My last response didn't call the required `{name}` tool. \
+                 I MUST respond with exactly one call to `{name}`."
             ),
         };
         match self.demanded_error(outcome) {

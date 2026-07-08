@@ -7,7 +7,7 @@ Args: `{ path, find, replacement, count? }`
   replacement: Replacement template using Rust regex replacement syntax: `$1`, `${name}`, and `$$` for a literal `$`.
   count:       Optional maximum match count. If `find` matches more than `count` times, the call fails without writing and reports the actual match count.
 
-This tool is unanchored by design: it is for cross-cutting changes such as renaming a repeated identifier or normalizing a recurring import. Use `file_replace_lines` when you need a precise anchor-bracketed range.
+This tool is unanchored by design: it is for cross-cutting changes such as renaming a repeated identifier or normalizing a recurring import. I use `file_replace_lines` when I need a precise anchor-bracketed range.
 
 If the regex matches zero times, the call succeeds with a no-changes result; it does not write the file or run the formatter.
 

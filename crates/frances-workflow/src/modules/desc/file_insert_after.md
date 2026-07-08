@@ -11,7 +11,7 @@ WORKED EXAMPLE. After `file_read` on `src/greet.py` returns:
   Banana§    print("hi")
   Daisy§def goodbye():
 
-To insert a docstring before `goodbye` (which is the same as inserting AFTER the blank line — but if there isn't one, you can pin to `Banana` and insert after that, or use `file_insert_before` on `Daisy`). To add a comment after the print:
+To insert a docstring before `goodbye` (which is the same as inserting AFTER the blank line — but if there isn't one, I can pin to `Banana` and insert after that, or use `file_insert_before` on `Daisy`). To add a comment after the print:
 
 {
   "path": "src/greet.py",
@@ -20,4 +20,3 @@ To insert a docstring before `goodbye` (which is the same as inserting AFTER the
 }
 
 Returns the diff block for the file with new anchors for inserted lines.
-

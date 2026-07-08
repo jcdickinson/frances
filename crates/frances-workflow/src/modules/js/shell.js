@@ -78,17 +78,17 @@ const shellFamily = defineToolFamily({
 const QUIET_PROP = {
   type: "number",
   description:
-    "Seconds of output silence before control returns to you (default 10). " +
-    "The command keeps running — call shell_wait to resume. Lower it when you " +
+    "Seconds of output silence before control returns to me (default 10). " +
+    "The command keeps running — I MUST call shell_wait to resume. I lower it when I " +
     "expect a quick command; raise it for ones with long silent phases.",
 };
 const MAX_PROP = {
   type: "number",
   description:
-    "Wall-clock seconds before control returns to you regardless of output " +
+    "Wall-clock seconds before control returns to me regardless of output " +
     "(default 120). The command is NOT killed — shell_wait resumes it. Raise it " +
     "for known-long or streaming commands (builds, dev servers, log tails) so " +
-    "you aren't interrupted every couple of minutes; this is your timeout knob. " +
+    "I am not interrupted every couple of minutes; this is my timeout knob. " +
     "If set at or below quiet, it's raised to quiet + 10s.",
 };
 // `head` / `tail` bound only the copy of the output returned to YOU; the
@@ -97,13 +97,13 @@ const MAX_PROP = {
 const HEAD_PROP = {
   type: "number",
   description:
-    "Return only the first N lines of output to you (the full output is always " +
+    "I receive only the first N lines of output (the full output is always " +
     "kept in the user's scrollback). Combine with `tail` to see both ends.",
 };
 const TAIL_PROP = {
   type: "number",
   description:
-    "Return only the last N lines of output to you (full output kept in " +
+    "I receive only the last N lines of output (full output kept in " +
     "scrollback). Combine with `head`. When neither is set, the last ~200 lines " +
     "are returned by default. Prefer this over piping to `tail` in bash.",
 };
@@ -456,10 +456,10 @@ class Run {
       "`persist` for that run, and `persist` is not a durable watch list. " +
       "Optional `stdin` is delivered to fd 0 for that invocation. " +
       "FRANCES_ROOT is reserved and Frances-managed. If output goes quiet " +
-      "before the command finishes, the result will say so — call shell_wait " +
+      "before the command finishes, the result will say so — I MUST call shell_wait " +
       "to keep waiting or shell_kill to stop. Set `quiet` and `max` (seconds) " +
       "to tune how long it waits before handing control back — raise them for " +
-      "slow or streaming commands so you aren't pinged early.";
+      "slow or streaming commands so I am not pinged early.";
     this.parameters = RUN_SCHEMA;
     this.family = shellFamily;
   }
@@ -564,7 +564,7 @@ class Run {
           await _abortRunningShell(
             shell,
             scope,
-            `Killed the shell command from ${call.id} — model did not call ` +
+            `Killed the shell command from ${call.id} — I did not call ` +
               `${waitName} or ${killName} after ${maxScolds} scold(s).`,
           );
           break;
@@ -572,7 +572,7 @@ class Run {
         scoldsRemaining -= 1;
         const scoldMsg =
           `Shell from ${call.id} is still running. ` +
-          `You MUST call ${waitName} or ${killName} now.`;
+          `I MUST call ${waitName} or ${killName} now.`;
         transcript.push(
           new MarkdownSection({ content: scoldMsg, closed: true }),
         );
@@ -591,7 +591,7 @@ class Wait {
     this.shell = shell;
     this.name = "shell_wait";
     this.description =
-      "Continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
+      "I will continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
     this.parameters = WAIT_SCHEMA;
     this.family = shellFamily;
     this.hidden = true;
@@ -776,11 +776,11 @@ class Set {
     if (hasSet && hasExport) {
       return _errResult(
         call.id,
-        "provide exactly one of `set` or `export`, not both",
+        "I provide exactly one of `set` or `export`, not both",
       );
     }
     if (!hasSet && !hasExport) {
-      return _errResult(call.id, "provide exactly one of `set` or `export`");
+      return _errResult(call.id, "I provide exactly one of `set` or `export`");
     }
     const from = args.from;
     if (typeof from !== "string" || from.length === 0) {
