@@ -327,6 +327,8 @@ fn js_thread_main<D: WorkflowDeps>(
                 return;
             }
         };
+        js.set_loader(modules::EmbeddedResolver, modules::EmbeddedLoader)
+            .await;
         let transpile_cache = StdMutex::new(TranspileCache::default());
         let _ = ack_tx.send(Ok(()));
         while let Some(StartRequest { inv, reply }) = start_rx.recv().await {

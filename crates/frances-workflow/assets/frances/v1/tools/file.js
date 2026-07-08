@@ -16,9 +16,8 @@
 // `from: "<varname>"` in place of `text`, pulling the new content from
 // a stored value (string verbatim, non-string `JSON.stringify`-encoded).
 //
-// Tool descriptions live as `.md` files next to this module and are
-// pulled in via `include_str!` on the Rust side, then handed to us
-// through the stash.
+// Tool descriptions and family guidance live as `.md` files next to
+// this module and import as default strings through the embedded VFS.
 //
 // Typical wiring:
 //
@@ -36,54 +35,20 @@
 
 import { transcript, DiffSection } from "frances:v1/sections";
 import { defineToolFamily } from "frances:v1/tool-family";
+import editingFamilyPrompt from "./editing_family.md";
+import fileReadDescription from "./file_read.md";
+import fileReplaceLinesDescription from "./file_replace_lines.md";
+import fileReplaceAllDescription from "./file_replace_all.md";
+import fileInsertAfterDescription from "./file_insert_after.md";
+import fileInsertBeforeDescription from "./file_insert_before.md";
+import fileNewDescription from "./file_new.md";
+import fileOverwriteDescription from "./file_overwrite.md";
 
-const { Editor, EditorDescriptions: desc } = globalThis.__frances_v1_stash__;
+const { Editor } = globalThis.__frances_v1_stash__;
 
-// Build the editing preamble from a plain array to avoid
-// backtick-escaping headaches in a template literal.
 const editingFamily = defineToolFamily({
   prompt() {
-    return [
-      "## Editing tools — shared protocol",
-      "",
-      "Files must be read via `file_read` (without `into`) before editing.",
-      "`file_new` creates new files (no prior read needed); all other editing",
-      "tools require a prior read. `file_new` and `file_overwrite` echo back",
-      "fresh anchors for subsequent edits.",
-      "",
-      "CRITICAL: `text` must NEVER contain a `Word§` prefix unless I",
-      "genuinely want those literal characters in the file (editing the anchor",
-      "engine itself, a test fixture, prose with `Word§`). Anchors are",
-      "read-only metadata the engine assigns — they're not part of line",
-      "content. If I paste back the rendered prefixes from a `file_read`,",
-      "they get written verbatim and my edit is broken.",
-      "",
-      '  WRONG → text: "Apple§def hello():\\nBanana§    print(\\"hi\\")"',
-      '  RIGHT → text: "def hello():\\n    print(\\"hi\\")"',
-      "",
-      "All write tools accept `text` or `from` (exactly one):",
-      "  text:  the raw content and NOTHING ELSE. Use `\\n` for newlines.",
-      "         Multi-line is fine.",
-      "  from:  a Frances variable name. Its value is used as the content",
-      "         (string values pass through verbatim; non-string values are",
-      "         JSON-encoded). I use this when the content was prepared via",
-      "         `variable_set` / `variable_assign` / `file_read into:` /",
-      "         `shell_capture`, to avoid re-emitting a long payload in a",
-      "         tool-call.",
-      "",
-      "Anchor protocol: every line in a `file_read` (or post-edit diff) is",
-      "rendered as `Word§content` — a stable per-line anchor word, then `§`,",
-      "then the line's content. The rendered string of each line is exactly",
-      "what I pass back as the `anchor` (and `end_anchor`) field of an",
-      "edit call. `anchor` and `end_anchor` are each a single rendered line",
-      "— never glue several `Word§content` lines into one field. A newline",
-      "in an anchor field is rejected. On a content mismatch the call fails",
-      "and I should re-read the file before retrying.",
-      "",
-      "After every edit the file is run through the project formatter and",
-      "written to disk; the returned diff block reflects the post-format",
-      "content.",
-    ].join("\n");
+    return editingFamilyPrompt;
   },
 });
 
@@ -253,7 +218,7 @@ class Read {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_read";
-    this.description = desc.file_read;
+    this.description = fileReadDescription;
     this.parameters = READ_SCHEMA;
   }
 
@@ -298,7 +263,7 @@ class ReplaceLines {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_replace_lines";
-    this.description = desc.file_replace_lines;
+    this.description = fileReplaceLinesDescription;
     this.parameters = REPLACE_SCHEMA;
     this.family = editingFamily;
   }
@@ -337,7 +302,7 @@ class ReplaceAll {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_replace_all";
-    this.description = desc.file_replace_all;
+    this.description = fileReplaceAllDescription;
     this.parameters = REPLACE_ALL_SCHEMA;
     this.family = editingFamily;
   }
@@ -372,7 +337,7 @@ class InsertAfter {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_insert_after";
-    this.description = desc.file_insert_after;
+    this.description = fileInsertAfterDescription;
     this.parameters = INSERT_SCHEMA;
     this.family = editingFamily;
   }
@@ -410,7 +375,7 @@ class InsertBefore {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_insert_before";
-    this.description = desc.file_insert_before;
+    this.description = fileInsertBeforeDescription;
     this.parameters = INSERT_SCHEMA;
     this.family = editingFamily;
   }
@@ -448,7 +413,7 @@ class New {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_new";
-    this.description = desc.file_new;
+    this.description = fileNewDescription;
     this.parameters = WHOLE_FILE_SCHEMA;
     this.family = editingFamily;
   }
@@ -485,7 +450,7 @@ class Overwrite {
     this.editor = editor;
     this.vars = vars;
     this.name = "file_overwrite";
-    this.description = desc.file_overwrite;
+    this.description = fileOverwriteDescription;
     this.parameters = WHOLE_FILE_SCHEMA;
     this.family = editingFamily;
   }

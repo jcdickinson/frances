@@ -22,7 +22,11 @@
 //   const vars = new Variables();
 //   chat.tools.push(new Get(vars), new Set(vars), new Assign(vars));
 
-const { VariableDescriptions: desc, _jaqEval } = globalThis.__frances_v1_stash__;
+import variableGetDescription from "./variable_get.md";
+import variableSetDescription from "./variable_set.md";
+import variableAssignDescription from "./variable_assign.md";
+
+const { _jaqEval } = globalThis.__frances_v1_stash__;
 
 // ---- schemas --------------------------------------------------------------
 
@@ -124,7 +128,7 @@ class Get {
   constructor(vars) {
     this.vars = vars;
     this.name = "variable_get";
-    this.description = desc.variable_get;
+    this.description = variableGetDescription;
     this.parameters = GET_SCHEMA;
   }
 
@@ -158,7 +162,7 @@ class Set {
   constructor(vars) {
     this.vars = vars;
     this.name = "variable_set";
-    this.description = desc.variable_set;
+    this.description = variableSetDescription;
     this.parameters = SET_SCHEMA;
   }
 
@@ -179,7 +183,7 @@ class Assign {
   constructor(vars) {
     this.vars = vars;
     this.name = "variable_assign";
-    this.description = desc.variable_assign;
+    this.description = variableAssignDescription;
     this.parameters = ASSIGN_SCHEMA;
   }
 

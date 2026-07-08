@@ -23,7 +23,7 @@ against the absence of a feature we have. Two knowledge gaps, same cause: **the
 model isn't told the cwd, and isn't told the cwd persists.**
 
 Separately, the edit-tool descriptions duplicate a large block of prose. See
-`crates/frances-workflow/src/modules/desc/file_replace_lines.md`,
+`crates/frances-workflow/assets/frances/v1/tools/file_replace_lines.md`,
 `file_insert_after.md`, `file_insert_before.md` (and the `file_new` /
 `file_overwrite` precondition line): the `CRITICAL: text must NEVER contain a
 Word§ prefix` block with its WRONG/RIGHT example, the `Anchor protocol:`
@@ -36,7 +36,7 @@ note are near-verbatim across tools. That shared guidance wants one home.
 Nothing else can land until the prompt is assembled in JS. This change builds the
 machinery and makes it the *only* path to the system prompt.
 
-`ChatSession` (`crates/frances-workflow/src/modules/js/chat.js`) is barebones
+`ChatSession` (`crates/frances-workflow/assets/frances/v1/chat.js`) is barebones
 today: a mutable `tools` array, `push`, `stream`. Give it an ordered list of
 **sections**.
 

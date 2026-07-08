@@ -6,8 +6,7 @@
 //!   (channels, flags) flow through a transient stash on `globalThis`;
 //!   each module's body captures them into its local scope and the
 //!   stash is then deleted, so user scripts can't reach it.
-//! - `whatwg:*` — vendored polyfills under `modules/whatwg/`,
-//!   embedded via `include_str!` and refreshed by `update.sh`. They
+//! - `whatwg:*` — vendored polyfills under `assets/whatwg/`. They
 //!   used to be pure JS with no per-invocation state; today
 //!   `whatwg:abortcontroller` also captures `_setSleep` from the
 //!   stash, so the stash must be live when whatwg modules evaluate.
@@ -24,8 +23,8 @@
 //! 4. `remove_stash` — delete the stash from `globalThis` so user
 //!    scripts can't reach it.
 //!
-//! Module source files live as siblings under `js/` (v1) or under
-//! `modules/whatwg/` at the workspace root.
+//! Module source files and prompt markdown live under `assets/`, embedded
+//! as one VFS via `rust-embed`.
 //!
 //! Modules:
 //!
@@ -35,7 +34,7 @@
 //!   `JsonSection` (frame-objects-with-history API).
 //! - `frances:v1/chat`           — `ChatSession` (LLM access).
 //! - `frances:v1/io`             — `Timer` + `TimerError`. The user-facing
-//!   surface is pure JS in `js/io.js`; Rust exposes a private sleep
+//!   surface is pure JS in `assets/frances/v1/io.js`; Rust exposes a private sleep
 //!   primitive (`_setSleep` / `_clearSleep`) on the install-time stash
 //!   that the JS wrapper composes against.
 //! - `frances:v1/approval`       — single async
@@ -73,11 +72,14 @@
 //!   the stash's sleep primitive.
 //! - `whatwg:dom`                — minimal DOM Standard surface
 //!   (currently just `DOMException`).
+//! - `vendor:mustache`           — vendored Mustache template renderer.
 
 use std::sync::Arc;
 
-use rquickjs::module::Module;
-use rquickjs::{CatchResultExt, Ctx, Object, Value};
+use rquickjs::loader::{Loader, Resolver};
+use rquickjs::module::{Declared, Module};
+use rquickjs::{CatchResultExt, Ctx, Error as JsError, Object, Value};
+use rust_embed::Embed;
 use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -104,6 +106,95 @@ pub mod workflow;
 /// install. Deleted after every virtual module has captured its slot,
 /// so user scripts can't reach it via `globalThis`.
 const STASH_KEY: &str = "__frances_v1_stash__";
+
+#[derive(Embed)]
+#[folder = "assets/"]
+struct WorkflowAssets;
+
+pub(crate) struct EmbeddedResolver;
+
+impl Resolver for EmbeddedResolver {
+    fn resolve<'js>(
+        &mut self,
+        _ctx: &Ctx<'js>,
+        base: &str,
+        name: &str,
+    ) -> rquickjs::Result<String> {
+        let resolved = resolve_module_name(base, name);
+        if asset_path(&resolved)
+            .as_deref()
+            .is_some_and(|path| WorkflowAssets::get(path).is_some())
+        {
+            return Ok(resolved);
+        }
+        Err(JsError::new_resolving(base, name))
+    }
+}
+
+pub(crate) struct EmbeddedLoader;
+
+impl Loader for EmbeddedLoader {
+    fn load<'js>(&mut self, ctx: &Ctx<'js>, name: &str) -> rquickjs::Result<Module<'js, Declared>> {
+        let Some(source) = load_asset_text(name) else {
+            return Err(JsError::new_loading(name));
+        };
+        if name.ends_with(".md") {
+            let js = serde_json::to_string(&source)
+                .map(|text| format!("export default {text};\n"))
+                .map_err(|err| JsError::new_loading_message(name, err.to_string()))?;
+            return Module::declare(ctx.clone(), name, js.as_bytes());
+        }
+        Module::declare(ctx.clone(), name, source.as_bytes())
+    }
+}
+
+fn resolve_module_name(base: &str, name: &str) -> String {
+    if !name.starts_with('.') {
+        return name.to_owned();
+    }
+
+    let prefix = base
+        .rsplit_once('/')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or("");
+    let mut parts: Vec<&str> = prefix.split('/').filter(|part| !part.is_empty()).collect();
+    for part in name.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    parts.join("/")
+}
+
+fn asset_path(module_name: &str) -> Option<String> {
+    let path = if let Some(path) = module_name.strip_prefix("frances:v1/") {
+        format!("frances/v1/{path}")
+    } else if let Some(path) = module_name.strip_prefix("whatwg:") {
+        format!("whatwg/{path}")
+    } else if let Some(path) = module_name.strip_prefix("vendor:") {
+        format!("vendor/{path}")
+    } else {
+        return None;
+    };
+
+    if path.ends_with(".md") || path.ends_with(".js") {
+        Some(path)
+    } else {
+        Some(format!("{path}.js"))
+    }
+}
+
+fn load_asset_text(module_name: &str) -> Option<String> {
+    let path = asset_path(module_name)?;
+    let file = WorkflowAssets::get(&path)?;
+    std::str::from_utf8(file.data.as_ref())
+        .ok()
+        .map(str::to_owned)
+}
 
 /// Per-invocation host state that gets stashed for module bodies to capture.
 pub(crate) struct V1HostState<D: WorkflowDeps> {
@@ -206,29 +297,11 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     let shell_ctor = shell::build_shell_ctor(ctx, deps.clone())?;
     stash.set("Shell", shell_ctor)?;
 
-    let shell_desc = Object::new(ctx.clone())?;
-    shell_desc.set("shell_set", include_str!("desc/shell_set.md"))?;
-    shell_desc.set("shell_capture", include_str!("desc/shell_capture.md"))?;
-    stash.set("ShellDescriptions", shell_desc)?;
-
     let editor_ctor = file::build_editor_ctor(ctx, deps.clone())?;
     stash.set("Editor", editor_ctor)?;
-    stash.set("EditorDescriptions", file::build_descriptions(ctx)?)?;
 
     let file_search_ctor = file_find_or_grep::build_file_search_ctor(ctx, deps.clone())?;
     stash.set("FileSearch", file_search_ctor)?;
-    let file_search_desc = Object::new(ctx.clone())?;
-    file_search_desc.set(
-        "file_find_or_grep",
-        include_str!("desc/file_find_or_grep.md"),
-    )?;
-    stash.set("FileSearchDescriptions", file_search_desc)?;
-
-    let variable_desc = Object::new(ctx.clone())?;
-    variable_desc.set("variable_get", include_str!("desc/variable_get.md"))?;
-    variable_desc.set("variable_set", include_str!("desc/variable_set.md"))?;
-    variable_desc.set("variable_assign", include_str!("desc/variable_assign.md"))?;
-    stash.set("VariableDescriptions", variable_desc)?;
 
     let jaq_eval = jaq::build_jaq_eval(ctx)?;
     stash.set("_jaqEval", jaq_eval)?;
@@ -258,9 +331,9 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 /// and captures `_setSleep` from the install stash (which must already
 /// be live).
 pub(crate) fn install_whatwg<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
-    declare_and_eval(ctx, "whatwg:dom", DOM_SRC)?;
-    declare_and_eval(ctx, "whatwg:web-streams", WEB_STREAMS_SRC)?;
-    declare_and_eval(ctx, "whatwg:abortcontroller", ABORTCONTROLLER_SRC)?;
+    declare_and_eval(ctx, "whatwg:dom")?;
+    declare_and_eval(ctx, "whatwg:web-streams")?;
+    declare_and_eval(ctx, "whatwg:abortcontroller")?;
     Ok(())
 }
 
@@ -268,23 +341,23 @@ pub(crate) fn install_whatwg<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
 /// must already be live so each module body can `const __s =
 /// globalThis.__frances_v1_stash__` and capture its slots.
 pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowError> {
-    declare_and_eval(ctx, "frances:v1/workflow", WORKFLOW_SRC)?;
-    declare_and_eval(ctx, "frances:v1/lifecycle", LIFECYCLE_SRC)?;
-    declare_and_eval(ctx, "frances:v1/inbox", INBOX_SRC)?;
-    declare_and_eval(ctx, "frances:v1/sections", SECTIONS_SRC)?;
-    declare_and_eval(ctx, "frances:v1/chat", CHAT_SRC)?;
-    declare_and_eval(ctx, "frances:v1/io", IO_SRC)?;
-    declare_and_eval(ctx, "frances:v1/approval", APPROVAL_SRC)?;
-    declare_and_eval(ctx, "frances:v1/storage", STORAGE_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tool-family", TOOL_FAMILY_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tools/shell", SHELL_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tools/file", FILE_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tools/file_find_or_grep", FILE_SEARCH_SRC)?;
-    declare_and_eval(ctx, "frances:v1/tools/variable", VARIABLE_SRC)?;
+    declare_and_eval(ctx, "frances:v1/workflow")?;
+    declare_and_eval(ctx, "frances:v1/lifecycle")?;
+    declare_and_eval(ctx, "frances:v1/inbox")?;
+    declare_and_eval(ctx, "frances:v1/sections")?;
+    declare_and_eval(ctx, "frances:v1/chat")?;
+    declare_and_eval(ctx, "frances:v1/io")?;
+    declare_and_eval(ctx, "frances:v1/approval")?;
+    declare_and_eval(ctx, "frances:v1/storage")?;
+    declare_and_eval(ctx, "frances:v1/tool-family")?;
+    declare_and_eval(ctx, "frances:v1/tools/shell")?;
+    declare_and_eval(ctx, "frances:v1/tools/file")?;
+    declare_and_eval(ctx, "frances:v1/tools/file_find_or_grep")?;
+    declare_and_eval(ctx, "frances:v1/tools/variable")?;
 
-    declare_and_eval(ctx, "frances:v1/context-sections", CONTEXT_SECTIONS_SRC)?;
-    declare_and_eval(ctx, "frances:v1/agents", AGENTS_SRC)?;
-    declare_and_eval(ctx, "frances:v1/agent-sections", AGENT_SECTIONS_SRC)?;
+    declare_and_eval(ctx, "frances:v1/context-sections")?;
+    declare_and_eval(ctx, "frances:v1/agents")?;
+    declare_and_eval(ctx, "frances:v1/agent-sections")?;
 
     Ok(())
 }
@@ -368,36 +441,12 @@ pub(super) fn rquickjs_to_json(value: &Value<'_>) -> Result<serde_json::Value, S
 fn declare_and_eval<'js>(
     ctx: &Ctx<'js>,
     name: &'static str,
-    source: &str,
 ) -> Result<rquickjs::module::Module<'js, rquickjs::module::Evaluated>, WorkflowError> {
-    let module = Module::declare(ctx.clone(), name, source)
+    let source =
+        load_asset_text(name).ok_or_else(|| WorkflowError::Script(JsError::new_loading(name)))?;
+    let module = Module::declare(ctx.clone(), name, source.as_bytes())
         .catch(ctx)
         .map_err(caught(name))?;
     let (evaluated, _promise) = module.eval().catch(ctx).map_err(caught(name))?;
     Ok(evaluated)
 }
-
-// ---- Module source strings ------------------------------------------------
-
-const WORKFLOW_SRC: &str = include_str!("js/workflow.js");
-const LIFECYCLE_SRC: &str = include_str!("js/lifecycle.js");
-const INBOX_SRC: &str = include_str!("js/inbox.js");
-const SECTIONS_SRC: &str = include_str!("js/sections.js");
-const CHAT_SRC: &str = include_str!("js/chat.js");
-const IO_SRC: &str = include_str!("js/io.js");
-const APPROVAL_SRC: &str = include_str!("js/approval.js");
-const STORAGE_SRC: &str = include_str!("js/storage.js");
-const SHELL_SRC: &str = include_str!("js/shell.js");
-const FILE_SRC: &str = include_str!("js/file.js");
-const FILE_SEARCH_SRC: &str = include_str!("js/file_find_or_grep.js");
-const VARIABLE_SRC: &str = include_str!("js/variable.js");
-const TOOL_FAMILY_SRC: &str = include_str!("js/tool-family.js");
-const CONTEXT_SECTIONS_SRC: &str = include_str!("js/context-sections.js");
-const AGENTS_SRC: &str = include_str!("js/agents.js");
-const AGENT_SECTIONS_SRC: &str = include_str!("js/agent-sections.js");
-
-// `whatwg:*` polyfills live at the workspace root so they can be
-// refreshed by `modules/whatwg/update.sh` without touching this crate.
-const DOM_SRC: &str = include_str!("../../../../modules/whatwg/dom.mjs");
-const WEB_STREAMS_SRC: &str = include_str!("../../../../modules/whatwg/web-streams.mjs");
-const ABORTCONTROLLER_SRC: &str = include_str!("../../../../modules/whatwg/abortcontroller.mjs");

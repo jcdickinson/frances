@@ -53,22 +53,15 @@ import {
 } from "frances:v1/sections";
 import { approve } from "frances:v1/approval";
 import { defineToolFamily } from "frances:v1/tool-family";
+import shellFamilyPrompt from "./shell_family.md";
+import shellSetDescription from "./shell_set.md";
+import shellCaptureDescription from "./shell_capture.md";
 
-const { Shell, ShellDescriptions: shellDesc } = globalThis.__frances_v1_stash__;
+const { Shell } = globalThis.__frances_v1_stash__;
 
 const shellFamily = defineToolFamily({
   prompt() {
-    return [
-      "## Shell tools — quasi-persistent state",
-      "",
-      "Commands use quasi-persistent bash state. The working directory always",
-      "persists after completed shell_run calls. Exported environment variables",
-      "persist only when a shell_run call includes their names in `persist`;",
-      "that `persist` list applies to that one run and is not a durable watch list.",
-      "FRANCES_ROOT is reserved and Frances-managed; persisted environment cannot",
-      "override it. Prefer dedicated tools (`file_read`, `file_replace_lines`,",
-      "`variable_*`) over shell equivalents (`cat`, `echo`, `jq`) when available.",
-    ].join("\n");
+    return shellFamilyPrompt;
   },
 });
 
@@ -456,7 +449,7 @@ class Run {
       "`persist` for that run, and `persist` is not a durable watch list. " +
       "Optional `stdin` is delivered to fd 0 for that invocation. " +
       "FRANCES_ROOT is reserved and Frances-managed. If output goes quiet " +
-      "before the command finishes, the result will say so — I MUST call shell_wait " +
+      "before the command finishes, the result will say so — I call shell_wait " +
       "to keep waiting or shell_kill to stop. Set `quiet` and `max` (seconds) " +
       "to tune how long it waits before handing control back — raise them for " +
       "slow or streaming commands so I am not pinged early.";
@@ -591,7 +584,7 @@ class Wait {
     this.shell = shell;
     this.name = "shell_wait";
     this.description =
-      "I will continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
+      "I continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
     this.parameters = WAIT_SCHEMA;
     this.family = shellFamily;
     this.hidden = true;
@@ -756,7 +749,7 @@ class Set {
     this.shell = shell;
     this.vars = vars;
     this.name = "shell_set";
-    this.description = shellDesc.shell_set;
+    this.description = shellSetDescription;
     this.parameters = SET_SCHEMA;
     this.family = shellFamily;
   }
@@ -817,7 +810,7 @@ class Capture {
     this.shell = shell;
     this.vars = vars;
     this.name = "shell_capture";
-    this.description = shellDesc.shell_capture;
+    this.description = shellCaptureDescription;
     this.parameters = CAPTURE_SCHEMA;
     this.family = shellFamily;
   }

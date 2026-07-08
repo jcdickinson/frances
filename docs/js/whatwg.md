@@ -11,10 +11,10 @@ import { AbortController } from "whatwg:abortcontroller";
 import { DOMException } from "whatwg:dom";
 ```
 
-Sources live at the workspace root under `modules/whatwg/` and are
-embedded into the binary via `include_str!`. Where a usable upstream
-polyfill exists we vendor it; `modules/whatwg/update.sh` refreshes those
-from unpkg. Where the upstream is unusable (CJS-only, busted ESM build,
+Sources live under `crates/frances-workflow/assets/whatwg/` and are
+embedded with the rest of the workflow JS assets via `rust-embed`. Where a
+usable upstream polyfill exists we vendor it; `assets/update-vendored.sh`
+refreshes those from unpkg. Where the upstream is unusable (CJS-only, busted ESM build,
 EventTarget-dependent) we hand-roll instead.
 
 ## `whatwg:dom` — DOM on a what-we-need basis
@@ -46,6 +46,6 @@ and update this list. Don't pre-build.
 
 | Module                  | Origin                                                | Notes                                                                                  |
 | ----------------------- | ----------------------------------------------------- | -------------------------------------------------------------------------------------- |
-| `whatwg:web-streams`    | `web-streams-polyfill@4` `dist/ponyfill.mjs` (vendored) | Ponyfill build (named exports, no globalThis mutation). Refresh with `update.sh`.      |
+| `whatwg:web-streams`    | `web-streams-polyfill@4` `dist/ponyfill.mjs` (vendored) | Ponyfill build (named exports, no globalThis mutation). Refresh with `assets/update-vendored.sh`.      |
 | `whatwg:abortcontroller`| hand-rolled                                           | `abortcontroller-polyfill`'s ESM doesn't load standalone. No EventTarget; no `timeout`.|
 | `whatwg:dom`            | hand-rolled                                           | Just `DOMException` today. See policy above before adding.                             |

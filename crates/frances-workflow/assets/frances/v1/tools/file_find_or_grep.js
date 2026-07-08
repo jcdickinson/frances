@@ -16,8 +16,9 @@
 //   const vars   = new Variables();
 //   chat.tools.push(new Search(fs, vars));
 
-const { FileSearch, FileSearchDescriptions: desc } =
-  globalThis.__frances_v1_stash__;
+import fileFindOrGrepDescription from "./file_find_or_grep.md";
+
+const { FileSearch } = globalThis.__frances_v1_stash__;
 
 const SEARCH_SCHEMA = {
   type: "object",
@@ -125,7 +126,7 @@ class Search {
     this.fileSearch = fileSearch;
     this.vars = vars;
     this.name = "file_find_or_grep";
-    this.description = desc.file_find_or_grep;
+    this.description = fileFindOrGrepDescription;
     this.parameters = SEARCH_SCHEMA;
   }
 

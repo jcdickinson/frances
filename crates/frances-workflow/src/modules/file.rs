@@ -70,32 +70,6 @@ pub(crate) fn build_editor_ctor<'js, D: WorkflowDeps>(
     )
 }
 
-/// Builds the `{ file_read, file_replace_lines, ... }` descriptions object
-/// for the stash. JS doesn't have verbatim string literals, so we keep
-/// the LLM-facing markdown next to the module under `desc/` and inline
-/// it via `include_str!` instead of fighting backtick escaping in
-/// template literals.
-pub(crate) fn build_descriptions<'js>(ctx: &Ctx<'js>) -> JsResult<Object<'js>> {
-    let obj = Object::new(ctx.clone())?;
-    obj.set("file_read", include_str!("desc/file_read.md"))?;
-    obj.set(
-        "file_replace_lines",
-        include_str!("desc/file_replace_lines.md"),
-    )?;
-    obj.set("file_replace_all", include_str!("desc/file_replace_all.md"))?;
-    obj.set(
-        "file_insert_after",
-        include_str!("desc/file_insert_after.md"),
-    )?;
-    obj.set(
-        "file_insert_before",
-        include_str!("desc/file_insert_before.md"),
-    )?;
-    obj.set("file_new", include_str!("desc/file_new.md"))?;
-    obj.set("file_overwrite", include_str!("desc/file_overwrite.md"))?;
-    Ok(obj)
-}
-
 pub struct EditorJs<D: WorkflowDeps> {
     deps: D,
     /// This editor's per-context read session. `pub(crate)` so a `FileSearch`

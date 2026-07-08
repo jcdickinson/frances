@@ -25,6 +25,7 @@ jaq-json.workspace = true
 jaq-std.workspace = true
 parking_lot.workspace = true
 rquickjs.workspace = true
+rust-embed.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
