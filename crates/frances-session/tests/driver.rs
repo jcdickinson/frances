@@ -77,19 +77,21 @@ async fn harness(workflow_src: &str) -> Harness {
     src.flush().expect("flush src");
     let src_path = src.path().to_path_buf();
 
+    let session_id = uuid::Uuid::new_v4().to_string();
     let session = Session {
         paths: Paths {
             state_root: tempdir.path().to_path_buf(),
             runtime_root: tempdir.path().to_path_buf(),
         },
-        id: "test-session".to_owned(),
+        id: session_id.clone(),
         dir: tempdir.path().join("session"),
         runtime_dir: tempdir.path().join("runtime"),
         meta: SessionMeta {
             version: 1,
-            id: "test-session".to_owned(),
+            id: session_id,
             created: 0,
             cwd: None,
+            workflow: None,
             reserved: None,
         },
     };
@@ -117,6 +119,7 @@ async fn harness(workflow_src: &str) -> Harness {
             on_cache: Some(Box::new(move |cache| {
                 cache.insert_stub("test", stub_for_hook);
             })),
+            ..StartOverrides::default()
         },
     )
     .await

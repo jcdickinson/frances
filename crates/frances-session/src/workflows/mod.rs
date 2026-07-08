@@ -1,105 +1,47 @@
-//! Per-session workflow stack.
+//! Per-session workflow selection.
 //!
-//! ## Single-slot in-memory, multi-level in DB
+//! A session owns at most one workflow. The selected workflow is stored in
+//! session metadata and restored with the session id as `import.meta.instance`
+//! across process restarts. Switching workflows updates that metadata after
+//! the new workflow has booted successfully and the old one has shut down.
 //!
-//! At any time only one workflow runs — the **top** of the stack, owned
-//! by the long-lived driver task (`run_driver`). Levels below the top
-//! live as rows in the `workflow_stack` table (`active = 0`,
-//! `completed_at IS NULL`). When
-//! a slash command pushes B on top of A, A is **dehydrated**:
-//! [`WorkflowHandle::request_shutdown`] fires, the body's
-//! `frances:v1/lifecycle` hook runs, the inbox closes, and A's task
-//! ends. A's row stays in the DB. When B exits, A is **rehydrated**:
-//! a fresh runtime starts with A's original `instance_id` round-tripped
-//! into `import.meta.instance`, so A's body can read its own table
-//! state and pick up where it left off.
-//!
-//! ## Append-only table
-//!
-//! Pops never delete: they set `completed_at` and clear `active`.
-//! Push truncates any non-completed rows above the current top (a
-//! defensive sweep against crash-mid-pop) and inserts the new row
-//! with the next AUTOINCREMENT position. Rows accumulate.
-//!
-//! ## Boot
-//!
-//! `restore_or_seed` reads the table. If `COUNT(*) = 0`, it pushes
-//! the configured `default_workflow` (which inserts the first row and
-//! hydrates). Otherwise it hydrates the row with `active = 1`. If no
-//! row is active (the user popped everything down to zero live rows
-//! in a previous session), the stack starts empty — the default
-//! workflow is **not** re-seeded.
+//! On first boot, empty workflow metadata is seeded from `default_workflow`, which
+//! defaults to `"main"` when unset.
 
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use frances_core::{now_ns, resolve_relative};
+use frances_core::resolve_relative;
 use parking_lot::Mutex as PlMutex;
-use thiserror::Error;
 
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
 use tracing::warn;
-use turso::Value;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::{ScrollbackFrame, StreamFrame};
+use crate::events::StreamFrame;
 use crate::runtime::{EventsChannel, SessionRuntime};
+use crate::session::SessionWorkflow;
 use crate::store::Database;
 
-use frances_storage::{EntitySchema, Migration};
+use frances_storage::Migration;
 use frances_workflow::{
     InboxItem, Invocation, PermissionRequest, SectionId, SectionKind, SectionSpec,
     SectionTranscript, SurfaceCmd, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
-/// Owns the per-session `workflow_stack` table. UUID is permanent;
-/// never edit.
-pub static SCHEMA: EntitySchema<'static> = EntitySchema {
-    entity: Uuid::from_u128(0x6f3a8c1d_0b4e_4b9a_9c1f_5d8a2e6f7b30),
-    migrations: Cow::Borrowed(&[Migration {
-        name: Cow::Borrowed("0001_init.sql"),
-        sql: Cow::Borrowed(include_str!("migrations/0001_init.sql")),
-    }]),
-};
-
-/// Errors specific to the workflow-stack persistence layer. Wraps
-/// turso + JSON decoding failures; emitted as
-/// [`crate::Error::WorkflowStack`] so callers can `?` through
-/// `crate::Result`.
-#[derive(Debug, Error)]
-pub enum WorkflowStackError {
-    #[error("workflow_stack sql: {0}")]
-    Turso(#[from] turso::Error),
-    #[error("workflow_stack: malformed args json: {0}")]
-    Json(#[from] serde_json::Error),
-    #[error(
-        "workflow_stack: unexpected column shape for {column}: expected {expected}, got {found:?}"
-    )]
-    UnexpectedColumn {
-        column: &'static str,
-        expected: &'static str,
-        found: Value,
-    },
-    #[error("workflow_stack: instance_id is not 16 bytes (got {got})")]
-    InstanceIdLength { got: usize },
-}
-
 /// How long to wait for a dehydrating workflow's body to settle after
 /// `request_shutdown`. Bounded so a misbehaving `lifecycle.shutdown`
-/// hook can't hang a push.
+/// hook can't hang a workflow switch.
 const DEHYDRATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The session-scoped workflow stack. The currently-hydrated workflow is
-/// owned by the long-lived driver task (see `run_driver`), not held
-/// here — this struct keeps the per-session [`Database`] plus the
-/// "live wires" the rest of the runtime uses to reach the active
-/// workflow without going through the driver: a clone of its inbox
-/// sender and its `instance_id`.
-pub struct WorkflowStack {
+/// In-memory access to the currently-hydrated workflow. The driver owns
+/// the instance; this struct holds the per-session [`Database`] plus the
+/// live wires the rest of the runtime uses to reach it: a clone of its
+/// inbox sender and its `instance_id`.
+pub struct ActiveWorkflow {
     db: Database,
     /// Sender into the active workflow's `inbox`. Set when the driver
     /// seats an instance, cleared when none is active. `prompt` and
@@ -111,10 +53,8 @@ pub struct WorkflowStack {
     active_instance_id: PlMutex<Option<Uuid>>,
 }
 
-impl WorkflowStack {
-    /// Builds an empty in-memory stack bound to `db`. Layering across
-    /// process restarts lives entirely in the per-session
-    /// `workflow_stack` table on this database.
+impl ActiveWorkflow {
+    /// Builds an empty active-workflow handle bound to `db`.
     pub fn new(db: Database) -> Self {
         Self {
             db,
@@ -125,7 +65,7 @@ impl WorkflowStack {
 
     /// Per-session [`Database`] handle. Same lock the rest of the runtime
     /// uses; cheap clone for callers (like scrollback replay) that want
-    /// to issue SQL against it without going through the stack itself.
+    /// to issue SQL against it without going through this owner.
     pub fn db(&self) -> &Database {
         &self.db
     }
@@ -140,7 +80,7 @@ impl WorkflowStack {
     /// Publish the active wires for the driver's initial instance,
     /// synchronously during `SessionRuntime::start` (before the driver
     /// task is scheduled) so the startup scrollback replay sees it right
-    /// away. No-op when the stack boots empty.
+    /// away. No-op when no workflow boots.
     pub(crate) fn seat_initial(&self, instance: Option<&WorkflowInstance>) {
         match instance {
             Some(inst) => self.set_active(inst),
@@ -173,12 +113,11 @@ impl WorkflowStack {
 
 /// A command for the long-lived workflow driver. Input and interrupts
 /// do *not* go through here — they're delivered straight to the active
-/// inbox via [`WorkflowStack::deliver`]. Only stack-lifecycle changes
-/// (slash-command pushes) need the driver to act.
+/// inbox via [`ActiveWorkflow::deliver`]. Only workflow switches need the
+/// driver to act.
 pub(crate) enum DriverCmd {
-    /// Push a fresh workflow on top of the stack (dehydrating the
-    /// current active one first).
-    Push { name: String, args: Vec<String> },
+    /// Replace the session's selected workflow.
+    Switch { name: String, args: Vec<String> },
 }
 
 /// The currently-hydrated workflow plus the emit-state needed across
@@ -336,7 +275,7 @@ impl EmitState {
 }
 
 /// Translate a prompt-RPC text into the right delivery. Slash commands
-/// become a [`DriverCmd::Push`] (stack lifecycle, handled by the
+/// become a [`DriverCmd::Switch`] (handled by the
 /// driver); everything else is plain input delivered straight to the
 /// active workflow's inbox — input is just IO, no cycle.
 ///
@@ -349,13 +288,13 @@ pub(crate) fn dispatch_input<Io: frances_workflow::WorkflowIo>(
 ) {
     match parse_slash_command(text) {
         Ok(Some((name, args))) => {
-            let _ = runtime.workflow_cmd.send(DriverCmd::Push {
+            let _ = runtime.workflow_cmd.send(DriverCmd::Switch {
                 name: name.to_owned(),
                 args,
             });
         }
         Ok(None) => {
-            runtime.workflow_stack.deliver(InboxItem::Input(UserInput {
+            runtime.active_workflow.deliver(InboxItem::Input(UserInput {
                 content: text.to_owned(),
             }));
         }
@@ -369,29 +308,22 @@ pub(crate) fn dispatch_input<Io: frances_workflow::WorkflowIo>(
 
 /// Deliver an interrupt to the active workflow's inbox.
 pub(crate) fn dispatch_interrupt<Io: frances_workflow::WorkflowIo>(runtime: &SessionRuntime<Io>) {
-    runtime.workflow_stack.deliver(InboxItem::Interrupt);
+    runtime.active_workflow.deliver(InboxItem::Interrupt);
 }
 
-/// Boot-time entry. Either restores the persisted stack (hydrating
-/// the row with `active = 1`) or, if the table is literally empty,
-/// seats the configured `default_workflow`. Returns the instance to
-/// seat as the driver's initial active workflow (or `None` when the
-/// stack is empty / nothing hydrated).
-///
-/// Errors during hydration (missing config, migration drift, runtime
-/// error) cascade until a row hydrates cleanly or the live stack is
-/// exhausted. The runtime is always usable when this returns.
-pub(crate) async fn restore_or_seed<Io: frances_workflow::WorkflowIo>(
+/// Boot-time entry. Restores the selected workflow, or starts the
+/// configured `default_workflow` when this session has never selected
+/// one. `default_workflow` defaults to `"main"` when unset.
+pub(crate) async fn restore_or_start_default<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
 ) -> Result<Option<WorkflowInstance>> {
-    let db = &runtime.workflow_stack.db;
-
-    if row_count(db).await? == 0 {
+    if runtime.session.meta.workflow.is_none() {
         let default_workflow = runtime.default_workflow.get();
-        let Some(name) = default_workflow.as_deref().and_then(|opt| opt.as_deref()) else {
-            return Ok(None);
-        };
-        match push_default_workflow(runtime, name).await {
+        let name = default_workflow
+            .as_deref()
+            .and_then(|opt| opt.as_deref())
+            .unwrap_or("main");
+        match start_default_workflow(runtime, name).await {
             Ok(instance) => return Ok(instance),
             Err(error) => {
                 warn!(%error, workflow = %name, "default_workflow start failed");
@@ -400,18 +332,17 @@ pub(crate) async fn restore_or_seed<Io: frances_workflow::WorkflowIo>(
         }
     }
 
-    hydrate_active_or_cascade(runtime).await
+    hydrate_selected(runtime).await
 }
 
-/// Push the configured default workflow with empty args. Used by
-/// `restore_or_seed` when the table is empty (first-ever boot or a
+/// Start the configured default workflow with empty args. Used by
+/// `restore_or_start_default` when the table is empty (first-ever boot or a
 /// fresh session). Returns the started instance for the driver to seat;
 /// `Ok(None)` when no matching config entry exists. A boot failure
-/// (migration read or runtime start) propagates as `Err` — `restore_or_seed`
-/// logs it and leaves the stack empty. Frames the workflow emits during
-/// top-level evaluation buffer in `WorkflowHandle::frames` and flush once
-/// the driver starts pumping.
-async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
+/// (migration read or runtime start) propagates as `Err`. Frames the workflow
+/// emits during top-level evaluation buffer in `WorkflowHandle::frames` and
+/// flush once the driver starts pumping.
+async fn start_default_workflow<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     name: &str,
 ) -> Result<Option<WorkflowInstance>> {
@@ -420,22 +351,21 @@ async fn push_default_workflow<Io: frances_workflow::WorkflowIo>(
         warn!(
             workflow = name,
             "default_workflow is set but no matching [workflows.*] entry exists; \
-             leaving stack empty"
+             leaving session without an active workflow"
         );
         return Ok(None);
     };
-    let instance_id = Uuid::new_v4();
+    let instance_id = session_instance_id(runtime);
     let instance = boot_instance(runtime, cfg, instance_id, Vec::new()).await?;
-    insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &[]).await?;
+    write_session_workflow(runtime, name, &[])?;
     Ok(Some(instance))
 }
 
-/// Slash-command push: start the new workflow, then (only on success)
+/// Workflow switch: start the new workflow, then (only on success)
 /// dehydrate `old`, persist the row, and tell the TUI to replay the new
 /// instance's scrollback. Returns the new `current` for the driver:
-/// `Some(new)` on success, or `old` unchanged if the push aborted (so a
-/// failed start never leaves the stack empty).
-async fn push<Io: frances_workflow::WorkflowIo>(
+/// `Some(new)` on success, or `old` unchanged if the switch aborted.
+async fn switch_workflow<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     old: Option<WorkflowInstance>,
     name: &str,
@@ -449,7 +379,7 @@ async fn push<Io: frances_workflow::WorkflowIo>(
         return old;
     };
 
-    let instance_id = Uuid::new_v4();
+    let instance_id = session_instance_id(runtime);
 
     // Boot the new instance BEFORE touching any state. If migrations or
     // start fail, the previous workflow keeps running and the DB is
@@ -464,32 +394,28 @@ async fn push<Io: frances_workflow::WorkflowIo>(
         }
     };
 
-    // Commit to the push: dehydrate the old workflow (bounded by
+    // Commit to the switch: dehydrate the old workflow (bounded by
     // `DEHYDRATE_TIMEOUT`; the body's `lifecycle.shutdown` runs first).
     if let Some(old) = old
         && let Err(error) = dehydrate(runtime, old).await
     {
-        warn!(%error, "dehydrate during push failed");
+        warn!(%error, "dehydrate during switch failed");
     }
 
-    // Persist the new row (truncates any non-completed rows above the
-    // demoted top — defensive against crash-mid-pop).
-    if let Err(error) =
-        insert_pushed_row(&runtime.workflow_stack.db, name, instance_id, &args).await
-    {
-        warn!(%error, "insert_pushed_row failed");
+    if let Err(error) = write_session_workflow(runtime, name, &args) {
+        warn!(%error, "write session workflow failed");
     }
 
     // Tell the TUI to drop the previous workflow's in-memory scrollback
     // and replay the new active instance's.
     if let Err(error) = crate::scrollback::replay_to_channel(
         &runtime.events,
-        &runtime.workflow_stack.db,
+        &runtime.active_workflow.db,
         instance_id,
     )
     .await
     {
-        warn!(%error, "scrollback replay on push failed");
+        warn!(%error, "scrollback replay on switch failed");
     }
 
     Some(instance)
@@ -499,10 +425,10 @@ async fn push<Io: frances_workflow::WorkflowIo>(
 /// in-memory life and plays the host side of a classical event loop:
 /// continuously pump the body's `HostFrame`s to the TUI, watch for
 /// genuine termination (`done` — the top-level promise settled or
-/// `exit()`), and apply stack-lifecycle commands (slash pushes).
+/// `exit()`), and apply workflow switches.
 ///
 /// Input and interrupts do NOT pass through here — they're delivered
-/// straight to the active inbox via [`WorkflowStack::deliver`], so the
+/// straight to the active inbox via [`ActiveWorkflow::deliver`], so the
 /// body receives them whenever its JS loop reads, mid-turn or not.
 pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
     runtime: Arc<SessionRuntime<Io>>,
@@ -515,24 +441,24 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
         Permission(PermissionRequest),
         Usage(frances_models_llm::Usage),
         Done(Option<WorkflowError>),
-        Push { name: String, args: Vec<String> },
+        Switch { name: String, args: Vec<String> },
         Shutdown,
     }
 
     let mut current = initial;
     if let Some(instance) = current.as_ref() {
-        runtime.workflow_stack.set_active(instance);
+        runtime.active_workflow.set_active(instance);
     }
 
     loop {
         let Some(instance) = current.as_mut() else {
-            // No active workflow: only a push can make progress.
+            // No active workflow: only a switch can make progress.
             match cmd_rx.recv().await {
-                Some(DriverCmd::Push { name, args }) => {
-                    current = push(&runtime, None, &name, args).await;
+                Some(DriverCmd::Switch { name, args }) => {
+                    current = switch_workflow(&runtime, None, &name, args).await;
                     match current.as_ref() {
-                        Some(inst) => runtime.workflow_stack.set_active(inst),
-                        None => runtime.workflow_stack.clear_active(),
+                        Some(inst) => runtime.active_workflow.set_active(inst),
+                        None => runtime.active_workflow.clear_active(),
                     }
                 }
                 None => return,
@@ -577,7 +503,7 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
                 }
             },
             cmd = cmd_rx.recv() => match cmd {
-                Some(DriverCmd::Push { name, args }) => Step::Push { name, args },
+                Some(DriverCmd::Switch { name, args }) => Step::Switch { name, args },
                 None => Step::Shutdown,
             },
         };
@@ -594,32 +520,20 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
             Step::Usage(usage) => emit_usage(&runtime, usage),
             Step::Done(reported) => {
                 let mut instance = current.take().expect("active on done");
-                runtime.workflow_stack.clear_active();
+                runtime.active_workflow.clear_active();
                 if let Err(error) = finish_done(&runtime, &mut instance, reported).await {
                     warn!(%error, "workflow done handling failed");
                 }
-                let instance_id = instance.handle.instance;
-                // Drop the in-memory state so its task is gone before we
-                // rehydrate the next row.
                 drop(instance);
-                match drop_active_and_promote(&runtime, instance_id).await {
-                    Ok(next) => current = next,
-                    Err(error) => {
-                        warn!(%error, "pop/promote failed");
-                        current = None;
-                    }
-                }
-                if let Some(inst) = current.as_ref() {
-                    runtime.workflow_stack.set_active(inst);
-                }
+                current = None;
             }
-            Step::Push { name, args } => {
+            Step::Switch { name, args } => {
                 let old = current.take();
-                runtime.workflow_stack.clear_active();
-                current = push(&runtime, old, &name, args).await;
+                runtime.active_workflow.clear_active();
+                current = switch_workflow(&runtime, old, &name, args).await;
                 match current.as_ref() {
-                    Some(inst) => runtime.workflow_stack.set_active(inst),
-                    None => runtime.workflow_stack.clear_active(),
+                    Some(inst) => runtime.active_workflow.set_active(inst),
+                    None => runtime.active_workflow.clear_active(),
                 }
             }
             Step::Shutdown => return,
@@ -664,8 +578,8 @@ async fn finish_done<Io: frances_workflow::WorkflowIo>(
 
 /// The side-effect-free core every boot path shares: read migrations,
 /// build the invocation, start the runtime, wrap it in a
-/// [`WorkflowInstance`]. Touches no stack table and emits no frames —
-/// the caller owns instance-id minting, row persistence, and error
+/// [`WorkflowInstance`]. Touches no session metadata and emits no frames —
+/// the caller owns instance id selection, metadata persistence, and error
 /// policy.
 async fn boot_instance<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
@@ -684,7 +598,7 @@ async fn boot_instance<Io: frances_workflow::WorkflowIo>(
     let handle = runtime.workflow_runtime.start(invocation).await?;
     Ok(WorkflowInstance {
         handle,
-        emit: EmitState::new(runtime.workflow_stack.db.clone(), instance_id),
+        emit: EmitState::new(runtime.active_workflow.db.clone(), instance_id),
     })
 }
 
@@ -766,7 +680,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                 );
                 // Body never settled. Mark every in-flight block
                 // truncated. No `BlockStop` event — the TUI is about to
-                // be told to clear via `ScrollbackFrame::Reset` by the caller's push path.
+                // be told to clear via `ScrollbackFrame::Reset` by the switch path.
                 instance.emit.close_all(CloseMode::Truncate).await?;
                 return Ok(());
             }
@@ -924,549 +838,70 @@ async fn emit_permission<Io: frances_workflow::WorkflowIo>(
 
 // --- Persistence helpers --------------------------------------------------
 
-/// SQL helper: tombstone the row matching `instance_id` and promote
-/// the next live row to `active = 1`. Then hydrate the new top in
-/// memory (if any). If hydration fails, recurse — tombstoning the
-/// failed row's branch — until either a row hydrates cleanly or the
-/// live stack is exhausted (top stays `None`).
-async fn drop_active_and_promote<Io: frances_workflow::WorkflowIo>(
-    runtime: &Arc<SessionRuntime<Io>>,
-    instance_id: Uuid,
-) -> Result<Option<WorkflowInstance>> {
-    mark_completed_and_promote(&runtime.workflow_stack.db, instance_id).await?;
-    let promoted = hydrate_active_or_cascade(runtime).await?;
-    // Tell the TUI to clear scrollback and replay the newly-promoted
-    // workflow's history (if any row was promoted). When the stack ran
-    // dry there's no instance to replay — we still emit an empty reset
-    // so the previous workflow's in-memory scrollback is dropped.
-    if let Some(instance) = promoted.as_ref() {
-        crate::scrollback::replay_to_channel(
-            &runtime.events,
-            &runtime.workflow_stack.db,
-            instance.handle.instance,
-        )
-        .await?;
-    } else {
-        runtime
-            .events
-            .send(StreamFrame::Scrollback(ScrollbackFrame::Reset {
-                instance_id: Uuid::nil(),
-            }));
-        runtime
-            .events
-            .send(StreamFrame::Scrollback(ScrollbackFrame::End));
-    }
-    Ok(promoted)
-}
-
-/// Find the row with `active = 1` and hydrate it. On any failure,
-/// tombstone the row + everything at or above its position and promote
-/// the next live row; retry. Loops until a row hydrates (returns
-/// `Some`) or the stack runs dry (`None`).
-async fn hydrate_active_or_cascade<Io: frances_workflow::WorkflowIo>(
+/// Hydrate the session's selected workflow. If it cannot start, leave
+/// the metadata in place and run without an active workflow.
+async fn hydrate_selected<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
 ) -> Result<Option<WorkflowInstance>> {
-    let db = &runtime.workflow_stack.db;
-    loop {
-        let Some(row) = read_active_row(db).await? else {
-            return Ok(None);
-        };
+    let Some(workflow) = runtime.session.meta.workflow.as_ref() else {
+        return Ok(None);
+    };
+    let selection = WorkflowSelection {
+        config_key: workflow.name.clone(),
+        instance_id: session_instance_id(runtime),
+        args: workflow.args.clone(),
+    };
 
-        match hydrate(runtime, &row).await {
-            Ok(instance) => return Ok(Some(instance)),
-            Err(error) => {
-                warn!(
-                    instance = %row.instance_id,
-                    config = %row.config_key,
-                    %error,
-                    "workflow restore failed; tombstoning and trying next"
-                );
-                truncate_at_or_above(db, row.position).await?;
-            }
+    match hydrate(runtime, &selection).await {
+        Ok(instance) => Ok(Some(instance)),
+        Err(error) => {
+            warn!(
+                instance = %selection.instance_id,
+                config = %selection.config_key,
+                %error,
+                "workflow restore failed"
+            );
+            Ok(None)
         }
     }
 }
 
-/// Attempt to hydrate a single row: look up its config, load
-/// migrations, start the runtime with the row's `instance_id`
+/// Attempt to hydrate the selected workflow: look up its config, load
+/// migrations, start the runtime with the session `instance_id`
 /// preserved.
 async fn hydrate<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
-    row: &StackRow,
+    selection: &WorkflowSelection,
 ) -> Result<WorkflowInstance, WorkflowError> {
     let workflows = runtime.workflows.get_or_default();
     let cfg = workflows
-        .get(&row.config_key)
+        .get(&selection.config_key)
         .ok_or_else(|| WorkflowError::ScriptCaught {
             context: "restore",
-            detail: format!("no [workflows.{}] entry in config", row.config_key),
+            detail: format!("no [workflows.{}] entry in config", selection.config_key),
         })?;
-    boot_instance(runtime, cfg, row.instance_id, row.args.clone()).await
+    boot_instance(runtime, cfg, selection.instance_id, selection.args.clone()).await
 }
 
-/// Decoded `workflow_stack` row.
-struct StackRow {
-    position: i64,
+struct WorkflowSelection {
     config_key: String,
     instance_id: Uuid,
     args: Vec<String>,
 }
 
-/// Push transaction: truncate any non-completed rows above the
-/// current top (defensive), demote the current top, insert the new
-/// active row.
-async fn insert_pushed_row(
-    db: &Database,
-    config_key: &str,
-    instance_id: Uuid,
+fn write_session_workflow<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    name: &str,
     args: &[String],
-) -> Result<(), WorkflowStackError> {
-    let now = now_ns();
-    let args_json = serde_json::to_string(args)?;
-    let instance_bytes = instance_id.as_bytes().to_vec();
-
-    let conn = db.connect().await;
-    let tx = conn.unchecked_transaction().await?;
-    tx.execute(
-        "UPDATE workflow_stack
-            SET completed_at = ?1
-          WHERE completed_at IS NULL
-            AND position > COALESCE(
-              (SELECT MAX(position) FROM workflow_stack WHERE active = 1),
-              -1
-            )",
-        (now,),
-    )
-    .await?;
-    tx.execute("UPDATE workflow_stack SET active = 0 WHERE active = 1", ())
-        .await?;
-    tx.execute(
-        "INSERT INTO workflow_stack
-             (config_key, instance_id, args, created_at, active)
-         VALUES (?1, ?2, ?3, ?4, 1)",
-        (config_key.to_string(), instance_bytes, args_json, now),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
+) -> Result<()> {
+    runtime.session.write_workflow(SessionWorkflow {
+        name: name.to_owned(),
+        args: args.to_vec(),
+    })
 }
 
-/// Pop transaction: tombstone the active row (or, if no active row
-/// matches the given `instance_id`, tombstone by `instance_id`) and
-/// promote the next live row to active.
-async fn mark_completed_and_promote(
-    db: &Database,
-    instance_id: Uuid,
-) -> Result<(), WorkflowStackError> {
-    let now = now_ns();
-    let instance_bytes = instance_id.as_bytes().to_vec();
-
-    let conn = db.connect().await;
-    let tx = conn.unchecked_transaction().await?;
-    tx.execute(
-        "UPDATE workflow_stack
-            SET active = 0, completed_at = ?1
-          WHERE instance_id = ?2",
-        (now, instance_bytes),
-    )
-    .await?;
-    tx.execute(
-        "UPDATE workflow_stack
-            SET active = 1
-          WHERE position = (
-            SELECT MAX(position)
-              FROM workflow_stack
-             WHERE completed_at IS NULL
-          )",
-        (),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-/// Cascade-tombstone helper used on hydrate failure: mark this row
-/// and everything above it as completed, then promote the next live
-/// row.
-async fn truncate_at_or_above(db: &Database, position: i64) -> Result<(), WorkflowStackError> {
-    let now = now_ns();
-    let conn = db.connect().await;
-    let tx = conn.unchecked_transaction().await?;
-    tx.execute(
-        "UPDATE workflow_stack
-            SET active = 0, completed_at = ?1
-          WHERE completed_at IS NULL
-            AND position >= ?2",
-        (now, position),
-    )
-    .await?;
-    tx.execute(
-        "UPDATE workflow_stack
-            SET active = 1
-          WHERE position = (
-            SELECT MAX(position)
-              FROM workflow_stack
-             WHERE completed_at IS NULL
-          )",
-        (),
-    )
-    .await?;
-    tx.commit().await?;
-    Ok(())
-}
-
-async fn row_count(db: &Database) -> Result<i64, WorkflowStackError> {
-    let conn = db.connect().await;
-    let mut rows = conn
-        .query("SELECT COUNT(*) FROM workflow_stack", ())
-        .await?;
-    let row = rows.next().await?.expect("COUNT(*) always returns one row");
-    match row.get_value(0)? {
-        Value::Integer(n) => Ok(n),
-        other => Err(WorkflowStackError::UnexpectedColumn {
-            column: "COUNT(*)",
-            expected: "integer",
-            found: other,
-        }),
-    }
-}
-
-async fn read_active_row(db: &Database) -> Result<Option<StackRow>, WorkflowStackError> {
-    let conn = db.connect().await;
-    let mut rows = conn
-        .query(
-            "SELECT position, config_key, instance_id, args
-               FROM workflow_stack
-              WHERE active = 1
-              LIMIT 1",
-            (),
-        )
-        .await?;
-    let Some(row) = rows.next().await? else {
-        return Ok(None);
-    };
-
-    let position = match row.get_value(0)? {
-        Value::Integer(v) => v,
-        other => {
-            return Err(WorkflowStackError::UnexpectedColumn {
-                column: "position",
-                expected: "integer",
-                found: other,
-            });
-        }
-    };
-    let config_key = match row.get_value(1)? {
-        Value::Text(t) => t,
-        other => {
-            return Err(WorkflowStackError::UnexpectedColumn {
-                column: "config_key",
-                expected: "text",
-                found: other,
-            });
-        }
-    };
-    let instance_bytes = match row.get_value(2)? {
-        Value::Blob(b) => b,
-        other => {
-            return Err(WorkflowStackError::UnexpectedColumn {
-                column: "instance_id",
-                expected: "blob",
-                found: other,
-            });
-        }
-    };
-    if instance_bytes.len() != 16 {
-        return Err(WorkflowStackError::InstanceIdLength {
-            got: instance_bytes.len(),
-        });
-    }
-    let instance_id = Uuid::from_slice(&instance_bytes).expect("checked length");
-    let args_text = match row.get_value(3)? {
-        Value::Text(t) => t,
-        other => {
-            return Err(WorkflowStackError::UnexpectedColumn {
-                column: "args",
-                expected: "text",
-                found: other,
-            });
-        }
-    };
-    let args: Vec<String> = serde_json::from_str(&args_text)?;
-    Ok(Some(StackRow {
-        position,
-        config_key,
-        instance_id,
-        args,
-    }))
-}
-
-#[cfg(test)]
-mod tests {
-    //! Unit tests for the workflow_stack persistence helpers.
-    //!
-    //! These exercise the SQL layer in isolation against a fresh
-    //! in-memory turso connection — no runtime, no `ServerState`. The
-    //! end-to-end hydrate/dehydrate path is covered by the workflow
-    //! runtime's own test suite plus exercises the rest of the session's other
-    //! integration tests indirectly.
-    use super::*;
-    use frances_storage::run_all;
-
-    async fn fresh_db() -> Database {
-        let db = Database::open_in_memory().await.unwrap();
-        {
-            let conn = db.connect().await;
-            run_all(&conn, &[&SCHEMA]).await.unwrap();
-        }
-        db
-    }
-
-    /// Count live (non-completed) rows.
-    async fn count_live(db: &Database) -> i64 {
-        let conn = db.connect().await;
-        let mut rows = conn
-            .query(
-                "SELECT COUNT(*) FROM workflow_stack WHERE completed_at IS NULL",
-                (),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        match row.get_value(0).unwrap() {
-            Value::Integer(n) => n,
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    /// Read `(active, completed_at IS NULL)` flags for the given
-    /// `instance_id`. Returns `None` if the row does not exist.
-    async fn flags_for(db: &Database, instance_id: Uuid) -> Option<(bool, bool)> {
-        let conn = db.connect().await;
-        let mut rows = conn
-            .query(
-                "SELECT active, completed_at FROM workflow_stack WHERE instance_id = ?1",
-                (instance_id.as_bytes().to_vec(),),
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap()?;
-        let active = matches!(row.get_value(0).unwrap(), Value::Integer(1));
-        let alive = matches!(row.get_value(1).unwrap(), Value::Null);
-        Some((active, alive))
-    }
-
-    #[tokio::test]
-    async fn fresh_table_is_empty() {
-        let db = fresh_db().await;
-        assert_eq!(row_count(&db).await.unwrap(), 0);
-        assert!(read_active_row(&db).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn single_push_records_and_reads_back() {
-        let db = fresh_db().await;
-        let id = Uuid::new_v4();
-        insert_pushed_row(&db, "main", id, &["arg1".into(), "arg2".into()])
-            .await
-            .unwrap();
-
-        assert_eq!(row_count(&db).await.unwrap(), 1);
-        let row = read_active_row(&db).await.unwrap().expect("active row");
-        assert_eq!(row.config_key, "main");
-        assert_eq!(row.instance_id, id);
-        assert_eq!(row.args, vec!["arg1".to_owned(), "arg2".to_owned()]);
-    }
-
-    #[tokio::test]
-    async fn second_push_demotes_first_and_takes_top() {
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
-
-        assert_eq!(count_live(&db).await, 2);
-        let active = read_active_row(&db).await.unwrap().expect("top");
-        assert_eq!(active.instance_id, b);
-        assert_eq!(flags_for(&db, a).await, Some((false, true)));
-        assert_eq!(flags_for(&db, b).await, Some((true, true)));
-    }
-
-    #[tokio::test]
-    async fn pop_tombstones_and_promotes_previous() {
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
-
-        mark_completed_and_promote(&db, b).await.unwrap();
-
-        assert_eq!(flags_for(&db, b).await, Some((false, false)));
-        assert_eq!(flags_for(&db, a).await, Some((true, true)));
-        assert_eq!(
-            read_active_row(&db)
-                .await
-                .unwrap()
-                .expect("top")
-                .instance_id,
-            a
-        );
-    }
-
-    #[tokio::test]
-    async fn pop_to_empty_stack_leaves_no_active_row() {
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-
-        mark_completed_and_promote(&db, a).await.unwrap();
-
-        assert_eq!(flags_for(&db, a).await, Some((false, false)));
-        assert!(read_active_row(&db).await.unwrap().is_none());
-        // The row is still in the table — append-only.
-        assert_eq!(row_count(&db).await.unwrap(), 1);
-    }
-
-    #[tokio::test]
-    async fn push_truncates_orphans_above_current_top() {
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
-
-        // Forcibly clear `active` from B without tombstoning it. This
-        // simulates a crash where the runtime went down mid-pop after
-        // clearing active but before setting completed_at.
-        {
-            let conn = db.connect().await;
-            conn.execute("UPDATE workflow_stack SET active = 0", ())
-                .await
-                .unwrap();
-            // Now A is the highest position with completed_at NULL,
-            // but B sits above it. A push (orphan-truncation step)
-            // should tombstone B before inserting C. First make A the
-            // active top again so the truncation rule picks B
-            // (position > A) as the orphan.
-            conn.execute(
-                "UPDATE workflow_stack SET active = 1 WHERE instance_id = ?1",
-                (a.as_bytes().to_vec(),),
-            )
-            .await
-            .unwrap();
-        }
-
-        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
-
-        assert_eq!(flags_for(&db, b).await, Some((false, false)));
-        assert_eq!(flags_for(&db, a).await, Some((false, true)));
-        assert_eq!(flags_for(&db, c).await, Some((true, true)));
-    }
-
-    #[tokio::test]
-    async fn pop_then_push_walks_back_via_truncation() {
-        // A push above C, then user pops C: B is the active top, C is
-        // still alive (resumeable in principle). User pushes D: the
-        // C row gets tombstoned (orphan above B). D ends up on top.
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
-        let d = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
-        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
-
-        mark_completed_and_promote(&db, c).await.unwrap();
-        assert_eq!(flags_for(&db, c).await, Some((false, false)));
-        assert_eq!(flags_for(&db, b).await, Some((true, true)));
-
-        insert_pushed_row(&db, "d", d, &[]).await.unwrap();
-        assert_eq!(flags_for(&db, a).await, Some((false, true)));
-        assert_eq!(flags_for(&db, b).await, Some((false, true)));
-        assert_eq!(flags_for(&db, c).await, Some((false, false)));
-        assert_eq!(flags_for(&db, d).await, Some((true, true)));
-    }
-
-    #[tokio::test]
-    async fn truncate_at_or_above_kills_row_and_everything_higher() {
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-        insert_pushed_row(&db, "b", b, &[]).await.unwrap();
-        insert_pushed_row(&db, "c", c, &[]).await.unwrap();
-
-        // Find B's position.
-        let b_pos = {
-            let conn = db.connect().await;
-            let mut rows = conn
-                .query(
-                    "SELECT position FROM workflow_stack WHERE instance_id = ?1",
-                    (b.as_bytes().to_vec(),),
-                )
-                .await
-                .unwrap();
-            match rows.next().await.unwrap().unwrap().get_value(0).unwrap() {
-                Value::Integer(n) => n,
-                other => panic!("unexpected {other:?}"),
-            }
-        };
-
-        truncate_at_or_above(&db, b_pos).await.unwrap();
-
-        assert_eq!(flags_for(&db, a).await, Some((true, true)));
-        assert_eq!(flags_for(&db, b).await, Some((false, false)));
-        assert_eq!(flags_for(&db, c).await, Some((false, false)));
-    }
-
-    #[tokio::test]
-    async fn args_with_special_chars_round_trip() {
-        let db = fresh_db().await;
-        let id = Uuid::new_v4();
-        let args: Vec<String> = vec![
-            "plain".into(),
-            "with \"quotes\"".into(),
-            "tab\there".into(),
-            String::new(),
-        ];
-        insert_pushed_row(&db, "k", id, &args).await.unwrap();
-        let row = read_active_row(&db).await.unwrap().expect("active");
-        assert_eq!(row.args, args);
-    }
-
-    #[tokio::test]
-    async fn unique_active_constraint_holds() {
-        // The partial unique index forbids two active=1 rows at once.
-        // `insert_pushed_row` demotes the previous active before
-        // inserting the new one, so this never triggers in normal
-        // flow; verify the index is in place by attempting a manual
-        // conflicting INSERT.
-        let db = fresh_db().await;
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        insert_pushed_row(&db, "a", a, &[]).await.unwrap();
-
-        // Manually insert a second active row, bypassing our helper.
-        let err = {
-            let conn = db.connect().await;
-            conn.execute(
-                "INSERT INTO workflow_stack
-                 (config_key, instance_id, args, created_at, active)
-                 VALUES (?1, ?2, ?3, 0, 1)",
-                ("b".to_string(), b.as_bytes().to_vec(), "[]".to_string()),
-            )
-            .await
-            .unwrap_err()
-        };
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("unique") || msg.contains("constraint"),
-            "expected unique constraint failure, got: {msg}"
-        );
-    }
+fn session_instance_id<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+) -> Uuid {
+    Uuid::parse_str(&runtime.session.id).expect("session ids are UUIDs")
 }

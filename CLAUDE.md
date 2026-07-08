@@ -20,7 +20,7 @@ Frances is an agentic coding tool. The `frances` binary is a single-process TUI:
 The interesting crates under `crates/`:
 
 - **`frances`** — the binary. TUI (`src/tui/`, `src/ui.rs`), TTY identification (`src/tty.rs`), `main.rs` wires the runtime to the TUI.
-- **`frances-session`** — session runtime: per-session DB handle, workflow stack, history, scrollback persistence, anchor store, llm session provider, events channel into the TUI.
+- **`frances-session`** — session runtime: per-session DB handle, workflow selection, history, scrollback persistence, anchor store, llm session provider, events channel into the TUI.
 - **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat sessions and tool calls.
 - **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
 - **`frances-anchors`** — anchor word dictionary plus line hashing and word↔index encoding.

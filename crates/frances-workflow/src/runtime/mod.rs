@@ -181,8 +181,8 @@ pub struct Invocation {
     pub entity: uuid::Uuid,
     /// Per-invocation instance uuid exposed to JS as
     /// `import.meta.instance`. The runtime allocates one fresh on a new
-    /// push and round-trips it through `workflow_stack` so a restored
-    /// instance reads the same value out of `import.meta.instance`.
+    /// selection. The session runtime currently passes the session id so a
+    /// restored instance reads the same value out of `import.meta.instance`.
     /// [`uuid::Uuid::nil`] when tests don't care.
     pub instance_id: uuid::Uuid,
     /// Ready-to-apply migrations, read from disk by the caller. Empty

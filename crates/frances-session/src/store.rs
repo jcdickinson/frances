@@ -48,7 +48,6 @@ async fn apply_migrations(db: &Database) -> std::result::Result<(), DatabaseErro
             &crate::anchor_store::SCHEMA,
             &crate::history::SCHEMA,
             &crate::llm::session_provider::SCHEMA,
-            &crate::workflows::SCHEMA,
             &crate::scrollback::SCHEMA,
         ],
     )

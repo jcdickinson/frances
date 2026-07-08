@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use dashmap::DashMap;
 use parking_lot::Mutex as StdMutex;
 use tokio::sync::mpsc;
@@ -23,8 +24,11 @@ use crate::events::{PermissionResponseWire, StreamFrame};
 use crate::history::TursoHistoryStore;
 use crate::llm::{SessionConfigProvider, SessionConfigWriter};
 use crate::session::Session;
-use crate::workflows::{DriverCmd, WorkflowConfig, WorkflowStack};
-use frances_config::{ConfigBinding, ConfigHandle, ConfigProvider, EnvProvider, TomlProvider};
+use crate::workflows::{ActiveWorkflow, DriverCmd, WorkflowConfig};
+use frances_config::{
+    ConfigBinding, ConfigEvent, ConfigHandle, ConfigProvider, EnvProvider, EventSender, Path,
+    ProviderError, TomlProvider, Value as ConfigValue,
+};
 use frances_edit::{EditEngine, EditSession};
 use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
 use frances_models_llm::config::ModelConfig;
@@ -189,14 +193,14 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     pub history: TursoHistoryStore,
     pub cache: ProviderCache,
     pub workflows: ConfigBinding<HashMap<String, WorkflowConfig>>,
-    /// `default_workflow` config binding. `restore_or_seed` reads this
-    /// to choose what to push when the `workflow_stack` table is empty.
+    /// `default_workflow` config binding. Used when the session metadata
+    /// has no selected workflow yet.
     pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl<Io>>>,
-    pub workflow_stack: WorkflowStack,
+    pub active_workflow: ActiveWorkflow,
     /// Control channel into the long-lived workflow driver task. Slash
-    /// pushes go here; plain input/interrupts bypass it and land on the
-    /// active inbox via [`WorkflowStack`]'s live sender.
+    /// workflow switches go here; plain input/interrupts bypass it and
+    /// land on the active inbox via [`ActiveWorkflow`]'s live sender.
     pub(crate) workflow_cmd: mpsc::UnboundedSender<DriverCmd>,
     /// Same `ChatSessionManager` the workflow runtime uses (it's a
     /// cheap `Arc`-backed clone). The auto-judge calls `chat.complete`
@@ -214,6 +218,22 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
 /// tests to `cache.insert_stub(<id>, Arc::new(StubProvider::new()))`.
 pub type ProviderCacheHook = Box<dyn FnOnce(&ProviderCache) + Send>;
 
+struct DefaultWorkflowProvider {
+    default_workflow: String,
+}
+
+#[async_trait]
+impl ConfigProvider for DefaultWorkflowProvider {
+    async fn load(&self, events: EventSender) -> Result<(), ProviderError> {
+        let event = ConfigEvent::new(
+            Path::parse("default_workflow"),
+            ConfigValue::String(self.default_workflow.clone().into()),
+        );
+        let _ = events.send(vec![event]).await;
+        Ok(())
+    }
+}
+
 /// Knobs passed to [`SessionRuntime::start_with`] /
 /// [`SessionRuntime::start_with_io`]. Default is the production
 /// behaviour (empty providers vec, no-op cache hook), so callers that
@@ -226,6 +246,8 @@ pub struct StartOverrides {
     /// here to seed `models.default`, `model_providers.<id>`, and
     /// `workflows.<id>.file` without touching XDG.
     pub extra_config_providers: Vec<Arc<dyn ConfigProvider>>,
+    /// Override the workflow selected for a newly-created session.
+    pub default_workflow: Option<String>,
     /// Closure run against the freshly-built [`ProviderCache`] before
     /// the [`ChatSessionManager`] is constructed.
     pub on_cache: Option<ProviderCacheHook>,
@@ -233,7 +255,7 @@ pub struct StartOverrides {
 
 impl SessionRuntime<RealIo> {
     /// Build the runtime with the production IO bundle, restore the
-    /// persisted workflow stack, and return it alongside the events
+    /// selected workflow, and return it alongside the events
     /// receiver the TUI should drain. Initial scrollback replay is
     /// not done here — call
     /// [`SessionRuntime::replay_initial_scrollback`] after the receiver
@@ -273,7 +295,8 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         io: Io,
     ) -> crate::Result<(Arc<Self>, tokio::sync::mpsc::UnboundedReceiver<StreamFrame>)> {
         let StartOverrides {
-            extra_config_providers,
+            mut extra_config_providers,
+            default_workflow,
             on_cache,
         } = overrides;
 
@@ -287,6 +310,9 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         let edit_engine = EditEngine::new(AnchorStoreImpl::new(db.clone()));
 
         let session_provider = Arc::new(SessionConfigProvider::new(db.clone()));
+        if let Some(default_workflow) = default_workflow {
+            extra_config_providers.push(Arc::new(DefaultWorkflowProvider { default_workflow }));
+        }
         let config_providers =
             build_config_providers(session_provider.clone(), extra_config_providers);
         let config = ConfigHandle::build(config_providers).await?;
@@ -350,29 +376,29 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             workflows,
             default_workflow,
             workflow_runtime,
-            workflow_stack: WorkflowStack::new(db),
+            active_workflow: ActiveWorkflow::new(db),
             workflow_cmd,
             chat,
             session_config_writer,
             cancel: CancellationToken::new(),
         });
 
-        // Restore the persisted workflow stack — or, if the table is
-        // literally empty, seat the configured `default_workflow`. The
+        // Restore the selected workflow — or, if the session metadata has
+        // none, seat the configured `default_workflow`. The
         // returned instance becomes the driver's initial active workflow;
         // anything it emits during top-level evaluation buffers in the
         // handle's frame channel and flushes once the driver pumps.
-        let initial = match crate::workflows::restore_or_seed(&runtime).await {
+        let initial = match crate::workflows::restore_or_start_default(&runtime).await {
             Ok(initial) => initial,
             Err(error) => {
-                warn!(%error, "workflow stack restore failed");
+                warn!(%error, "workflow session restore failed");
                 None
             }
         };
         // Publish the active wires synchronously (before the driver task
         // is scheduled) so `replay_initial_scrollback` sees the
         // active instance immediately.
-        runtime.workflow_stack.seat_initial(initial.as_ref());
+        runtime.active_workflow.seat_initial(initial.as_ref());
 
         tokio::spawn(crate::workflows::run_driver(
             runtime.clone(),
@@ -393,16 +419,16 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
     /// workflow instance. Sends a `ScrollbackFrame::Reset` / replay /
     /// `ScrollbackFrame::End` burst into the events channel.
     pub async fn replay_initial_scrollback(self: &Arc<Self>) {
-        let active_instance = self.workflow_stack.active_instance().await;
+        let active_instance = self.active_workflow.active_instance().await;
         if let Err(error) =
-            replay::write_initial_replay(&self.events, self.workflow_stack.db(), active_instance)
+            replay::write_initial_replay(&self.events, self.active_workflow.db(), active_instance)
                 .await
         {
             warn!(%error, "initial scrollback replay failed");
         }
     }
 
-    /// Deliver user input. Slash commands push a workflow (via the
+    /// Deliver user input. Slash commands switch workflow (via the
     /// driver's control channel); anything else lands on the active
     /// workflow's inbox as plain input. Non-blocking — input is just
     /// IO, decoupled from any cycle. Frames flow through `self.events`.

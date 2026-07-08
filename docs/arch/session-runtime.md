@@ -35,7 +35,7 @@ that workflows read via `current_env` / `current_cwd`.
 There is no IPC, no socket-pairing race, no protocol versioning, no
 re-attach. The single-process model intentionally drops the "session
 outlives the TUI" property — quitting the TUI cancels any in-flight turn.
-Persisted state (scrollback rows, history rows, workflow stack rows) is
+Persisted state (scrollback rows, history rows, workflow metadata) is
 written eagerly during the turn so a partial turn survives the restart.
 
 ## Per-session database

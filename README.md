@@ -74,9 +74,9 @@ The interesting crates live under `crates/`:
 
 - **`frances`** — the binary. TUI, TTY identification, and `main.rs` wiring the
   runtime to the TUI.
-- **`frances-session`** — session runtime: per-session DB handle, workflow stack,
-  history, scrollback persistence, anchor store, the LLM session provider, and the
-  events channel into the TUI.
+- **`frances-session`** — session runtime: per-session DB handle, workflow
+  selection, history, scrollback persistence, anchor store, the LLM session
+  provider, and the events channel into the TUI.
 - **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat
   sessions and tool calls.
 - **`frances-llm`** / **`frances-models-llm`** — provider configuration, auth
@@ -108,7 +108,8 @@ A `nix develop` dev shell provides the toolchain plus `rust-analyzer`, `jq`,
 
 ```bash
 frances        # open the TUI for the current TTY's session (creating one if none)
-frances new    # unlink the current TTY's session so the next run starts fresh
+frances new            # unlink the current TTY's session and start fresh
+frances new review     # start a fresh session with the `review` workflow
 ```
 
 ## Configuration
@@ -263,6 +264,6 @@ which names one of the `[workflows.*]` entries:
 default_workflow = "main"
 ```
 
-On a fresh session the runtime seats `default_workflow`; on an existing session
-it restores the persisted workflow stack instead. If `default_workflow` is unset
-(as in the example config), the session starts with an empty stack.
+On a fresh session the runtime seats `default_workflow`, defaulting to `main`
+when unset. On an existing session it restores that session's persisted workflow
+selection instead.

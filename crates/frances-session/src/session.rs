@@ -2,11 +2,11 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use frances_core::now_unix_secs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::Result;
 use crate::tty::TtyKey;
@@ -82,7 +82,14 @@ pub struct SessionMeta {
     pub id: String,
     pub created: u64,
     pub cwd: Option<PathBuf>,
+    pub workflow: Option<SessionWorkflow>,
     pub reserved: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionWorkflow {
+    pub name: String,
+    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -156,6 +163,7 @@ impl Paths {
             id: id.clone(),
             created: now_unix_secs(),
             cwd,
+            workflow: None,
             reserved: None,
         };
 
@@ -286,14 +294,23 @@ impl Session {
     pub fn database_path(&self) -> PathBuf {
         self.dir.join("frances.db")
     }
+
+    pub fn write_meta(&mut self, meta: SessionMeta) -> Result<()> {
+        write_metadata(&self.metadata_path(), &meta)?;
+        self.id = meta.id.clone();
+        self.meta = meta;
+        Ok(())
+    }
+
+    pub fn write_workflow(&self, workflow: SessionWorkflow) -> Result<()> {
+        let mut meta = self.meta.clone();
+        meta.workflow = Some(workflow);
+        write_metadata(&self.metadata_path(), &meta)
+    }
 }
 
 fn generate_session_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:x}-{:x}", nanos, std::process::id())
+    Uuid::new_v4().to_string()
 }
 
 fn current_uid() -> u32 {
