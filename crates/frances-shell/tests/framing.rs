@@ -1,4 +1,4 @@
-use frances_shell::{RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
+use frances_shell::{RunOutcome, Shell, ShellOptions, WaitOpts};
 
 #[tokio::test]
 async fn unbalanced_quote_does_not_break_shell() {
@@ -19,7 +19,6 @@ async fn unbalanced_quote_does_not_break_shell() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    assert!(shell.is_alive());
     let next = shell.run("echo alive", WaitOpts::default()).await.unwrap();
     assert!(matches!(next, RunOutcome::Done { exit_code: 0, .. }));
 }
@@ -44,17 +43,92 @@ async fn nonce_tamper_resistance() {
         }
         other => panic!("unexpected: {other:?}"),
     }
-    assert!(shell.is_alive());
 }
 
 #[tokio::test]
-async fn exit_kills_shell() {
+async fn dead_run_does_not_break_shell() {
+    // Self-SIGKILL takes the wrapper bash down before the sentinel can
+    // print, so the run ends Dead — but the shell stays usable and the
+    // next run spawns a fresh bash against the same stored state.
     let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
-    let res = shell.run("exit", WaitOpts::default()).await.unwrap();
+    let res = shell.run("kill -9 $$", WaitOpts::default()).await.unwrap();
     assert!(matches!(res, RunOutcome::Dead { .. }));
-    assert!(!shell.is_alive());
-    let again = shell.run("echo nope", WaitOpts::default()).await;
-    assert!(matches!(again, Err(ShellError::Dead)));
+    let again = shell
+        .run("echo recovered", WaitOpts::default())
+        .await
+        .unwrap();
+    match again {
+        RunOutcome::Done { exit_code, output } => {
+            assert_eq!(exit_code, 0);
+            assert!(output.contains("recovered"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn exit_frames_done_with_status() {
+    // `exit N` exits the wrapper bash mid-source, but the EXIT trap still
+    // runs teardown: the status is framed as Done and cwd persists.
+    let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
+    let res = shell
+        .run("echo before; cd /; exit 42", WaitOpts::default())
+        .await
+        .unwrap();
+    match res {
+        RunOutcome::Done { exit_code, output } => {
+            assert_eq!(exit_code, 42);
+            assert!(output.contains("before"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let after = shell.run("pwd", WaitOpts::default()).await.unwrap();
+    match after {
+        RunOutcome::Done { exit_code, output } => {
+            assert_eq!(exit_code, 0);
+            assert_eq!(output.trim(), "/", "cd before exit should persist");
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_e_failure_frames_done() {
+    // A user-script `set -e` death exits the wrapper bash, but the EXIT
+    // trap frames the failing status instead of reporting Dead.
+    let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
+    let res = shell
+        .run("set -e; false; echo unreachable", WaitOpts::default())
+        .await
+        .unwrap();
+    match res {
+        RunOutcome::Done { exit_code, output } => {
+            assert_eq!(exit_code, 1);
+            assert!(!output.contains("unreachable"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn user_exit_trap_does_not_break_framing() {
+    // A user script that installs its own EXIT trap replaces the
+    // wrapper's. The wrapper's explicit teardown call still frames the
+    // normal-completion path.
+    let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
+    let res = shell
+        .run("trap 'echo cleanup' EXIT; echo work", WaitOpts::default())
+        .await
+        .unwrap();
+    match res {
+        RunOutcome::Done { exit_code, output } => {
+            assert_eq!(exit_code, 0);
+            assert!(output.contains("work"));
+        }
+        other => panic!("unexpected: {other:?}"),
+    }
+    let next = shell.run("echo next", WaitOpts::default()).await.unwrap();
+    assert!(matches!(next, RunOutcome::Done { exit_code: 0, .. }));
 }
 
 #[tokio::test]

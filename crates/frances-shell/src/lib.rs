@@ -16,8 +16,9 @@
 //! [`Shell::run`] returns [`RunOutcome::Done`] when the sentinel arrives,
 //! [`RunOutcome::Quiet`] when output goes silent (or a max wall-clock ceiling
 //! trips), and [`RunOutcome::Dead`] when the invocation exits before framing a
-//! result. [`Shell::keep_waiting`] continues an in-flight invocation;
-//! [`Shell::interrupt`] / [`Shell::kill_running`] signal its process group.
+//! result — the shell itself stays usable and the next run spawns a fresh
+//! bash. [`Shell::keep_waiting`] continues an in-flight invocation;
+//! [`Shell::kill_running`] SIGKILLs its process group.
 //!
 //! Pipes-only — no PTY in v1. Apps that hard-require a TTY (`vim`, `top`,
 //! `psql` without `-c`) are unsupported here; their non-interactive equivalents

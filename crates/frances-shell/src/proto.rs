@@ -92,13 +92,42 @@ pub fn wrapper_script(
     let mut script = String::new();
     script.push_str("exec 2>&1\n");
     script.push_str("set +e\n");
+    // Teardown is a function called from two places: an EXIT trap, so a
+    // user script that calls `exit N` (or dies to its own `set -e`)
+    // still gets cwd/env captured and its status framed by the
+    // sentinel; and an explicit call at the end of the wrapper, so a
+    // user script that installs its own EXIT trap doesn't lose the
+    // framing on the normal path. The `__f_done` guard keeps the
+    // sentinel single however we get here. Only an unframed death
+    // (SIGKILL, `exec`, sabotage) ends the run without a sentinel,
+    // which readers report as Dead.
+    script.push_str("__f_teardown() {\n");
+    script.push_str("  __f_ec=$?\n");
+    script.push_str("  if [ -n \"${__f_done+x}\" ]; then return; fi\n");
+    script.push_str("  __f_done=1\n");
+    script.push_str("  if [ -n \"${__f_exit_code+x}\" ]; then __f_ec=$__f_exit_code; fi\n");
     writeln!(
         script,
-        "cd -- {} || exit_code=$?",
+        "  pwd > {}",
+        shell_single_quote(&cwd_path.to_string_lossy())
+    )
+    .unwrap();
+    writeln!(
+        script,
+        "  env -0 > {}",
+        shell_single_quote(&env_path.to_string_lossy())
+    )
+    .unwrap();
+    writeln!(script, "  printf '\\n__F_{nonce}_%d__\\n' \"$__f_ec\"").unwrap();
+    script.push_str("}\n");
+    script.push_str("trap __f_teardown EXIT\n");
+    writeln!(
+        script,
+        "cd -- {} || __f_exit_code=$?",
         shell_single_quote(&cwd.to_string_lossy())
     )
     .unwrap();
-    script.push_str("if [ -z \"${exit_code+x}\" ]; then\n");
+    script.push_str("if [ -z \"${__f_exit_code+x}\" ]; then\n");
     for (name, value) in env {
         if !is_bash_name(name) {
             continue;
@@ -112,21 +141,9 @@ pub fn wrapper_script(
         shell_single_quote(&user_path.to_string_lossy())
     )
     .unwrap();
-    script.push_str("exit_code=$?\n");
+    script.push_str("__f_exit_code=$?\n");
     script.push_str("fi\n");
-    writeln!(
-        script,
-        "pwd > {}",
-        shell_single_quote(&cwd_path.to_string_lossy())
-    )
-    .unwrap();
-    writeln!(
-        script,
-        "env -0 > {}",
-        shell_single_quote(&env_path.to_string_lossy())
-    )
-    .unwrap();
-    writeln!(script, "printf '\\n__F_{nonce}_%d__\\n' \"$exit_code\"").unwrap();
+    script.push_str("__f_teardown\n");
     script
 }
 

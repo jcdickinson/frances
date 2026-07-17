@@ -22,8 +22,8 @@ async fn quiet_trips_on_silent_command() {
         } => assert!(output.is_empty()),
         other => panic!("unexpected: {other:?}"),
     }
-    // Interrupt rather than wait the full 3s.
-    shell.interrupt().await.unwrap();
+    // Kill rather than wait the full 3s.
+    shell.kill_running().await.unwrap();
     let _ = shell.keep_waiting(WaitOpts::default()).await.unwrap();
 }
 
@@ -85,7 +85,7 @@ async fn keep_waiting_resumes_after_quiet() {
 }
 
 #[tokio::test]
-async fn interrupt_ends_in_flight_invocation() {
+async fn kill_ends_in_flight_invocation_and_shell_recovers() {
     let mut shell = Shell::spawn(ShellOptions::default()).await.unwrap();
     let first = shell
         .run(
@@ -99,7 +99,9 @@ async fn interrupt_ends_in_flight_invocation() {
         .unwrap();
     assert!(matches!(first, RunOutcome::Quiet { .. }));
 
-    shell.interrupt().await.unwrap();
+    // SIGKILL hits the whole process group, bash included, so the run
+    // ends Dead rather than Done.
+    shell.kill_running().await.unwrap();
     let after = shell
         .keep_waiting(WaitOpts {
             quiet: Some(Duration::from_millis(200)),
@@ -108,19 +110,19 @@ async fn interrupt_ends_in_flight_invocation() {
         .await
         .unwrap();
     match after {
-        RunOutcome::Done { exit_code, output } => {
-            assert_ne!(exit_code, 0, "interrupted command should not exit 0");
-            assert!(
-                !output.contains("too late"),
-                "echo after sleep must not have run",
-            );
-        }
         RunOutcome::Dead { output } => {
             assert!(
                 !output.contains("too late"),
                 "echo after sleep must not have run",
             );
         }
-        other => panic!("expected Done or Dead after interrupt, got {other:?}"),
+        other => panic!("expected Dead after kill, got {other:?}"),
     }
+
+    // A killed run must not poison the shell — the next run works.
+    let next = shell
+        .run("echo recovered", WaitOpts::default())
+        .await
+        .unwrap();
+    assert!(matches!(next, RunOutcome::Done { exit_code: 0, .. }));
 }

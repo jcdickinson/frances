@@ -66,7 +66,7 @@ fn markdown_pushes(frames: &[SectionTranscript]) -> Vec<String> {
 }
 
 #[tokio::test]
-async fn shell_set_set_form_is_not_exported() {
+async fn shell_set_persists_across_runs_and_subprocesses() {
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"
@@ -84,18 +84,18 @@ async fn shell_set_set_form_is_not_exported() {
         vars.set("v", "abc");
         await setTool.handler({
             call: { id: "s1", name: "shell_set",
-                    arguments: { set: "FOO", from: "v" } },
+                    arguments: { name: "FOO", from: "v" } },
             scope: null,
         });
 
-        // Inside the shell, $FOO is set (visible to bash itself).
+        // A later run (a fresh bash) sees the persisted export.
         const seen = await run.handler({
             call: { id: "r1", name: "shell_run", arguments: { cmd: "echo \"[$FOO]\"" } },
             scope: null,
         });
         transcript.push(new MarkdownSection({ content: seen.content }));
 
-        // But subprocesses don't inherit a non-exported var.
+        // Subprocesses inherit it too.
         const sub = await run.handler({
             call: { id: "r2", name: "shell_run",
                     arguments: { cmd: "bash -c 'echo \"[${FOO:-unset}]\"'" } },
@@ -124,14 +124,14 @@ async fn shell_set_set_form_is_not_exported() {
         pushes[0]
     );
     assert!(
-        pushes[1].contains("[unset]"),
-        "expected [unset] in {:?}",
+        pushes[1].contains("[abc]"),
+        "expected [abc] in {:?}",
         pushes[1]
     );
 }
 
 #[tokio::test]
-async fn shell_set_export_form_visible_to_subprocesses() {
+async fn shell_set_multiline_value_survives() {
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"
@@ -151,7 +151,7 @@ async fn shell_set_export_form_visible_to_subprocesses() {
         vars.set("payload", "alpha\nbeta\ngamma");
         await setTool.handler({
             call: { id: "s1", name: "shell_set",
-                    arguments: { export: "PAYLOAD", from: "payload" } },
+                    arguments: { name: "PAYLOAD", from: "payload" } },
             scope: null,
         });
 
@@ -200,7 +200,7 @@ async fn shell_set_object_value_is_json_encoded() {
         vars.set("obj", { a: 1, b: [2, 3] });
         await setTool.handler({
             call: { id: "s1", name: "shell_set",
-                    arguments: { set: "OBJ", from: "obj" } },
+                    arguments: { name: "OBJ", from: "obj" } },
             scope: null,
         });
 
@@ -230,7 +230,7 @@ async fn shell_set_object_value_is_json_encoded() {
 }
 
 #[tokio::test]
-async fn shell_set_validates_xor_and_missing_from() {
+async fn shell_set_validates_names_and_from() {
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"
@@ -243,31 +243,31 @@ async fn shell_set_validates_xor_and_missing_from() {
         vars.set("v", "value");
         const setTool = new ShellSet(sh, vars);
 
-        const both = await setTool.handler({
+        const noName = await setTool.handler({
             call: { id: "s1", name: "shell_set",
-                    arguments: { set: "A", export: "A", from: "v" } },
-            scope: null,
-        });
-        const neither = await setTool.handler({
-            call: { id: "s2", name: "shell_set",
                     arguments: { from: "v" } },
             scope: null,
         });
         const missing = await setTool.handler({
-            call: { id: "s3", name: "shell_set",
-                    arguments: { set: "A", from: "nope" } },
+            call: { id: "s2", name: "shell_set",
+                    arguments: { name: "A", from: "nope" } },
             scope: null,
         });
         const bad = await setTool.handler({
+            call: { id: "s3", name: "shell_set",
+                    arguments: { name: "1bad", from: "v" } },
+            scope: null,
+        });
+        const reserved = await setTool.handler({
             call: { id: "s4", name: "shell_set",
-                    arguments: { set: "1bad", from: "v" } },
+                    arguments: { name: "FRANCES_ROOT", from: "v" } },
             scope: null,
         });
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify(both) }));
-        transcript.push(new MarkdownSection({ content: JSON.stringify(neither) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(noName) }));
         transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
         transcript.push(new MarkdownSection({ content: JSON.stringify(bad) }));
+        transcript.push(new MarkdownSection({ content: JSON.stringify(reserved) }));
 
         await sh.close();
         "#,
@@ -284,10 +284,10 @@ async fn shell_set_validates_xor_and_missing_from() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
     for (idx, expected_fragment) in [
-        (0usize, "exactly one"),
-        (1, "exactly one"),
-        (2, "unknown variable"),
-        (3, "invalid bash name"),
+        (0usize, "missing `name`"),
+        (1, "unknown variable"),
+        (2, "invalid bash name"),
+        (3, "reserved"),
     ] {
         let f = text_of(&frames[idx]);
         assert!(f.contains(r#""is_error":true"#), "frame {idx}: {f}");
@@ -312,9 +312,12 @@ async fn shell_capture_round_trip_via_variable_assign() {
         const capture = new ShellCapture(sh, vars);
         const assign = new VarAssign(vars);
 
+        // Each run is a fresh bash: OUT must be exported and persisted
+        // for the capture (a separate run) to see it.
         await run.handler({
             call: { id: "r1", name: "shell_run",
-                    arguments: { cmd: "OUT='{\"a\":1,\"b\":[2,3]}'" } },
+                    arguments: { cmd: "export OUT='{\"a\":1,\"b\":[2,3]}'",
+                                 persist: ["OUT"] } },
             scope: null,
         });
         await capture.handler({
@@ -604,9 +607,14 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
         // source sentinel fires once the SIGKILL'd sleep is reaped.
         const stillRunning = await sh.isRunning();
 
+        // Regression: SIGKILL takes bash down with the command (Dead),
+        // which must not brick the Shell — the next run spawns a fresh
+        // bash and works.
+        const revived = await sh.runOnce("echo revived");
+
         await sh.close();
         transcript.push(new MarkdownSection({
-            content: `r1Kind=${r1.kind} isErr=${result.is_error} hasStillRunning=${result.content.includes("Still running")} running=${stillRunning} content=${JSON.stringify(result.content)}`,
+            content: `r1Kind=${r1.kind} isErr=${result.is_error} hasStillRunning=${result.content.includes("Still running")} running=${stillRunning} revivedKind=${revived.kind} revivedExit=${revived.exit_code} content=${JSON.stringify(result.content)}`,
         }));
         "#,
     );
@@ -630,5 +638,9 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
     assert!(
         summary.contains("running=false"),
         "shell must be idle after Kill drained: `{summary}`",
+    );
+    assert!(
+        summary.contains("revivedKind=done") && summary.contains("revivedExit=0"),
+        "a killed run must not brick the shell: `{summary}`",
     );
 }

@@ -12,7 +12,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use frances_core::Truncated;
 
 use crate::child::signal_pgid;
-use crate::error::{HandshakeFailure, ShellError, ShellResult};
+use crate::error::{ShellError, ShellResult};
 use crate::proto::{Sentinel, make_nonce, wrapper_script};
 pub use crate::reader::QuietReason;
 use crate::reader::{OutputReader, ReadEvent, ReadOutcome};
@@ -43,7 +43,6 @@ pub struct Shell {
     nonce: String,
     tmpdir: TempDir,
     next_run_id: u64,
-    alive: bool,
 }
 
 struct InFlight {
@@ -122,11 +121,14 @@ pub enum RunOutcome {
     /// status.
     Done { exit_code: i32, output: String },
     /// One of the wait thresholds tripped. The invocation is still alive —
-    /// call [`Shell::keep_waiting`] again (or [`Shell::interrupt`] /
-    /// [`Shell::kill_running`] to stop it).
+    /// call [`Shell::keep_waiting`] again (or [`Shell::kill_running`] to
+    /// stop it).
     Quiet { output: String, reason: QuietReason },
-    /// EOF before the sentinel: the invocation died before Frances could run
-    /// teardown and frame the result. Stored state is left unchanged.
+    /// EOF before the sentinel: the invocation's bash died (killed, `exec`,
+    /// crash) before the wrapper's teardown could frame a result. A plain
+    /// `exit N` is framed as `Done` by the wrapper's EXIT trap, so it does
+    /// not land here. Stored state is left unchanged and the shell stays
+    /// usable — the next run spawns a fresh bash as always.
     Dead { output: String },
 }
 
@@ -155,38 +157,29 @@ impl Shell {
             nonce: make_nonce(),
             tmpdir: TempDir::new()?,
             next_run_id: 0,
-            alive: true,
         };
 
         if let Some(script) = opts.init_script {
             match shell.run(&script, WaitOpts::default()).await? {
                 RunOutcome::Done { exit_code: 0, .. } => {}
                 RunOutcome::Done { exit_code, output } => {
-                    return Err(ShellError::Handshake(HandshakeFailure::InitScriptFailed {
+                    return Err(ShellError::InitScriptFailed {
                         exit_code,
                         output: Truncated::new(output),
-                    }));
+                    });
                 }
                 RunOutcome::Quiet { .. } => {
-                    return Err(ShellError::Handshake(HandshakeFailure::InitScriptQuiet));
+                    return Err(ShellError::InitScriptQuiet);
                 }
                 RunOutcome::Dead { output } => {
-                    return Err(ShellError::Handshake(
-                        HandshakeFailure::BashDiedDuringInit {
-                            output: Truncated::new(output),
-                        },
-                    ));
+                    return Err(ShellError::InitScriptDied {
+                        output: Truncated::new(output),
+                    });
                 }
             }
         }
 
         Ok(shell)
-    }
-
-    /// Whether this state holder can accept new runs. A `Dead` outcome marks
-    /// it unusable to preserve the existing public lifecycle contract.
-    pub fn is_alive(&self) -> bool {
-        self.alive
     }
 
     /// Return a clone of the persisted cwd/exported-env snapshot.
@@ -225,9 +218,6 @@ impl Shell {
         opts: RunOpts,
         wait: WaitOpts,
     ) -> ShellResult<RunOutcome> {
-        if !self.alive {
-            return Err(ShellError::Dead);
-        }
         if self.in_flight.is_some() {
             return Err(ShellError::CommandRunning);
         }
@@ -240,25 +230,20 @@ impl Shell {
     /// [`Shell::run`]. Errors with [`ShellError::NoRunningCommand`] if no
     /// command is currently in flight.
     pub async fn keep_waiting(&mut self, wait: WaitOpts) -> ShellResult<RunOutcome> {
-        if !self.alive {
-            return Err(ShellError::Dead);
-        }
         if self.in_flight.is_none() {
             return Err(ShellError::NoRunningCommand);
         }
         self.read_outcome(wait).await
     }
 
-    /// Send `SIGINT` to the in-flight process group. No-op if no command is
-    /// currently running.
-    pub async fn interrupt(&mut self) -> ShellResult<()> {
-        self.signal_running(libc::SIGINT)
-    }
-
-    /// Like [`Shell::interrupt`] but `SIGKILL`. Used when a command ignores
-    /// `SIGINT`.
+    /// `SIGKILL` the in-flight invocation's process group. No-op if no
+    /// command is currently running. Bash is that group's leader, so the
+    /// run ends [`RunOutcome::Dead`] rather than `Done`.
     pub async fn kill_running(&mut self) -> ShellResult<()> {
-        self.signal_running(libc::SIGKILL)
+        let Some(in_flight) = self.in_flight.as_ref() else {
+            return Ok(());
+        };
+        signal_pgid(in_flight.pgid, libc::SIGKILL).map_err(ShellError::Signal)
     }
 
     async fn start_run(&mut self, cmd: &str, opts: RunOpts) -> ShellResult<()> {
@@ -309,21 +294,13 @@ impl Shell {
         }
 
         let mut child = command.spawn().map_err(ShellError::Spawn)?;
-        let pgid = child
-            .id()
-            .ok_or(ShellError::Handshake(HandshakeFailure::MissingPid))?;
+        let pgid = child.id().ok_or(ShellError::MissingPid)?;
         if let Some(stdin) = opts.stdin {
-            let mut child_stdin = child
-                .stdin
-                .take()
-                .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdin))?;
+            let mut child_stdin = child.stdin.take().ok_or(ShellError::MissingStdin)?;
             child_stdin.write_all(&stdin).await?;
             child_stdin.flush().await?;
         }
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or(ShellError::Handshake(HandshakeFailure::MissingStdout))?;
+        let stdout = child.stdout.take().ok_or(ShellError::MissingStdout)?;
         let mut reader = OutputReader::new(stdout, Sentinel::new(&self.nonce));
         reader.set_sink(self.output_sink.clone());
 
@@ -338,16 +315,6 @@ impl Shell {
             },
         });
         Ok(())
-    }
-
-    fn signal_running(&self, sig: libc::c_int) -> ShellResult<()> {
-        if !self.alive {
-            return Err(ShellError::Dead);
-        }
-        let Some(in_flight) = self.in_flight.as_ref() else {
-            return Ok(());
-        };
-        signal_pgid(in_flight.pgid, sig).map_err(ShellError::Signal)
     }
 
     async fn read_outcome(&mut self, wait: WaitOpts) -> ShellResult<RunOutcome> {
@@ -379,7 +346,6 @@ impl Shell {
             ReadOutcome::Eof { output } => {
                 let mut in_flight = self.in_flight.take().expect("in_flight exists after read");
                 let _ = in_flight.child.wait().await;
-                self.alive = false;
                 RunOutcome::Dead {
                     output: String::from_utf8_lossy(&output).into_owned(),
                 }

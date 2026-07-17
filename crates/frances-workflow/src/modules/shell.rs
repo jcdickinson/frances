@@ -15,24 +15,29 @@
 //!   persists; `persist` is per-run, not a durable watch list.
 //!   Resolves to `{ kind: "done", exit_code, output }`,
 //!   `{ kind: "quiet", output, reason }`, or `{ kind: "dead", output }`.
+//!   A `dead` outcome means that run's bash died before reporting a
+//!   status; the Shell stays usable and the next `runOnce` spawns a
+//!   fresh bash against the same stored state.
 //!   Throws if a command is already in flight on this Shell.
 //! - `keepWaiting()` — resume waiting on the in-flight command.
 //!   Same shape as `runOnce`. Throws if nothing is in flight.
 //! - `kill()` — SIGKILL the in-flight command (no-op if nothing
 //!   running). After kill, the next `keepWaiting` typically returns
 //!   Done (with a non-zero exit) or Dead.
-//! - `close()` — drop the bash subprocess. Future calls error.
+//! - `close()` — retire this Shell (any in-flight run's process is
+//!   killed on drop). Future calls error.
 //! - `isRunning()` — true while a command is suspended in Quiet state.
-//! - `setVar(name, value, exported)` — bridge a Frances variable into
-//!   bash: write `value` to a temp file and run either
-//!   `<name>=$(cat 'tmp')` (shell var, current shell only) or
-//!   `export <name>=$(cat 'tmp')` (env var, visible to subprocesses).
-//!   Awaits Done; errors on non-zero exit.
+//! - `setVar(name, value)` — bridge a Frances variable into bash: write
+//!   `value` to a temp file, run `export <name>=$(cat 'tmp')`, and
+//!   persist the exported value into the stored snapshot so subsequent
+//!   runs (and their subprocesses) see it. Awaits Done; errors on
+//!   non-zero exit.
 //! - `captureVar(name)` — bridge a bash variable back into Frances:
 //!   run `( set -u; printf '%s' "$<name>" > 'tmp' )`, await Done,
 //!   return the temp file's contents as a string. Errors if the bash
 //!   var is unset (the `set -u` subshell makes that visible instead of
-//!   silently capturing `""`).
+//!   silently capturing `""`) — with fresh bash per run, that means
+//!   persisted env, wrapper-restored state, or bash builtins.
 //!
 //! The wait/quiet thresholds aren't exposed yet — `runOnce` /
 //! `keepWaiting` use `frances_shell::WaitOpts::default()` (1s of output
@@ -108,7 +113,7 @@ struct ShellState {
     /// True after a runOnce/keepWaiting returned Quiet. Cleared when
     /// Done/Dead lands.
     running: bool,
-    /// Flipped by `close()` or a Dead outcome. Methods error after.
+    /// Flipped by `close()`. Methods error after.
     closed: bool,
     /// Sender plumbed into the `Shell`'s `OutputReader` on lazy
     /// spawn. Dropped on `close()` so the receiver sees the channel
@@ -219,18 +224,13 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
             "setVar",
             Function::new(
                 ctx.clone(),
-                |this: This<Class<'js, ShellJs<F>>>,
-                 name: String,
-                 value: String,
-                 exported: bool| {
+                |this: This<Class<'js, ShellJs<F>>>, name: String, value: String| {
                     let borrow = this.0.borrow();
                     let state = borrow.state.clone();
                     let factory = borrow.factory.clone();
                     drop(borrow);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        ShellUnitResult(
-                            set_var_inner(&factory, &state, name, value, exported).await,
-                        )
+                        ShellUnitResult(set_var_inner(&factory, &state, name, value).await)
                     }))
                 },
             )?,
@@ -270,8 +270,6 @@ enum ShellToolError {
     Busy,
     #[error("no command in flight; call runOnce first")]
     NoCommandInFlight,
-    #[error("shell handle gone")]
-    HandleGone,
     #[error("spawn bash: {0}")]
     Spawn(#[source] ShellError),
     #[error("run: {0}")]
@@ -288,9 +286,8 @@ enum ShellToolError {
     FlushTempfile(#[source] io::Error),
     #[error("read captured tempfile: {0}")]
     ReadCaptured(#[source] io::Error),
-    #[error("{action} {name}: exit {exit}\n{output}")]
+    #[error("export {name}: exit {exit}\n{output}")]
     SetVarFailed {
-        action: &'static str,
         name: String,
         exit: i32,
         output: String,
@@ -303,12 +300,14 @@ enum ShellToolError {
     },
     #[error("command went quiet (export/capture expect immediate Done):\n{output}")]
     WentQuiet { output: String },
-    #[error("shell died:\n{output}")]
+    #[error("bash died mid-command:\n{output}")]
     Died { output: String },
     #[error("empty bash name")]
     EmptyBashName,
     #[error("invalid bash name: {0:?}")]
     InvalidBashName(String),
+    #[error("FRANCES_ROOT is reserved and Frances-managed")]
+    ReservedBashName,
 }
 
 /// The shell tool's wall-clock ceiling when the model doesn't set `max`.
@@ -460,7 +459,7 @@ async fn keep_waiting_inner(
         return Err(ShellToolError::NoCommandInFlight);
     }
     let outcome = {
-        let shell = guard.shell.as_mut().ok_or(ShellToolError::HandleGone)?;
+        let shell = guard.shell.as_mut().expect("shell is Some while running");
         shell
             .keep_waiting(wait)
             .await
@@ -477,43 +476,37 @@ async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), ShellTool
     if !guard.running {
         return Ok(());
     }
-    let shell = guard.shell.as_mut().ok_or(ShellToolError::HandleGone)?;
+    let shell = guard.shell.as_mut().expect("shell is Some while running");
     shell.kill_running().await.map_err(ShellToolError::Kill)
 }
 
-/// Bridge a Frances variable into bash via the `name=$(cat tmpfile)`
-/// trick. With `exported=true` the assignment is prefixed `export` so
-/// subprocesses inherit it; otherwise it's a plain shell variable
-/// (current bash session only). The temp file goes through RAII drop
-/// after the bash run settles. Caller must have already coerced
-/// `value` into a string (raw for string values, JSON for everything
-/// else).
+/// Bridge a Frances variable into bash via the `export name=$(cat
+/// tmpfile)` trick, persisting the exported value into the stored
+/// snapshot so subsequent runs (and their subprocesses) inherit it.
+/// The temp file goes through RAII drop after the bash run settles.
+/// Caller must have already coerced `value` into a string (raw for
+/// string values, JSON for everything else).
 async fn set_var_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     name: String,
     value: String,
-    exported: bool,
 ) -> Result<(), ShellToolError> {
     validate_bash_name(&name)?;
+    if name == "FRANCES_ROOT" {
+        return Err(ShellToolError::ReservedBashName);
+    }
     let mut tmp = tempfile::NamedTempFile::new().map_err(ShellToolError::Tempfile)?;
     tmp.write_all(value.as_bytes())
         .map_err(ShellToolError::WriteTempfile)?;
     tmp.flush().map_err(ShellToolError::FlushTempfile)?;
-    let prefix = if exported { "export " } else { "" };
     let cmd = format!(
-        "{prefix}{name}=$(cat {})",
+        "export {name}=$(cat {})",
         shell_quote(tmp.path().to_string_lossy().as_ref()),
     );
-    let (exit, output) = run_to_done(factory, state, &cmd).await?;
+    let (exit, output) = run_to_done(factory, state, &cmd, vec![name.clone()]).await?;
     if exit != 0 {
-        let action = if exported { "export" } else { "set" };
-        return Err(ShellToolError::SetVarFailed {
-            action,
-            name,
-            exit,
-            output,
-        });
+        return Err(ShellToolError::SetVarFailed { name, exit, output });
     }
     // `tmp` drops here — file is removed.
     drop(tmp);
@@ -538,7 +531,7 @@ async fn capture_var_inner<F: WorkflowShell>(
         "( set -u; printf '%s' \"${name}\" > {} )",
         shell_quote(tmp.path().to_string_lossy().as_ref()),
     );
-    let (exit, output) = run_to_done(factory, state, &cmd).await?;
+    let (exit, output) = run_to_done(factory, state, &cmd, Vec::new()).await?;
     if exit != 0 {
         return Err(ShellToolError::CaptureFailed { name, exit, output });
     }
@@ -554,6 +547,7 @@ async fn run_to_done<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     cmd: &str,
+    persist: Vec<String>,
 ) -> Result<(i32, String), ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
@@ -566,7 +560,14 @@ async fn run_to_done<F: WorkflowShell>(
     let outcome = {
         let shell = guard.shell.as_mut().expect("shell is Some");
         shell
-            .run(cmd, WaitOpts::default())
+            .run_with_opts(
+                cmd,
+                ShellRunOpts {
+                    stdin: None,
+                    persist,
+                },
+                WaitOpts::default(),
+            )
             .await
             .map_err(ShellToolError::Run)?
     };
@@ -625,10 +626,12 @@ fn absorb_outcome(state: &mut ShellState, outcome: RunOutcome) -> Outcome {
                 reason: quiet_reason_str(reason),
             }
         }
+        // Dead means that run's bash died before framing a result. The
+        // Shell itself is still usable — every run spawns a fresh bash —
+        // so only the running flag resets. Closing here would brick the
+        // tool for the rest of the session over one killed command.
         RunOutcome::Dead { output } => {
             state.running = false;
-            state.shell = None;
-            state.closed = true;
             Outcome::Dead { output }
         }
     }

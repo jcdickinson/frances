@@ -37,11 +37,11 @@
 // The leaf `Wait` and `Kill` tools are unchanged from before.
 //
 // Two more leaf tools — `Set` and `Capture` — bridge Frances variables
-// to/from bash variables. `Set` writes a Frances var into either a
-// shell variable (`set:`) or an exported env var (`export:`); `Capture`
-// reads a bash variable back into a Frances var. They run short
-// deterministic bash commands through the same `Shell` and share its
-// busy/closed state. Both take a `Variables` instance:
+// to/from bash variables. `Set` exports a Frances var into the shell's
+// persisted environment (subsequent runs and their subprocesses see
+// it); `Capture` reads a bash variable back into a Frances var. They
+// run short deterministic bash commands through the same `Shell` and
+// share its busy/closed state. Both take a `Variables` instance:
 //
 //   const vars = new Variables();
 //   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
@@ -129,7 +129,7 @@ const RUN_SCHEMA = {
         "finishes. Cwd always persists; persist applies only to this run, is " +
         "not a durable watch list, and tracks exported env vars only. Names " +
         "must be plain bash identifiers. FRANCES_ROOT is reserved and " +
-        "Frances-managed, so attempts to persist it error before execution.",
+        "Frances-managed; persisting it is ignored.",
     },
   },
   required: ["cmd"],
@@ -212,7 +212,11 @@ function _format(call_id, outcome, view) {
   return {
     role: "tool",
     call_id,
-    content: `Bash exited. Output:\n${out}`,
+    content:
+      `Command ended without an exit status (bash died — killed or ` +
+      `replaced via \`exec\`). Output:\n${out}\n` +
+      `This run's cwd/env changes were not captured; the next shell_run ` +
+      `works normally.`,
     is_error: true,
   };
 }
@@ -626,11 +630,11 @@ class Kill {
   handler = async ({ call }) => {
     try {
       // Drain after SIGKILL. Loop a few attempts with re-kills between
-      // them: in the common case bash flushes its "Killed" notice and
-      // the wrapper's post-source sentinel well within one wait. We
-      // retry because a single Quiet here is what used to drive the
-      // model into a `shell_kill` loop (Quiet formats as "Still
-      // running … call shell_kill to stop").
+      // them: SIGKILL hits the whole process group, bash included, so
+      // in the common case the drain promptly lands on the Dead
+      // outcome. We retry because a single Quiet here is what used to
+      // drive the model into a `shell_kill` loop (Quiet formats as
+      // "Still running … call shell_kill to stop").
       let final = null;
       let drained = false;
       const MAX_ATTEMPTS = 3;
@@ -704,15 +708,10 @@ class Kill {
 const SET_SCHEMA = {
   type: "object",
   properties: {
-    set: {
+    name: {
       type: "string",
       description:
-        "Bash variable name to assign as a plain shell variable. Visible only inside the current bash session; subprocesses do NOT inherit it. Provide exactly one of `set` or `export`.",
-    },
-    export: {
-      type: "string",
-      description:
-        "Bash variable name to assign AND export. Same as `set` but also exported so subprocesses inherit the value. Provide exactly one of `set` or `export`.",
+        "Bash variable name to assign and export. Persists: subsequent shell_run calls and their subprocesses see it.",
     },
     from: {
       type: "string",
@@ -720,7 +719,7 @@ const SET_SCHEMA = {
         "Frances variable name to pull the value from. Strings pass through verbatim; non-strings are JSON-encoded.",
     },
   },
-  required: ["from"],
+  required: ["name", "from"],
 };
 
 const CAPTURE_SCHEMA = {
@@ -756,24 +755,16 @@ class Set {
 
   describe(call) {
     const a = call.arguments || {};
-    const target = a.export || a.set;
-    if (!target) return "";
+    if (!a.name) return "";
     const from = a.from ? ` ← ${a.from}` : "";
-    return `$${target}${from}`;
+    return `$${a.name}${from}`;
   }
 
   handler = async ({ call }) => {
     const args = call.arguments;
-    const hasSet = typeof args.set === "string" && args.set.length > 0;
-    const hasExport = typeof args.export === "string" && args.export.length > 0;
-    if (hasSet && hasExport) {
-      return _errResult(
-        call.id,
-        "I provide exactly one of `set` or `export`, not both",
-      );
-    }
-    if (!hasSet && !hasExport) {
-      return _errResult(call.id, "I provide exactly one of `set` or `export`");
+    const bashName = args.name;
+    if (typeof bashName !== "string" || bashName.length === 0) {
+      return _errResult(call.id, "missing `name` (bash variable name)");
     }
     const from = args.from;
     if (typeof from !== "string" || from.length === 0) {
@@ -782,22 +773,15 @@ class Set {
     if (!this.vars.has(from)) {
       return _errResult(call.id, `unknown variable: ${from}`);
     }
-    const bashName = hasSet ? args.set : args.export;
-    const exported = hasExport;
     try {
-      await this.shell.setVar(
-        bashName,
-        _stringify(this.vars.get(from)),
-        exported,
-      );
+      await this.shell.setVar(bashName, _stringify(this.vars.get(from)));
     } catch (err) {
       return _errResult(call.id, err);
     }
-    const verb = exported ? "exported" : "set";
     return {
       role: "tool",
       call_id: call.id,
-      content: `${verb} $${bashName} from ${from}`,
+      content: `exported $${bashName} from ${from}`,
       is_error: false,
     };
   };
