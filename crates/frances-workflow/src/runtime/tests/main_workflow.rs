@@ -18,6 +18,10 @@ fn contains_text(frames: &[SectionTranscript], needle: &str) -> bool {
     frames.iter().any(|frame| text_of(frame).contains(needle))
 }
 
+fn main_workflow_source() -> String {
+    std::fs::read_to_string(main_workflow_path()).expect("read main workflow source")
+}
+
 async fn wait_for_text(handle: &mut WorkflowHandle, needle: &str) -> Vec<SectionTranscript> {
     let mut frames = Vec::new();
     let deadline = tokio::time::Instant::now() + CYCLE_TIMEOUT;
@@ -56,7 +60,7 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         const chat = new ChatSession({ model_intents: ["chat"] });
         const chatId = await chat.ensurePersisted();
         const state = {
-          schemaVersion: 1,
+          schemaVersion: 2,
           instanceId,
           mode: "planning",
           plan: {
@@ -64,13 +68,13 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
             prelude: "Persisted plan context",
             updatedAt: new Date().toISOString(),
             steps: [{
-              id: "step-a",
+
               title: "Keep state",
               body: "I keep state across restart.",
               status: "active"
             }]
           },
-          nextStepId: 2,
+
           currentChat: { id: chatId, mode: "planning", pendingSeed: null },
           variables: [["restart_marker", { survived: true, count: 1 }]],
           stepTranscript: { entries: ["## User\nseeded before restart"], summary: null },
@@ -87,7 +91,7 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         await db.exec(
           "INSERT INTO main_workflow_state (instance_id, version, state_json, updated_at) " +
           "VALUES (?, ?, ?, ?)",
-          [instanceId, 1, JSON.stringify(state), new Date().toISOString()]
+          [instanceId, 2, JSON.stringify(state), new Date().toISOString()]
         );
         "####,
     );
@@ -126,6 +130,42 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         contains_text(&frames, "Planning complete"),
         "pending plan_exit should be consumed after hydrate: {frames:?}"
     );
+}
+
+#[test]
+fn planning_contract_uses_atomic_protected_zero_based_operations() {
+    let source = main_workflow_source();
+
+    for operation in ["add", "update", "remove", "move"] {
+        assert!(source.contains(&format!("enum: [\"{operation}\"]")));
+    }
+    assert!(source.contains("const next = steps.map((step) => ({ ...step }))"));
+    assert!(source.contains("const boundary = editableBoundary(next)"));
+    assert!(source.contains("step ${index} is protected"));
+    assert!(source.contains("move crosses the protected boundary"));
+    assert!(source.contains("add index must be between ${boundary} and ${next.length}"));
+    assert!(source.contains("`${index}. ${step.title}`"));
+    assert!(source.contains("Plan updated:\\n${planTitles() || \"(no steps)\"}"));
+    assert!(!source.contains("nextStepId"));
+    assert!(!source.contains("step_id"));
+    assert!(!source.contains("current_step"));
+}
+
+#[test]
+fn finish_step_contract_is_sequential_complete_or_skip_only() {
+    let source = main_workflow_source();
+
+    assert!(source.contains("enum: [\"complete\"]"));
+    assert!(source.contains("required: [\"action\", \"summary\", \"proof\"]"));
+    assert!(source.contains("enum: [\"skip\"]"));
+    assert!(source.contains("required: [\"action\", \"reason\"]"));
+    assert!(source.contains("if (!currentStep()) return _errResult(call.id, \"no active step\")"));
+    assert!(source.contains("const judgement = await referee(signal)"));
+    assert!(source.contains("if (judgement.type === \"decline\")"));
+    assert!(source.contains("activateNextStep()"));
+    assert!(source.contains("Completion is referee-reviewed; skipping advances directly."));
+    assert!(!source.contains("task_complete"));
+    assert!(!source.contains("outcome:"));
 }
 
 #[tokio::test]

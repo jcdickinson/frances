@@ -1,17 +1,14 @@
 // Frances primary workflow: an agentic chat with shell and file tools.
-// User input becomes a user message; the LLM responds and can call
-// shell_run/wait/kill against one long-lived bash subprocess, plus the
-// anchor-aware file_read/replace/insert_*/new/overwrite family.
+// User input becomes a user message; the LLM responds and can call the
+// standard shell, file, search, and variable tools.
 //
-// This version also keeps a rudimentary in-memory agentic loop:
-//   - a planning phase that interviews the user, then `plan_exit`
-//   - `plan_begin` to drop back into planning mid-execution to ask the user
-//     questions, carrying a goal + self-context across the context clear
-//   - a living typed plan (`plan_update`)
-//   - a structured task-completion signal (`task_complete`)
-//   - a cheap/referee model that approves or declines completion
-//   - ralph-wiggum reset after every referee verdict (approve or decline):
-//     the context is cleared and re-seeded from the plan state
+// The workflow maintains a planning/execution loop with:
+//   - planning interviews followed by `plan_exit`
+//   - atomic pending-step edits through `plan_update`
+//   - sequential `plan_finish_step` completion or skipping
+//   - referee review of completed work
+//   - context reset and reseeding after every progression or decline
+//   - `plan_begin` when execution requires a user decision
 //
 // Wire up as the daemon's default workflow via config:
 //   default_workflow = "main"
@@ -66,17 +63,15 @@ import {
   nestedAgentsInventory,
 } from "frances:v1/agent-sections";
 
-type StepStatus = "pending" | "active" | "completed" | "abandoned";
-type StepOutcome = "succeeded" | "partial" | "failed" | "abandoned";
+type StepStatus = "pending" | "active" | "completed" | "skipped";
 
 type PlanStep = {
-  id: string;
   title: string;
   body: string;
   status: StepStatus;
   summary?: string;
-  outcome?: StepOutcome;
   proof?: unknown;
+  reason?: string;
   transcript_summary?: string;
 };
 
@@ -87,17 +82,14 @@ type Plan = {
   updatedAt: string;
 };
 
-type CompletionSignal = {
-  step_id?: string;
-  outcome: StepOutcome;
-  summary: string;
-  proof: unknown;
-  findings?: unknown;
-  decisions?: unknown;
-  transcript_summary?: string;
-  open_questions?: unknown;
-  artifacts?: unknown;
-};
+type FinishSignal =
+  | {
+      action: "complete";
+      summary: string;
+      proof: unknown;
+      transcript_summary?: string;
+    }
+  | { action: "skip"; reason: string };
 
 type ToolResult = {
   role: "tool";
@@ -105,6 +97,7 @@ type ToolResult = {
   content: string;
   is_error: boolean;
 };
+
 
 type PersistedChat = {
   id: number | null;
@@ -118,22 +111,21 @@ type PersistedStepTranscript = {
 };
 
 type PersistedState = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   instanceId: string;
   mode: Mode;
   plan: Plan;
-  nextStepId: number;
   currentChat: PersistedChat;
   variables: Array<[string, unknown]>;
   stepTranscript: PersistedStepTranscript;
   pending: {
-    completion: CompletionSignal | null;
+    completion: FinishSignal | null;
     planExit: boolean;
     planBegin: PlanBeginRequest | null;
   };
 };
 
-const STATE_SCHEMA_VERSION = 1;
+const STATE_SCHEMA_VERSION = 2;
 const INSTANCE_ID = String(import.meta.instance);
 const STATE_TABLE = "main_workflow_state";
 
@@ -146,8 +138,7 @@ let plan: Plan = {
   steps: [],
   updatedAt: new Date().toISOString(),
 };
-let nextStepId = 1;
-let pendingCompletion: CompletionSignal | null = null;
+let pendingCompletion: FinishSignal | null = null;
 let pendingPlanExit = false;
 // When set, the execution agent has asked to drop back into planning. `goal`
 // is what it wants to resolve with the user; `context` is self-context it
@@ -172,25 +163,26 @@ const PLANNING_PROMPT =
   "If a question can be answered by exploring the codebase, I will explore the " +
   "codebase instead (I have read and search tools).\n\n" +
   "As understanding crystallises, I will record it with the `plan_update` tool: a " +
-  "title, a prelude capturing durable context and the decisions reached, and " +
-  "an ordered list of steps. I write the plan like an ADR and in first person: " +
-  "the prelude records what I know, and each step says what I will do. " +
-  "When the user and I share a clear understanding and the plan has concrete " +
-  "steps, I MUST call `plan_exit` to leave planning and begin execution.";
+  "title, a prelude capturing durable context and decisions, and atomic edits to " +
+  "an ordered list of execution steps. Plans contain only work to execute after " +
+  "planning; interviewing, investigating to form the plan, and planning itself are " +
+  "not steps. I write the plan like an ADR and in first person: the prelude records " +
+  "what I know, and each step says what I will do. When the user and I share a clear " +
+  "understanding and the plan has concrete execution steps, I MUST call `plan_exit` " +
+  "to leave planning and begin execution.";
 
 const SYSTEM_PROMPT =
   "I am an agentic coding assistant in the EXECUTION phase of a structured " +
-  "agentic loop. A plan has already been agreed with the user. The plan is " +
-  "living state: I will keep it accurate with the `plan_update` tool whenever reality " +
-  "changes, but I won't re-plan from scratch. I will work only on the " +
-  "active step. When the active step is complete, I MUST call `task_complete` with an " +
-  "outcome, summary, and concrete proof. A separate referee model will approve " +
-  "or decline the completion. On approval, my conversation context is cleared " +
-  "and I am restarted with the whole plan (each step title, body, and " +
-  "completed proof) plus the current location. If I am blocked on something " +
-  "only the user can decide, I MUST call `plan_begin` to return to planning and ask — " +
-  "I won't guess. I will occasionally provide updates on what I am trying to do; " +
-  "I won't just present the user with a stream of tool calls.";
+  "agentic loop. A plan has already been agreed with the user. The plan contains " +
+  "only execution work. I will keep pending steps accurate with atomic `plan_update` " +
+  "operations whenever reality changes, but completed/skipped history and the active " +
+  "step are protected. I will work only on the active step. When it is done, I MUST " +
+  "call `plan_finish_step` with either `complete` plus summary/proof, or `skip` plus " +
+  "a reason. Completion is referee-reviewed; skipping advances directly. On advance, " +
+  "my conversation context is cleared and I am restarted from the whole plan and " +
+  "current location. If blocked on something only the user can decide, I MUST call " +
+  "`plan_begin` to return to planning and ask — I won't guess. I will occasionally " +
+  "provide updates on what I am trying to do; I won't just present a stream of tool calls.";
 
 // Stable section objects for planning and execution prompts.
 // These are mode-specific identity objects referenced by promptSections.
@@ -257,7 +249,7 @@ function makePersistedState(): PersistedState {
     instanceId: INSTANCE_ID,
     mode,
     plan,
-    nextStepId,
+
     currentChat: {
       id: currentChatId,
       mode,
@@ -307,7 +299,7 @@ async function loadPersistedState(): Promise<PersistedState | null> {
 function restorePersistedState(state: PersistedState): void {
   mode = state.mode === "executing" ? "executing" : "planning";
   plan = state.plan;
-  nextStepId = typeof state.nextStepId === "number" ? state.nextStepId : 1;
+  validatePlan();
   currentChatId = typeof state.currentChat?.id === "number" ? state.currentChat.id : null;
   currentChatPendingSeed =
     typeof state.currentChat?.pendingSeed === "string"
@@ -327,58 +319,47 @@ function restorePersistedState(state: PersistedState): void {
   pendingPlanBegin = state.pending?.planBegin || null;
 }
 
-function normalizeStep(raw: any, idx: number): PlanStep {
-  const status = ["pending", "active", "completed", "abandoned"].includes(
-    raw && raw.status,
-  )
-    ? raw.status
-    : "pending";
-  return {
-    id:
-      typeof raw?.id === "string" && raw.id.length > 0
-        ? raw.id
-        : `step-${nextStepId++}`,
-    title:
-      typeof raw?.title === "string" && raw.title.length > 0
-        ? raw.title
-        : `Step ${idx + 1}`,
-    body: typeof raw?.body === "string" ? raw.body : "",
-    status,
-    summary: typeof raw?.summary === "string" ? raw.summary : undefined,
-    outcome: ["succeeded", "partial", "failed", "abandoned"].includes(
-      raw?.outcome,
-    )
-      ? raw.outcome
-      : undefined,
-    proof: raw?.proof,
-    transcript_summary:
-      typeof raw?.transcript_summary === "string"
-        ? raw.transcript_summary
-        : undefined,
-  };
+function validatePlan(): void {
+  let seenUnfinished = false;
+  let activeCount = 0;
+  for (const step of plan.steps) {
+    if (!["pending", "active", "completed", "skipped"].includes(step.status)) {
+      throw new Error(`invalid plan step status: ${step.status}`);
+    }
+    if (step.status === "completed" || step.status === "skipped") {
+      if (seenUnfinished) throw new Error("terminal steps must form an immutable prefix");
+    } else {
+      seenUnfinished = true;
+    }
+    if (step.status === "active") activeCount += 1;
+  }
+  if (activeCount > 1) throw new Error("plan has more than one active step");
+  const firstUnfinished = plan.steps.findIndex(
+    (step) => step.status === "active" || step.status === "pending",
+  );
+  const active = currentStepIndex();
+  if (active >= 0 && active !== firstUnfinished) {
+    throw new Error("the active step must be the first unfinished step");
+  }
 }
 
-function normalizePlan(): void {
-  let sawActive = false;
-  for (const step of plan.steps) {
-    if (step.status === "active") {
-      if (sawActive) step.status = "pending";
-      sawActive = true;
-    }
-  }
-  if (!sawActive) {
-    const next = plan.steps.find((s) => s.status === "pending");
-    if (next) next.status = "active";
-  }
+function activateNextStep(): void {
+  if (currentStep()) return;
+  const next = plan.steps.find((step) => step.status === "pending");
+  if (next) next.status = "active";
   plan.updatedAt = now();
 }
 
 function currentStep(): PlanStep | null {
-  return plan.steps.find((s) => s.status === "active") || null;
+  return plan.steps.find((step) => step.status === "active") || null;
+}
+
+function currentStepIndex(): number {
+  return plan.steps.findIndex((step) => step.status === "active");
 }
 
 function stepNumber(step: PlanStep): number {
-  return plan.steps.findIndex((s) => s.id === step.id) + 1;
+  return plan.steps.indexOf(step) + 1;
 }
 
 function textToString(value: unknown): string {
@@ -410,7 +391,7 @@ function proofToString(proof: unknown): string {
 }
 
 async function summarizeStepTranscript(
-  signal: CompletionSignal,
+  signal: FinishSignal,
 ): Promise<string> {
   if (stepTranscriptSummary) return stepTranscriptSummary;
 
@@ -437,7 +418,7 @@ async function summarizeStepTranscript(
   summarizer.push({
     role: "user",
     content:
-      `Current step: ${step ? `${step.title} (id: ${step.id})` : "(none)"}\n` +
+      `Current step: ${step ? step.title : "(none)"}\n` +
       `Step body: ${step?.body || "(empty)"}\n\n` +
       `Completion signal:\n${JSON.stringify(signal, null, 2)}\n\n` +
       `Transcript to summarize:\n${truncateForTranscript(transcriptText, 30000)}`,
@@ -529,11 +510,11 @@ async function pipeReasoningToFrame(
 // and one section per step. This is what the user sees in the transcript and
 // what the model and referee read back in their prompts.
 function renderPlan(): string {
-  normalizePlan();
+  validatePlan();
   const out = [`# ${plan.title}`];
   if (plan.prelude.trim()) out.push("", plan.prelude.trim());
   if (plan.steps.length === 0) {
-    out.push("", "_No steps yet — agree a plan before doing work._");
+    out.push("", "_No execution steps yet — agree a plan before doing work._");
     return out.join("\n");
   }
   for (let i = 0; i < plan.steps.length; i++) {
@@ -541,12 +522,13 @@ function renderPlan(): string {
     out.push("", `## ${i + 1}. ${step.title} _(${step.status})_`);
     if (step.body.trim()) out.push("", step.body.trim());
     if (step.status === "completed") {
-      out.push("", `**Outcome:** ${step.outcome || "succeeded"}`);
       if (step.summary) out.push("", `**Summary:** ${step.summary}`);
       out.push("", "**Proof:**", "", "```", proofToString(step.proof), "```");
       if (step.transcript_summary) {
         out.push("", `**Transcript summary:** ${step.transcript_summary}`);
       }
+    } else if (step.status === "skipped") {
+      out.push("", `**Skip reason:** ${step.reason || "(none)"}`);
     }
   }
   const active = currentStep();
@@ -559,55 +541,40 @@ function renderPlan(): string {
   return out.join("\n");
 }
 
-function activateStep(ref: unknown): void {
-  let target: PlanStep | undefined;
-  if (typeof ref === "number") {
-    target = plan.steps[ref - 1];
-  } else if (typeof ref === "string") {
-    target = plan.steps.find((s) => s.id === ref || s.title === ref);
+function markFinished(signal: FinishSignal): PlanStep {
+  validatePlan();
+  const step = currentStep();
+  if (!step) throw new Error("plan_finish_step called with no active step");
+  if (signal.action === "complete") {
+    step.status = "completed";
+    step.summary = signal.summary;
+    step.proof = signal.proof;
+    step.transcript_summary = signal.transcript_summary;
+  } else {
+    step.status = "skipped";
+    step.reason = signal.reason;
   }
-  if (!target) return;
-  for (const step of plan.steps) {
-    if (step.status === "active") step.status = "pending";
-  }
-  if (target.status !== "completed" && target.status !== "abandoned") {
-    target.status = "active";
-  }
-}
-
-function markCompletion(signal: CompletionSignal): PlanStep {
-  normalizePlan();
-  const step = signal.step_id
-    ? plan.steps.find((s) => s.id === signal.step_id) || currentStep()
-    : currentStep();
-  if (!step) throw new Error("task_complete called with no active step");
-  step.status = "completed";
-  step.outcome = signal.outcome;
-  step.summary = signal.summary;
-  step.proof = signal.proof;
-  step.transcript_summary = signal.transcript_summary;
-  const next = plan.steps.find((s) => s.status === "pending");
-  if (next) next.status = "active";
-  plan.updatedAt = now();
+  activateNextStep();
+  validatePlan();
   return step;
 }
 
-function contextAfterCompletion(completed: PlanStep): string {
+function contextAfterProgress(step: PlanStep): string {
+  const result = step.status === "completed" ? "completed with referee approval" : "skipped";
   return (
-    `The referee approved completion of step ${stepNumber(completed)}: ` +
-    `${completed.title}. The prior conversation context has been cleared.\n\n` +
-    "Here is the full living plan state. It includes all steps with title, " +
-    "body, and proof for completed steps, plus the current location. I will continue " +
-    "from there. If the plan is finished, I report the final result to the user.\n\n" +
+    `Step ${stepNumber(step)} was ${result}: ${step.title}. ` +
+    "The prior conversation context has been cleared.\n\n" +
+    "Here is the full plan state, including terminal history and the current location. " +
+    "I will continue strictly in order. If the plan is finished, I report the final result.\n\n" +
     renderPlan()
   );
 }
 
 function executionSeed(): string {
   return (
-    "Planning is complete. The agreed plan is below. I will begin executing from the " +
-    "active step. I will work only that step; when it is done I MUST call `task_complete` " +
-    "with an outcome, summary, and concrete proof.\n\n" +
+    "Planning is complete. The agreed execution plan is below. I will begin at the " +
+    "active step and progress strictly in order. When it is done I MUST call " +
+    "`plan_finish_step` with `complete` and summary/proof, or `skip` and a reason.\n\n" +
     renderPlan()
   );
 }
@@ -633,166 +600,241 @@ function planBeginSeed(req: PlanBeginRequest): string {
 
 function declineSeed(reason: string): string {
   return (
-    "A referee reviewed my `task_complete` signal for the active step and " +
+    "A referee reviewed my `plan_finish_step` completion for the active step and " +
     "DECLINED it. My conversation context has been cleared. Reason given:\n\n" +
     reason +
     "\n\nThe full plan and my current position are below. I will do the missing " +
-    "work for the active step, then I MUST call `task_complete` again only once the " +
-    "proof is adequate.\n\n" +
+    "work for the active step, then call `plan_finish_step` with `complete` again " +
+    "only once the proof is adequate.\n\n" +
     renderPlan()
   );
 }
+
+const STEP_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    title: { type: "string" },
+    body: {
+      type: "string",
+      description: "Execution work, written in first person.",
+    },
+  },
+  required: ["title", "body"],
+};
 
 const PLAN_UPDATE_SCHEMA = {
   type: "object",
   properties: {
     title: { type: "string" },
-    prelude: {
-      type: "string",
-      description: "Durable context for the whole plan.",
-    },
-    steps: {
+    prelude: { type: "string", description: "Durable context and decisions." },
+    operations: {
       type: "array",
       description:
-        "Full ordered replacement list of steps. Each step is {id?, title, body, status?, summary?, outcome?, proof?, transcript_summary?}; step bodies should be written in first person.",
+        "Atomic, sequential, zero-based list edits. Completed/skipped steps and the active step cannot be edited, removed, or moved.",
       items: {
-        type: "object",
-        properties: {
-          id: { type: "string" },
-          title: { type: "string" },
-          body: { type: "string" },
-          status: {
-            type: "string",
-            enum: ["pending", "active", "completed", "abandoned"],
+        oneOf: [
+          {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["add"] },
+              index: { type: "integer", minimum: 0 },
+              step: STEP_INPUT_SCHEMA,
+            },
+            required: ["action", "index", "step"],
           },
-          summary: { type: "string" },
-          outcome: {
-            type: "string",
-            enum: ["succeeded", "partial", "failed", "abandoned"],
+          {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["update"] },
+              index: { type: "integer", minimum: 0 },
+              step: STEP_INPUT_SCHEMA,
+            },
+            required: ["action", "index", "step"],
           },
-          proof: {},
-          transcript_summary: {
-            type: "string",
-            description:
-              "Workflow-generated summary of the transcript for this step.",
+          {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["remove"] },
+              index: { type: "integer", minimum: 0 },
+            },
+            required: ["action", "index"],
           },
-        },
-        required: ["title", "body"],
+          {
+            type: "object",
+            properties: {
+              action: { type: "string", enum: ["move"] },
+              from: { type: "integer", minimum: 0 },
+              to: { type: "integer", minimum: 0 },
+            },
+            required: ["action", "from", "to"],
+          },
+        ],
       },
-    },
-    current_step: {
-      description:
-        "Optional 1-based step number, step id, or exact title to mark active.",
     },
   },
 };
 
+function editableBoundary(steps: PlanStep[]): number {
+  const active = steps.findIndex((step) => step.status === "active");
+  if (active >= 0) return active + 1;
+  let terminal = -1;
+  for (let index = 0; index < steps.length; index++) {
+    if (steps[index].status === "completed" || steps[index].status === "skipped") {
+      terminal = index;
+    }
+  }
+  return terminal + 1;
+}
+
+function requireIndex(index: unknown, length: number, label: string): number {
+  if (!Number.isInteger(index) || (index as number) < 0 || (index as number) >= length) {
+    throw new Error(`${label} must be a zero-based index between 0 and ${length - 1}`);
+  }
+  return index as number;
+}
+
+function pendingStep(raw: any): PlanStep {
+  if (typeof raw?.title !== "string" || !raw.title.trim()) {
+    throw new Error("step title must be a non-empty string");
+  }
+  if (typeof raw?.body !== "string" || !raw.body.trim()) {
+    throw new Error("step body must be a non-empty execution instruction");
+  }
+  return { title: raw.title.trim(), body: raw.body.trim(), status: "pending" };
+}
+
+function applyPlanOperations(steps: PlanStep[], operations: any[]): PlanStep[] {
+  const next = steps.map((step) => ({ ...step }));
+  for (const operation of operations) {
+    const boundary = editableBoundary(next);
+    if (operation?.action === "add") {
+      const index = operation.index;
+      if (!Number.isInteger(index) || index < boundary || index > next.length) {
+        throw new Error(`add index must be between ${boundary} and ${next.length}`);
+      }
+      next.splice(index, 0, pendingStep(operation.step));
+    } else if (operation?.action === "update") {
+      const index = requireIndex(operation.index, next.length, "update index");
+      if (index < boundary) throw new Error(`step ${index} is protected`);
+      next[index] = pendingStep(operation.step);
+    } else if (operation?.action === "remove") {
+      const index = requireIndex(operation.index, next.length, "remove index");
+      if (index < boundary) throw new Error(`step ${index} is protected`);
+      next.splice(index, 1);
+    } else if (operation?.action === "move") {
+      const from = requireIndex(operation.from, next.length, "move from");
+      const to = requireIndex(operation.to, next.length, "move to");
+      if (from < boundary || to < boundary) throw new Error("move crosses the protected boundary");
+      const [step] = next.splice(from, 1);
+      next.splice(to, 0, step);
+    } else {
+      throw new Error(`unknown plan operation: ${operation?.action}`);
+    }
+  }
+  return next;
+}
+
+function planTitles(): string {
+  return plan.steps.map((step, index) => `${index}. ${step.title}`).join("\n");
+}
+
 class PlanUpdate {
   name = "plan_update";
   description =
-    "I create or update the living typed plan. The plan is in-memory for this workflow. " +
-    "I MUST call this before doing work if there is no active step, and any time the plan should change.";
+    "I update plan metadata and pending execution steps with atomic zero-based operations. " +
+    "Operations run sequentially and all fail together. Terminal history and the active step are protected.";
   parameters = PLAN_UPDATE_SCHEMA;
 
   describe(call: any) {
-    const a = call.arguments || {};
-    if (typeof a.title === "string" && a.title.length > 0) return a.title;
-    if (a.current_step !== undefined) return `→ ${a.current_step}`;
-    return "";
+    const operations = call.arguments?.operations;
+    return Array.isArray(operations) ? `${operations.length} operation(s)` : "metadata";
   }
 
   handler = async ({ call }: any) => {
     try {
       const args = call.arguments || {};
-      if (typeof args.title === "string") plan.title = args.title;
-      if (typeof args.prelude === "string") plan.prelude = args.prelude;
-      if (Array.isArray(args.steps)) {
-        plan.steps = args.steps.map((step: any, idx: number) =>
-          normalizeStep(step, idx),
-        );
-      }
-      if (args.current_step !== undefined) activateStep(args.current_step);
-      normalizePlan();
+      const nextTitle = typeof args.title === "string" ? args.title.trim() : plan.title;
+      const nextPrelude = typeof args.prelude === "string" ? args.prelude : plan.prelude;
+      if (!nextTitle) throw new Error("plan title must be non-empty");
+      const nextSteps = Array.isArray(args.operations)
+        ? applyPlanOperations(plan.steps, args.operations)
+        : plan.steps;
+      plan = {
+        title: nextTitle,
+        prelude: nextPrelude,
+        steps: nextSteps,
+        updatedAt: now(),
+      };
+      validatePlan();
+      const confirmation = `Plan updated:\n${planTitles() || "(no steps)"}`;
       transcript.push(
-        new MarkdownSection({
-          content: `**Plan updated.**\n\n${renderPlan()}`,
-          source: "assistant",
-          closed: true,
-        }),
+        new MarkdownSection({ content: confirmation, source: "assistant", closed: true }),
       );
       await saveState();
-      return _okResult(call.id, renderPlan());
+      return _okResult(call.id, confirmation);
     } catch (err) {
       return _errResult(call.id, err);
     }
   };
 }
 
-const TASK_COMPLETE_SCHEMA = {
+const PLAN_FINISH_STEP_SCHEMA = {
   type: "object",
-  properties: {
-    step_id: {
-      type: "string",
-      description: "Optional id of the active step being completed.",
+  oneOf: [
+    {
+      properties: {
+        action: { type: "string", enum: ["complete"] },
+        summary: { type: "string", description: "What was completed." },
+        proof: { description: "Concrete commands, output, diffs, or explicit prose proof." },
+      },
+      additionalProperties: false,
+      required: ["action", "summary", "proof"],
     },
-    outcome: {
-      type: "string",
-      enum: ["succeeded", "partial", "failed", "abandoned"],
+    {
+      properties: {
+        action: { type: "string", enum: ["skip"] },
+        reason: { type: "string", description: "Why this execution step should be skipped." },
+      },
+      additionalProperties: false,
+      required: ["action", "reason"],
     },
-    summary: { type: "string", description: "What happened in this step." },
-    proof: {
-      description:
-        "Concrete proof: commands run, exit codes, test/build output, diffs, or explicit prose proof.",
-    },
-    findings: { description: "Optional facts learned during the step." },
-    decisions: { description: "Optional decisions made during the step." },
-    open_questions: { description: "Optional unresolved questions." },
-    artifacts: { description: "Optional files, commands, turn notes, etc." },
-    transcript_summary: {
-      type: "string",
-      description:
-        "Workflow-populated summary of the step transcript; agents normally omit this.",
-    },
-  },
-  required: ["outcome", "summary", "proof"],
+  ],
 };
 
-class TaskComplete {
-  name = "task_complete";
+class PlanFinishStep {
+  name = "plan_finish_step";
   description =
-    "I signal that the active plan step is complete. I include outcome, summary, and proof. " +
-    "This does not directly advance the plan; a referee model must approve it first.";
-  parameters = TASK_COMPLETE_SCHEMA;
+    "I finish the active step sequentially. `complete` awaits referee approval; `skip` records a reason and advances immediately. There is no target or outcome argument.";
+  parameters = PLAN_FINISH_STEP_SCHEMA;
 
   describe(call: any) {
-    const a = call.arguments || {};
-    return typeof a.outcome === "string" ? a.outcome : "";
+    return typeof call.arguments?.action === "string" ? call.arguments.action : "";
   }
 
   handler = async ({ call }: any) => {
     const args = call.arguments || {};
-    if (!currentStep()) {
-      return _errResult(call.id, "no active step; I MUST call plan_update first");
+    if (!currentStep()) return _errResult(call.id, "no active step");
+    if (args.action === "complete") {
+      if (typeof args.summary !== "string" || !args.summary.trim()) {
+        return _errResult(call.id, "complete requires a non-empty summary");
+      }
+      pendingCompletion = {
+        action: "complete",
+        summary: args.summary.trim(),
+        proof: args.proof,
+      };
+      await saveState();
+      return _okResult(call.id, "Step completion recorded; awaiting referee approval.");
     }
-    pendingCompletion = {
-      step_id: typeof args.step_id === "string" ? args.step_id : undefined,
-      outcome: args.outcome,
-      summary: args.summary,
-      proof: args.proof,
-      findings: args.findings,
-      decisions: args.decisions,
-      open_questions: args.open_questions,
-      transcript_summary:
-        typeof args.transcript_summary === "string"
-          ? args.transcript_summary
-          : undefined,
-      artifacts: args.artifacts,
-    };
-    await saveState();
-    return _okResult(
-      call.id,
-      "Task-completion signal recorded; awaiting referee approval.",
-    );
+    if (args.action === "skip") {
+      if (typeof args.reason !== "string" || !args.reason.trim()) {
+        return _errResult(call.id, "skip requires a non-empty reason");
+      }
+      pendingCompletion = { action: "skip", reason: args.reason.trim() };
+      await saveState();
+      return _okResult(call.id, "Step skip recorded; advancing sequentially.");
+    }
+    return _errResult(call.id, "action must be complete or skip");
   };
 }
 
@@ -812,8 +854,13 @@ class PlanExit {
     if (plan.steps.length === 0) {
       return _errResult(
         call.id,
-        "cannot exit planning with an empty plan; I MUST call plan_update to add steps first",
+        "cannot exit planning with an empty plan; add execution steps first",
       );
+    }
+    validatePlan();
+    activateNextStep();
+    if (!currentStep()) {
+      return _errResult(call.id, "cannot resume execution because the plan is already finished");
     }
     pendingPlanExit = true;
     await saveState();
@@ -882,7 +929,7 @@ const DECIDE_SCHEMA = {
 };
 
 async function referee(
-  signal: CompletionSignal,
+  signal: FinishSignal,
 ): Promise<{ type: "approve" } | { type: "decline"; message: string }> {
   // One forced `decide` call — `complete` (with `toolChoice`) routes to
   // the enforced path, so the force-a-tool + scold-on-miss + bounded
@@ -987,7 +1034,7 @@ const varGet = new VarGet(vars);
 const varSet = new VarSet(vars);
 const varAssign = new VarAssign(vars);
 const planUpdate = new PlanUpdate();
-const taskComplete = new TaskComplete();
+const planFinishStep = new PlanFinishStep();
 const planExit = new PlanExit();
 const planBegin = new PlanBegin();
 const persistentTools = [
@@ -1000,7 +1047,7 @@ const persistentTools = [
   varSet,
   varAssign,
   planUpdate,
-  taskComplete,
+  planFinishStep,
   planExit,
   planBegin,
 ];
@@ -1041,7 +1088,7 @@ function freshContext(): void {
     varAssign,
   ];
   planningTools = [...explore, planUpdate, planExit];
-  executingTools = [...explore, ...editTools, planUpdate, taskComplete, planBegin];
+  executingTools = [...explore, ...editTools, planUpdate, planFinishStep, planBegin];
 }
 
 function attachPlanningChat(session: ChatSession): ChatSession {
@@ -1115,13 +1162,23 @@ async function initializeWorkflow(): Promise<boolean> {
 async function handlePendingCompletion(): Promise<boolean> {
   if (!pendingCompletion) return false;
   const signal = pendingCompletion;
+  if (signal.action === "skip") {
+    const skipped = markFinished(signal);
+    transcript.push(
+      new MarkdownSection({
+        content: `Step ${stepNumber(skipped)} skipped: **${skipped.title}**\n\nReason: ${skipped.reason}`,
+        source: "assistant",
+        closed: true,
+      }),
+    );
+    resetStepTranscript();
+    pendingCompletion = null;
+    await newExecutionChat(contextAfterProgress(skipped));
+    return true;
+  }
   const judgement = await referee(signal);
   if (judgement.type === "decline") {
-    // Ralph Wiggum retry: clear context and restart the step from the plan,
-    // carrying only the referee's reason forward. Same reset as an approval;
-    // the difference is the step doesn't advance and the step transcript
-    // keeps accumulating across the retry (so the eventual summary covers it).
-    const msg = `Referee declined task completion: ${judgement.message}`;
+    const msg = `Referee declined step completion: ${judgement.message}`;
     transcript.push(new MarkdownSection({ content: msg, closed: true }));
     pendingCompletion = null;
     await newExecutionChat(declineSeed(judgement.message));
@@ -1131,13 +1188,11 @@ async function handlePendingCompletion(): Promise<boolean> {
   let completed: PlanStep;
   try {
     signal.transcript_summary = await summarizeStepTranscript(signal);
-    completed = markCompletion(signal);
+    completed = markFinished(signal);
   } catch (err) {
     chat.push({
       role: "user",
-      content:
-        `Internal plan error while completing the task: ${String(err)}. ` +
-        "Call plan_update to repair the plan, then continue.",
+      content: `Internal plan error while completing the step: ${String(err)}. Continue the active step.`,
     });
     await saveState();
     return false;
@@ -1146,7 +1201,6 @@ async function handlePendingCompletion(): Promise<boolean> {
     new MarkdownSection({
       content:
         `Step ${stepNumber(completed)} completed: **${completed.title}**\n\n` +
-        `Outcome: ${completed.outcome}\n\n` +
         `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\`\n\n` +
         `Transcript summary:\n\n${completed.transcript_summary || "(none)"}`,
       source: "assistant",
@@ -1155,7 +1209,7 @@ async function handlePendingCompletion(): Promise<boolean> {
   );
   resetStepTranscript();
   pendingCompletion = null;
-  await newExecutionChat(contextAfterCompletion(completed));
+  await newExecutionChat(contextAfterProgress(completed));
   return true;
 }
 
@@ -1322,21 +1376,17 @@ async function turn(): Promise<TurnEnd> {
     const { tool_calls } = winner.completed;
     if (await consumePendingSignals()) continue;
     if (!tool_calls || tool_calls.length === 0) {
-      // The only clean way out of a step is `task_complete`. If the model went
-      // idle while a step is still active, it stopped prematurely — nudge it
-      // to drive the step to a completion signal rather than handing a
-      // half-done step back to the user. With no active step the plan is
-      // finished, so break and yield (the same as planning's Q&A pause).
+      // The only clean way out of a step is `plan_finish_step`. If the model went
+      // idle while a step is still active, nudge it to continue.
       if (mode === "executing" && currentStep()) {
         if (overBudget()) break;
         chat.push({
           role: "user",
           content:
-            "I stopped without finishing the active step. I MUST continue working " +
-            "on it. I MUST call `task_complete` with an outcome (succeeded / partial " +
-            "/ failed), a summary, and concrete proof once it is done or I am " +
-            "blocked; I MUST call `plan_update` if the plan needs to change, or " +
-            "I MUST call `plan_begin` if I need to ask the user something.",
+            "I stopped without finishing the active step. I MUST continue working on it. " +
+            "When done I MUST call `plan_finish_step` with `complete` plus summary/proof, " +
+            "or `skip` plus a reason. I MUST use `plan_update` only for pending-step edits, " +
+            "or `plan_begin` if I need to ask the user something.",
         });
         await saveState();
         continue;
