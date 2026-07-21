@@ -1726,6 +1726,7 @@ dependencies = [
  "frances-storage",
  "frances-workflow",
  "globset",
+ "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",

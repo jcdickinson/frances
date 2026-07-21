@@ -187,6 +187,49 @@ async fn search_finds_match_with_line_number_and_skips_binary() {
 }
 
 #[tokio::test]
+async fn huge_matching_line_returns_bounded_match_centered_excerpt() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut body = vec![b'a'; 10 * 1024 * 1024];
+    let needle = b"UNIQUE_NEEDLE";
+    let needle_at = body.len() / 2;
+    body[needle_at..needle_at + needle.len()].copy_from_slice(needle);
+    std::fs::write(dir.path().join("minified.js"), &body).unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let frames = run_script(deps, &dump_raw_script(r#"{ search: "UNIQUE_NEEDLE" }"#)).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let first = &v["entries"][0]["first_match"];
+    let text = first["text"].as_str().unwrap();
+
+    assert!(text.contains("UNIQUE_NEEDLE"), "excerpt lost match: {text}");
+    assert!(text.len() <= 512, "excerpt was {} bytes", text.len());
+    assert_eq!(first["text_truncated"], true);
+    assert_eq!(first["line_bytes"], body.len());
+    assert!(
+        text.starts_with('…') && text.ends_with('…'),
+        "middle excerpt should mark both omitted sides: {text}"
+    );
+}
+
+#[tokio::test]
+async fn matching_excerpt_handles_utf8_at_slice_boundaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = format!("q{}UNICODE_NEEDLE{}", "é".repeat(300), "界".repeat(300));
+    std::fs::write(dir.path().join("unicode.txt"), &body).unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let frames = run_script(deps, &dump_raw_script(r#"{ search: "UNICODE_NEEDLE" }"#)).await;
+    let v: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let text = v["entries"][0]["first_match"]["text"].as_str().unwrap();
+
+    assert!(
+        text.contains("UNICODE_NEEDLE"),
+        "excerpt lost match: {text}"
+    );
+    assert!(text.len() <= 512, "excerpt was {} bytes", text.len());
+}
+
+#[tokio::test]
 async fn paths_only_keeps_match_count_drops_first_match() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("a.rs"), "x\nx\nx\n").unwrap();
@@ -360,6 +403,46 @@ async fn search_tool_without_into_returns_compact_text() {
     assert!(
         tool_result.contains("a.txt:1:hello"),
         "expected inline match line, got: {tool_result}"
+    );
+}
+
+#[tokio::test]
+async fn search_tool_caps_aggregate_inline_output() {
+    let dir = tempfile::tempdir().unwrap();
+    // Unicode keeps the character count well below the byte count. This
+    // catches accidentally enforcing a UTF-16-code-unit limit in JS while
+    // claiming the budget is bytes.
+    let body = format!("needle {}\n", "界".repeat(170));
+    for i in 0..40 {
+        std::fs::write(dir.path().join(format!("match-{i:02}.txt")), &body).unwrap();
+    }
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let script = r#"
+        import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
+        import { Editor } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        const tool = new Search(new FileSearch(new Editor()), new Variables());
+        const r = await tool.handler({
+            call: { id: "c1", name: "file_find_or_grep",
+                    arguments: { search: "needle" } },
+            scope: null,
+        });
+        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+    "#;
+    let frames = run_script(deps, script).await;
+    let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+    let content = result["content"].as_str().unwrap();
+
+    assert!(
+        content.len() <= 16 * 1024,
+        "output was {} bytes",
+        content.len()
+    );
+    assert!(
+        content.contains("entries omitted from this response"),
+        "missing explicit output-limit notice: {content}"
     );
 }
 

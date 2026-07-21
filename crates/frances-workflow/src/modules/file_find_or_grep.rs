@@ -26,6 +26,7 @@ use std::time::SystemTime;
 use frances_core::{JsonRepair, expand_tilde, resolve_relative};
 use frances_edit::{LoopKey, LoopKind};
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Sink, SinkMatch};
 use ignore::WalkState;
@@ -48,8 +49,17 @@ use crate::deps::{EditorSession, WorkflowDeps};
 /// final list is trimmed to exactly `RESULT_CAP`.
 const RESULT_CAP: usize = 1000;
 
+/// Maximum UTF-8 size of the text retained for one matching line.
+/// A result-count cap cannot protect the context window from minified or
+/// generated files where a single line may be several megabytes long.
+const MATCH_TEXT_CAP: usize = 512;
+
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
 }
 
 #[derive(Deserialize, Debug)]
@@ -247,6 +257,10 @@ struct Entry {
 struct FirstMatch {
     line: u64,
     text: String,
+    #[serde(skip_serializing_if = "is_false")]
+    text_truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line_bytes: Option<usize>,
 }
 
 #[derive(Serialize, Debug)]
@@ -418,7 +432,7 @@ fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String>
             }
 
             let (match_count, first_match) = if let Some(m) = matcher.as_ref() {
-                let mut sink = MatchSink::default();
+                let mut sink = MatchSink::new(m, !paths_only);
                 if searcher.search_path(m, path, &mut sink).is_err() {
                     return WalkState::Continue;
                 }
@@ -484,13 +498,25 @@ fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String>
     serde_json::to_string(&payload).map_err(|e| format!("serialize: {e}"))
 }
 
-#[derive(Default)]
-struct MatchSink {
+struct MatchSink<'a> {
+    matcher: &'a RegexMatcher,
+    capture_first: bool,
     count: u64,
     first: Option<FirstMatch>,
 }
 
-impl Sink for MatchSink {
+impl<'a> MatchSink<'a> {
+    fn new(matcher: &'a RegexMatcher, capture_first: bool) -> Self {
+        Self {
+            matcher,
+            capture_first,
+            count: 0,
+            first: None,
+        }
+    }
+}
+
+impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(
@@ -499,15 +525,68 @@ impl Sink for MatchSink {
         mat: &SinkMatch<'_>,
     ) -> Result<bool, std::io::Error> {
         self.count += 1;
-        if self.first.is_none() {
-            let text = String::from_utf8_lossy(mat.bytes())
-                .trim_end_matches(['\n', '\r'])
-                .to_string();
+        if self.capture_first && self.first.is_none() {
+            let (text, line_bytes) = match_excerpt(self.matcher, mat.bytes());
             let line = mat.line_number().unwrap_or(0);
-            self.first = Some(FirstMatch { line, text });
+            self.first = Some(FirstMatch {
+                line,
+                text,
+                text_truncated: line_bytes.is_some(),
+                line_bytes,
+            });
         }
         Ok(true)
     }
+}
+
+/// Keep a bounded excerpt with the actual regex match about one third of the
+/// way into the preview. Prefix-only truncation is nearly useless for a match
+/// near the end of a minified file.
+fn match_excerpt(matcher: &RegexMatcher, bytes: &[u8]) -> (String, Option<usize>) {
+    let bytes = trim_line_terminator(bytes);
+    if bytes.len() <= MATCH_TEXT_CAP {
+        let mut text = String::from_utf8_lossy(bytes).into_owned();
+        let expanded_past_cap = text.len() > MATCH_TEXT_CAP;
+        truncate_utf8(&mut text, MATCH_TEXT_CAP);
+        return (text, expanded_past_cap.then_some(bytes.len()));
+    }
+
+    const ELLIPSIS: &str = "…";
+    let source_cap = MATCH_TEXT_CAP - (ELLIPSIS.len() * 2);
+    let match_start = matcher.find(bytes).ok().flatten().map_or(0, |m| m.start());
+    let start = match_start
+        .saturating_sub(source_cap / 3)
+        .min(bytes.len() - source_cap);
+    let end = start + source_cap;
+
+    let mut text = String::with_capacity(MATCH_TEXT_CAP);
+    if start > 0 {
+        text.push_str(ELLIPSIS);
+    }
+    text.push_str(&String::from_utf8_lossy(&bytes[start..end]));
+    if end < bytes.len() {
+        text.push_str(ELLIPSIS);
+    }
+    truncate_utf8(&mut text, MATCH_TEXT_CAP);
+    (text, Some(bytes.len()))
+}
+
+fn trim_line_terminator(mut bytes: &[u8]) -> &[u8] {
+    while bytes.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn truncate_utf8(text: &mut String, byte_cap: usize) {
+    if text.len() <= byte_cap {
+        return;
+    }
+    let mut end = byte_cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text.truncate(end);
 }
 
 /// Cheap binary detection: peek the first 8 KiB and look for NUL.

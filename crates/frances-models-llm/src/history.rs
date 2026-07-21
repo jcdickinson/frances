@@ -8,6 +8,11 @@ use serde_json::Value;
 
 use crate::chat::HistoryError;
 
+/// Hard ceiling for one tool result entering conversation history. Tools
+/// should apply their own semantic limits first; this is the last-resort
+/// guard against an overlooked unbounded string.
+pub const TOOL_RESULT_BYTE_CAP: usize = 16 * 1024;
+
 /// Primitive content the provider may need to forge into wire shape — both
 /// inline during `stream` (for the just-arrived turn delta) and in batch
 /// during a swap-time `forge_history` call (rebuilding the cache from
@@ -138,6 +143,68 @@ impl OwnedHistoryInput {
             Self::ToolCall { .. } => "tool_call",
             Self::ToolResult { .. } => "tool_result",
         }
+    }
+
+    /// Bound tool content before it is persisted or sent to a provider.
+    /// Other message kinds are intentionally untouched.
+    pub fn truncate_tool_result(&mut self) {
+        let Self::ToolResult { content, .. } = self else {
+            return;
+        };
+        if content.len() <= TOOL_RESULT_BYTE_CAP {
+            return;
+        }
+
+        let original_len = content.len();
+        let marker = format!(
+            "\n… tool result truncated from {original_len} bytes at the \
+             {TOOL_RESULT_BYTE_CAP}-byte history limit …"
+        );
+        let mut end = TOOL_RESULT_BYTE_CAP.saturating_sub(marker.len());
+        while !content.is_char_boundary(end) {
+            end -= 1;
+        }
+        content.truncate(end);
+        content.push_str(&marker);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_result_under_cap_is_unchanged() {
+        let mut input = OwnedHistoryInput::ToolResult {
+            call_id: "c1".to_owned(),
+            content: "small result".to_owned(),
+            is_error: false,
+        };
+
+        input.truncate_tool_result();
+
+        assert!(matches!(
+            input,
+            OwnedHistoryInput::ToolResult { content, .. } if content == "small result"
+        ));
+    }
+
+    #[test]
+    fn tool_result_cap_preserves_utf8_and_reports_truncation() {
+        let mut input = OwnedHistoryInput::ToolResult {
+            call_id: "c1".to_owned(),
+            content: "🦀".repeat(TOOL_RESULT_BYTE_CAP),
+            is_error: false,
+        };
+
+        input.truncate_tool_result();
+
+        let OwnedHistoryInput::ToolResult { content, .. } = input else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() <= TOOL_RESULT_BYTE_CAP);
+        assert!(content.contains("tool result truncated from"));
+        assert!(content.ends_with("history limit …"));
     }
 }
 

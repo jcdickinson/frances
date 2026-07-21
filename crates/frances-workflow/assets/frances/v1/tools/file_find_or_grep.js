@@ -20,6 +20,12 @@ import fileFindOrGrepDescription from "./file_find_or_grep.md";
 
 const { FileSearch } = globalThis.__frances_v1_stash__;
 
+// Keep one grep call to a few thousand tokens even when it finds hundreds of
+// files. Rust separately bounds each matching-line preview; this bounds their
+// aggregate after formatting for the model.
+const INLINE_RESULT_BYTE_CAP = 16 * 1024;
+const INLINE_NOTICE_RESERVE = 512;
+
 const SEARCH_SCHEMA = {
   type: "object",
   properties: {
@@ -80,25 +86,68 @@ function _errResult(call_id, err) {
   };
 }
 
-// Render the full result as a compact, scannable text block. One line per
-// entry. With `search`, lines look like `path:line:text  (N matches)`;
-// without, `path  (size B)`. Truncation banner appended if present.
-function _formatInline(result, hasSearch) {
+function _formatEntry(e, hasSearch) {
+  if (hasSearch && e.first_match) {
+    const truncation = e.first_match.text_truncated
+      ? `  [line truncated from ${e.first_match.line_bytes}B]`
+      : "";
+    const location = `${e.path}:${e.first_match.line}:${e.first_match.text}`;
+    return `${location}${truncation}  (${e.match_count} matches)`;
+  }
+  if (hasSearch) return `${e.path}  (${e.match_count} matches)`;
+  return `${e.path}  (${e.size}B)`;
+}
+
+function _utf8Length(text) {
+  let bytes = 0;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    if (code < 0x80) {
+      bytes += 1;
+    } else if (code < 0x800) {
+      bytes += 2;
+    } else if (
+      code >= 0xd800 &&
+      code <= 0xdbff &&
+      i + 1 < text.length &&
+      text.charCodeAt(i + 1) >= 0xdc00 &&
+      text.charCodeAt(i + 1) <= 0xdfff
+    ) {
+      bytes += 4;
+      i += 1;
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
+}
+
+// Render a bounded, scannable text block. One line per entry. The notice
+// reserve guarantees that omission is always explicit rather than silently
+// consuming the entire budget with entry text.
+function _formatInline(result, hasSearch, byteCap = INLINE_RESULT_BYTE_CAP) {
   const lines = [];
+  const entryCap = Math.max(0, byteCap - INLINE_NOTICE_RESERVE);
+  let bytes = 0;
+  let shown = 0;
   if (result.entries.length === 0) {
     lines.push(hasSearch ? "no matches" : "no files");
   } else {
     for (const e of result.entries) {
-      if (hasSearch && e.first_match) {
-        lines.push(
-          `${e.path}:${e.first_match.line}:${e.first_match.text}  (${e.match_count} matches)`,
-        );
-      } else if (hasSearch) {
-        lines.push(`${e.path}  (${e.match_count} matches)`);
-      } else {
-        lines.push(`${e.path}  (${e.size}B)`);
-      }
+      const line = _formatEntry(e, hasSearch);
+      const addedBytes = _utf8Length(line) + (lines.length === 0 ? 0 : 1);
+      if (bytes + addedBytes > entryCap) break;
+      lines.push(line);
+      bytes += addedBytes;
+      shown += 1;
     }
+  }
+  const omitted = result.entries.length - shown;
+  if (omitted > 0) {
+    lines.push("");
+    lines.push(
+      `… ${omitted} entries omitted from this response (${INLINE_RESULT_BYTE_CAP / 1024} KiB output limit); narrow paths/search or use into`,
+    );
   }
   if (result.truncated) {
     lines.push("");
@@ -113,9 +162,15 @@ function _formatInline(result, hasSearch) {
 function _formatSummary(varName, result, hasSearch) {
   const n = result.entries.length;
   const head = result.entries.slice(0, 5);
-  const preview = _formatInline({ entries: head, truncated: null }, hasSearch);
   const headLine = `${varName} = ${n}${result.truncated ? "+" : ""} entries`;
   const truncLine = result.truncated ? `\n${result.truncated.message}` : "";
+  const previewCap =
+    INLINE_RESULT_BYTE_CAP - _utf8Length(headLine) - _utf8Length(truncLine) - 2;
+  const preview = _formatInline(
+    { entries: head, truncated: null },
+    hasSearch,
+    previewCap,
+  );
   return `${headLine}\n${preview}${truncLine}`;
 }
 

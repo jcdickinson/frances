@@ -127,7 +127,8 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         Ok(())
     }
 
-    fn push_internal(&self, input: OwnedHistoryInput) {
+    fn push_internal(&self, mut input: OwnedHistoryInput) {
+        input.truncate_tool_result();
         self.inner.pending.lock().push(input);
     }
 
@@ -547,6 +548,24 @@ mod tests {
         // the user message — so the leading-system hoist fills `instructions`.
         assert_eq!(roles, vec!["system", "system", "user"]);
         assert!(matches!(&pending[0], OwnedHistoryInput::System { text } if text == "sys"));
+    }
+
+    #[tokio::test]
+    async fn push_caps_tool_results_before_history() {
+        let (manager, _store, _stub) = build_manager().await;
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        session.push(OwnedHistoryInput::ToolResult {
+            call_id: "c1".to_owned(),
+            content: "x".repeat(frances_models_llm::history::TOOL_RESULT_BYTE_CAP * 2),
+            is_error: false,
+        });
+
+        let pending = session.inner.pending.lock();
+        let OwnedHistoryInput::ToolResult { content, .. } = &pending[0] else {
+            panic!("expected tool result");
+        };
+        assert!(content.len() <= frances_models_llm::history::TOOL_RESULT_BYTE_CAP);
+        assert!(content.contains("tool result truncated from"));
     }
 
     #[tokio::test]

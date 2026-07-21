@@ -32,7 +32,7 @@ Args: `{ root?, paths?, search?, exclude?, ignore?, hidden?, depth?, paths_only?
 
 Omitting both `paths` and `search` is valid — `{}`, `{ depth: 1 }`, `{ depth: 1, ignore: false }`, `{ hidden: true }`, etc. all list files under cwd subject to whatever filters I set. The only rejected shape is an explicit `paths: []` with no `search` — an empty list is treated as a likely bug, not a wildcard; I send `{}` if I really mean "everything."
 
-Result entries are sorted alphabetically by path. Each entry is `{ path, size, mtime, binary, match_count?, first_match? }`. The output is capped at 1000 entries; if more would have matched, a `truncated` field is included so I know to narrow the query.
+Result entries are sorted alphabetically by path. Each entry is `{ path, size, mtime, binary, match_count?, first_match? }`. Matching-line text is limited to a 512-byte excerpt around the match; oversized lines set `first_match.text_truncated` and `first_match.line_bytes`. The structured result is capped at 1000 entries, and the inline response is capped at 16 KiB. Either limit reports its omission explicitly so I know to narrow the query.
 
 Examples:
 
