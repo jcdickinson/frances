@@ -106,11 +106,18 @@ fn prompt_config(config_home: &Path, workflow_file: &Path) -> Result<String> {
         );
     }
 
+    let effort_config = if provider_id == "codex" {
+        "effort = 50\neffort_tiers = 'openai'\n"
+    } else {
+        ""
+    };
+
     Ok(format!(
         "{provider_block}\n\
          [models.default]\n\
          model_provider = '{provider_id}'\n\
          id = '{model_id}'\n\
+         {effort_config}\
          \n\
          default_workflow = 'main'\n\
          \n\

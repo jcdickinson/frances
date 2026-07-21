@@ -7,7 +7,9 @@ use frances_models_llm::chat::{
     ChatError, ChatSession as ChatSessionTrait, ChatSessionId, HistoryBatch, HistoryError,
     ModelIntents, OwnedHistoryInput,
 };
-use frances_models_llm::{CompletionOutcome, ErasedError, StreamEvent, ToolChoice, ToolDef};
+use frances_models_llm::{
+    CompletionOutcome, ErasedError, NormalizedEffort, StreamEvent, ToolChoice, ToolDef,
+};
 use parking_lot::Mutex;
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -40,6 +42,8 @@ struct ChatSessionInner<D: ChatManagerDeps> {
     /// Set on first `run` via `ensure_row` (or up-front for `load`).
     /// Stays `None` forever for `ephemeral` sessions.
     id: Mutex<Option<ChatSessionId>>,
+    /// Mutable workflow preference. `None` uses the selected model's default.
+    effort: Mutex<Option<NormalizedEffort>>,
     /// Opaque per-session UUID; threaded into provider requests for
     /// token-cache scoping.
     session_id: String,
@@ -66,6 +70,7 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         Self {
             inner: Arc::new(ChatSessionInner {
                 id: Mutex::new(id),
+                effort: Mutex::new(None),
                 session_id,
                 model_intents,
                 ephemeral,
@@ -77,6 +82,14 @@ impl<D: ChatManagerDeps> ChatSession<D> {
 
     pub fn id(&self) -> Option<ChatSessionId> {
         *self.inner.id.lock()
+    }
+
+    pub fn effort(&self) -> Option<NormalizedEffort> {
+        *self.inner.effort.lock()
+    }
+
+    pub fn set_effort(&self, effort: Option<NormalizedEffort>) {
+        *self.inner.effort.lock() = effort;
     }
 
     pub fn session_id(&self) -> &str {
@@ -164,6 +177,14 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         self.id()
     }
 
+    fn effort(&self) -> Option<NormalizedEffort> {
+        self.effort()
+    }
+
+    fn set_effort(&self, effort: Option<NormalizedEffort>) {
+        self.set_effort(effort);
+    }
+
     async fn ensure_persisted(&self) -> Result<Option<ChatSessionId>, ChatError> {
         self.ensure_row().await.map_err(ChatError::from)
     }
@@ -234,6 +255,7 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
             tools: &tools,
             tool_choice: tool_choice.as_ref(),
             env: env.as_ref(),
+            effort: self.effort(),
             max_tool_calls,
         };
 
@@ -479,6 +501,20 @@ mod tests {
             )
             .await
             .expect("run should succeed");
+    }
+
+    #[tokio::test]
+    async fn session_effort_is_forwarded_to_provider_request() {
+        let (manager, _store, stub) = build_manager().await;
+        stub.push_script(assistant_script("ok"));
+        let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
+        session.set_effort(Some(frances_models_llm::NormalizedEffort::new(73).unwrap()));
+
+        run_once(&session).await;
+
+        let captured = stub.captured();
+        assert_eq!(captured.len(), 1);
+        assert_eq!(captured[0].effort.map(|effort| effort.get()), Some(73));
     }
 
     #[tokio::test]

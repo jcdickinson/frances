@@ -35,6 +35,8 @@ questionnaire offers your Codex (ChatGPT) login, or any other provider — for
 which it writes the token you paste to `~/.config/frances/<provider>.txt`.
 
 Once the TUI is up, type `/main` to kick off the `main` workflow.
+Within that workflow, `/effort`, `/effort 0` through `/effort 100`, and
+`/effort default` inspect, set, and clear the persistent session override.
 
 If you'd rather write the config by hand, a minimum viable `config.toml`:
 
@@ -152,6 +154,8 @@ auth = { file = "/home/jono/.config/frances/ds.txt" }
 [models.default]
 model_provider = "codex"
 id = "gpt-5.5"
+effort = 50
+effort_tiers = "openai"
 
 [models.cheap]
 model_provider = "codex"
@@ -239,7 +243,11 @@ only reader.
 ### Models (`[models.<name>]`)
 
 Each model binds a `model_provider` (a provider id) to a model `id`. `default`
-and `cheap` are the conventional names.
+and `cheap` are the conventional names. `effort` is an optional normalized
+integer percentage from 0 through 100. `effort_tiers` maps it onto provider
+labels and accepts either the `"openai"` preset or an explicit ascending array,
+for example `["off", "low", "high"]`. A chat-session override takes precedence
+over the model default; without either value no effort is sent.
 
 ### Workflows (`[workflows.<name>]`)
 

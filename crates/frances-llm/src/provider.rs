@@ -15,8 +15,8 @@ use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::config::{ModelConfig, ProviderConfig};
 use frances_models_llm::{
-    ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, StreamEvent,
-    ToolChoice, ToolDef,
+    ChunkAbort, CompletionOutcome, ErasedError, ErasedResult, HistoryInput, NormalizedEffort,
+    StreamEvent, ToolChoice, ToolDef,
 };
 
 /// All non-callback inputs to a single chat call, shared by `stream` and
@@ -44,6 +44,8 @@ pub struct ProviderRequest<'a> {
     pub tools: &'a [ToolDef],
     pub tool_choice: Option<&'a ToolChoice>,
     pub env: &'a HashMap<OsString, OsString>,
+    /// Persistent-session override. `None` uses the model default.
+    pub effort: Option<NormalizedEffort>,
     /// Per-request cap on the number of tool calls the provider will
     /// surface. `None` = unbounded (today's behaviour). `Some(n)` =
     /// keep up to `n`, drop any further calls and close the stream

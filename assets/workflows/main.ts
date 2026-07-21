@@ -111,10 +111,11 @@ type PersistedStepTranscript = {
 };
 
 type PersistedState = {
-  schemaVersion: 2;
+  schemaVersion: 3;
   instanceId: string;
   mode: Mode;
   plan: Plan;
+  effort: number | null;
   currentChat: PersistedChat;
   variables: Array<[string, unknown]>;
   stepTranscript: PersistedStepTranscript;
@@ -125,12 +126,13 @@ type PersistedState = {
   };
 };
 
-const STATE_SCHEMA_VERSION = 2;
+const STATE_SCHEMA_VERSION = 3;
 const INSTANCE_ID = String(import.meta.instance);
 const STATE_TABLE = "main_workflow_state";
 
 let currentChatId: number | null = null;
 let currentChatPendingSeed: string | null = null;
+let effortOverride: number | null = null;
 
 let plan: Plan = {
   title: "Untitled plan",
@@ -249,6 +251,7 @@ function makePersistedState(): PersistedState {
     instanceId: INSTANCE_ID,
     mode,
     plan,
+    effort: effortOverride,
 
     currentChat: {
       id: currentChatId,
@@ -300,6 +303,10 @@ function restorePersistedState(state: PersistedState): void {
   mode = state.mode === "executing" ? "executing" : "planning";
   plan = state.plan;
   validatePlan();
+  effortOverride =
+    Number.isInteger(state.effort) && state.effort! >= 0 && state.effort! <= 100
+      ? state.effort
+      : null;
   currentChatId = typeof state.currentChat?.id === "number" ? state.currentChat.id : null;
   currentChatPendingSeed =
     typeof state.currentChat?.pendingSeed === "string"
@@ -1093,6 +1100,7 @@ function freshContext(): void {
 
 function attachPlanningChat(session: ChatSession): ChatSession {
   freshContext();
+  session.effort = effortOverride;
   session.promptSections.push(...planningSections);
   session.tools.push(...planningTools);
   return session;
@@ -1100,6 +1108,7 @@ function attachPlanningChat(session: ChatSession): ChatSession {
 
 function attachExecutionChat(session: ChatSession): ChatSession {
   freshContext();
+  session.effort = effortOverride;
   session.promptSections.push(...executionSections);
   session.tools.push(...executingTools);
   return session;
@@ -1157,6 +1166,35 @@ async function initializeWorkflow(): Promise<boolean> {
   currentChatPendingSeed = null;
   await ensureCurrentChatPersisted();
   return false;
+}
+
+async function handleEffortCommand(msg: string): Promise<boolean> {
+  if (msg !== "/effort" && !msg.startsWith("/effort ")) return false;
+
+  const parts = msg.split(/\s+/);
+  let response: string;
+  if (parts.length === 1) {
+    response = effortOverride === null ? "default" : `${effortOverride}%`;
+  } else if (parts.length === 2 && parts[1] === "default") {
+    effortOverride = null;
+    chat.effort = null;
+    response = "Effort: default";
+  } else if (
+    parts.length === 2 &&
+    /^(?:0|[1-9]\d?|100)$/.test(parts[1])
+  ) {
+    effortOverride = Number(parts[1]);
+    chat.effort = effortOverride;
+    response = `Effort: ${effortOverride}%`;
+  } else {
+    response = "Usage: /effort [default|0-100]";
+  }
+
+  transcript.push(
+    new MarkdownSection({ content: response, source: "assistant", closed: true }),
+  );
+  await saveState();
+  return true;
 }
 
 async function handlePendingCompletion(): Promise<boolean> {
@@ -1436,8 +1474,6 @@ async function ourLoop(): Promise<void> {
     transcript.push(
       new MarkdownSection({ content: msg, source: "user", closed: true }),
     );
-    recordStepTranscript("User", msg);
-    await saveState();
     if (msg === "quit") {
       transcript.push(
         new MarkdownSection({ content: "bye", source: "assistant", closed: true }),
@@ -1445,6 +1481,10 @@ async function ourLoop(): Promise<void> {
       exit();
       break;
     }
+    if (await handleEffortCommand(msg)) continue;
+
+    recordStepTranscript("User", msg);
+    await saveState();
 
     currentChatPendingSeed = msg;
     chat.push({ role: "user", content: msg });

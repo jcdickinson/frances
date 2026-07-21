@@ -60,9 +60,10 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         const chat = new ChatSession({ model_intents: ["chat"] });
         const chatId = await chat.ensurePersisted();
         const state = {
-          schemaVersion: 2,
+          schemaVersion: 3,
           instanceId,
           mode: "planning",
+          effort: 73,
           plan: {
             title: "Restart regression plan",
             prelude: "Persisted plan context",
@@ -91,7 +92,7 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         await db.exec(
           "INSERT INTO main_workflow_state (instance_id, version, state_json, updated_at) " +
           "VALUES (?, ?, ?, ?)",
-          [instanceId, 2, JSON.stringify(state), new Date().toISOString()]
+          [instanceId, 3, JSON.stringify(state), new Date().toISOString()]
         );
         "####,
     );
@@ -118,7 +119,6 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
         !contains_text(&boot_frames, "frances ready"),
         "restored workflow must not re-emit ready banner: {boot_frames:?}"
     );
-
     restored
         .input_tx
         .send(InboxItem::Input(UserInput {
@@ -129,6 +129,98 @@ async fn main_workflow_hydrates_restart_state_without_ready_banner() {
     assert!(
         contains_text(&frames, "Planning complete"),
         "pending plan_exit should be consumed after hydrate: {frames:?}"
+    );
+    let sessions = deps.sessions();
+    assert_eq!(
+        frances_models_llm::ChatSession::effort(sessions.last().unwrap())
+            .map(|effort| effort.get()),
+        Some(73)
+    );
+}
+
+#[tokio::test]
+async fn effort_command_updates_session_without_entering_chat_history() {
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let entity = uuid::Uuid::new_v4();
+    let instance = uuid::Uuid::new_v4();
+    let mut handle = rt.start(main_invocation(entity, instance)).await.unwrap();
+    let (_boot_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(done.is_none());
+
+    handle
+        .input_tx
+        .send(InboxItem::Input(UserInput {
+            content: " /effort 73 ".to_owned(),
+        }))
+        .unwrap();
+    let frames = wait_for_text(&mut handle, "Effort: 73%").await;
+    assert!(contains_text(&frames, "/effort 73"));
+    assert!(contains_text(&frames, "Effort: 73%"));
+
+    let sessions = deps.sessions();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(
+        frances_models_llm::ChatSession::effort(&sessions[0]).map(|effort| effort.get()),
+        Some(73)
+    );
+    assert!(sessions[0].pending().is_empty());
+
+    handle
+        .input_tx
+        .send(InboxItem::Input(UserInput {
+            content: "/effort nope".to_owned(),
+        }))
+        .unwrap();
+    let frames = wait_for_text(&mut handle, "Usage: /effort [default|0-100]").await;
+    assert!(contains_text(&frames, "Usage: /effort [default|0-100]"));
+    assert_eq!(
+        frances_models_llm::ChatSession::effort(&sessions[0]).map(|effort| effort.get()),
+        Some(73)
+    );
+}
+
+#[tokio::test]
+async fn effort_command_persists_across_workflow_restart_and_can_clear() {
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let entity = uuid::Uuid::new_v4();
+    let instance = uuid::Uuid::new_v4();
+
+    let mut first = rt.start(main_invocation(entity, instance)).await.unwrap();
+    let (_boot_frames, done) = drive_one_cycle(&mut first).await;
+    assert!(done.is_none());
+    first
+        .input_tx
+        .send(InboxItem::Input(UserInput {
+            content: "/effort 61".to_owned(),
+        }))
+        .unwrap();
+    wait_for_text(&mut first, "Effort: 61%").await;
+    drop(first);
+
+    let mut restored = rt.start(main_invocation(entity, instance)).await.unwrap();
+    let (_boot_frames, done) = drive_one_cycle(&mut restored).await;
+    assert!(done.is_none());
+    restored
+        .input_tx
+        .send(InboxItem::Input(UserInput {
+            content: "/effort".to_owned(),
+        }))
+        .unwrap();
+    wait_for_text(&mut restored, "61%").await;
+
+    restored
+        .input_tx
+        .send(InboxItem::Input(UserInput {
+            content: "/effort default".to_owned(),
+        }))
+        .unwrap();
+    wait_for_text(&mut restored, "Effort: default").await;
+    let sessions = deps.sessions();
+    assert_eq!(
+        frances_models_llm::ChatSession::effort(sessions.last().unwrap()),
+        None
     );
 }
 

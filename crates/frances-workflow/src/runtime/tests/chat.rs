@@ -121,6 +121,87 @@ async fn chat_session_can_be_persisted_and_loaded_by_id() {
 }
 
 #[tokio::test]
+async fn chat_session_effort_can_be_set_cleared_and_loaded() {
+    let deps = StubDeps::default();
+    let rt = Runtime::new(deps.clone()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession, loadChatSession } from "frances:v1/chat";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+
+        const created = new ChatSession({ model_intents: ["x"] });
+        if (created.effort !== null) throw new Error("fresh effort should be null");
+        created.effort = 42;
+        if (created.effort !== 42) throw new Error(`expected 42, got ${created.effort}`);
+        created.effort = null;
+        if (created.effort !== null) throw new Error("cleared effort should be null");
+
+        const id = await created.ensurePersisted();
+        const loaded = await loadChatSession(id);
+        if (loaded.effort !== null) throw new Error("loaded effort should start null");
+        loaded.effort = 100;
+        transcript.push(new MarkdownSection({ content: `effort ${loaded.effort}` }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+    assert_eq!(text_of(&frames[0]), "effort 100");
+
+    let sessions = deps.sessions();
+    assert_eq!(sessions.len(), 2);
+    assert_eq!(frances_models_llm::ChatSession::effort(&sessions[0]), None);
+    assert_eq!(
+        frances_models_llm::ChatSession::effort(&sessions[1]).map(|effort| effort.get()),
+        Some(100)
+    );
+}
+
+#[tokio::test]
+async fn chat_session_effort_rejects_invalid_values_without_mutating() {
+    let rt = Runtime::new(StubDeps::default()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { ChatSession } from "frances:v1/chat";
+        const session = new ChatSession({ model_intents: ["x"] });
+        session.effort = 25;
+
+        for (const invalid of [undefined, true, "50", 1.5, -1, 101, NaN, Infinity, {}]) {
+            let rejected = false;
+            try {
+                session.effort = invalid;
+            } catch (error) {
+                rejected = String(error).includes(
+                    "ChatSession.effort must be null or an integer from 0 through 100",
+                );
+            }
+            if (!rejected) throw new Error(`accepted invalid effort ${String(invalid)}`);
+            if (session.effort !== 25) throw new Error("invalid assignment mutated effort");
+        }
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (_frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+}
+
+#[tokio::test]
 async fn chat_session_ephemeral_rejects_non_bool() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
@@ -302,7 +383,7 @@ async fn chat_session_raw_inner_stream_is_not_exposed() {
     // should appear; the inner raw stream function must not.
     assert_eq!(
         text_of(&frames[0]),
-        "proto=_envInfo,_pushSystem,ensurePersisted,id,push,stream stash=true"
+        "proto=_envInfo,_pushSystem,effort,ensurePersisted,id,push,stream stash=true"
     );
 }
 

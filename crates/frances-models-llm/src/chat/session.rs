@@ -11,7 +11,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::{CompletionOutcome, HistoryInput, OwnedHistoryInput, StreamEvent, ToolChoice, ToolDef};
+use crate::{
+    CompletionOutcome, HistoryInput, NormalizedEffort, OwnedHistoryInput, StreamEvent, ToolChoice,
+    ToolDef,
+};
 
 use super::builder::ChatSessionBuilder;
 use super::complete::{CompleteRequest, Demand, EnforceError};
@@ -22,6 +25,12 @@ use super::types::ChatSessionId;
 pub trait ChatSession: Clone + Send + Sync + 'static {
     /// Return the persisted chat session id, if this session has one.
     fn id(&self) -> Option<ChatSessionId>;
+
+    /// Return this session's provider-neutral effort override.
+    fn effort(&self) -> Option<NormalizedEffort>;
+
+    /// Replace or clear this session's provider-neutral effort override.
+    fn set_effort(&self, effort: Option<NormalizedEffort>);
 
     /// Ensure this session has a durable row and return its id.
     ///

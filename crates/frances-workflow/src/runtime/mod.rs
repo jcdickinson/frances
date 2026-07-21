@@ -1032,6 +1032,7 @@ pub mod test_deps {
             self.builders.lock().push(builder);
             let session = StubSession {
                 id: Arc::new(Mutex::new(None)),
+                effort: Arc::new(Mutex::new(None)),
                 pending: Arc::new(Mutex::new(Vec::new())),
                 next_script: self.next_script.clone(),
             };
@@ -1041,6 +1042,7 @@ pub mod test_deps {
 
         async fn load(&self, id: ChatSessionId) -> Result<Self::Session, ChatError> {
             let session = StubSession {
+                effort: Arc::new(Mutex::new(None)),
                 id: Arc::new(Mutex::new(Some(id))),
                 pending: Arc::new(Mutex::new(Vec::new())),
                 next_script: self.next_script.clone(),
@@ -1072,6 +1074,7 @@ pub mod test_deps {
     #[derive(Clone)]
     pub struct StubSession {
         id: Arc<Mutex<Option<ChatSessionId>>>,
+        effort: Arc<Mutex<Option<frances_models_llm::NormalizedEffort>>>,
         pending: Arc<Mutex<Vec<OwnedHistoryInput>>>,
         next_script: Arc<Mutex<std::collections::VecDeque<Script>>>,
     }
@@ -1086,6 +1089,14 @@ pub mod test_deps {
     impl ChatSession for StubSession {
         fn id(&self) -> Option<ChatSessionId> {
             *self.id.lock()
+        }
+
+        fn effort(&self) -> Option<frances_models_llm::NormalizedEffort> {
+            *self.effort.lock()
+        }
+
+        fn set_effort(&self, effort: Option<frances_models_llm::NormalizedEffort>) {
+            *self.effort.lock() = effort;
         }
 
         async fn ensure_persisted(&self) -> Result<Option<ChatSessionId>, ChatError> {

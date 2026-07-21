@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod completion;
 pub mod config;
+pub mod effort;
 pub mod erased;
 pub mod history;
 pub mod tool;
@@ -16,6 +17,7 @@ pub use completion::{CompletionOutcome, StreamEvent, ToolCall, ToolCallError, Us
 pub use config::{
     AuthCommand, AuthMethod, ModelConfig, OpenRouterConfig, OpenRouterModelConfig, ProviderConfig,
 };
+pub use effort::{EffortTiers, InvalidNormalizedEffort, NormalizedEffort};
 pub use erased::{ChunkAbort, ErasedError, ErasedResult};
 pub use history::{BatchRow, HistoryBatch, HistoryInput, OwnedHistoryInput};
 pub use tool::{ToolChoice, ToolDef, ToolFunction};

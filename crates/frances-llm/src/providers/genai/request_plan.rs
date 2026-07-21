@@ -11,9 +11,10 @@ use std::path::PathBuf;
 
 use frances_config::EnvLookup;
 use thiserror::Error as ThisError;
-use tracing::warn;
+use tracing::{trace, warn};
 use url::Url;
 
+use frances_models_llm::NormalizedEffort;
 use frances_models_llm::config::{AuthMethod, ModelConfig, ProviderConfig};
 
 use super::codex_auth;
@@ -51,23 +52,48 @@ pub(super) struct RequestPlan {
     /// forward.
     pub(super) extra_headers: Vec<(String, String)>,
     pub(super) model: ModelConfig,
+    pub(super) effort_label: Option<String>,
 }
 
 impl RequestPlan {
     pub(super) async fn build(
         provider_config: &ProviderConfig,
         model: &ModelConfig,
+        effort_override: Option<NormalizedEffort>,
         env: &HashMap<OsString, OsString>,
         http: &reqwest::Client,
     ) -> Result<Self, Error> {
         let auth = resolve_auth(&provider_config.auth, env, http).await?;
         let mut extra_headers = expand_headers(&provider_config.http_headers, env)?;
         extra_headers.extend(auth.headers);
+        let effort = effort_override.or(model.effort);
+        let effort_label = match (effort, model.effort_tiers.as_ref()) {
+            (Some(effort), Some(tiers)) => {
+                let label = tiers.label_for(effort).to_owned();
+                trace!(
+                    model = %model.id,
+                    effort = effort.get(),
+                    tier = %label,
+                    "mapped normalized model effort"
+                );
+                Some(label)
+            }
+            (Some(effort), None) => {
+                warn!(
+                    model = %model.id,
+                    effort = effort.get(),
+                    "model effort omitted because effort_tiers is not configured"
+                );
+                None
+            }
+            (None, _) => None,
+        };
         Ok(RequestPlan {
             base_url: provider_config.base_url.clone(),
             api_key: auth.bearer,
             extra_headers,
             model: model.clone(),
+            effort_label,
         })
     }
 }
@@ -142,4 +168,81 @@ fn expand_headers(
         out.push((name.clone(), value));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frances_models_llm::EffortTiers;
+
+    fn provider() -> ProviderConfig {
+        ProviderConfig {
+            kind: "openai-responses".into(),
+            name: None,
+            base_url: "https://example.com".parse().unwrap(),
+            auth: AuthMethod::Token {
+                token: "test".into(),
+            },
+            http_headers: Default::default(),
+            query_params: Default::default(),
+            supports_websockets: false,
+            request_max_retries: 0,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: 1,
+        }
+    }
+
+    fn model(effort: Option<u8>, effort_tiers: Option<EffortTiers>) -> ModelConfig {
+        ModelConfig {
+            model_provider: "test".into(),
+            id: "test-model".into(),
+            max_tokens: None,
+            stream_idle_timeout_ms: 1,
+            effort: effort.map(|value| NormalizedEffort::new(value).unwrap()),
+            effort_tiers,
+            service_tier: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn session_effort_overrides_model_default() {
+        let plan = RequestPlan::build(
+            &provider(),
+            &model(Some(25), Some(EffortTiers::openai())),
+            Some(NormalizedEffort::new(100).unwrap()),
+            &HashMap::new(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.effort_label.as_deref(), Some("max"));
+    }
+
+    #[tokio::test]
+    async fn model_default_applies_without_session_override() {
+        let plan = RequestPlan::build(
+            &provider(),
+            &model(Some(50), Some(EffortTiers::openai())),
+            None,
+            &HashMap::new(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.effort_label.as_deref(), Some("medium"));
+    }
+
+    #[tokio::test]
+    async fn effort_without_tiers_is_omitted() {
+        let plan = RequestPlan::build(
+            &provider(),
+            &model(Some(100), None),
+            None,
+            &HashMap::new(),
+            &reqwest::Client::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(plan.effort_label, None);
+    }
 }

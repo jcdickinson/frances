@@ -238,8 +238,14 @@ impl provider::Provider for Provider {
         }
         let max_tool_calls = req.max_tool_calls;
         let qwen_quirks = self.qwen_quirks_for(req.model_name);
-        let plan =
-            RequestPlan::build(&self.provider_config, req.model, req.env, &self.http).await?;
+        let plan = RequestPlan::build(
+            &self.provider_config,
+            req.model,
+            req.effort,
+            req.env,
+            &self.http,
+        )
+        .await?;
 
         // Trace incoming tool-related inputs before forge so the round-
         // trip with the model is visible in the session runtime trace stream.
@@ -578,6 +584,9 @@ fn build_chat_options(plan: &RequestPlan, tool_choice: Option<&ToolChoice>) -> C
     opts.capture_usage = Some(true);
     opts.capture_reasoning_content = Some(true);
     opts.capture_tool_calls = Some(true);
+    if let Some(label) = &plan.effort_label {
+        opts.extra_body = Some(serde_json::json!({ "reasoning_effort": label }));
+    }
     if !plan.extra_headers.is_empty() {
         opts.extra_headers = Some(genai::Headers::from(plan.extra_headers.clone()));
     }
@@ -1275,5 +1284,26 @@ mod tests {
         assert_eq!(mapped.prompt_tokens, 10);
         assert_eq!(mapped.completion_tokens, 5);
         assert_eq!(mapped.total_tokens, 15);
+    }
+
+    #[test]
+    fn build_chat_options_preserves_configured_effort_label() {
+        let model: frances_models_llm::config::ModelConfig = serde_json::from_value(json!({
+            "model_provider": "test",
+            "id": "test-model"
+        }))
+        .unwrap();
+        let plan = RequestPlan {
+            base_url: "https://example.com".parse().unwrap(),
+            api_key: "test".into(),
+            extra_headers: Vec::new(),
+            model,
+            effort_label: Some("LOUD".into()),
+        };
+        let options = build_chat_options(&plan, None);
+        assert_eq!(
+            options.extra_body,
+            Some(json!({ "reasoning_effort": "LOUD" }))
+        );
     }
 }

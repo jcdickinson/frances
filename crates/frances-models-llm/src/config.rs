@@ -5,6 +5,8 @@ use frances_config::EnvString;
 use serde::Deserialize;
 use url::Url;
 
+use crate::{EffortTiers, NormalizedEffort};
+
 /// Codex-shaped provider definition. One instance per `model_providers.<id>`
 /// table in the config tree. The `id` itself is the binding key, not a field.
 #[derive(Debug, Clone, Deserialize)]
@@ -107,11 +109,12 @@ pub struct ModelConfig {
     pub max_tokens: Option<u32>,
     #[serde(default = "default_model_stream_idle_timeout_ms")]
     pub stream_idle_timeout_ms: u64,
-    /// 0..=100 → mapped to the provider's reasoning-effort scale at request
-    /// time. The OpenRouter Responses provider maps this onto the
-    /// `low`/`medium`/`high` effort enum.
+    /// Provider-neutral default effort percentage.
     #[serde(default)]
-    pub reasoning_effort: Option<u8>,
+    pub effort: Option<NormalizedEffort>,
+    /// Ordered provider labels used to map normalized effort percentages.
+    #[serde(default)]
+    pub effort_tiers: Option<EffortTiers>,
     /// 0..=100 → mapped to a provider service-tier label at request time.
     /// The OpenRouter Responses provider maps to `flex`/`default`/`priority`.
     #[serde(default)]
@@ -196,5 +199,36 @@ mod tests {
         let auth: AuthMethod =
             serde_json::from_value(serde_json::json!({ "token": "secret" })).unwrap();
         assert!(matches!(auth, AuthMethod::Token { token } if token == "secret"));
+    }
+
+    #[test]
+    fn model_effort_and_openai_tiers_deserialize() {
+        let model: ModelConfig = serde_json::from_value(serde_json::json!({
+            "model_provider": "openai",
+            "id": "gpt",
+            "effort": 50,
+            "effort_tiers": "openai"
+        }))
+        .unwrap();
+        assert_eq!(model.effort.map(|effort| effort.get()), Some(50));
+        assert_eq!(model.effort_tiers.unwrap(), EffortTiers::openai());
+    }
+
+    #[test]
+    fn model_effort_configuration_rejects_invalid_values() {
+        let base = serde_json::json!({
+            "model_provider": "openai",
+            "id": "gpt"
+        });
+        for invalid in [
+            serde_json::json!(101),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("high"),
+        ] {
+            let mut value = base.clone();
+            value["effort"] = invalid;
+            assert!(serde_json::from_value::<ModelConfig>(value).is_err());
+        }
     }
 }

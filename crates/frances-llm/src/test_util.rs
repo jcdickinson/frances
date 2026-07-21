@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 
 use frances_models_llm::chat::OwnedHistoryInput;
 use frances_models_llm::config::ProviderConfig;
-use frances_models_llm::{CompletionOutcome, ErasedError, HistoryInput, StreamEvent};
+use frances_models_llm::{
+    CompletionOutcome, ErasedError, HistoryInput, NormalizedEffort, StreamEvent,
+};
 
 use crate::provider::{Provider, ProviderRequest};
 
@@ -45,6 +47,7 @@ impl StubScript {
 #[derive(Debug, Clone)]
 pub struct CapturedRequest {
     pub session_id: String,
+    pub effort: Option<NormalizedEffort>,
     pub history: Vec<Value>,
     pub new_inputs: Vec<OwnedHistoryInput>,
 }
@@ -142,6 +145,7 @@ impl Provider for StubProvider {
         }
         self.requests.lock().push(CapturedRequest {
             session_id: req.session_id.to_owned(),
+            effort: req.effort,
             history: req.history.to_vec(),
             new_inputs: req
                 .new_inputs

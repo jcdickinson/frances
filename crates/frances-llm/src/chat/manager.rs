@@ -127,6 +127,7 @@ impl<D: ChatManagerDeps> ChatSessionManager<D> {
             tools: req.tools,
             tool_choice: req.tool_choice,
             env: req.env,
+            effort: None,
             max_tool_calls: req.max_tool_calls,
         };
         let mut wrapped = |ev: StreamEvent| -> Result<(), ErasedError> {

@@ -503,7 +503,7 @@ mod tests {
     #[test]
     fn write_row_preserves_cell_modifiers() {
         let mut backend = make();
-        let cells = vec![
+        let cells = [
             styled_cell("B", Modifier::BOLD),
             styled_cell("I", Modifier::ITALIC),
             styled_cell("R", Modifier::REVERSED | Modifier::CROSSED_OUT),

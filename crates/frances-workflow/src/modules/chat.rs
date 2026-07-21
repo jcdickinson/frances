@@ -43,6 +43,7 @@ use std::sync::Arc;
 use rquickjs::atom::PredefinedAtom;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
+use rquickjs::object::Accessor;
 use rquickjs::promise::Promised;
 use rquickjs::{
     Array, Class, Ctx, Exception, Function, IntoJs, JsLifetime, Object, Result as JsResult, Value,
@@ -60,7 +61,9 @@ use frances_models_llm::chat::{
     ChatSessionManager as ChatSessionManagerTrait, CompleteRequest, Demand, EnforceError,
     ModelIntents, OwnedHistoryInput,
 };
-use frances_models_llm::{HistoryInput, StreamEvent, ToolCall, ToolDef, ToolFunction};
+use frances_models_llm::{
+    HistoryInput, NormalizedEffort, StreamEvent, ToolCall, ToolDef, ToolFunction,
+};
 
 use super::{get_or_undefined, throw_js as throw};
 use crate::deps::WorkflowDeps;
@@ -386,6 +389,34 @@ fn parse_message_obj<'js>(
     }
 }
 
+fn effort_into_js<'js>(ctx: &Ctx<'js>, effort: Option<NormalizedEffort>) -> JsResult<Value<'js>> {
+    match effort {
+        Some(effort) => effort.get().into_js(ctx),
+        None => Ok(Value::new_null(ctx.clone())),
+    }
+}
+
+fn effort_from_js<'js>(ctx: &Ctx<'js>, value: &Value<'js>) -> JsResult<Option<NormalizedEffort>> {
+    if value.is_null() {
+        return Ok(None);
+    }
+    let number = value.as_number().ok_or_else(|| {
+        throw(
+            ctx,
+            "ChatSession.effort must be null or an integer from 0 through 100",
+        )
+    })?;
+    if !number.is_finite() || number.fract() != 0.0 || !(0.0..=100.0).contains(&number) {
+        return Err(throw(
+            ctx,
+            "ChatSession.effort must be null or an integer from 0 through 100",
+        ));
+    }
+    Ok(Some(
+        NormalizedEffort::new(number as u8).expect("range checked above"),
+    ))
+}
+
 enum ChatSessionIdResult {
     Ready(Option<ChatSessionId>),
     Failed(ChatError),
@@ -489,6 +520,21 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for ChatSessionJs<D> {
                     push_message::<D>(&ctx, &this.0, msg)
                 },
             )?,
+        )?;
+
+        proto.prop(
+            "effort",
+            Accessor::new(
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>| {
+                    let effort = this.0.borrow().handle.effort();
+                    effort_into_js(&ctx, effort)
+                },
+                |ctx: Ctx<'js>, this: This<Class<'js, ChatSessionJs<D>>>, value: Value<'js>| {
+                    let effort = effort_from_js(&ctx, &value)?;
+                    this.0.borrow().handle.set_effort(effort);
+                    Ok::<(), rquickjs::Error>(())
+                },
+            ),
         )?;
 
         proto.set(
