@@ -270,6 +270,12 @@ impl App<'_> {
             container.push(Box::new(RawBlock::single_styled(line, style)));
         }
 
+        // Restore a previously-set session title. Left untouched when the
+        // session has none — no reason to clobber the terminal's title.
+        if let Some(title) = &self.session.meta.title {
+            set_terminal_title(Some(title));
+        }
+
         let mut state = LiveBlocks::new();
         let mut pending_approval: Option<PermissionRequest> = None;
         let mut frame_rx = self.events;
@@ -406,13 +412,17 @@ impl App<'_> {
                     // does. Repaint happens at the top of the loop.
                 }
                 Some(frame) = frame_rx.recv() => {
-                    // The busy indicator is workflow-driven: a `Surface`
-                    // frame sets or clears the footer.
+                    // The busy indicator and terminal title are
+                    // workflow-driven: a `Surface` frame sets or clears
+                    // them.
                     if let StreamFrame::Surface(cmd) = &frame {
-                        status = match cmd {
-                            SurfaceCmd::SetFooter { text } => Some(text.clone()),
-                            SurfaceCmd::ClearFooter => None,
-                        };
+                        match cmd {
+                            SurfaceCmd::SetFooter { text } => status = Some(text.clone()),
+                            SurfaceCmd::ClearFooter => status = None,
+                            SurfaceCmd::SetTitle { title } => {
+                                set_terminal_title(title.as_deref());
+                            }
+                        }
                     }
                     if let Some(req) = handle_frame(
                         &mut terminal,
@@ -714,6 +724,15 @@ fn classify_scrollback_key(key: &KeyEvent, page: u16) -> ScrollbackAction {
 fn scrollback_page(terminal_h: u16) -> u16 {
     // Content area = terminal_h - 2 status bars - footer (textarea + token row).
     terminal_h.saturating_sub(7).max(1)
+}
+
+/// Set the terminal window/tab title. `None` falls back to "frances":
+/// there's no portable way to restore whatever title the terminal had
+/// before we started overwriting it.
+fn set_terminal_title(title: Option<&str>) {
+    let mut out = stdout();
+    let _ = out.queue(crossterm::terminal::SetTitle(title.unwrap_or("frances")));
+    let _ = out.flush();
 }
 
 fn enter_scrollback(terminal: &mut AppTerminal) -> Result<()> {

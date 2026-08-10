@@ -28,7 +28,8 @@
 //!
 //! Modules:
 //!
-//! - `frances:v1/workflow`       — `exit` lifecycle function.
+//! - `frances:v1/workflow`       — `exit` lifecycle function, `setStatus`
+//!   busy indicator, `setTitle`/`getTitle` session title.
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
 //! - `frances:v1/sections`         — `transcript`, `MarkdownSection`, `ErrorSection`,
 //!   `JsonSection` (frame-objects-with-history API).
@@ -251,6 +252,10 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 
     let set_status_fn = workflow::build_set_status(ctx, senders.surfaces.clone())?;
     stash.set("setStatus", set_status_fn)?;
+
+    let set_title_fn = workflow::build_set_title(ctx, senders.surfaces.clone())?;
+    stash.set("_setTitle", set_title_fn)?;
+    stash.set("_initialTitle", deps.session_title())?;
 
     // The lifecycle hook is invoked by the runtime on shutdown (it reads
     // `lifecycle.shutdown` off the returned object) and the runtime closes

@@ -21,7 +21,7 @@ use frances_models_llm::{CompletionOutcome, StreamEvent};
 use frances_session::context::{InvocationContext, ProcessContext};
 use frances_session::events::{SectionKind, StreamFrame};
 use frances_session::runtime::{SessionRuntime, StartOverrides};
-use frances_session::session::{Paths, Session, SessionMeta};
+use frances_session::session::Paths;
 use frances_session::store;
 
 /// Anything the harness keeps alive for the duration of one test.
@@ -67,34 +67,23 @@ impl Harness {
 async fn harness(workflow_src: &str) -> Harness {
     use std::io::Write;
     let tempdir = tempfile::tempdir().expect("tempdir");
-    // SessionRuntime::start_with calls create_dir_all on session.runtime_dir
-    // but not on session.dir itself.
-    std::fs::create_dir_all(tempdir.path().join("session")).unwrap();
-    std::fs::create_dir_all(tempdir.path().join("runtime")).unwrap();
 
     let mut src = NamedTempFile::with_suffix(".ts").expect("tempfile");
     src.write_all(workflow_src.as_bytes()).expect("write src");
     src.flush().expect("flush src");
     let src_path = src.path().to_path_buf();
 
-    let session_id = uuid::Uuid::new_v4().to_string();
-    let session = Session {
-        paths: Paths {
-            state_root: tempdir.path().to_path_buf(),
-            runtime_root: tempdir.path().to_path_buf(),
-        },
-        id: session_id.clone(),
-        dir: tempdir.path().join("session"),
-        runtime_dir: tempdir.path().join("runtime"),
-        meta: SessionMeta {
-            version: 1,
-            id: session_id,
-            created: 0,
-            cwd: None,
-            workflow: None,
-            reserved: None,
-        },
+    // Go through the real creation path so the session's metadata file
+    // exists on disk — the runtime reads-modifies-writes it (selected
+    // workflow, title).
+    let paths = Paths {
+        state_root: tempdir.path().to_path_buf(),
+        runtime_root: tempdir.path().to_path_buf(),
     };
+    paths.ensure_layout().expect("ensure layout");
+    let session = paths
+        .create_session(Some(tempdir.path().to_path_buf()))
+        .expect("create session");
 
     let db = store::open(&session).await.expect("open db");
 

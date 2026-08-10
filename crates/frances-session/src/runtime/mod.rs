@@ -83,6 +83,11 @@ pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     /// map. Wrapped in `Arc` so clones (one per workflow invocation)
     /// see the same cache.
     pub workflow_dbs: Arc<DashMap<Uuid, Arc<WorkflowDb>>>,
+    /// Current session title, shared with [`SessionRuntime`]. The
+    /// workflow driver writes it when a `SurfaceCmd::SetTitle` arrives;
+    /// this side only reads it (to seed a booting workflow's
+    /// `getTitle`).
+    pub session_title: Arc<StdMutex<Option<String>>>,
     /// IO bundle (timer + shell + fs). Production wires `RealIo`;
     /// tests wire a `StubIo` variant.
     pub io: Io,
@@ -125,6 +130,10 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
 
     fn current_cwd(&self) -> Option<PathBuf> {
         self.invocation.lock().process.cwd.clone()
+    }
+
+    fn session_title(&self) -> Option<String> {
+        self.session_title.lock().clone()
     }
 
     fn editable_roots(&self) -> &[PathBuf] {
@@ -197,6 +206,10 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     /// has no selected workflow yet.
     pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl<Io>>>,
+    /// Current session title. Same cell [`WorkflowDepsImpl`] reads;
+    /// written by the workflow driver on `SurfaceCmd::SetTitle`
+    /// alongside the metadata persist.
+    pub session_title: Arc<StdMutex<Option<String>>>,
     pub active_workflow: ActiveWorkflow,
     /// Control channel into the long-lived workflow driver task. Slash
     /// workflow switches go here; plain input/interrupts bypass it and
@@ -352,12 +365,14 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         let editor_factory = SessionEditorFactory {
             engine: Arc::new(edit_engine),
         };
+        let session_title = Arc::new(StdMutex::new(session.meta.title.clone()));
         let workflow_runtime = Arc::new(WorkflowRuntime::new(WorkflowDepsImpl {
             chat: chat.clone(),
             invocation: invocation.clone(),
             editor_factory: editor_factory.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
+            session_title: session_title.clone(),
             io,
             editable_roots,
         })?);
@@ -376,6 +391,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             workflows,
             default_workflow,
             workflow_runtime,
+            session_title,
             active_workflow: ActiveWorkflow::new(db),
             workflow_cmd,
             chat,

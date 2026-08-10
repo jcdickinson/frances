@@ -83,6 +83,9 @@ pub struct SessionMeta {
     pub created: u64,
     pub cwd: Option<PathBuf>,
     pub workflow: Option<SessionWorkflow>,
+    /// Human-readable session title. Set by the active workflow via
+    /// `setTitle`; `None` until one is set.
+    pub title: Option<String>,
     pub reserved: Option<String>,
 }
 
@@ -164,6 +167,7 @@ impl Paths {
             created: now_unix_secs(),
             cwd,
             workflow: None,
+            title: None,
             reserved: None,
         };
 
@@ -295,17 +299,23 @@ impl Session {
         self.dir.join("frances.db")
     }
 
-    pub fn write_meta(&mut self, meta: SessionMeta) -> Result<()> {
-        write_metadata(&self.metadata_path(), &meta)?;
-        self.id = meta.id.clone();
-        self.meta = meta;
-        Ok(())
+    /// Read-modify-write the metadata file. Rereads from disk (rather
+    /// than cloning the boot-time `self.meta` snapshot) so one field's
+    /// update can't clobber another's earlier write. All post-boot
+    /// writes happen on the workflow driver task, so there is no
+    /// concurrent-writer race to guard.
+    pub fn update_meta(&self, update: impl FnOnce(&mut SessionMeta)) -> Result<()> {
+        let mut meta = read_metadata(&self.metadata_path())?;
+        update(&mut meta);
+        write_metadata(&self.metadata_path(), &meta)
     }
 
     pub fn write_workflow(&self, workflow: SessionWorkflow) -> Result<()> {
-        let mut meta = self.meta.clone();
-        meta.workflow = Some(workflow);
-        write_metadata(&self.metadata_path(), &meta)
+        self.update_meta(|meta| meta.workflow = Some(workflow))
+    }
+
+    pub fn write_title(&self, title: Option<String>) -> Result<()> {
+        self.update_meta(|meta| meta.title = title)
     }
 }
 

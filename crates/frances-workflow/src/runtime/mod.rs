@@ -73,15 +73,18 @@ pub enum SectionTranscript {
 
 /// Chrome a workflow declares — the `surfaces` output. Declarative
 /// Set/Clear, not a stream: a re-`SetFooter` replaces the footer view,
-/// `ClearFooter` removes it. Today the only surface is the footer busy
-/// indicator; this grows a `Region`/`ViewNode` vocabulary only when a
-/// second surface (panel, plan-editor) actually appears.
+/// `ClearFooter` removes it. This grows a `Region`/`ViewNode` vocabulary
+/// only when a richer surface (panel, plan-editor) actually appears.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceCmd {
     /// Show `text` (with a spinner) in the footer busy indicator.
     SetFooter { text: String },
     /// Hide the footer busy indicator.
     ClearFooter,
+    /// Set (`Some`) or clear (`None`) the session title. Unlike the
+    /// footer this one outlives the workflow: the driver persists it
+    /// into session metadata before forwarding it to the TUI.
+    SetTitle { title: Option<String> },
 }
 
 /// The workflow's typed outputs: a bag of single-consumer channels. The
@@ -799,6 +802,10 @@ pub mod test_deps {
             self.cwd.lock().clone()
         }
 
+        fn session_title(&self) -> Option<String> {
+            None
+        }
+
         fn editable_roots(&self) -> &[PathBuf] {
             &self.editable_roots
         }
@@ -926,6 +933,10 @@ pub mod test_deps {
         }
 
         fn current_cwd(&self) -> Option<PathBuf> {
+            None
+        }
+
+        fn session_title(&self) -> Option<String> {
             None
         }
 

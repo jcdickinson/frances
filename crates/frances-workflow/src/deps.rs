@@ -41,6 +41,12 @@ pub trait WorkflowDeps: WorkflowIo + Clone {
     /// the invocation context is set.
     fn current_cwd(&self) -> Option<PathBuf>;
 
+    /// The session's current title, if one has been set. Read once at
+    /// module-install time to seed the JS-side `getTitle()`; afterwards
+    /// the JS layer tracks its own `setTitle` calls (the workflow is the
+    /// only writer).
+    fn session_title(&self) -> Option<String>;
+
     /// The project roots that define which files are "editable" (eligible
     /// for anchor-based reads and edits). Discovered once at session start
     /// by walking up from the initial cwd looking for `.git` / `.jj`.

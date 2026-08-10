@@ -787,12 +787,20 @@ fn is_one_shot(kind: &SectionKind) -> bool {
     )
 }
 
-/// Workflow-declared chrome (the footer busy indicator). Ephemeral —
-/// never persisted; forwarded to the TUI as-is.
+/// Workflow-declared chrome, forwarded to the TUI as-is. The footer
+/// commands are ephemeral; `SetTitle` is session state — it lands in
+/// the shared title cell (which seeds a booting workflow's `getTitle`)
+/// and session metadata before the frame goes out.
 fn emit_surface<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     cmd: SurfaceCmd,
 ) {
+    if let SurfaceCmd::SetTitle { title } = &cmd {
+        *runtime.session_title.lock() = title.clone();
+        if let Err(error) = runtime.session.write_title(title.clone()) {
+            warn!(%error, "persist session title failed");
+        }
+    }
     runtime.events.send(StreamFrame::Surface(cmd));
 }
 

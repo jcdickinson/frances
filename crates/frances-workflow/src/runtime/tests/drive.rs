@@ -38,6 +38,59 @@ async fn set_status_emits_status_frames() {
 }
 
 #[tokio::test]
+async fn set_title_emits_title_frames_and_get_title_tracks() {
+    let rt = Runtime::new(StubDeps::default()).unwrap();
+    let file = write_source(
+        "js",
+        r#"
+        import { setTitle, getTitle } from "frances:v1/workflow";
+        import { transcript, MarkdownSection } from "frances:v1/sections";
+        transcript.push(new MarkdownSection({ content: `before:${getTitle()}` }));
+        setTitle("fixing the bug");
+        transcript.push(new MarkdownSection({ content: `after:${getTitle()}` }));
+        setTitle(null);
+        transcript.push(new MarkdownSection({ content: `cleared:${getTitle()}` }));
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))));
+
+    let texts: Vec<String> = frames
+        .iter()
+        .map(text_of)
+        .filter(|text| !text.is_empty())
+        .collect();
+    assert_eq!(
+        texts,
+        vec!["before:null", "after:fixing the bug", "cleared:null"],
+        "getTitle should track setTitle locally",
+    );
+
+    let mut surfaces = Vec::new();
+    while let Ok(s) = handle.outputs.surfaces.try_recv() {
+        surfaces.push(s);
+    }
+    assert_eq!(
+        surfaces,
+        vec![
+            SurfaceCmd::SetTitle {
+                title: Some("fixing the bug".to_string())
+            },
+            SurfaceCmd::SetTitle { title: None },
+        ],
+        "expected set then clear on the surfaces channel",
+    );
+}
+
+#[tokio::test]
 async fn body_returns_terminates_workflow() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(

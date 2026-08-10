@@ -10,6 +10,10 @@
 //!
 //! `setStatus(text | null)` drives the TUI footer's busy indicator:
 //! `Some(text)` shows the text with a spinner, `None` hides it.
+//!
+//! `setTitle(text | null)` sets or clears the session title. It rides
+//! the same surfaces channel; the driver persists it into session
+//! metadata (unlike the footer, it outlives the workflow).
 
 use std::sync::Arc;
 
@@ -43,6 +47,22 @@ pub(crate) fn build_set_status<'js>(
             None => SurfaceCmd::ClearFooter,
         };
         let _ = surfaces_tx.send(cmd);
+        Ok::<_, rquickjs::Error>(())
+    })
+}
+
+/// Build the `_setTitle(text | null)` primitive. Same optional/nullable
+/// argument shape as `setStatus`; the JS wrapper in
+/// `assets/frances/v1/workflow.js` layers `getTitle()` on top by caching
+/// the last value it sent.
+pub(crate) fn build_set_title<'js>(
+    ctx: &Ctx<'js>,
+    surfaces_tx: UnboundedSender<SurfaceCmd>,
+) -> JsResult<Function<'js>> {
+    Function::new(ctx.clone(), move |text: Opt<Option<String>>| {
+        let _ = surfaces_tx.send(SurfaceCmd::SetTitle {
+            title: text.0.flatten(),
+        });
         Ok::<_, rquickjs::Error>(())
     })
 }
