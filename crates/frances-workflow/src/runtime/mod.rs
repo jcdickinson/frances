@@ -75,7 +75,7 @@ pub enum SectionTranscript {
 /// Set/Clear, not a stream: a re-`SetFooter` replaces the footer view,
 /// `ClearFooter` removes it. This grows a `Region`/`ViewNode` vocabulary
 /// only when a richer surface (panel, plan-editor) actually appears.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceCmd {
     /// Show `text` (with a spinner) in the footer busy indicator.

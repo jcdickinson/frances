@@ -1,11 +1,10 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
-  import { listen } from '@tauri-apps/api/event';
   import { onMount, tick } from 'svelte';
+  import { commands as backend, events, type UiEvent, type Usage } from './bindings';
   import CommandPalette from './CommandPalette.svelte';
   import SectionView from './SectionView.svelte';
   import type { Command } from './commands';
-  import type { AppInfo, Section, UiEvent, Usage } from './types';
+  import { type Section, unwrap } from './types';
 
   let sections = $state<Section[]>([]);
   let sessionId = $state('starting…');
@@ -23,8 +22,8 @@
     let unlisten: (() => void) | undefined;
 
     void (async () => {
-      unlisten = await listen<UiEvent>('session-event', ({ payload }) => applyEvent(payload));
-      const info = await invoke<AppInfo>('frontend_ready');
+      unlisten = await events.uiEvent.listen(({ payload }) => applyEvent(payload));
+      const info = unwrap(await backend.frontendReady());
       sessionId = info.sessionId;
       await tick();
       textarea.focus();
@@ -39,7 +38,7 @@
         if (historyMode) {
           historyMode = false;
         } else {
-          void invoke('interrupt').catch(showError);
+          void backend.interrupt().catch(showError);
         }
       } else if (event.ctrlKey && event.key.toLowerCase() === 'o') {
         event.preventDefault();
@@ -118,13 +117,13 @@
     if (permission) {
       await answerPermission('chat', text);
     } else {
-      await invoke('send_prompt', { text }).catch(showError);
+      await backend.sendPrompt(text).catch(showError);
     }
   }
 
   async function answerPermission(decision: 'yes' | 'no' | 'chat', text = input): Promise<void> {
     const details = text.trim() || null;
-    await invoke('respond_permission', { decision, details }).catch(showError);
+    await backend.respondPermission(decision, details).then(unwrap).catch(showError);
     permission = null;
     input = '';
     await tick();
@@ -135,7 +134,7 @@
     {
       id: 'workspace::save',
       title: 'Save Workspace',
-      run: () => invoke('save_workspace'),
+      run: async () => void unwrap(await backend.saveWorkspace()),
     },
   ];
 

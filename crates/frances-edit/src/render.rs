@@ -21,7 +21,7 @@ pub fn render_file(state: &FileAnchorState, lines: &[String]) -> String {
 
 /// One entry in a structured diff. `Context` carries the post-side line
 /// number (1-based); `Added` / `Removed` carry only the raw line content.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, specta::Type)]
 pub enum DiffOp {
     Context { text: String, line: u32 },
     Added(String),

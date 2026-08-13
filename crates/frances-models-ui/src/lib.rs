@@ -24,14 +24,14 @@ use serde::{Deserialize, Serialize};
 /// Section identity, scoped to one workflow invocation. Monotonically
 /// assigned by `transcript.push` on the workflow side. The frontend
 /// uses it to route subsequent events to the right rendered section.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, specta::Type)]
 #[serde(transparent)]
 pub struct SectionId(pub u64);
 
 /// Who produced a [`SectionKind::Markdown`] section. The frontend
 /// styles each speaker differently and gates markdown rendering
 /// (`source != User`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum Source {
     User,
@@ -42,7 +42,7 @@ pub enum Source {
 /// What kind of section, and any bounded metadata that rides with it.
 /// One variant per section presentation in the UI. The frontend
 /// matches on this to pick a rendering when a new section id is seen.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SectionKind {
     /// `MarkdownSection` — streaming text. `source` names the speaker;
@@ -77,7 +77,7 @@ pub enum SectionKind {
 }
 
 /// Terminal status for [`SectionKind::ShellOutput`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub enum ShellState {
     Running,
     Success,
@@ -85,7 +85,7 @@ pub enum ShellState {
 }
 
 /// Terminal status for [`SectionKind::Reasoning`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
 pub enum ReasoningState {
     Streaming,
     Done,

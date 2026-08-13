@@ -65,7 +65,7 @@ pub struct ToolCallError {
 /// Token-usage report. Universal shape; `cached_input_tokens` mirrors
 /// OpenAI's `prompt_tokens_details.cached_tokens` for the wires that
 /// surface it.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

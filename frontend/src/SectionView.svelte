@@ -1,5 +1,6 @@
 <script lang="ts">
-  import type { DiffLine, Section, ShellState } from './types';
+  import type { DiffOp, ShellState } from './bindings';
+  import type { Section } from './types';
 
   let { section }: { section: Section } = $props();
   let expanded = $state(false);
@@ -34,7 +35,7 @@
     };
   }
 
-  function diffLine(line: DiffLine): { className: string; prefix: string; text: string } {
+  function diffLine(line: DiffOp): { className: string; prefix: string; text: string } {
     if ('Context' in line) {
       return {
         className: 'context',

@@ -19,8 +19,11 @@ tracing.workspace = true
 frances-models-ui.workspace = true
 frances-session.workspace = true
 serde.workspace = true
+specta.workspace = true
+specta-typescript.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
+tauri-specta.workspace = true
 xdg.workspace = true
 
 [build-dependencies]

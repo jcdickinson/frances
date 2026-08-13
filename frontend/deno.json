@@ -19,12 +19,13 @@
     "tauri": "cd ../crates/frances && deno run -A npm:@tauri-apps/cli@^2.0.0"
   },
   "fmt": {
-    "exclude": [".vite", "dist", "node_modules"],
+    "exclude": [".vite", "dist", "node_modules", "src/bindings.ts"],
     "lineWidth": 100,
     "singleQuote": true
   },
   "lint": {
     "include": ["src/**/*.ts", "vite.config.ts"],
+    "exclude": ["src/bindings.ts"],
     "rules": {
       "tags": ["recommended"]
     }

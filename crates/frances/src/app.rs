@@ -13,8 +13,9 @@ use frances_session::session::{Paths, Session};
 use frances_session::store;
 use frances_session::workspace::Workspace;
 use serde::Serialize;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
+use tauri_specta::Event as _;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -24,14 +25,14 @@ struct Backend {
     permission: Mutex<Option<oneshot::Sender<PermissionResponse>>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     session_id: String,
     title: Option<String>,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, specta::Type, tauri_specta::Event)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum UiEvent {
     Reset,
@@ -65,38 +66,37 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
     let invocation = InvocationContext::capture(workspace);
     install_logging(&session)?;
 
+    let specta = specta_builder();
+    #[cfg(debug_assertions)]
+    export_bindings(&specta)?;
+
     let session_for_setup = session.clone();
-    let builder = tauri::Builder::default().setup(move |app| {
-        let (runtime, events) = tauri::async_runtime::block_on(start_runtime(
-            session_for_setup.clone(),
-            invocation,
-            workflow,
-        ))?;
-
-        if let Some(title) = &session_for_setup.meta.title
-            && let Some(window) = app.get_webview_window("main")
-        {
-            window.set_title(title)?;
-        }
-
-        debug!(session_id = %session_for_setup.id, "starting desktop app");
-        app.manage(Backend {
-            runtime,
-            events: Mutex::new(Some(events)),
-            permission: Mutex::new(None),
-        });
-        Ok(())
-    });
-
-    let app = builder
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![
-            frontend_ready,
-            send_prompt,
-            interrupt,
-            respond_permission,
-            save_workspace
-        ])
+        .invoke_handler(specta.invoke_handler())
+        .setup(move |app| {
+            specta.mount_events(app);
+
+            let (runtime, events) = tauri::async_runtime::block_on(start_runtime(
+                session_for_setup.clone(),
+                invocation,
+                workflow,
+            ))?;
+
+            if let Some(title) = &session_for_setup.meta.title
+                && let Some(window) = app.get_webview_window("main")
+            {
+                window.set_title(title)?;
+            }
+
+            debug!(session_id = %session_for_setup.id, "starting desktop app");
+            app.manage(Backend {
+                runtime,
+                events: Mutex::new(Some(events)),
+                permission: Mutex::new(None),
+            });
+            Ok(())
+        })
         .build(tauri::generate_context!())?;
 
     app.run(|handle, event| {
@@ -104,6 +104,31 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
             handle.state::<Backend>().runtime.shutdown();
         }
     });
+    Ok(())
+}
+
+fn specta_builder() -> tauri_specta::Builder {
+    tauri_specta::Builder::<tauri::Wry>::new()
+        .commands(tauri_specta::collect_commands![
+            frontend_ready,
+            send_prompt,
+            interrupt,
+            respond_permission,
+            save_workspace
+        ])
+        .events(tauri_specta::collect_events![UiEvent])
+}
+
+/// Write the generated TypeScript bindings into the frontend source tree.
+fn export_bindings(specta: &tauri_specta::Builder) -> Result<()> {
+    specta.export(
+        specta_typescript::Typescript::default()
+            .bigint(specta_typescript::BigIntExportBehavior::Number),
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../frontend/src/bindings.ts"
+        ),
+    )?;
     Ok(())
 }
 
@@ -121,6 +146,7 @@ async fn start_runtime(
 }
 
 #[tauri::command]
+#[specta::specta]
 async fn frontend_ready(
     app: tauri::AppHandle,
     state: tauri::State<'_, Backend>,
@@ -144,11 +170,13 @@ async fn frontend_ready(
 }
 
 #[tauri::command]
+#[specta::specta]
 fn send_prompt(state: tauri::State<'_, Backend>, text: String) {
     state.runtime.prompt(text);
 }
 
 #[tauri::command]
+#[specta::specta]
 fn interrupt(state: tauri::State<'_, Backend>) {
     state.runtime.interrupt();
 }
@@ -156,6 +184,7 @@ fn interrupt(state: tauri::State<'_, Backend>) {
 /// Show a save dialog and write the current workspace as a workspace
 /// file. Returns the saved path, or `None` if the user cancelled.
 #[tauri::command]
+#[specta::specta]
 async fn save_workspace(
     app: tauri::AppHandle,
     state: tauri::State<'_, Backend>,
@@ -186,6 +215,7 @@ async fn save_workspace(
 }
 
 #[tauri::command]
+#[specta::specta]
 fn respond_permission(
     state: tauri::State<'_, Backend>,
     decision: String,
@@ -227,7 +257,7 @@ async fn forward_events(app: tauri::AppHandle, mut events: mpsc::UnboundedReceiv
             let _ = window.set_title(title.as_deref().unwrap_or("frances"));
         }
 
-        if let Err(error) = app.emit("session-event", event) {
+        if let Err(error) = event.emit(&app) {
             warn!(%error, "emit session event failed");
         }
     }
@@ -292,4 +322,16 @@ fn store_permission(app: &tauri::AppHandle, request: PermissionRequest) -> Optio
     Some(UiEvent::Permission {
         prompt: request.prompt,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regenerates `frontend/src/bindings.ts`. The debug desktop launch
+    /// does the same; this keeps the bindings reproducible headlessly.
+    #[test]
+    fn export_typescript_bindings() {
+        export_bindings(&specta_builder()).expect("export bindings");
+    }
 }

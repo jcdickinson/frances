@@ -11,6 +11,7 @@ frances-config.workspace = true
 jsonschema = { version = "0.46.5", default-features = false }
 serde.workspace = true
 serde_json.workspace = true
+specta.workspace = true
 thiserror.workspace = true
 tokio-util.workspace = true
 url.workspace = true
