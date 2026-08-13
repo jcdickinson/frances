@@ -23,6 +23,7 @@ use frances_session::events::{SectionKind, StreamFrame};
 use frances_session::runtime::{SessionRuntime, StartOverrides};
 use frances_session::session::Paths;
 use frances_session::store;
+use frances_session::workspace::Workspace;
 
 /// Anything the harness keeps alive for the duration of one test.
 struct Harness {
@@ -81,14 +82,13 @@ async fn harness(workflow_src: &str) -> Harness {
         runtime_root: tempdir.path().to_path_buf(),
     };
     paths.ensure_layout().expect("ensure layout");
-    let session = paths
-        .create_session(Some(tempdir.path().to_path_buf()))
-        .expect("create session");
+    let workspace = Workspace::open(tempdir.path()).expect("open workspace");
+    let session = paths.create_session(&workspace).expect("create session");
 
     let db = store::open(&session).await.expect("open db");
 
     let invocation = InvocationContext {
-        tty_key: None,
+        workspace,
         process: ProcessContext {
             cwd: Some(tempdir.path().to_path_buf()),
             env: std::sync::Arc::new(std::env::vars_os().collect()),

@@ -58,7 +58,7 @@ Cross-machine sync is out of scope. Project DBs are local artifacts, like build 
 
 ## Concurrent sessions on the same project
 
-Two TTYs with active Frances sessions both touching `src/llm.rs`. Both eventually complete plans that promote file summaries for the same path.
+Two active Frances sessions both touching `src/llm.rs`. Both eventually complete plans that promote file summaries for the same path.
 
 Do not try to merge them. Each promotion creates a `file_summary` row keyed by `(plan_id, path)` — multiple plans can have entries for the same file. The agent reading the project DB sees them all, with plan IDs and timestamps; if the agent needs to synthesize "what's the current state," that's a query-time task it can perform with full context.
 

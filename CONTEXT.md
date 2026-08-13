@@ -18,6 +18,7 @@ a spec.
 - **Frontend-ready handshake** — the frontend installs its Tauri event listener
   before asking Rust to start forwarding buffered runtime events. This prevents
   initial replay frames from being lost while the webview loads.
-- **TTY key** — the launching terminal's session identity. The foreground child
-  receives it from the detached launcher because `setsid` deliberately removes
-  its controlling terminal.
+- **Workspace** — what a launch opens: a directory (implicit single-dir
+  workspace) or a workspace file listing several dirs. Canonicalized before
+  the launcher detaches; every launch creates a fresh session recording its
+  workspace source.

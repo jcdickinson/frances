@@ -53,7 +53,7 @@ Probably: turn = one model invocation, producing N tool calls and 1 model output
 
 ## Conflict resolution on parallel sessions
 
-Two TTYs both edit `src/llm.rs` in different sessions, both promote to project DB. The current answer is "don't merge, store both with session_id annotation." Open:
+Two concurrent sessions both edit `src/llm.rs` in different sessions, both promote to project DB. The current answer is "don't merge, store both with session_id annotation." Open:
 
 - Does the agent in a third session need any UI/tool support for distinguishing "the latest" from "the conflicting"?
 - Is there ever a case where automatic merge is reasonable? (Probably not; let humans resolve.)

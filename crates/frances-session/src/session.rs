@@ -1,6 +1,6 @@
 use std::env;
 use std::fs;
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use frances_core::now_unix_secs;
@@ -9,7 +9,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::tty::TtyKey;
+use crate::workspace::Workspace;
 
 const METADATA_FILE: &str = "metadata.bin";
 const SESSION_DIR_MODE: u32 = 0o700;
@@ -20,8 +20,6 @@ pub enum SessionError {
     HomeNotSet,
     #[error("session metadata id mismatch for {requested}: file says {found}")]
     MetadataIdMismatch { requested: String, found: String },
-    #[error("invalid tty link target for {tty_key}: {}", target.display())]
-    InvalidTtyLinkTarget { tty_key: String, target: PathBuf },
     #[error("create directory {path}: {source}")]
     CreateDir {
         path: PathBuf,
@@ -50,24 +48,6 @@ pub enum SessionError {
     EncodeMetadata(#[from] bincode::error::EncodeError),
     #[error("decode metadata: {0}")]
     DecodeMetadata(#[from] bincode::error::DecodeError),
-    #[error("read tty link {tty_key}: {source}")]
-    ReadTtyLink {
-        tty_key: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("create tty link for {tty_key}: {source}")]
-    CreateTtyLink {
-        tty_key: String,
-        #[source]
-        source: std::io::Error,
-    },
-    #[error("remove tty link {tty_key}: {source}")]
-    RemoveTtyLink {
-        tty_key: String,
-        #[source]
-        source: std::io::Error,
-    },
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +61,14 @@ pub struct SessionMeta {
     pub version: u32,
     pub id: String,
     pub created: u64,
-    pub cwd: Option<PathBuf>,
+    /// The workspace's primary dir at creation time — where the session
+    /// started.
+    pub cwd: PathBuf,
+    /// Canonical path of the dir or workspace file the session was
+    /// opened on. Lets sessions be grouped by workspace later (MRU,
+    /// pickers) — the workspace itself is re-read from this path, not
+    /// stored here.
+    pub workspace_source: PathBuf,
     pub workflow: Option<SessionWorkflow>,
     /// Human-readable session title. Set by the active workflow via
     /// `setTitle`; `None` until one is set.
@@ -137,7 +124,6 @@ impl Paths {
         create_private_dir(&self.sessions_root())?;
         create_private_dir(&self.runtime_root)?;
         create_private_dir(&self.runtime_sessions_root())?;
-        create_private_dir(&self.tty_links_root())?;
         Ok(())
     }
 
@@ -149,11 +135,7 @@ impl Paths {
         self.runtime_root.join("sessions")
     }
 
-    pub fn tty_links_root(&self) -> PathBuf {
-        self.runtime_root.join("tty-links")
-    }
-
-    pub fn create_session(&self, cwd: Option<PathBuf>) -> Result<Session> {
+    pub fn create_session(&self, workspace: &Workspace) -> Result<Session> {
         let id = generate_session_id();
         let dir = self.sessions_root().join(&id);
         let runtime_dir = self.runtime_sessions_root().join(&id);
@@ -165,7 +147,8 @@ impl Paths {
             version: 1,
             id: id.clone(),
             created: now_unix_secs(),
-            cwd,
+            cwd: workspace.primary_dir().to_path_buf(),
+            workspace_source: workspace.source.identity_path().to_path_buf(),
             workflow: None,
             title: None,
             reserved: None,
@@ -204,89 +187,6 @@ impl Paths {
             runtime_dir,
             meta,
         })
-    }
-
-    pub fn resolve_or_create_for_tty(
-        &self,
-        tty_key: &TtyKey,
-        cwd: Option<PathBuf>,
-    ) -> Result<Session> {
-        if let Some(session) = self.resolve_tty_link(tty_key)? {
-            return Ok(session);
-        }
-
-        let session = self.create_session(cwd)?;
-        self.link_tty(tty_key, &session)?;
-        Ok(session)
-    }
-
-    pub fn resolve_tty_link(&self, tty_key: &TtyKey) -> Result<Option<Session>> {
-        let link_path = self.tty_link_path(tty_key);
-        if !link_path.exists() {
-            return Ok(None);
-        }
-
-        let target = match fs::read_link(&link_path) {
-            Ok(target) => target,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(source) => {
-                return Err(SessionError::ReadTtyLink {
-                    tty_key: tty_key.to_string(),
-                    source,
-                }
-                .into());
-            }
-        };
-
-        if !target.exists() {
-            let _ = fs::remove_file(&link_path);
-            return Ok(None);
-        }
-
-        let session_id = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| SessionError::InvalidTtyLinkTarget {
-                tty_key: tty_key.to_string(),
-                target: target.clone(),
-            })?;
-
-        match self.load_session(session_id) {
-            Ok(session) => Ok(Some(session)),
-            Err(_) => {
-                let _ = fs::remove_file(&link_path);
-                Ok(None)
-            }
-        }
-    }
-
-    pub fn link_tty(&self, tty_key: &TtyKey, session: &Session) -> Result<()> {
-        let link_path = self.tty_link_path(tty_key);
-        if link_path.exists() {
-            let _ = fs::remove_file(&link_path);
-        }
-        symlink(&session.dir, &link_path).map_err(|source| SessionError::CreateTtyLink {
-            tty_key: tty_key.to_string(),
-            source,
-        })?;
-        Ok(())
-    }
-
-    pub fn unlink_tty(&self, tty_key: &TtyKey) -> Result<bool> {
-        let link_path = self.tty_link_path(tty_key);
-        match fs::remove_file(&link_path) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
-            Err(source) => Err(SessionError::RemoveTtyLink {
-                tty_key: tty_key.to_string(),
-                source,
-            }
-            .into()),
-        }
-    }
-
-    pub fn tty_link_path(&self, tty_key: &TtyKey) -> PathBuf {
-        self.tty_links_root().join(tty_key.as_str())
     }
 }
 

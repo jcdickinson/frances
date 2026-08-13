@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use tracing::trace;
 
-use crate::tty::TtyKey;
+use crate::workspace::Workspace;
 
 #[derive(Debug, Clone)]
 pub struct ProcessContext {
@@ -16,24 +16,28 @@ pub struct ProcessContext {
 
 #[derive(Debug, Clone)]
 pub struct InvocationContext {
-    pub tty_key: Option<TtyKey>,
+    pub workspace: Workspace,
     pub process: ProcessContext,
 }
 
 impl InvocationContext {
-    pub fn capture(tty_key: Option<TtyKey>) -> Self {
+    /// Snapshot the launch context. `cwd` comes from the workspace's
+    /// primary dir, not the launching process — the session's working
+    /// directory must not depend on where it was relaunched from. Env
+    /// still snapshots the real process environment (secrets arrive
+    /// that way).
+    pub fn capture(workspace: Workspace) -> Self {
         let context = Self {
-            tty_key,
             process: ProcessContext {
-                cwd: env::current_dir().ok(),
+                cwd: Some(workspace.primary_dir().to_path_buf()),
                 env: Arc::new(env::vars_os().collect()),
             },
+            workspace,
         };
 
         trace!(
-            has_tty_key = context.tty_key.is_some(),
+            workspace = %context.workspace.source.identity_path().display(),
             env_vars = context.process.env.len(),
-            has_cwd = context.process.cwd.is_some(),
             "captured invocation context"
         );
 

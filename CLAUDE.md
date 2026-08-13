@@ -11,7 +11,7 @@ wasn't created.
 
 ## Project
 
-Frances is an agentic coding tool with a Tauri desktop app. The launcher identifies the controlling terminal, resolves (or creates) its per-terminal session, opens a per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), and constructs an in-process `SessionRuntime`. A Svelte frontend renders the runtime's event stream.
+Frances is an agentic coding tool with a Tauri desktop app. The launcher opens a workspace (a directory, or a workspace file listing several dirs), creates a fresh session for it, opens the per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), and constructs an in-process `SessionRuntime`. A Svelte frontend renders the runtime's event stream.
 
 **Frances has never shipped — there is no backward-compatibility burden.** No released version, no users with persisted state to preserve. DB schemas, on-disk serialization formats, wire shapes, and public APIs can change freely; do not write migrations, compatibility shims, or "old behaviour" fallbacks for the sake of existing data. When a refactor improves the type or format, just make the change.
 
@@ -19,7 +19,7 @@ Frances is an agentic coding tool with a Tauri desktop app. The launcher identif
 
 The interesting components:
 
-- **`frances`** — the Tauri binary, detached launcher, TTY identification, and event bridge.
+- **`frances`** — the Tauri binary, detached launcher, and event bridge.
 - **`frontend`** — the Svelte + SCSS interface, developed and built with Deno.
 - **`frances-session`** — session runtime: per-session DB handle, workflow selection, history, scrollback persistence, anchor store, llm session provider, and UI event channel.
 - **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat sessions and tool calls.
@@ -32,7 +32,7 @@ Workspace pins a single Rust toolchain in `rust-toolchain.toml` (1.95.0, edition
 
 Read these before changing the relevant area:
 
-- [`docs/arch/session-runtime.md`](docs/arch/session-runtime.md) — in-process runtime model, session/TTY layout, per-session database.
+- [`docs/arch/session-runtime.md`](docs/arch/session-runtime.md) — in-process runtime model, workspace/session layout, per-session database.
 - [`docs/arch/edit-engine.md`](docs/arch/edit-engine.md) — how `frances-edit` and `frances-anchors` are wired into the binary.
 - [`docs/arch/anchors.md`](docs/arch/anchors.md) — full anchor system design (line anchors, reconciliation, word pool, edit tool flow).
 
@@ -69,11 +69,12 @@ doesn't have that problem.
 
 The user runs the dev shell via `nix develop` (provides toolchain + `rust-analyzer` + `jq` + `python3`).
 
-`frances` subcommands:
+`frances` CLI:
 
-- `frances` — launch the desktop app against the current terminal's session and return immediately.
+- `frances [path]` — open a directory or workspace file (defaults to `.`) in a fresh session and return immediately. Every launch is a new session.
+- `frances --workflow <name>` — start the session with a specific workflow.
 - `frances --foreground` — run the desktop app attached to the launcher process.
-- `frances new` — unlink the current TTY's session so the next run creates a fresh session. The old session's state on disk is left intact.
+- `frances install [--local]` — write a starter config and install the `main` workflow.
 
 ## Code style and conventions
 

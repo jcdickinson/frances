@@ -1,8 +1,8 @@
 # Frances
 
 Frances is an agentic coding tool with a Tauri desktop app. The launcher
-identifies the controlling terminal, resolves (or creates) its session, and
-starts the app in the background. The Rust backend owns the in-process
+opens a workspace (a directory, or a workspace file listing several), creates
+a fresh session for it, and starts the app in the background. The Rust backend owns the in-process
 `SessionRuntime`; a Svelte frontend renders its event stream. LLM completions
 stream through a configurable set of model providers.
 
@@ -60,7 +60,6 @@ id = "e3c5d9f6-141b-4cf8-b6ad-41e5a9cdee43"
 file = "/home/you/Code/frances/assets/workflows/main.ts"
 ```
 
-`frances new` later unlinks this terminal's session so the next run starts fresh.
 
 ## The name
 
@@ -113,11 +112,14 @@ A `nix develop` dev shell provides the toolchain plus `rust-analyzer`, `jq`,
 ## Running
 
 ```bash
-frances                 # launch in the background and return immediately
+frances                 # open the current directory; launch in the background
+frances path/to/repo    # open a directory as a workspace
+frances ws.json         # open a workspace file: { "dirs": ["a", "b"] }
+frances --workflow review  # start with the `review` workflow
 frances --foreground    # run attached (useful for development)
-frances new             # unlink this terminal's session and launch fresh
-frances new review      # launch fresh with the `review` workflow
 ```
+
+Every launch starts a fresh session.
 
 ## Configuration
 

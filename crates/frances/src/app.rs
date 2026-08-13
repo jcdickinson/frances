@@ -11,13 +11,11 @@ use frances_session::llm::Usage;
 use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
 use frances_session::session::{Paths, Session};
 use frances_session::store;
-use frances_session::tty::TtyKey;
+use frances_session::workspace::Workspace;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
-
-use crate::Command;
 
 struct Backend {
     runtime: Arc<SessionRuntime>,
@@ -60,19 +58,10 @@ enum UiEvent {
     },
 }
 
-pub fn run(tty_key: TtyKey, command: Option<Command>) -> Result<()> {
+pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
     let paths = Paths::discover()?;
-    let workflow = match &command {
-        Some(Command::New { workflow }) => workflow.clone(),
-        _ => None,
-    };
-
-    if matches!(command, Some(Command::New { .. })) && paths.resolve_tty_link(&tty_key)?.is_some() {
-        paths.unlink_tty(&tty_key)?;
-    }
-
-    let invocation = InvocationContext::capture(Some(tty_key.clone()));
-    let session = paths.resolve_or_create_for_tty(&tty_key, invocation.process.cwd.clone())?;
+    let session = paths.create_session(&workspace)?;
+    let invocation = InvocationContext::capture(workspace);
     install_logging(&session)?;
 
     let session_for_setup = session.clone();

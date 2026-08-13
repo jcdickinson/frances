@@ -5,17 +5,34 @@ The unit of state is a **session**, identified by a random ID. A session owns:
 - `state_root/sessions/<id>/` — durable: `metadata.bin`, `frances.db` (turso), anchor state, `frances.log`.
 - `runtime_root/sessions/<id>/` — ephemeral runtime dir. Empty in the current
   build; reserved for future per-process locks or scratch files.
-- `runtime_root/tty-links/<tty_key>` — symlink from the controlling TTY to
-  its session dir.
 
 `state_root` resolves from `XDG_STATE_HOME` (else `~/.local/state/frances`);
 `runtime_root` from `XDG_RUNTIME_DIR` (else `/tmp/frances-<uid>`). Both
 directories are created `0700`.
 
+## Workspaces
+
+A launch opens a **workspace**: `frances [path]` where path is a directory
+(an implicit single-dir workspace) or a workspace file — JSON
+`{ "dirs": [...] }`, relative entries resolved against the file's parent,
+`.frances-workspace` extension by convention (not enforced). The path is
+canonicalized and validated before the launcher detaches, so errors land on
+the launching terminal.
+
+**Every launch creates a fresh session.** There is no workspace→session
+link and no resume; `SessionMeta.workspace_source` records the workspace's
+canonical identity path so a future MRU/picker can enumerate sessions by
+workspace and reopen them. The session's cwd is the workspace's primary dir
+(`dirs[0]`), not the launching process's cwd.
+
+`editable_roots` currently derives from a marker walk on the primary dir;
+switching it to the workspace's dirs verbatim is a known follow-up once
+multi-dir workspaces are exercised.
+
 ## In-process runtime
 
-There is no daemon. `frances` is a single process: the binary captures the
-controlling TTY, resolves (or creates) the matching session, opens the
+There is no daemon. `frances` is a single process: the binary resolves the
+workspace, creates the session, opens the
 per-session turso database, and constructs a
 [`SessionRuntime`](../../crates/frances-session/src/runtime/mod.rs). The desktop UI
 runs in the same process and talks to the runtime through:

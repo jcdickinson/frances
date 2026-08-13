@@ -1,24 +1,27 @@
 mod app;
 mod install;
-mod tty;
 
-use std::ffi::OsString;
+use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use frances_session::tty::TtyKey;
+use frances_session::workspace::Workspace;
 
 #[derive(Debug, Parser)]
 #[command(name = "frances")]
 struct Cli {
+    /// Directory or workspace file to open. Defaults to the current
+    /// directory. Every launch starts a fresh session.
+    path: Option<PathBuf>,
+
+    /// Workflow to start the session with. Defaults to `default_workflow`.
+    #[arg(long)]
+    workflow: Option<String>,
+
     /// Keep the desktop app attached to this process.
     #[arg(long, global = true)]
     foreground: bool,
-
-    /// TTY identity captured by the detached launcher.
-    #[arg(long, global = true, hide = true)]
-    tty_key: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -26,11 +29,6 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Unlink the current terminal's session so this launch starts fresh.
-    New {
-        /// Workflow to start in the new session. Defaults to `default_workflow`.
-        workflow: Option<String>,
-    },
     /// Write a starter config and install the `main` workflow.
     Install {
         /// Point config at the in-repo workflow instead of copying it.
@@ -53,28 +51,28 @@ fn real_main() -> Result<()> {
         return install::run(local);
     }
 
-    let tty_key = match cli.tty_key {
-        Some(key) => TtyKey(key),
-        None => tty::controlling_tty_key()?,
-    };
+    // Canonicalize and validate before detaching so errors land on the
+    // launching terminal and the child gets an unambiguous path.
+    let path = cli.path.unwrap_or_else(|| PathBuf::from("."));
+    let workspace = Workspace::open(&path)?;
 
     if !cli.foreground {
-        return launch_detached(&tty_key);
+        return launch_detached(&workspace, cli.workflow.as_deref());
     }
 
-    app::run(tty_key, cli.command)
+    app::run(workspace, cli.workflow)
 }
 
-fn launch_detached(tty_key: &TtyKey) -> Result<()> {
+fn launch_detached(workspace: &Workspace, workflow: Option<&str>) -> Result<()> {
     let executable = std::env::current_exe().context("resolve frances executable")?;
-    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
-    args.push("--foreground".into());
-    args.push("--tty-key".into());
-    args.push(tty_key.0.clone().into());
 
     let mut command = ProcessCommand::new(executable);
+    command.arg("--foreground");
+    if let Some(workflow) = workflow {
+        command.arg("--workflow").arg(workflow);
+    }
     command
-        .args(args)
+        .arg(workspace.source.identity_path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -103,26 +101,30 @@ fn launch_detached(tty_key: &TtyKey) -> Result<()> {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command};
+    use super::Cli;
 
     #[test]
-    fn launches_detached_by_default() {
+    fn bare_launch_defaults_to_detached_cwd() {
         let cli = Cli::try_parse_from(["frances"]).unwrap();
 
         assert!(!cli.foreground);
-        assert!(cli.command.is_none());
+        assert!(cli.path.is_none());
+        assert!(cli.workflow.is_none());
     }
 
     #[test]
-    fn foreground_is_global() {
-        let cli = Cli::try_parse_from(["frances", "new", "review", "--foreground"]).unwrap();
+    fn path_and_workflow_parse() {
+        let cli = Cli::try_parse_from([
+            "frances",
+            "some/dir",
+            "--workflow",
+            "review",
+            "--foreground",
+        ])
+        .unwrap();
 
         assert!(cli.foreground);
-        assert!(matches!(
-            cli.command,
-            Some(Command::New {
-                workflow: Some(ref workflow)
-            }) if workflow == "review"
-        ));
+        assert_eq!(cli.path.unwrap(), std::path::Path::new("some/dir"));
+        assert_eq!(cli.workflow.as_deref(), Some("review"));
     }
 }
