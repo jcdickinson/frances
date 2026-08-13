@@ -324,7 +324,7 @@ pub struct MarkdownSection {
     id: AtomicU64,
     /// Initial content captured at construction. `None` when the workflow omitted `content`.
     content: Option<String>,
-    /// Speaker for the frame. Drives the host-side sigil. Defaults to [`Source::Internal`].
+    /// Speaker for the frame. Drives frontend styling and the markdown gate. Defaults to [`Source::Internal`].
     source: Source,
     /// Flipped by [`close_section`]. Subsequent writes throw; subsequent closes are no-ops.
     closed: AtomicBool,
@@ -614,8 +614,8 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 // ---------------------------------------------------------------------
 
 /// One-shot frame carrying a unified-diff payload. Constructed by the
-/// JS file tools after a successful mutation; the runtime translates each
-/// op into a wire `protocol::DiffLine` and emits a `BlockKind::Diff` block.
+/// JS file tools after a successful mutation; the runtime moves the ops
+/// into a [`SectionKind::Diff`] section.
 pub struct DiffSection {
     id: AtomicU64,
     /// Drained on push — the runtime moves the ops into `SectionKind::Diff` rather than cloning.
@@ -968,9 +968,9 @@ fn set_shell_state<'js>(
     }
     state_atom.store(encode_shell_state(&new_state), Ordering::Release);
     // Metadata-only re-`Set`: no body (`seed: None`), so the runtime
-    // emits a no-text BlockDelta carrying just the new kind. `cmd` rides
-    // along because the wire `BlockKind::ShellOutput` carries it on
-    // every delta.
+    // emits a no-text append carrying just the new kind. `cmd` rides
+    // along because `SectionKind::ShellOutput` carries it on every
+    // append.
     let section = SectionSpec {
         kind: SectionKind::ShellOutput {
             state: new_state,
