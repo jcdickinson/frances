@@ -114,7 +114,7 @@ A `nix develop` dev shell provides the toolchain plus `rust-analyzer`, `jq`,
 ```bash
 frances                 # open the current directory; launch in the background
 frances path/to/repo    # open a directory as a workspace
-frances ws.json         # open a workspace file: { "dirs": ["a", "b"] }
+frances ws.toml         # open a workspace file: dirs = ["a", "b"]
 frances --workflow review  # start with the `review` workflow
 frances --foreground    # run attached (useful for development)
 ```

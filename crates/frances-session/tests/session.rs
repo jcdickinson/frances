@@ -91,8 +91,8 @@ fn workspace_file_resolves_relative_dirs() {
     let b = root.join("nested").join("b");
     fs::create_dir_all(&a).expect("create a");
     fs::create_dir_all(&b).expect("create b");
-    let file = root.join("ws.json");
-    fs::write(&file, r#"{ "dirs": ["a", "nested/b"] }"#).expect("write file");
+    let file = root.join("ws.toml");
+    fs::write(&file, r#"dirs = ["a", "nested/b"]"#).expect("write file");
 
     let workspace = Workspace::open(&file).expect("open workspace file");
 
@@ -110,8 +110,8 @@ fn workspace_file_resolves_relative_dirs() {
 fn workspace_file_with_no_dirs_errors() {
     let root = temp_root("nodirs");
     fs::create_dir_all(&root).expect("create root");
-    let file = root.join("ws.json");
-    fs::write(&file, r#"{ "dirs": [] }"#).expect("write file");
+    let file = root.join("ws.toml");
+    fs::write(&file, "dirs = []").expect("write file");
 
     assert!(Workspace::open(&file).is_err());
 
@@ -122,8 +122,8 @@ fn workspace_file_with_no_dirs_errors() {
 fn workspace_file_with_missing_dir_errors() {
     let root = temp_root("missingdir");
     fs::create_dir_all(&root).expect("create root");
-    let file = root.join("ws.json");
-    fs::write(&file, r#"{ "dirs": ["does-not-exist"] }"#).expect("write file");
+    let file = root.join("ws.toml");
+    fs::write(&file, r#"dirs = ["does-not-exist"]"#).expect("write file");
 
     assert!(Workspace::open(&file).is_err());
 

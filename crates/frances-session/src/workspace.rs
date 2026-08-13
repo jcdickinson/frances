@@ -2,7 +2,7 @@
 //!
 //! A workspace is a collection of directories, VS Code style. A bare
 //! directory acts as an implicit single-dir workspace; a regular file
-//! is parsed as a workspace file — JSON `{ "dirs": [...] }` with
+//! is parsed as a workspace file — TOML `dirs = ["a", "b"]` with
 //! relative entries resolved against the file's parent directory.
 
 use std::fs;
@@ -29,7 +29,7 @@ pub enum WorkspaceError {
     ParseFile {
         path: PathBuf,
         #[source]
-        source: serde_json::Error,
+        source: toml::de::Error,
     },
     #[error("workspace file {} lists no dirs", path.display())]
     NoDirs { path: PathBuf },
@@ -93,7 +93,7 @@ impl Workspace {
             source,
         })?;
         let file: WorkspaceFile =
-            serde_json::from_str(&text).map_err(|source| WorkspaceError::ParseFile {
+            toml::from_str(&text).map_err(|source| WorkspaceError::ParseFile {
                 path: canonical.clone(),
                 source,
             })?;

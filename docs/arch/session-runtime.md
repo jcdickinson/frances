@@ -13,8 +13,8 @@ directories are created `0700`.
 ## Workspaces
 
 A launch opens a **workspace**: `frances [path]` where path is a directory
-(an implicit single-dir workspace) or a workspace file — JSON
-`{ "dirs": [...] }`, relative entries resolved against the file's parent,
+(an implicit single-dir workspace) or a workspace file — TOML
+`dirs = ["a", "b"]`, relative entries resolved against the file's parent,
 `.frances-workspace` extension by convention (not enforced). The path is
 canonicalized and validated before the launcher detaches, so errors land on
 the launching terminal.
