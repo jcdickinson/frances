@@ -13,7 +13,17 @@ use crate::session::Session;
 
 use super::RuntimeError;
 
-/// Wire tracing to write into `session.dir/frances.log`.
+/// Default to warn for the world; raise frances/* crates to trace.
+fn default_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        EnvFilter::new(
+            "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
+        )
+    })
+}
+
+/// Wire tracing to write into `session.dir/frances.log`, and to stderr for
+/// foreground/dev runs (detached launches null stderr, so it's silent there).
 pub fn install_logging(session: &Session) -> Result<()> {
     let main_path = session.dir.join("frances.log");
     let main_file = fs::OpenOptions::new()
@@ -26,19 +36,18 @@ pub fn install_logging(session: &Session) -> Result<()> {
         })?;
     let main_writer = Mutex::new(main_file);
 
-    // Default to warn for the world; raise frances/* crates to trace.
-    let main_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        EnvFilter::new(
-            "warn,frances=trace,frances_session=trace,frances_edit=trace,frances_anchors=trace,frances_config=trace",
-        )
-    });
     let main_layer = fmt::layer()
         .with_ansi(false)
         .with_writer(main_writer)
-        .with_filter(main_filter);
+        .with_filter(default_filter());
+
+    let console_layer = fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(default_filter());
 
     tracing_subscriber::registry()
         .with(main_layer)
+        .with(console_layer)
         .try_init()
         .map_err(RuntimeError::InstallSubscriber)?;
 
