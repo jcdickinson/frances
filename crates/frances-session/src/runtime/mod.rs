@@ -415,6 +415,9 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         // is scheduled) so `replay_initial_scrollback` sees the
         // active instance immediately.
         runtime.active_workflow.seat_initial(initial.as_ref());
+        // Queue the initial workspace frame; the UI drains it when it
+        // attaches to the events receiver.
+        runtime.publish_workspace();
 
         tokio::spawn(crate::workflows::run_driver(
             runtime.clone(),
@@ -429,6 +432,13 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
     /// `current_env` / `current_cwd` see the new value on next access.
     pub fn update_invocation(&self, ctx: InvocationContext) {
         *self.invocation.lock() = ctx;
+        self.publish_workspace();
+    }
+
+    /// Send the current workspace directory set into the events channel.
+    fn publish_workspace(&self) {
+        let dirs = self.invocation.lock().workspace.dirs().to_vec();
+        self.events.send(StreamFrame::Workspace { dirs });
     }
 
     /// Run the initial scrollback replay for the currently-active

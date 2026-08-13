@@ -1,13 +1,15 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
   import { commands as backend, events, type UiEvent, type Usage } from './bindings';
-  import CommandPalette from './CommandPalette.svelte';
-  import SectionView from './SectionView.svelte';
+  import CommandPalette from './components/CommandPalette.svelte';
+  import SectionView from './components/SectionView.svelte';
+  import Sidebar from './components/Sidebar.svelte';
   import type { Command } from './commands';
   import { type Section, unwrap } from './types';
 
   let sections = $state<Section[]>([]);
   let sessionId = $state('starting…');
+  let directories = $state<string[]>([]);
   let input = $state('');
   let status = $state<string | null>(null);
   let usage = $state<Usage | null>(null);
@@ -32,7 +34,13 @@
     const keydown = (event: KeyboardEvent) => {
       if (event.ctrlKey && event.key.toLowerCase() === 'p') {
         event.preventDefault();
-        paletteOpen = !paletteOpen;
+        if (paletteOpen) {
+          void closePalette();
+        } else {
+          paletteOpen = true;
+        }
+      } else if (paletteOpen) {
+        // The palette dialog owns the keyboard while open (Escape closes it).
       } else if (event.key === 'Escape') {
         event.preventDefault();
         if (historyMode) {
@@ -83,6 +91,8 @@
       }
     } else if (event.type === 'usage') {
       usage = event.usage;
+    } else if (event.type === 'workspace') {
+      directories = event.directories;
     } else if (event.type === 'surface') {
       if (event.command.type === 'set_footer') status = event.command.text;
       if (event.command.type === 'clear_footer') status = null;
@@ -153,6 +163,8 @@
     return `tokens: ${usage.total_tokens} total · ${usage.prompt_tokens} prompt (${usage.cached_input_tokens} cached) · ${usage.completion_tokens} completion`;
   }
 </script>
+
+<Sidebar {directories} />
 
 <main>
   <section class="scrollback" bind:this={scrollback} aria-live="polite">

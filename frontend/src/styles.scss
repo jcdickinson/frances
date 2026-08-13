@@ -27,6 +27,10 @@ html, body, #app {
   margin: 0;
 }
 
+#app {
+  display: flex;
+}
+
 body {
   overflow: hidden;
 }
@@ -38,10 +42,53 @@ button, textarea {
 main {
   display: grid;
   grid-template-rows: minmax(0, 1fr) auto auto auto;
+  flex: 1;
+  min-width: 0;
   height: 100%;
   background:
     radial-gradient(circle at 70% -20%, rgba(70, 100, 75, 0.14), transparent 45%),
     $background;
+}
+
+.sidebar {
+  flex-shrink: 0;
+  overflow: auto;
+  padding: 30px 16px 22px;
+  background: $panel;
+  scrollbar-color: $border transparent;
+
+  h2 {
+    margin: 0 0 12px;
+    color: $muted;
+    font-size: inherit;
+    font-weight: normal;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  li {
+    margin-bottom: 6px;
+    overflow-wrap: anywhere;
+    line-height: 1.4;
+  }
+}
+
+.sidebar-handle {
+  flex-shrink: 0;
+  width: 5px;
+  margin-left: -2px;
+  border-left: 1px solid $border;
+  cursor: col-resize;
+
+  &:hover {
+    border-color: $cyan;
+  }
 }
 
 .scrollback {
@@ -157,14 +204,14 @@ pre {
 .palette-overlay {
   position: fixed;
   inset: 0;
-  display: flex;
-  justify-content: center;
-  align-items: flex-start;
-  padding-top: 12vh;
   background: rgba(#000, 0.45);
 }
 
 .palette {
+  position: fixed;
+  top: 12vh;
+  left: 50%;
+  transform: translateX(-50%);
   width: min(560px, 90vw);
   border: 1px solid $border;
   border-radius: 4px;
@@ -187,38 +234,31 @@ pre {
     }
   }
 
-  ul {
+  [data-command-list] {
     max-height: 40vh;
     overflow: auto;
-    margin: 0;
     padding: 4px 0;
-    list-style: none;
     scrollbar-color: $border transparent;
   }
 
-  button {
+  [data-command-item] {
     display: flex;
     justify-content: space-between;
     gap: 12px;
-    width: 100%;
     padding: 7px 14px;
-    border: 0;
-    color: $foreground;
-    background: none;
-    text-align: left;
     cursor: pointer;
 
-    &.selected {
+    &[data-selected] {
       color: $cyan;
       background: rgba($cyan, 0.08);
     }
   }
 
-  .id, .empty {
+  .id, [data-command-empty] {
     color: $muted;
   }
 
-  .empty {
+  [data-command-empty] {
     padding: 7px 14px;
   }
 }

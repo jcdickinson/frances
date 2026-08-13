@@ -49,6 +49,9 @@ enum UiEvent {
     Usage {
         usage: Usage,
     },
+    Workspace {
+        directories: Vec<String>,
+    },
     Surface {
         command: SurfaceCmd,
     },
@@ -277,6 +280,9 @@ fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> 
             truncated: true,
         }),
         StreamFrame::Usage(usage) => Some(UiEvent::Usage { usage }),
+        StreamFrame::Workspace { dirs } => Some(UiEvent::Workspace {
+            directories: dirs.iter().map(|dir| dir.display().to_string()).collect(),
+        }),
         StreamFrame::Surface(command) => Some(UiEvent::Surface { command }),
         StreamFrame::Error(message) => Some(UiEvent::Error { message }),
         StreamFrame::Permission(request) => store_permission(app, request),

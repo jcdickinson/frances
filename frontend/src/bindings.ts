@@ -147,7 +147,7 @@ export type SurfaceCmd =
  * into session metadata before forwarding it to the UI.
  */
 { type: "set_title"; title: string | null }
-export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | { type: "usage"; usage: Usage } | { type: "surface"; command: SurfaceCmd } | { type: "error"; message: string } | { type: "permission"; prompt: string }
+export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | { type: "usage"; usage: Usage } | { type: "workspace"; directories: string[] } | { type: "surface"; command: SurfaceCmd } | { type: "error"; message: string } | { type: "permission"; prompt: string }
 /**
  * Token-usage report. Universal shape; `cached_input_tokens` mirrors
  * OpenAI's `prompt_tokens_details.cached_tokens` for the wires that

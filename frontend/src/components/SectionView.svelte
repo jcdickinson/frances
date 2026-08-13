@@ -1,6 +1,6 @@
 <script lang="ts">
-  import type { DiffOp, ShellState } from './bindings';
-  import type { Section } from './types';
+  import type { DiffOp, ShellState } from '../bindings';
+  import type { Section } from '../types';
 
   let { section }: { section: Section } = $props();
   let expanded = $state(false);

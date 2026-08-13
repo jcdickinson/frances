@@ -9,6 +9,8 @@
 //! reserved for the LLM provider's HTTP boundary (see
 //! `frances-llm::Provider::kind`).
 
+use std::path::PathBuf;
+
 use uuid::Uuid;
 
 pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
@@ -45,6 +47,11 @@ pub enum StreamFrame {
         id: SectionId,
     },
     Usage(Usage),
+    /// Current workspace directory set. Emitted once at runtime start
+    /// and again whenever the invocation context is replaced.
+    Workspace {
+        dirs: Vec<PathBuf>,
+    },
     /// Workflow-declared chrome (the footer busy indicator today).
     /// `SetFooter`/`ClearFooter`. Driven by `setStatus` in the workflow;
     /// not persisted, dropped during replay.
