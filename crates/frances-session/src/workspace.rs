@@ -8,8 +8,9 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error)]
 pub enum WorkspaceError {
@@ -40,6 +41,18 @@ pub enum WorkspaceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("serialize workspace file {}", path.display())]
+    SerializeFile {
+        path: PathBuf,
+        #[source]
+        source: toml::ser::Error,
+    },
+    #[error("write workspace file {}", path.display())]
+    WriteFile {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// What the launch path named: a bare directory (implicit single-dir
@@ -63,14 +76,20 @@ impl WorkspaceSource {
 #[derive(Debug, Clone)]
 pub struct Workspace {
     pub source: WorkspaceSource,
+    /// Stable identity used to group sessions. Read from the workspace
+    /// file; a bare dir (or a file without an `id`) gets a fresh one,
+    /// which `save` then persists — sessions created before the save
+    /// already carry it, so saving links them retroactively.
+    pub id: Uuid,
     /// Canonical, non-empty. `dirs[0]` is the primary dir — the cwd
     /// sessions start in.
     dirs: Vec<PathBuf>,
 }
 
 /// On-disk workspace-file shape.
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 struct WorkspaceFile {
+    id: Option<Uuid>,
     dirs: Vec<PathBuf>,
 }
 
@@ -84,6 +103,7 @@ impl Workspace {
         if canonical.is_dir() {
             return Ok(Self {
                 source: WorkspaceSource::Dir(canonical.clone()),
+                id: Uuid::new_v4(),
                 dirs: vec![canonical],
             });
         }
@@ -118,6 +138,7 @@ impl Workspace {
 
         Ok(Self {
             source: WorkspaceSource::File(canonical),
+            id: file.id.unwrap_or_else(Uuid::new_v4),
             dirs,
         })
     }
@@ -130,5 +151,22 @@ impl Workspace {
 
     pub fn dirs(&self) -> &[PathBuf] {
         &self.dirs
+    }
+
+    /// Write this workspace as a workspace file. Dirs are canonical, so
+    /// they're written absolute.
+    pub fn save(&self, path: &Path) -> Result<(), WorkspaceError> {
+        let file = WorkspaceFile {
+            id: Some(self.id),
+            dirs: self.dirs.clone(),
+        };
+        let text = toml::to_string(&file).map_err(|source| WorkspaceError::SerializeFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        fs::write(path, text).map_err(|source| WorkspaceError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        })
     }
 }

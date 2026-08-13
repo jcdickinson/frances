@@ -69,6 +69,10 @@ pub struct SessionMeta {
     /// pickers) — the workspace itself is re-read from this path, not
     /// stored here.
     pub workspace_source: PathBuf,
+    /// The workspace's stable identity at creation time. Saving a
+    /// brand-new workspace persists the same id, linking the sessions
+    /// it already spawned to the saved file.
+    pub workspace_id: Uuid,
     pub workflow: Option<SessionWorkflow>,
     /// Human-readable session title. Set by the active workflow via
     /// `setTitle`; `None` until one is set.
@@ -149,6 +153,7 @@ impl Paths {
             created: now_unix_secs(),
             cwd: workspace.primary_dir().to_path_buf(),
             workspace_source: workspace.source.identity_path().to_path_buf(),
+            workspace_id: workspace.id,
             workflow: None,
             title: None,
             reserved: None,

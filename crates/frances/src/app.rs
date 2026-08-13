@@ -14,6 +14,7 @@ use frances_session::store;
 use frances_session::workspace::Workspace;
 use serde::Serialize;
 use tauri::{Emitter, Manager};
+use tauri_plugin_dialog::DialogExt;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, warn};
 
@@ -88,11 +89,13 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
     });
 
     let app = builder
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             frontend_ready,
             send_prompt,
             interrupt,
-            respond_permission
+            respond_permission,
+            save_workspace
         ])
         .build(tauri::generate_context!())?;
 
@@ -148,6 +151,38 @@ fn send_prompt(state: tauri::State<'_, Backend>, text: String) {
 #[tauri::command]
 fn interrupt(state: tauri::State<'_, Backend>) {
     state.runtime.interrupt();
+}
+
+/// Show a save dialog and write the current workspace as a workspace
+/// file. Returns the saved path, or `None` if the user cancelled.
+#[tauri::command]
+async fn save_workspace(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Backend>,
+) -> Result<Option<String>, String> {
+    let workspace = state.runtime.invocation.lock().workspace.clone();
+
+    let (reply, chosen) = oneshot::channel();
+    app.dialog()
+        .file()
+        .set_title("Save Workspace")
+        .add_filter("frances workspace", &["toml"])
+        .set_directory(workspace.primary_dir())
+        .set_file_name("workspace.toml")
+        .save_file(move |path| {
+            let _ = reply.send(path);
+        });
+
+    let Some(path) = chosen
+        .await
+        .map_err(|_| "save dialog closed without a response".to_string())?
+    else {
+        return Ok(None);
+    };
+
+    let path = path.into_path().map_err(|error| error.to_string())?;
+    workspace.save(&path).map_err(|error| error.to_string())?;
+    Ok(Some(path.display().to_string()))
 }
 
 #[tauri::command]

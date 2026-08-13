@@ -2,7 +2,9 @@
   import { invoke } from '@tauri-apps/api/core';
   import { listen } from '@tauri-apps/api/event';
   import { onMount, tick } from 'svelte';
+  import CommandPalette from './CommandPalette.svelte';
   import SectionView from './SectionView.svelte';
+  import type { Command } from './commands';
   import type { AppInfo, Section, UiEvent, Usage } from './types';
 
   let sections = $state<Section[]>([]);
@@ -12,6 +14,7 @@
   let usage = $state<Usage | null>(null);
   let permission = $state<string | null>(null);
   let historyMode = $state(false);
+  let paletteOpen = $state(false);
   let errorId = -1;
   let scrollback: HTMLElement;
   let textarea: HTMLTextAreaElement;
@@ -28,7 +31,10 @@
     })().catch(showError);
 
     const keydown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
+      if (event.ctrlKey && event.key.toLowerCase() === 'p') {
+        event.preventDefault();
+        paletteOpen = !paletteOpen;
+      } else if (event.key === 'Escape') {
         event.preventDefault();
         if (historyMode) {
           historyMode = false;
@@ -125,6 +131,24 @@
     textarea.focus();
   }
 
+  const commands: Command[] = [
+    {
+      id: 'workspace::save',
+      title: 'Save Workspace',
+      run: () => invoke('save_workspace'),
+    },
+  ];
+
+  function runCommand(command: Command): void {
+    void closePalette().then(() => command.run()).catch(showError);
+  }
+
+  async function closePalette(): Promise<void> {
+    paletteOpen = false;
+    await tick();
+    textarea.focus();
+  }
+
   function tokenStatus(): string {
     if (!usage) return 'tokens: —';
     return `tokens: ${usage.total_tokens} total · ${usage.prompt_tokens} prompt (${usage.cached_input_tokens} cached) · ${usage.completion_tokens} completion`;
@@ -137,6 +161,7 @@
       <div>frances session {sessionId}</div>
       <div>
         Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for history.
+        Ctrl-P for commands.
       </div>
     </header>
 
@@ -144,6 +169,10 @@
       <SectionView {section} />
     {/each}
   </section>
+
+  {#if paletteOpen}
+    <CommandPalette {commands} onrun={runCommand} onclose={() => void closePalette()} />
+  {/if}
 
   {#if historyMode}
     <div class="history-bar">history · Ctrl-O or Esc to return to live output</div>

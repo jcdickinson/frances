@@ -154,6 +154,75 @@ pre {
   }
 }
 
+.palette-overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgba(#000, 0.45);
+}
+
+.palette {
+  width: min(560px, 90vw);
+  border: 1px solid $border;
+  border-radius: 4px;
+  background: $panel;
+  box-shadow: 0 12px 40px rgba(#000, 0.5);
+
+  input {
+    width: 100%;
+    padding: 11px 14px;
+    border: 0;
+    border-bottom: 1px solid $border;
+    outline: 0;
+    font: inherit;
+    color: $foreground;
+    background: transparent;
+    caret-color: $cyan;
+
+    &::placeholder {
+      color: $muted;
+    }
+  }
+
+  ul {
+    max-height: 40vh;
+    overflow: auto;
+    margin: 0;
+    padding: 4px 0;
+    list-style: none;
+    scrollbar-color: $border transparent;
+  }
+
+  button {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    width: 100%;
+    padding: 7px 14px;
+    border: 0;
+    color: $foreground;
+    background: none;
+    text-align: left;
+    cursor: pointer;
+
+    &.selected {
+      color: $cyan;
+      background: rgba($cyan, 0.08);
+    }
+  }
+
+  .id, .empty {
+    color: $muted;
+  }
+
+  .empty {
+    padding: 7px 14px;
+  }
+}
+
 .history-bar, .permission, footer {
   border-top: 1px solid $border;
   background: rgba($panel, 0.97);

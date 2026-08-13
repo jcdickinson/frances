@@ -39,6 +39,7 @@ fn metadata_roundtrip_and_session_creation() {
     let loaded = paths.load_session(&session.id).expect("load session");
     assert_eq!(loaded.meta.id, session.id);
     assert_eq!(loaded.meta.cwd, workspace.primary_dir());
+    assert_eq!(loaded.meta.workspace_id, workspace.id);
     assert_eq!(
         loaded.meta.workspace_source,
         workspace.source.identity_path()
@@ -102,6 +103,38 @@ fn workspace_file_resolves_relative_dirs() {
         workspace.dirs(),
         [a.canonicalize().unwrap(), b.canonicalize().unwrap()]
     );
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn save_roundtrips_workspace_id() {
+    let root = temp_root("saveid");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("create work dir");
+
+    let workspace = Workspace::open(&work).expect("open workspace");
+    let file = root.join("ws.toml");
+    workspace.save(&file).expect("save workspace");
+
+    let reopened = Workspace::open(&file).expect("reopen workspace");
+    assert_eq!(reopened.id, workspace.id);
+    assert_eq!(reopened.dirs(), workspace.dirs());
+
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn workspace_file_without_id_gets_a_fresh_one() {
+    let root = temp_root("noid");
+    let work = root.join("work");
+    fs::create_dir_all(&work).expect("create work dir");
+    let file = root.join("ws.toml");
+    fs::write(&file, r#"dirs = ["work"]"#).expect("write file");
+
+    let first = Workspace::open(&file).expect("open workspace file");
+    let second = Workspace::open(&file).expect("open workspace file again");
+    assert_ne!(first.id, second.id);
 
     let _ = fs::remove_dir_all(root);
 }

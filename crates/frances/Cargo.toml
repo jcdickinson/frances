@@ -20,6 +20,7 @@ frances-models-ui.workspace = true
 frances-session.workspace = true
 serde.workspace = true
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
 xdg.workspace = true
 
 [build-dependencies]

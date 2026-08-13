@@ -19,11 +19,17 @@ A launch opens a **workspace**: `frances [path]` where path is a directory
 canonicalized and validated before the launcher detaches, so errors land on
 the launching terminal.
 
-**Every launch creates a fresh session.** There is no workspace→session
-link and no resume; `SessionMeta.workspace_source` records the workspace's
-canonical identity path so a future MRU/picker can enumerate sessions by
-workspace and reopen them. The session's cwd is the workspace's primary dir
-(`dirs[0]`), not the launching process's cwd.
+**Every launch creates a fresh session.** There is no resume;
+`SessionMeta.workspace_source` records the workspace's canonical identity
+path so a future MRU/picker can enumerate sessions by workspace and reopen
+them. The session's cwd is the workspace's primary dir (`dirs[0]`), not the
+launching process's cwd.
+
+Workspaces also carry a UUID identity: read from the workspace file's `id`
+field, or generated in memory when opening a bare dir (or a file without an
+`id`). `SessionMeta.workspace_id` snapshots it at session creation, and
+saving the workspace (the `workspace::save` command) writes the same id into
+the file — so sessions spawned before the save are already linked to it.
 
 `editable_roots` currently derives from a marker walk on the primary dir;
 switching it to the workspace's dirs verbatim is a known follow-up once
