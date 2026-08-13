@@ -75,7 +75,8 @@ pub enum SectionTranscript {
 /// Set/Clear, not a stream: a re-`SetFooter` replaces the footer view,
 /// `ClearFooter` removes it. This grows a `Region`/`ViewNode` vocabulary
 /// only when a richer surface (panel, plan-editor) actually appears.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceCmd {
     /// Show `text` (with a spinner) in the footer busy indicator.
     SetFooter { text: String },
@@ -83,7 +84,7 @@ pub enum SurfaceCmd {
     ClearFooter,
     /// Set (`Some`) or clear (`None`) the session title. Unlike the
     /// footer this one outlives the workflow: the driver persists it
-    /// into session metadata before forwarding it to the TUI.
+    /// into session metadata before forwarding it to the UI.
     SetTitle { title: Option<String> },
 }
 
@@ -100,7 +101,7 @@ pub struct WorkflowOutputs {
     /// Permission asks awaiting a user (or auto-approver) answer.
     pub permissions: UnboundedReceiver<PermissionRequest>,
     /// LLM token-usage telemetry. Side-channel; opens/closes no block and
-    /// is never persisted (the TUI drops it during replay).
+    /// is never persisted (the UI drops it during replay).
     pub usage: UnboundedReceiver<frances_models_llm::Usage>,
 }
 
@@ -114,7 +115,7 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
-pub use frances_models_tui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
+pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
 
 /// What a [`SectionTranscript::Set`] carries: the section's kind +
 /// bounded metadata, plus an optional `seed` — the initial body chunk
@@ -143,7 +144,7 @@ impl<'js> IntoJs<'js> for UserInput {
 }
 
 /// An item delivered to the workflow's `inbox` stream. Either a normal
-/// user message or an out-of-band interrupt request (Esc in the TUI).
+/// user message or an out-of-band interrupt request (Esc in the UI).
 /// The body distinguishes them in JS: `Input` arrives as
 /// `{ content }`, `Interrupt` arrives as the registered symbol
 /// `Symbol.for("frances.interrupt")` (re-exported as `INTERRUPT` from

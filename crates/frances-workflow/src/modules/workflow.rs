@@ -8,7 +8,7 @@
 //! `lifecycle.shutdown` handler still terminate promptly — the IIFE
 //! closes the inbox unconditionally after the (absent) hook returns.
 //!
-//! `setStatus(text | null)` drives the TUI footer's busy indicator:
+//! `setStatus(text | null)` drives the app footer's busy indicator:
 //! `Some(text)` shows the text with a spinner, `None` hides it.
 //!
 //! `setTitle(text | null)` sets or clears the session title. It rides

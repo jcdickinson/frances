@@ -385,7 +385,7 @@ impl provider::Provider for Provider {
                         }
                         ChatStreamEvent::Chunk(_) => {}
                         ChatStreamEvent::ReasoningChunk(chunk) if !chunk.content.is_empty() => {
-                            // Reasoning rides its own channel — consumers (TUI,
+                            // Reasoning rides its own channel — consumers (UI,
                             // step-transcript summariser) treat it differently
                             // from response text. It's also retained verbatim for
                             // the assistant `reasoning_content` round-trip.

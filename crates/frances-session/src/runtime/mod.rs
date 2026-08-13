@@ -2,7 +2,7 @@
 //!
 //! Owns the per-session state: per-session DB handles, the workflow runtime, the
 //! chat manager, scrollback / history stores, and the events channel
-//! into the TUI.
+//! into the UI.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -64,7 +64,7 @@ impl ChatManagerDeps for ChatDepsImpl {
 }
 
 /// Concrete `WorkflowDeps` impl. Holds the chat manager and the
-/// per-session DB handle plus the same editor factory the TUI sees, so
+/// per-session DB handle plus the same editor factory the UI sees, so
 /// `current_env` / `current_cwd` share state with the host.
 ///
 /// Generic on the `Io` bundle (`WorkflowIo`); production defaults to
@@ -183,7 +183,7 @@ impl EditorFactory for SessionEditorFactory {
 
 /// The session runtime. Holds the per-session state; produces frames
 /// into [`EventsChannel`] and accepts prompt / permission input from
-/// the TUI.
+/// the UI.
 ///
 /// Generic on the workflow `Io` bundle so tests can inject a
 /// `MockTimer`-bearing IO via [`SessionRuntime::start_with_io`].
@@ -269,7 +269,7 @@ pub struct StartOverrides {
 impl SessionRuntime<RealIo> {
     /// Build the runtime with the production IO bundle, restore the
     /// selected workflow, and return it alongside the events
-    /// receiver the TUI should drain. Initial scrollback replay is
+    /// receiver the UI should drain. Initial scrollback replay is
     /// not done here — call
     /// [`SessionRuntime::replay_initial_scrollback`] after the receiver
     /// is hooked up.
@@ -453,7 +453,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
     }
 
     /// Deliver an interrupt to the active workflow's inbox (Esc in the
-    /// TUI). The workflow decides how to react.
+    /// UI). The workflow decides how to react.
     pub fn interrupt(self: &Arc<Self>) {
         crate::workflows::dispatch_interrupt(self);
     }

@@ -11,16 +11,17 @@ wasn't created.
 
 ## Project
 
-Frances is an agentic coding tool. The `frances` binary is a single-process TUI: it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens a per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), constructs an in-process `SessionRuntime`, and runs the TUI directly against it. LLM completions stream via OpenRouter.
+Frances is an agentic coding tool with a Tauri desktop app. The launcher identifies the controlling terminal, resolves (or creates) its per-terminal session, opens a per-session turso database (the `turso` crate, successor to libsql — do not refer to it as libsql), and constructs an in-process `SessionRuntime`. A Svelte frontend renders the runtime's event stream.
 
 **Frances has never shipped — there is no backward-compatibility burden.** No released version, no users with persisted state to preserve. DB schemas, on-disk serialization formats, wire shapes, and public APIs can change freely; do not write migrations, compatibility shims, or "old behaviour" fallbacks for the sake of existing data. When a refactor improves the type or format, just make the change.
 
 ## Workspace layout
 
-The interesting crates under `crates/`:
+The interesting components:
 
-- **`frances`** — the binary. TUI (`src/tui/`, `src/ui.rs`), TTY identification (`src/tty.rs`), `main.rs` wires the runtime to the TUI.
-- **`frances-session`** — session runtime: per-session DB handle, workflow selection, history, scrollback persistence, anchor store, llm session provider, events channel into the TUI.
+- **`frances`** — the Tauri binary, detached launcher, TTY identification, and event bridge.
+- **`frontend`** — the Svelte + SCSS interface, developed and built with Deno.
+- **`frances-session`** — session runtime: per-session DB handle, workflow selection, history, scrollback persistence, anchor store, llm session provider, and UI event channel.
 - **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat sessions and tool calls.
 - **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
 - **`frances-anchors`** — anchor word dictionary plus line hashing and word↔index encoding.
@@ -48,6 +49,9 @@ changes shape. (Same scratch convention `docs/newui/` used.)
 ```bash
 cargo build                       # build everything
 cargo build -p frances            # just the binary (matches Nix flake)
+cd frontend && deno task build    # build the Svelte frontend
+cd frontend && deno task check    # type-check the frontend
+deno task --config frontend/deno.json app # run with frontend HMR
 cargo nextest                        # all tests
 cargo nextest -p frances-edit        # one crate
 cargo nextest -p frances-edit reconcile::tests::name_of_test  # one test
@@ -67,7 +71,8 @@ The user runs the dev shell via `nix develop` (provides toolchain + `rust-analyz
 
 `frances` subcommands:
 
-- `frances` — open the TUI against the current TTY's session, creating one if none is linked.
+- `frances` — launch the desktop app against the current terminal's session and return immediately.
+- `frances --foreground` — run the desktop app attached to the launcher process.
 - `frances new` — unlink the current TTY's session so the next run creates a fresh session. The old session's state on disk is left intact.
 
 ## Code style and conventions

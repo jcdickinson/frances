@@ -952,7 +952,7 @@ fn start_stream<'js, D: WorkflowDeps>(
                 Box::new(move |event| {
                     if let StreamEvent::Usage(u) = &event {
                         *usage_for_callback.lock() = Some(u.clone());
-                        // Side-channel to the host so the TUI footer
+                        // Side-channel to the host so the app footer
                         // updates. Best-effort: if the host is gone the
                         // workflow is shutting down anyway.
                         let _ = usage_tx_for_callback.send(u.clone());

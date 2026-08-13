@@ -174,7 +174,7 @@ fn push_section<'js>(
         });
         // Pre-closed frame (either `{ ..., closed: true }` at
         // construction or `frame.close()` called before push) — seal
-        // it on the wire now that it has an id. The TUI sees Push +
+        // it on the wire now that it has an id. The UI sees Push +
         // Close in the same batch and never paints the spinner over
         // it.
         if borrow.closed.load(Ordering::Acquire) {
@@ -493,7 +493,7 @@ impl<'js> JsClass<'js> for JsonSection {
 
 /// Hard cap on the length of the `detail` string returned by a tool's
 /// `describe(call)`. The detail rides on every tool-call wire frame and
-/// is shown inline in the TUI; an unbounded value could flood the
+/// is shown inline in the UI; an unbounded value could flood the
 /// scrollback row or push the whole block off-screen. Anything past the
 /// cap is truncated with a trailing `…`.
 const TOOL_DETAIL_MAX: usize = 160;
@@ -750,7 +750,7 @@ pub struct ShellOutputSection {
     state: Arc<SectionsState>,
     id: AtomicU64,
     /// Bash source that produced this output. Pinned on every wire
-    /// frame so the TUI can render it as a header even when the body
+    /// frame so the UI can render it as a header even when the body
     /// has been truncated.
     cmd: String,
     /// Initial body captured at construction. Mirrors `MarkdownSection.content`.
@@ -1106,7 +1106,7 @@ fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResul
 
 /// Parse `new ShellOutputSection({ cmd, content?, closed? })`. `cmd` is
 /// required — it's the bash source that produced this output and the
-/// TUI renders it as a header. `content` is optional; if absent it
+/// UI renders it as a header. `content` is optional; if absent it
 /// defaults to an empty string. `closed: true` pre-seals the frame so
 /// `transcript.push` emits a `Close` right after the `Push`.
 fn parse_shell_output_arg<'js>(

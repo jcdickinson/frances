@@ -16,12 +16,10 @@ frances-core = { path = "crates/frances-core" }
 frances-session = { path = "crates/frances-session" }
 frances-edit = { path = "crates/frances-edit" }
 frances-llm = { path = "crates/frances-llm" }
-frances-markdown = { path = "crates/frances-markdown" }
 frances-models-llm = { path = "crates/frances-models-llm" }
-frances-models-tui = { path = "crates/frances-models-tui" }
+frances-models-ui = { path = "crates/frances-models-ui" }
 frances-shell = { path = "crates/frances-shell" }
 frances-storage = { path = "crates/frances-storage" }
-frances-tui = { path = "crates/frances-tui" }
 frances-workflow = { path = "crates/frances-workflow" }
 
 anyhow = "1"
@@ -30,9 +28,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
-crossterm = { version = "0.29", features = ["event-stream"] }
 dashmap = "6"
-ratatui-textarea = "0.9"
 deno_ast = { version = "0.53", features = ["transpiling"] }
 futures = "0.3"
 futures-util = "0.3"
@@ -50,7 +46,6 @@ genai = "0.6.0-beta.20"
 chrono = "0.4"
 markdown = "1"
 parking_lot = "0.12"
-ratatui = { version = "0.30", features = ["unstable-backend-writer", "unstable-rendered-line-info"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 regex = "1"
 rquickjs = { version = "0.11", features = ["futures", "loader", "macro"] }
@@ -62,7 +57,7 @@ shellexpand = "3"
 similar = { version = "3.1", default-features = false }
 slotmap = "1"
 smallvec = "1"
-taffy = "0.10"
+tauri = "2"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
@@ -73,7 +68,6 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 turso = { version = "0.6.0-pre.26", default-features = false }
 twox-hash = { version = "2.1.2", default-features = false, features = ["xxhash3_64"] }
-unicode-width = "0.2"
 url = { version = "2", features = ["serde"] }
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 xdg = "3"

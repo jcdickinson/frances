@@ -18,7 +18,7 @@
 //! instance in `id` order and emits a [`ScrollbackFrame`] burst (each
 //! wrapped in [`StreamFrame::Scrollback`]) on the supplied channel:
 //!
-//! 1. [`ScrollbackFrame::Reset`] — TUI clears its in-memory
+//! 1. [`ScrollbackFrame::Reset`] — UI clears its in-memory
 //!    scrollback and begins the burst.
 //! 2. For each row: a single self-describing
 //!    [`ScrollbackFrame::SectionAppend`] (the dispatcher constructs
@@ -26,11 +26,11 @@
 //!    [`ScrollbackFrame::SectionClose`] or
 //!    [`ScrollbackFrame::SectionTruncated`]. Error rows emit a single
 //!    [`ScrollbackFrame::Error`].
-//! 3. [`ScrollbackFrame::End`] — TUI returns to live mode.
+//! 3. [`ScrollbackFrame::End`] — UI returns to live mode.
 //!
 //! Replay's id allocator is independent of live-side `SectionId`s:
 //! each replayed section opens and closes within the burst before the
-//! next one starts, so the TUI's section map is empty at
+//! next one starts, so the UI's section map is empty at
 //! [`ScrollbackFrame::End`] and live ids after replay collide with
 //! nothing.
 

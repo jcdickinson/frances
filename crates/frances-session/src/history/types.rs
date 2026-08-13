@@ -86,7 +86,7 @@ impl OwnedHistoryInput {
     }
 }
 
-/// Translation target for the TUI replay path.
+/// Translation target for the UI replay path.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Block {

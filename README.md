@@ -1,10 +1,10 @@
 # Frances
 
-Frances is an agentic coding tool. The `frances` binary is a single-process TUI:
-it identifies the controlling TTY, resolves (or creates) a per-TTY session, opens
-a per-session [turso](https://github.com/tursodatabase/turso) database, constructs
-an in-process `SessionRuntime`, and runs the TUI directly against it. LLM
-completions stream through a configurable set of model providers.
+Frances is an agentic coding tool with a Tauri desktop app. The launcher
+identifies the controlling terminal, resolves (or creates) its session, and
+starts the app in the background. The Rust backend owns the in-process
+`SessionRuntime`; a Svelte frontend renders its event stream. LLM completions
+stream through a configurable set of model providers.
 
 > [!WARNING]
 > **This project is almost entirely coded by an LLM.** Treat the code, comments,
@@ -24,8 +24,10 @@ nix develop                    # or: rustup install 1.95.0
 cargo run -p frances -- install            # copies the workflow into the config dir
 cargo run -p frances -- install --local    # instead points the config at the in-repo workflow
 
-# 3. Run it.
-./target/debug/frances        # opens the TUI for this terminal's session
+# 3. Build the Svelte frontend, then run it.
+cd frontend && deno task build && cd ..
+./target/debug/frances        # launches the app and returns immediately
+./target/debug/frances --foreground # keep the launcher attached
 ```
 
 `install` always (re)installs the `main` workflow; it only runs the
@@ -34,7 +36,7 @@ refreshes the workflow without clobbering a config you've since edited. The
 questionnaire offers your Codex (ChatGPT) login, or any other provider — for
 which it writes the token you paste to `~/.config/frances/<provider>.txt`.
 
-Once the TUI is up, type `/main` to kick off the `main` workflow.
+Once the app is up, type `/main` to kick off the `main` workflow.
 Within that workflow, `/effort`, `/effort 0` through `/effort 100`, and
 `/effort default` inspect, set, and clear the persistent session override.
 
@@ -74,11 +76,11 @@ Frances is named for two early UNIVAC programmers:
 
 The interesting crates live under `crates/`:
 
-- **`frances`** — the binary. TUI, TTY identification, and `main.rs` wiring the
-  runtime to the TUI.
+- **`frances`** — the Tauri binary, launcher, and Rust-to-webview event bridge.
+- **`frontend`** — the Svelte, TypeScript, and SCSS interface, built with Deno.
 - **`frances-session`** — session runtime: per-session DB handle, workflow
   selection, history, scrollback persistence, anchor store, the LLM session
-  provider, and the events channel into the TUI.
+  provider, and the events channel into the desktop app.
 - **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat
   sessions and tool calls.
 - **`frances-llm`** / **`frances-models-llm`** — provider configuration, auth
@@ -97,6 +99,8 @@ The workspace pins a single Rust toolchain in `rust-toolchain.toml`
 ```bash
 cargo build                  # build everything
 cargo build -p frances       # just the binary
+cd frontend && deno task build
+deno task --config frontend/deno.json app
 cargo nextest                # run all tests
 cargo fmt --all
 cargo clippy --all-targets
@@ -109,9 +113,10 @@ A `nix develop` dev shell provides the toolchain plus `rust-analyzer`, `jq`,
 ## Running
 
 ```bash
-frances        # open the TUI for the current TTY's session (creating one if none)
-frances new            # unlink the current TTY's session and start fresh
-frances new review     # start a fresh session with the `review` workflow
+frances                 # launch in the background and return immediately
+frances --foreground    # run attached (useful for development)
+frances new             # unlink this terminal's session and launch fresh
+frances new review      # launch fresh with the `review` workflow
 ```
 
 ## Configuration

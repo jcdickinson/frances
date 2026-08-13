@@ -3,7 +3,7 @@
 //! A workflow is a script-defined hook that drives a chat session and
 //! its tool calls. Workflows
 //! are declared per-id in the layered config tree as
-//! `workflows.<id>.file = "/path/to/foo.ts"` and invoked from the TUI by
+//! `workflows.<id>.file = "/path/to/foo.ts"` and invoked from the UI by
 //! typing `/<id> [args...]`.
 //!
 //! This crate owns:

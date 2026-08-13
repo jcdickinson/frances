@@ -1,8 +1,8 @@
 //! Stream-event surface shared by producers (workflows, scrollback
-//! replay) and the TUI consumer.
+//! replay) and the UI consumer.
 //!
 //! There is no inter-process boundary — these types travel through an
-//! in-process `tokio::sync::mpsc` from the session runtime to the TUI.
+//! in-process `tokio::sync::mpsc` from the session runtime to the UI.
 //! Do not call this a "wire" or "protocol" in comments or variable
 //! names; it's a channel of Rust enums. The term "wire" is reserved for
 //! the LLM provider's HTTP boundary (see `frances-llm::Provider::kind`).
@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-pub use frances_models_tui::{
+pub use frances_models_ui::{
     ReasoningState, SectionApply, SectionId, SectionKind, ShellState, Source, WireSectionEvent,
 };
 pub use frances_workflow::SurfaceCmd;
@@ -72,7 +72,7 @@ pub enum DiffLine {
 #[derive(Debug)]
 pub enum StreamFrame {
     /// Self-describing section content. The first append with a
-    /// previously-unseen `id` implicitly opens the section (the TUI's
+    /// previously-unseen `id` implicitly opens the section (the UI's
     /// dispatcher constructs it via `make_section(&kind)`); subsequent
     /// appends either grow the text or carry an unchanged delta + new
     /// kind for metadata transitions (e.g. ShellState `Running` →
@@ -82,7 +82,7 @@ pub enum StreamFrame {
         kind: SectionKind,
         delta: String,
     },
-    /// Workflow sealed the section. The TUI's dispatcher seals its
+    /// Workflow sealed the section. The UI's dispatcher seals its
     /// trait object and routes a `Close` apply.
     SectionClose {
         id: SectionId,
@@ -107,7 +107,7 @@ pub enum StreamFrame {
     /// A frame of the scrollback-replay sub-protocol. A burst is
     /// bracketed by [`ScrollbackFrame::Reset`] / [`ScrollbackFrame::End`]
     /// and carries its own section frames — a closed, bounded set
-    /// distinct from the live variants above, so the TUI's replay
+    /// distinct from the live variants above, so the UI's replay
     /// handler never has to reason about live-only frames.
     Scrollback(ScrollbackFrame),
 }
@@ -118,7 +118,7 @@ pub enum StreamFrame {
 /// [`crate::scrollback::replay_to_channel`].
 #[derive(Debug, Clone)]
 pub enum ScrollbackFrame {
-    /// Burst opener: the TUI clears its in-memory scrollback container
+    /// Burst opener: the UI clears its in-memory scrollback container
     /// and replays `instance_id`'s persisted history into the alt-screen
     /// inspector's committed deque.
     Reset { instance_id: Uuid },
@@ -137,6 +137,6 @@ pub enum ScrollbackFrame {
     SectionTruncated { id: SectionId },
     /// A persisted error row.
     Error(String),
-    /// Burst closer: the TUI returns to live-mode handling.
+    /// Burst closer: the UI returns to live-mode handling.
     End,
 }

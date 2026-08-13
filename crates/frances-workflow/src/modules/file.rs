@@ -576,7 +576,7 @@ impl<'js> IntoJs<'js> for EditorStringResult {
 /// Promise payload for `editor.edit()`. Resolves to
 /// `{ text: string, diff: Array<{ kind, text, line? }> }` so the JS
 /// caller can both return the LLM-facing string AND push a
-/// `DiffSection` for the TUI. Rejects with an error message on failure.
+/// `DiffSection` for the UI. Rejects with an error message on failure.
 struct EditorEditResult(Result<DiffRender, FileToolError>);
 
 impl<'js> IntoJs<'js> for EditorEditResult {

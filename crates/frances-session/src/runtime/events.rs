@@ -1,6 +1,6 @@
 //! In-process events channel.
 //!
-//! The session runtime publishes [`StreamFrame`]s into an mpsc; the TUI
+//! The session runtime publishes [`StreamFrame`]s into an mpsc; the UI
 //! drains them through the matching receiver. The channel exists for
 //! the lifetime of the [`crate::runtime::SessionRuntime`] — there is no
 //! reattach race, no socket pairing, no per-client buffering.

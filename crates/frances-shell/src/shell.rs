@@ -383,7 +383,7 @@ impl Shell {
 }
 
 fn apply_output_env(cmd: &mut Command) {
-    // Plain-output hygiene: the TUI shows shell stdout as text, so ANSI colour
+    // Plain-output hygiene: the UI shows shell stdout as text, so ANSI colour
     // sequences are noise at best and broken at worst.
     cmd.env("TERM", "dumb")
         .env("NO_COLOR", "1")

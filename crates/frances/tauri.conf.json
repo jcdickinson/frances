@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Frances",
+  "version": "0.1.0",
+  "identifier": "dev.frances.app",
+  "build": {
+    "beforeDevCommand": "deno task --config ../frontend/deno.json dev",
+    "beforeBuildCommand": "deno task --config ../frontend/deno.json build",
+    "devUrl": "http://localhost:5173",
+    "frontendDist": "../../frontend/dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "frances",
+        "width": 1080,
+        "height": 760,
+        "minWidth": 620,
+        "minHeight": 420
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": false,
+    "icon": ["icons/icon.png"]
+  }
+}

@@ -8,7 +8,7 @@
 //! primitive makes a `oneshot`, embeds the sender in the
 //! [`PermissionRequest`], emits it on the workflow's `permissions`
 //! output, and awaits the receiver. Whoever answers — the host's
-//! auto-judge or the TUI — resolves the embedded `reply`. There is no
+//! auto-judge or the UI — resolves the embedded `reply`. There is no
 //! id-keyed correlation table.
 //!
 //! The wire response (`PermissionResponseWire`) and the workflow-facing
@@ -28,10 +28,10 @@ use tokio::sync::oneshot;
 /// directly; there is no id-keyed correlation table.
 ///
 /// `allow_auto` flags the gate as eligible for the host's auto-approver.
-/// The TUI ignores it (it only renders `prompt` / `tool_call`).
+/// The UI ignores it (it only renders `prompt` / `tool_call`).
 #[derive(Debug)]
 pub struct PermissionRequest {
-    /// Human-readable summary; the workflow precomputes it so the TUI
+    /// Human-readable summary; the workflow precomputes it so the UI
     /// doesn't need per-tool rendering logic.
     pub prompt: String,
     /// Structured subject — what tool invocation triggered the request,
@@ -44,7 +44,7 @@ pub struct PermissionRequest {
     pub reply: oneshot::Sender<PermissionResponse>,
 }
 
-/// What the TUI sends back over the wire. Three variants: yes / no /
+/// What the UI sends back over the wire. Three variants: yes / no /
 /// user-redirected-to-chat. The runtime strips `RedirectToChat` before
 /// resolving the workflow's oneshot.
 #[derive(Debug, Clone, PartialEq)]

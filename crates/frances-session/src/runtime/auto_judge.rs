@@ -2,13 +2,13 @@
 //! `allow_auto = true`.
 //!
 //! When a workflow opts a gate into auto, the runtime's emit loop
-//! calls [`judge`] before forwarding the request to the TUI. The
+//! calls [`judge`] before forwarding the request to the UI. The
 //! judge walks the model-intent fallback `["auto", "referee", "cheap"]`
 //! and forces a single `decide` tool whose `verdict` is the decision.
 //! Compliance is enforced by [`ChatSessionManager::complete_enforced`].
 //!
 //! On `Approve` the runtime resolves the permission's oneshot directly
-//! and the TUI never sees the prompt. On `Reject` or `Indeterminate`
+//! and the UI never sees the prompt. On `Reject` or `Indeterminate`
 //! the runtime falls through to the user.
 
 use std::sync::Arc;

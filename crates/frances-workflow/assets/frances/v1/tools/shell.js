@@ -358,7 +358,7 @@ async function _frameOutcome(shell, outcome, killedSuffix) {
     );
   } else if (outcome.kind === "dead") {
     // Bash itself exited. We don't know the cause; use -1 as a
-    // sentinel so the TUI renders it red without colliding with a
+    // sentinel so the UI renders it red without colliding with a
     // typical exit code.
     await _closeShellFrame(shell, { exit: -1 });
   }

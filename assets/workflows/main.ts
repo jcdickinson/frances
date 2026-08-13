@@ -1340,7 +1340,7 @@ async function turn(): Promise<TurnEnd> {
     setStatus(mode === "planning" ? "planning…" : "working…");
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
-    // Push the `frances:` frame eagerly with no content — the TUI tracks
+    // Push the `frances:` frame eagerly with no content — the UI tracks
     // the id but defers measure / render, and the daemon skips
     // persistence, until the first text delta materialises the block.
     // The `thought` frame sits alongside it for the reasoning channel;

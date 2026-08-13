@@ -17,7 +17,7 @@
 //! Rust does the work behind a single primitive `_approve(options)` on
 //! the install stash: parse the options object, allocate a
 //! `PermissionId` via the gateway, send a `PermissionAsk` on the
-//! permissions channel so the runtime can forward it to the TUI, then await the gateway's
+//! permissions channel so the runtime can forward it to the UI, then await the gateway's
 //! response oneshot. If the workflow shuts down first, the await
 //! resolves to a synthetic `No { details: None }` so the JS body can
 //! unwind cleanly without throwing.

@@ -4,7 +4,7 @@
 // modules evaluate, so the destructured bindings end up captured in this
 // module's local scope only.
 //
-// `setStatus(text | null)` drives the TUI footer busy indicator:
+// `setStatus(text | null)` drives the app footer busy indicator:
 // a string shows the text with a spinner, `null` hides it.
 //
 // `setTitle(text | null)` sets or clears the session title, which the

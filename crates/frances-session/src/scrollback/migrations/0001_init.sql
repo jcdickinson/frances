@@ -1,5 +1,5 @@
 -- Per-workflow scrollback sections. One row per finished or truncated
--- section plus one row per emitted Error frame. The TUI replays these
+-- section plus one row per emitted Error frame. The UI replays these
 -- straight into the alt-screen scrollback inspector on attach and
 -- whenever the active workflow changes.
 --

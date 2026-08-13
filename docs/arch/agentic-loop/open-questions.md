@@ -68,7 +68,7 @@ Project DBs grow forever. Out of scope for v1 but eventually needs:
 - By-age (drop everything older than N days)
 - By-status (drop plans with status `abandoned` after some grace period)
 - By-relevance (drop findings about files that no longer exist)
-- User-driven (a TUI command "clean up project memory")
+- User-driven (a UI command "clean up project memory")
 
 Probably solved by waiting for a real complaint, then picking the cheapest mitigation that addresses it.
 

@@ -128,4 +128,4 @@ FTS5 indexes over the same agent-readable surface as in-session.
 
 Project DBs grow forever. Eventually they need pruning — old plans, stale findings, summaries for deleted files.
 
-Out of scope for this design. A reasonable v1 strategy is "do nothing; assume plans are infrequent enough that a 10-MB project DB is fine for years." If/when GC becomes necessary: by-age (drop everything older than N days), by-status (drop plans with status `abandoned`), or user-driven (TUI command "clean up project memory"). Pick when the problem appears, not before.
+Out of scope for this design. A reasonable v1 strategy is "do nothing; assume plans are infrequent enough that a 10-MB project DB is fine for years." If/when GC becomes necessary: by-age (drop everything older than N days), by-status (drop plans with status `abandoned`), or user-driven (UI command "clean up project memory"). Pick when the problem appears, not before.

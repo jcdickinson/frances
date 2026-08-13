@@ -255,7 +255,7 @@ impl EmitState {
 
     /// Close every remaining open section. `Stop` emits a `SectionClose`
     /// per section and persists clean rows; `Truncate` emits nothing
-    /// (the TUI is about to clear and replay via `ScrollbackFrame::Reset`,
+    /// (the UI is about to clear and replay via `ScrollbackFrame::Reset`,
     /// which surfaces these rows as `SectionTruncated`) and marks each
     /// row truncated.
     async fn close_all(&mut self, mode: CloseMode<'_>) -> Result<()> {
@@ -362,7 +362,7 @@ async fn start_default_workflow<Io: frances_workflow::WorkflowIo>(
 }
 
 /// Workflow switch: start the new workflow, then (only on success)
-/// dehydrate `old`, persist the row, and tell the TUI to replay the new
+/// dehydrate `old`, persist the row, and tell the UI to replay the new
 /// instance's scrollback. Returns the new `current` for the driver:
 /// `Some(new)` on success, or `old` unchanged if the switch aborted.
 async fn switch_workflow<Io: frances_workflow::WorkflowIo>(
@@ -406,7 +406,7 @@ async fn switch_workflow<Io: frances_workflow::WorkflowIo>(
         warn!(%error, "write session workflow failed");
     }
 
-    // Tell the TUI to drop the previous workflow's in-memory scrollback
+    // Tell the UI to drop the previous workflow's in-memory scrollback
     // and replay the new active instance's.
     if let Err(error) = crate::scrollback::replay_to_channel(
         &runtime.events,
@@ -423,7 +423,7 @@ async fn switch_workflow<Io: frances_workflow::WorkflowIo>(
 
 /// The long-lived workflow driver. Owns the active instance for its
 /// in-memory life and plays the host side of a classical event loop:
-/// continuously pump the body's `HostFrame`s to the TUI, watch for
+/// continuously pump the body's `HostFrame`s to the UI, watch for
 /// genuine termination (`done` — the top-level promise settled or
 /// `exit()`), and apply workflow switches.
 ///
@@ -679,7 +679,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                     "workflow shutdown timed out; force-dropping handle"
                 );
                 // Body never settled. Mark every in-flight block
-                // truncated. No `BlockStop` event — the TUI is about to
+                // truncated. No `BlockStop` event — the UI is about to
                 // be told to clear via `ScrollbackFrame::Reset` by the switch path.
                 instance.emit.close_all(CloseMode::Truncate).await?;
                 return Ok(());
@@ -787,7 +787,7 @@ fn is_one_shot(kind: &SectionKind) -> bool {
     )
 }
 
-/// Workflow-declared chrome, forwarded to the TUI as-is. The footer
+/// Workflow-declared chrome, forwarded to the UI as-is. The footer
 /// commands are ephemeral; `SetTitle` is session state — it lands in
 /// the shared title cell (which seeds a booting workflow's `getTitle`)
 /// and session metadata before the frame goes out.
@@ -804,7 +804,7 @@ fn emit_surface<Io: frances_workflow::WorkflowIo>(
     runtime.events.send(StreamFrame::Surface(cmd));
 }
 
-/// LLM token-usage telemetry. Pass-through to the TUI footer; not persisted.
+/// LLM token-usage telemetry. Pass-through to the app footer; not persisted.
 fn emit_usage<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     usage: frances_models_llm::Usage,
@@ -814,7 +814,7 @@ fn emit_usage<Io: frances_workflow::WorkflowIo>(
 
 /// A permission request. When `allow_auto`, consult the auto-judge first
 /// and answer on the embedded reply slot on approve; otherwise (or on
-/// reject/indeterminate) forward to the TUI for a human decision.
+/// reject/indeterminate) forward to the UI for a human decision.
 async fn emit_permission<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     request: PermissionRequest,

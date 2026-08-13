@@ -50,7 +50,7 @@ pub fn run(local: bool) -> Result<()> {
     fs::write(&config_path, config)
         .with_context(|| format!("write config to {}", config_path.display()))?;
     println!("Wrote config: {}", config_path.display());
-    println!("\nDone. Run `frances` to open the TUI.");
+    println!("\nDone. Run `frances` to open the desktop app.");
     Ok(())
 }
 

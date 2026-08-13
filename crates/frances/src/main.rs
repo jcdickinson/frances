@@ -1,99 +1,128 @@
+mod app;
 mod install;
 mod tty;
-mod tui;
-mod ui;
 
-use anyhow::Result;
+use std::ffi::OsString;
+use std::process::{Command as ProcessCommand, Stdio};
+
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use frances_session::context::InvocationContext;
-use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
-use frances_session::session::Paths;
-use frances_session::store;
-use tracing::debug;
-
-use crate::ui::App;
+use frances_session::tty::TtyKey;
 
 #[derive(Debug, Parser)]
 #[command(name = "frances")]
 struct Cli {
+    /// Keep the desktop app attached to this process.
+    #[arg(long, global = true)]
+    foreground: bool,
+
+    /// TTY identity captured by the detached launcher.
+    #[arg(long, global = true, hide = true)]
+    tty_key: Option<String>,
+
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Unlink the current TTY's session so the next invocation starts
-    /// a fresh session. The old session's state on disk is left intact;
-    /// only the TTY → session link is removed.
+    /// Unlink the current terminal's session so this launch starts fresh.
     New {
         /// Workflow to start in the new session. Defaults to `default_workflow`.
         workflow: Option<String>,
     },
-    /// Write a starter config (asking a few questions if config.toml is
-    /// absent) and install the `main` workflow into the config dir.
+    /// Write a starter config and install the `main` workflow.
     Install {
-        /// Point the config at the in-repo workflow script instead of
-        /// copying the embedded one into the config dir.
+        /// Point config at the in-repo workflow instead of copying it.
         #[arg(long)]
         local: bool,
     },
 }
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = real_main().await {
+fn main() {
+    if let Err(error) = real_main() {
         eprintln!("frances: {error:#}");
         std::process::exit(1);
     }
 }
 
-async fn real_main() -> Result<()> {
+fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
     if let Some(Command::Install { local }) = cli.command {
         return install::run(local);
     }
 
-    let tty_key = tty::controlling_tty_key()?;
-    let paths = Paths::discover()?;
-
-    let new_workflow = match &cli.command {
-        Some(Command::New { workflow }) => workflow.clone(),
-        _ => None,
+    let tty_key = match cli.tty_key {
+        Some(key) => TtyKey(key),
+        None => tty::controlling_tty_key()?,
     };
 
-    if matches!(cli.command, Some(Command::New { .. }))
-        && paths.resolve_tty_link(&tty_key)?.is_some()
-    {
-        paths.unlink_tty(&tty_key)?;
+    if !cli.foreground {
+        return launch_detached(&tty_key);
     }
 
-    let invocation = InvocationContext::capture(Some(tty_key.clone()));
-    let session = paths.resolve_or_create_for_tty(&tty_key, invocation.process.cwd.clone())?;
-
-    install_logging(&session)?;
-    let db = store::open(&session).await?;
-    let overrides = start_overrides(new_workflow);
-    let (runtime, events_rx) =
-        SessionRuntime::start_with(session.clone(), db, invocation, overrides).await?;
-    runtime.replay_initial_scrollback().await;
-
-    debug!(session_id = %session.id, "starting TUI");
-    let result = App {
-        session: &session,
-        runtime: runtime.clone(),
-        events: events_rx,
-    }
-    .run()
-    .await;
-
-    runtime.shutdown();
-    result
+    app::run(tty_key, cli.command)
 }
 
-fn start_overrides(workflow: Option<String>) -> StartOverrides {
-    StartOverrides {
-        default_workflow: workflow,
-        ..StartOverrides::default()
+fn launch_detached(tty_key: &TtyKey) -> Result<()> {
+    let executable = std::env::current_exe().context("resolve frances executable")?;
+    let mut args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    args.push("--foreground".into());
+    args.push("--tty-key".into());
+    args.push(tty_key.0.clone().into());
+
+    let mut command = ProcessCommand::new(executable);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        // SAFETY: `setsid` takes no pointers and only changes process
+        // metadata in the freshly-forked child before exec.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    command.spawn().context("launch frances desktop app")?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::{Cli, Command};
+
+    #[test]
+    fn launches_detached_by_default() {
+        let cli = Cli::try_parse_from(["frances"]).unwrap();
+
+        assert!(!cli.foreground);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn foreground_is_global() {
+        let cli = Cli::try_parse_from(["frances", "new", "review", "--foreground"]).unwrap();
+
+        assert!(cli.foreground);
+        assert!(matches!(
+            cli.command,
+            Some(Command::New {
+                workflow: Some(ref workflow)
+            }) if workflow == "review"
+        ));
     }
 }

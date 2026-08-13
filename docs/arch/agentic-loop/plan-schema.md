@@ -1,6 +1,6 @@
 # Plan and step schema
 
-A plan is a typed structure, not a markdown file. The agent reads and writes it through structured tool calls; the TUI renders it natively at gates; the source of truth is rows in the per-session turso DB.
+A plan is a typed structure, not a markdown file. The agent reads and writes it through structured tool calls; the UI renders it natively at gates; the source of truth is rows in the per-session turso DB.
 
 ## Plan
 

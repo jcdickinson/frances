@@ -1,4 +1,8 @@
 target/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+crates/frances/gen/
 /result
 .claude/settings.local.json
 key.txt

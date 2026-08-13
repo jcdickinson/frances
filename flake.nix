@@ -22,6 +22,18 @@
           rustc = rustToolchain;
         };
 
+        tauriNativeBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux (with pkgs; [
+          pkg-config
+          wrapGAppsHook3
+        ]);
+
+        tauriBuildInputs = pkgs.lib.optionals pkgs.stdenv.isLinux (with pkgs; [
+          dbus
+          gtk3
+          libsoup_3
+          webkitgtk_4_1
+        ]);
+
         frances = rustPlatform.buildRustPackage {
           pname = "frances";
           version = "0.1.0";
@@ -33,6 +45,9 @@
 
           cargoBuildFlags = [ "-p" "frances" ];
           cargoTestFlags = [ "-p" "frances" ];
+
+          nativeBuildInputs = tauriNativeBuildInputs;
+          buildInputs = tauriBuildInputs;
 
           meta = with pkgs.lib; {
             description = "frances - an agentic coding tool";
@@ -48,7 +63,7 @@
         };
 
         devShells.default = pkgs.mkShell {
-          packages = with pkgs; [
+          packages = (with pkgs; [
             rustToolchain
             rust-analyzer
             jq
@@ -56,7 +71,8 @@
             cargo-nextest
             cargo-machete
             just
-          ];
+            deno
+          ]) ++ tauriNativeBuildInputs ++ tauriBuildInputs;
         };
       });
 }

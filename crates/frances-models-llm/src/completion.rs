@@ -4,6 +4,7 @@
 //! Assembled in-memory by the provider layer from the `genai` stream — not
 //! serialized.
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Streaming events emitted by provider `stream` implementations.
@@ -64,7 +65,7 @@ pub struct ToolCallError {
 /// Token-usage report. Universal shape; `cached_input_tokens` mirrors
 /// OpenAI's `prompt_tokens_details.cached_tokens` for the wires that
 /// surface it.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,

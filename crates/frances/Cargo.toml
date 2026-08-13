@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "frances"
@@ -15,18 +16,14 @@ libc.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-futures-util.workspace = true
-crossterm.workspace = true
-unicode-width.workspace = true
-frances-core.workspace = true
-frances-edit.workspace = true
-frances-markdown.workspace = true
-frances-models-tui.workspace = true
+frances-models-ui.workspace = true
 frances-session.workspace = true
-frances-tui.workspace = true
-ratatui.workspace = true
 serde.workspace = true
+tauri.workspace = true
 xdg.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
 serde_json.workspace = true

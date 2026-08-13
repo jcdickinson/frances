@@ -88,7 +88,7 @@ impl<S: AnchorStore> EditSession<S> {
     ///
     /// Returns the rendered diff block (or full anchored file in the `New`
     /// case) — `DiffRender` carries both the LLM-facing string and the
-    /// structured ops shipped to the TUI.
+    /// structured ops shipped to the UI.
     pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<DiffRender>
     where
         F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,

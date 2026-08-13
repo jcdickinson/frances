@@ -53,7 +53,7 @@ const editingFamily = defineToolFamily({
 });
 
 // Ship the structured diff portion of `editor.edit()`'s result to the
-// TUI as a one-shot `DiffSection`. The string portion is returned to the
+// UI as a one-shot `DiffSection`. The string portion is returned to the
 // LLM as the tool's content; the structured ops only travel to the
 // transcript. Skips empty payloads so no-op edits (replace_all with
 // zero matches, overwrites that didn't change anything) don't paint a

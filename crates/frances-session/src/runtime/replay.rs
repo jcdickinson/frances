@@ -1,5 +1,5 @@
 //! Initial scrollback replay — emitted into the events channel as soon
-//! as the TUI is wired up so the user sees the prior workflow's
+//! as the UI is wired up so the user sees the prior workflow's
 //! committed blocks before any live frames arrive.
 
 use uuid::Uuid;

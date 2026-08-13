@@ -58,7 +58,7 @@ The four actions:
 
 Discuss is not free-form chat — it's a structured state that makes user feedback land somewhere durable. When the user picks discuss:
 
-1. The TUI opens a chat overlay scoped to the just-completed step's context. The agent has access to the step's full transcript, not just the skeleton.
+1. The UI opens a chat overlay scoped to the just-completed step's context. The agent has access to the step's full transcript, not just the skeleton.
 2. The user types feedback, asks questions, points out concerns.
 3. The agent responds. If the user's feedback implies a structural change — "actually, the proof is too weak, run the integration tests too" or "step 5 should now do X instead" — the agent proposes a structured change (re-run with stronger proof, edit a future step, add a finding, etc).
 4. Each proposed change is shown for approval.
@@ -133,7 +133,7 @@ These exceptions exist because full-auto's promise is "trust me when things are 
 
 ## Implementation hooks
 
-The TUI needs:
+The UI needs:
 - A renderer for the step skeleton + proof
 - The four-action keymap
 - The discuss overlay
