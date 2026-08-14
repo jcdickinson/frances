@@ -9,13 +9,11 @@
 //! reserved for the LLM provider's HTTP boundary (see
 //! `frances-llm::Provider::kind`).
 
-use std::path::PathBuf;
-
 use uuid::Uuid;
 
-pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
-
-use crate::llm::Usage;
+pub use frances_models_ui::{
+    EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind, ShellState, Source,
+};
 
 pub use frances_workflow::permission::{
     PermissionRequest, PermissionResponse, PermissionResponseWire,
@@ -45,11 +43,23 @@ pub enum StreamFrame {
     SectionTruncated {
         id: SectionId,
     },
-    /// Whole-entity upsert: latest-wins UI state published by the
-    /// [`crate::runtime::UiRegistry`]. The registry queues one upsert
-    /// per entity at runtime start (the attach snapshot) and re-emits
-    /// the full entity on every change.
-    Entity(Entity),
+    /// Whole-entity upsert: latest-wins envelope + opaque snapshot
+    /// published by the [`crate::entities::EntityHub`]. The hub queues
+    /// one upsert per entity at runtime start (the attach snapshot)
+    /// and re-emits the full pair on every change.
+    EntityUpsert {
+        envelope: EntityEnvelope,
+        snapshot: serde_json::Value,
+    },
+    /// One item of an entity's append-only stream. Emitted only while
+    /// the frontend is subscribed to that entity (live tail or the
+    /// catch-up replay a subscription starts with); `seq` lets the
+    /// consumer drop duplicates across the catch-up/live splice.
+    EntityStream {
+        entity_id: Uuid,
+        seq: u64,
+        payload: serde_json::Value,
+    },
     Error(String),
     /// Runtime is asking the user for permission; client responds via
     /// [`crate::runtime::SessionRuntime::respond_permission`].
@@ -60,31 +70,6 @@ pub enum StreamFrame {
     /// distinct from the live variants above, so the UI's replay
     /// handler never has to reason about live-only frames.
     Scrollback(ScrollbackFrame),
-}
-
-/// Small, mutable, latest-wins UI state — as opposed to the append-only
-/// section streams. Each variant is one entity; both are singletons
-/// today (instanced entities like shells carry their own key when they
-/// arrive, so an upsert can never mismatch id and payload).
-#[derive(Debug, Clone)]
-pub enum Entity {
-    Workspace(WorkspaceEntity),
-    Session(SessionEntity),
-}
-
-#[derive(Debug, Clone)]
-pub struct WorkspaceEntity {
-    /// Canonical workspace directories; first is the primary dir.
-    pub directories: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-pub struct SessionEntity {
-    pub title: Option<String>,
-    pub usage: Option<Usage>,
-    /// Footer busy-indicator text (the workflow's `setStatus`). Not
-    /// persisted, so a fresh session starts with `None`.
-    pub busy: Option<String>,
 }
 
 /// The scrollback-replay sub-protocol: exactly the frames a replay

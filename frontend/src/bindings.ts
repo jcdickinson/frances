@@ -38,6 +38,38 @@ async saveWorkspace() : Promise<Result<string | null, string>> {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Attach the frontend to an entity's stream. `catch_up` replays every
+ * persisted item before tailing (a tab opening); without it the
+ * stream just starts tailing (an inline live view).
+ */
+async subscribeEntity(entityId: string, catchUp: boolean) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("subscribe_entity", { entityId, catchUp }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async unsubscribeEntity(entityId: string) : Promise<Result<null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("unsubscribe_entity", { entityId }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Point-read one settle artifact (e.g. a shell's `llm_digest`).
+ */
+async readEntityArtifact(entityId: string, tag: string) : Promise<Result<JsonValue | null, string>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("read_entity_artifact", { entityId, tag }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -62,12 +94,13 @@ export type AppInfo = { sessionId: string }
  * number (1-based); `Added` / `Removed` carry only the raw line content.
  */
 export type DiffOp = { Context: { text: string; line: number } } | { Added: string } | { Removed: string }
-/**
- * Serializable mirror of [`Entity`] — paths become strings at this
- * boundary. The tag doubles as the frontend store key.
- */
-export type EntityWire = { type: "workspace"; directories: string[] } | { type: "session"; title: string | null; usage: Usage | null; busy: string | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
+/**
+ * Whether an entity's producer is still running. The only envelope
+ * field besides identity: core machinery (forced settle, subscription
+ * gating) reads it, so it lives outside the opaque snapshot payload.
+ */
+export type Lifecycle = "live" | "settled"
 /**
  * Terminal status for [`SectionKind::Reasoning`].
  */
@@ -122,6 +155,15 @@ export type SectionKind =
  */
 { type: "diff"; lines: DiffOp[] }
 /**
+ * Snapshot payload of the singleton session entity.
+ */
+export type SessionSnapshot = { title: string | null; usage: Usage | null; 
+/**
+ * Footer busy-indicator text (the workflow's `setStatus`). Not
+ * meaningful after settle; a fresh session starts with `None`.
+ */
+busy: string | null }
+/**
  * Terminal status for [`SectionKind::ShellOutput`].
  */
 export type ShellState = "Running" | "Success" | { Exit: number }
@@ -131,13 +173,32 @@ export type ShellState = "Running" | "Success" | { Exit: number }
  * (`source != User`).
  */
 export type Source = "user" | "assistant" | "internal"
-export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | { type: "entity"; entity: EntityWire } | { type: "error"; message: string } | { type: "permission"; prompt: string }
+export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | 
+/**
+ * Latest-wins entity state. `snapshot` is opaque at this boundary;
+ * the frontend picks a renderer by `kind` and interprets it there.
+ */
+{ type: "entity_upsert"; entity_id: string; kind: string; lifecycle: Lifecycle; snapshot: JsonValue } | 
+/**
+ * One item of a subscribed entity's stream; `seq` dedupes across
+ * the catch-up/live splice.
+ */
+{ type: "entity_stream"; entity_id: string; seq: number; payload: JsonValue } | { type: "error"; message: string } | { type: "permission"; prompt: string }
 /**
  * Token-usage report. Universal shape; `cached_input_tokens` mirrors
  * OpenAI's `prompt_tokens_details.cached_tokens` for the wires that
  * surface it.
  */
 export type Usage = { prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_input_tokens: number }
+/**
+ * Snapshot payload of the singleton workspace entity. Typed here (the
+ * runtime is its producer); opaque JSON from the hub outward.
+ */
+export type WorkspaceSnapshot = { 
+/**
+ * Canonical workspace directories; first is the primary dir.
+ */
+directories: string[] }
 
 /** tauri-specta globals **/
 

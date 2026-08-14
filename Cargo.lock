@@ -1883,6 +1883,7 @@ dependencies = [
  "serde",
  "serde_json",
  "specta",
+ "uuid",
 ]
 
 [[package]]
@@ -1904,6 +1905,7 @@ dependencies = [
  "parking_lot",
  "serde",
  "serde_json",
+ "specta",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -5560,6 +5562,7 @@ dependencies = [
  "serde_json",
  "specta-macros",
  "thiserror 1.0.69",
+ "uuid",
 ]
 
 [[package]]

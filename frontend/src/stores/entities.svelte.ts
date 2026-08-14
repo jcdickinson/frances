@@ -1,20 +1,36 @@
-// Frontend mirror of the runtime's published entities. One-way: the
-// event listener writes via upsertEntity, components read projections.
 import { SvelteMap } from 'svelte/reactivity';
-import type { EntityWire } from '../bindings';
+import type { JsonValue, Lifecycle, SessionSnapshot, WorkspaceSnapshot } from '../bindings';
 
-const entities = new SvelteMap<EntityWire['type'], EntityWire>();
+export type EntityState = {
+  id: string;
+  kind: string;
+  lifecycle: Lifecycle;
+  /** Opaque payload; per-kind components cast it (see entities/registry). */
+  snapshot: JsonValue;
+};
 
-export function upsertEntity(entity: EntityWire): void {
-  entities.set(entity.type, entity);
+const entities = new SvelteMap<string, EntityState>();
+
+export function upsertEntity(entity: EntityState): void {
+  entities.set(entity.id, entity);
 }
 
-export function workspace(): Extract<EntityWire, { type: 'workspace' }> | undefined {
-  const entity = entities.get('workspace');
-  return entity?.type === 'workspace' ? entity : undefined;
+export function entity(id: string): EntityState | undefined {
+  return entities.get(id);
 }
 
-export function session(): Extract<EntityWire, { type: 'session' }> | undefined {
-  const entity = entities.get('session');
-  return entity?.type === 'session' ? entity : undefined;
+function snapshotOfKind<T>(kind: string): T | undefined {
+  for (const candidate of entities.values()) {
+    if (candidate.kind === kind) return candidate.snapshot as T;
+  }
+  return undefined;
+}
+
+// Typed projections of the two Rust-produced singletons.
+export function workspace(): WorkspaceSnapshot | undefined {
+  return snapshotOfKind<WorkspaceSnapshot>('workspace');
+}
+
+export function session(): SessionSnapshot | undefined {
+  return snapshotOfKind<SessionSnapshot>('session');
 }

@@ -20,6 +20,7 @@ tracing.workspace = true
 frances-models-ui.workspace = true
 frances-session.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 specta.workspace = true
 specta-typescript.workspace = true
 tauri.workspace = true
@@ -31,4 +32,3 @@ xdg.workspace = true
 tauri-build = { version = "2", features = [] }
 
 [dev-dependencies]
-serde_json.workspace = true

@@ -1,5 +1,6 @@
 pub mod anchor_store;
 pub mod context;
+pub mod entities;
 mod error;
 pub mod events;
 pub mod history;

@@ -20,7 +20,8 @@ use uuid::Uuid;
 
 use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
-use crate::events::{PermissionResponseWire, SessionEntity, StreamFrame, WorkspaceEntity};
+use crate::entities::{EntityHub, SessionSnapshot, WorkspaceSnapshot};
+use crate::events::{PermissionResponseWire, StreamFrame};
 use crate::history::TursoHistoryStore;
 use crate::llm::{SessionConfigProvider, SessionConfigWriter};
 use crate::session::Session;
@@ -42,13 +43,11 @@ pub(crate) mod auto_judge;
 mod error;
 mod events;
 mod logging;
-mod registry;
 mod replay;
 
 pub use error::RuntimeError;
 pub use events::EventsChannel;
 pub use logging::install_logging;
-pub use registry::UiRegistry;
 
 /// Concrete `ChatManagerDeps` impl reading from the per-session
 /// `TursoHistoryStore`. Cheap to clone.
@@ -85,10 +84,10 @@ pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     /// map. Wrapped in `Arc` so clones (one per workflow invocation)
     /// see the same cache.
     pub workflow_dbs: Arc<DashMap<Uuid, Arc<WorkflowDb>>>,
-    /// Same registry [`SessionRuntime`] publishes through. The workflow
+    /// Same hub [`SessionRuntime`] publishes through. The workflow
     /// driver writes the session title into it on `SurfaceCmd::SetTitle`;
     /// this side only reads it (to seed a booting workflow's `getTitle`).
-    pub registry: Arc<UiRegistry>,
+    pub entities: Arc<EntityHub>,
     /// IO bundle (timer + shell + fs). Production wires `RealIo`;
     /// tests wire a `StubIo` variant.
     pub io: Io,
@@ -134,7 +133,7 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
     }
 
     fn session_title(&self) -> Option<String> {
-        self.registry.session_title()
+        self.entities.session_title()
     }
 
     fn editable_roots(&self) -> &[PathBuf] {
@@ -195,9 +194,10 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     pub invocation: Arc<Mutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
     pub events: EventsChannel,
-    /// Publish point for latest-wins UI state (workspace dirs, session
-    /// title / usage / busy). Shared with [`WorkflowDepsImpl`].
-    pub registry: Arc<UiRegistry>,
+    /// Publish point for entity state — singleton chrome (workspace
+    /// dirs, session title / usage / busy) and every instanced entity
+    /// (shells, …). Shared with [`WorkflowDepsImpl`].
+    pub entities: Arc<EntityHub>,
     /// Kept alive so the config-event-processor task stays running for the
     /// runtime's lifetime. The chat manager and provider cache hold their
     /// own bindings, but parking the handle here makes the lifetime
@@ -365,17 +365,27 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             engine: Arc::new(edit_engine),
         };
         let (events, events_rx) = EventsChannel::new();
-        let registry = Arc::new(UiRegistry::new(
-            events.clone(),
-            WorkspaceEntity {
-                directories: invocation.workspace.dirs().to_vec(),
-            },
-            SessionEntity {
-                title: session.meta.title.clone(),
-                usage: None,
-                busy: None,
-            },
-        ));
+        // Force-settles any Live rows from a previous process, then
+        // loads what's persisted.
+        let entities = Arc::new(EntityHub::open(db.clone(), events.clone()).await?);
+        entities
+            .set_workspace(&WorkspaceSnapshot {
+                directories: invocation
+                    .workspace
+                    .dirs()
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect(),
+            })
+            .await;
+        entities
+            .update_session(|session_snapshot| {
+                *session_snapshot = SessionSnapshot {
+                    title: session.meta.title.clone(),
+                    ..SessionSnapshot::default()
+                };
+            })
+            .await;
         let invocation = Arc::new(Mutex::new(invocation));
         let workflow_runtime = Arc::new(WorkflowRuntime::new(WorkflowDepsImpl {
             chat: chat.clone(),
@@ -383,7 +393,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             editor_factory: editor_factory.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
-            registry: registry.clone(),
+            entities: entities.clone(),
             io,
             editable_roots,
         })?);
@@ -395,7 +405,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             invocation,
             editor_factory,
             events,
-            registry,
+            entities,
             _config: config,
             history,
             cache,
@@ -426,8 +436,10 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         // active instance immediately.
         runtime.active_workflow.seat_initial(initial.as_ref());
         // Queue the attach snapshot; the UI drains it when it attaches
-        // to the events receiver.
-        runtime.registry.publish_all();
+        // to the events receiver. Same ordered channel as the replay
+        // burst below it, so every entity snapshot arrives before any
+        // replayed section that references it.
+        runtime.entities.attach_publish_all();
 
         tokio::spawn(crate::workflows::run_driver(
             runtime.clone(),
@@ -440,10 +452,17 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
 
     /// Replace the latest invocation context. Workflows that read
     /// `current_env` / `current_cwd` see the new value on next access.
-    pub fn update_invocation(&self, ctx: InvocationContext) {
-        let directories = ctx.workspace.dirs().to_vec();
+    pub async fn update_invocation(&self, ctx: InvocationContext) {
+        let directories = ctx
+            .workspace
+            .dirs()
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
         *self.invocation.lock() = ctx;
-        self.registry.set_workspace(WorkspaceEntity { directories });
+        self.entities
+            .set_workspace(&WorkspaceSnapshot { directories })
+            .await;
     }
 
     /// Run the initial scrollback replay for the currently-active

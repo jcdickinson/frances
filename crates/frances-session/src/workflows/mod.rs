@@ -515,9 +515,9 @@ pub(crate) async fn run_driver<Io: frances_workflow::WorkflowIo>(
                     warn!(%error, "transcript emit failed");
                 }
             }
-            Step::Surface(status) => emit_surface(&runtime, status),
+            Step::Surface(status) => emit_surface(&runtime, status).await,
             Step::Permission(ask) => emit_permission(&runtime, ask).await,
-            Step::Usage(usage) => emit_usage(&runtime, usage),
+            Step::Usage(usage) => emit_usage(&runtime, usage).await,
             Step::Done(reported) => {
                 let mut instance = current.take().expect("active on done");
                 runtime.active_workflow.clear_active();
@@ -787,43 +787,48 @@ fn is_one_shot(kind: &SectionKind) -> bool {
     )
 }
 
-/// Workflow-declared chrome, published as Session-entity state. The
+/// Workflow-declared chrome, published as session-entity state. The
 /// footer commands are ephemeral; `SetTitle` also lands in session
-/// metadata (the registry seeds a booting workflow's `getTitle`).
-fn emit_surface<Io: frances_workflow::WorkflowIo>(
+/// metadata (the hub seeds a booting workflow's `getTitle`).
+async fn emit_surface<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     cmd: SurfaceCmd,
 ) {
     match cmd {
         SurfaceCmd::SetFooter { text } => {
             runtime
-                .registry
-                .update_session(|session| session.busy = Some(text));
+                .entities
+                .update_session(|session| session.busy = Some(text))
+                .await;
         }
         SurfaceCmd::ClearFooter => {
             runtime
-                .registry
-                .update_session(|session| session.busy = None);
+                .entities
+                .update_session(|session| session.busy = None)
+                .await;
         }
         SurfaceCmd::SetTitle { title } => {
             if let Err(error) = runtime.session.write_title(title.clone()) {
                 warn!(%error, "persist session title failed");
             }
             runtime
-                .registry
-                .update_session(|session| session.title = title);
+                .entities
+                .update_session(|session| session.title = title)
+                .await;
         }
     }
 }
 
-/// LLM token-usage telemetry. Session-entity state; not persisted.
-fn emit_usage<Io: frances_workflow::WorkflowIo>(
+/// LLM token-usage telemetry. Session-entity state; persisted only as
+/// the latest-wins snapshot.
+async fn emit_usage<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     usage: frances_models_llm::Usage,
 ) {
     runtime
-        .registry
-        .update_session(|session| session.usage = Some(usage));
+        .entities
+        .update_session(|session| session.usage = Some(usage))
+        .await;
 }
 
 /// A permission request. When `allow_auto`, consult the auto-judge first

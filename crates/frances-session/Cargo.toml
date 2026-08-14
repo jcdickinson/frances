@@ -22,6 +22,7 @@ thiserror.workspace = true
 twox-hash.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
+specta.workspace = true
 xdg.workspace = true
 uuid.workspace = true
 frances-config.workspace = true

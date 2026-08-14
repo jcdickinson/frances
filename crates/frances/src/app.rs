@@ -1,13 +1,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use frances_models_ui::{SectionId, SectionKind};
+use frances_models_ui::{Lifecycle, SectionId, SectionKind};
 use frances_session::context::InvocationContext;
+use frances_session::entities::{SESSION_KIND, SessionSnapshot};
 use frances_session::events::{
-    Entity, PermissionRequest, PermissionResponse, PermissionResponseWire, ScrollbackFrame,
-    StreamFrame,
+    PermissionRequest, PermissionResponse, PermissionResponseWire, ScrollbackFrame, StreamFrame,
 };
-use frances_session::llm::Usage;
 use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
 use frances_session::session::{Paths, Session};
 use frances_session::store;
@@ -32,40 +31,6 @@ struct AppInfo {
     session_id: String,
 }
 
-/// Serializable mirror of [`Entity`] — paths become strings at this
-/// boundary. The tag doubles as the frontend store key.
-#[derive(Clone, Serialize, specta::Type)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum EntityWire {
-    Workspace {
-        directories: Vec<String>,
-    },
-    Session {
-        title: Option<String>,
-        usage: Option<Usage>,
-        busy: Option<String>,
-    },
-}
-
-impl From<Entity> for EntityWire {
-    fn from(entity: Entity) -> Self {
-        match entity {
-            Entity::Workspace(workspace) => EntityWire::Workspace {
-                directories: workspace
-                    .directories
-                    .iter()
-                    .map(|dir| dir.display().to_string())
-                    .collect(),
-            },
-            Entity::Session(session) => EntityWire::Session {
-                title: session.title,
-                usage: session.usage,
-                busy: session.busy,
-            },
-        }
-    }
-}
-
 #[derive(Clone, Serialize, specta::Type, tauri_specta::Event)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum UiEvent {
@@ -80,8 +45,20 @@ enum UiEvent {
         id: SectionId,
         truncated: bool,
     },
-    Entity {
-        entity: EntityWire,
+    /// Latest-wins entity state. `snapshot` is opaque at this boundary;
+    /// the frontend picks a renderer by `kind` and interprets it there.
+    EntityUpsert {
+        entity_id: String,
+        kind: String,
+        lifecycle: Lifecycle,
+        snapshot: serde_json::Value,
+    },
+    /// One item of a subscribed entity's stream; `seq` dedupes across
+    /// the catch-up/live splice.
+    EntityStream {
+        entity_id: String,
+        seq: u64,
+        payload: serde_json::Value,
     },
     Error {
         message: String,
@@ -145,9 +122,16 @@ fn specta_builder() -> tauri_specta::Builder {
             send_prompt,
             interrupt,
             respond_permission,
-            save_workspace
+            save_workspace,
+            subscribe_entity,
+            unsubscribe_entity,
+            read_entity_artifact
         ])
         .events(tauri_specta::collect_events![UiEvent])
+        // Snapshot payloads are opaque JSON on the wire; export the
+        // Rust-produced singleton shapes so the frontend can cast them.
+        .typ::<frances_session::entities::WorkspaceSnapshot>()
+        .typ::<SessionSnapshot>()
 }
 
 /// Write the generated TypeScript bindings into the frontend source tree.
@@ -240,6 +224,50 @@ async fn save_workspace(
     Ok(Some(path.display().to_string()))
 }
 
+/// Attach the frontend to an entity's stream. `catch_up` replays every
+/// persisted item before tailing (a tab opening); without it the
+/// stream just starts tailing (an inline live view).
+#[tauri::command]
+#[specta::specta]
+async fn subscribe_entity(
+    state: tauri::State<'_, Backend>,
+    entity_id: String,
+    catch_up: bool,
+) -> Result<(), String> {
+    let id = entity_id.parse().map_err(|_| "bad entity id".to_string())?;
+    state
+        .runtime
+        .entities
+        .subscribe(id, catch_up)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+#[specta::specta]
+fn unsubscribe_entity(state: tauri::State<'_, Backend>, entity_id: String) -> Result<(), String> {
+    let id = entity_id.parse().map_err(|_| "bad entity id".to_string())?;
+    state.runtime.entities.unsubscribe(id);
+    Ok(())
+}
+
+/// Point-read one settle artifact (e.g. a shell's `llm_digest`).
+#[tauri::command]
+#[specta::specta]
+async fn read_entity_artifact(
+    state: tauri::State<'_, Backend>,
+    entity_id: String,
+    tag: String,
+) -> Result<Option<serde_json::Value>, String> {
+    let id = entity_id.parse().map_err(|_| "bad entity id".to_string())?;
+    state
+        .runtime
+        .entities
+        .read_artifact(id, &tag)
+        .await
+        .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 #[specta::specta]
 fn respond_permission(
@@ -274,12 +302,12 @@ async fn forward_events(app: tauri::AppHandle, mut events: mpsc::UnboundedReceiv
             continue;
         };
 
-        if let UiEvent::Entity {
-            entity: EntityWire::Session { title, .. },
-        } = &event
+        if let UiEvent::EntityUpsert { kind, snapshot, .. } = &event
+            && kind == SESSION_KIND
+            && let Ok(session) = serde_json::from_value::<SessionSnapshot>(snapshot.clone())
             && let Some(window) = app.get_webview_window("main")
         {
-            let _ = window.set_title(title.as_deref().unwrap_or("frances"));
+            let _ = window.set_title(session.title.as_deref().unwrap_or("frances"));
         }
 
         if let Err(error) = event.emit(&app) {
@@ -301,8 +329,20 @@ fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> 
             id,
             truncated: true,
         }),
-        StreamFrame::Entity(entity) => Some(UiEvent::Entity {
-            entity: entity.into(),
+        StreamFrame::EntityUpsert { envelope, snapshot } => Some(UiEvent::EntityUpsert {
+            entity_id: envelope.entity_id.to_string(),
+            kind: envelope.kind,
+            lifecycle: envelope.lifecycle,
+            snapshot,
+        }),
+        StreamFrame::EntityStream {
+            entity_id,
+            seq,
+            payload,
+        } => Some(UiEvent::EntityStream {
+            entity_id: entity_id.to_string(),
+            seq,
+            payload,
         }),
         StreamFrame::Error(message) => Some(UiEvent::Error { message }),
         StreamFrame::Permission(request) => store_permission(app, request),

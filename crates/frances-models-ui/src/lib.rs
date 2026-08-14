@@ -20,6 +20,31 @@
 //!   inside the matching [`SectionKind`] variants.
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+/// Whether an entity's producer is still running. The only envelope
+/// field besides identity: core machinery (forced settle, subscription
+/// gating) reads it, so it lives outside the opaque snapshot payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+#[serde(rename_all = "snake_case")]
+pub enum Lifecycle {
+    Live,
+    Settled,
+}
+
+/// The typed half of an entity. Everything core Rust reads lives here;
+/// the snapshot payload riding next to it is opaque JSON interpreted
+/// only by the producer and the frontend's per-kind components. If core
+/// logic ever needs a field from the payload, that field moves into the
+/// envelope instead of core parsing the payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
+pub struct EntityEnvelope {
+    pub entity_id: Uuid,
+    /// Open set — producers (including JS workflows) mint kinds freely;
+    /// core never matches on it, the frontend dispatches renderers by it.
+    pub kind: String,
+    pub lifecycle: Lifecycle,
+}
 
 /// Section identity, scoped to one workflow invocation. Monotonically
 /// assigned by `transcript.push` on the workflow side. The frontend

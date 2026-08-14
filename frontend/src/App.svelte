@@ -5,6 +5,7 @@
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
   import { session, upsertEntity } from './stores/entities.svelte';
+  import { applyStreamItem } from './stores/entityStreams.svelte';
   import type { Command } from './commands';
   import { type Section, unwrap } from './types';
 
@@ -94,8 +95,15 @@
         section.truncated = event.truncated;
         sections = [...sections];
       }
-    } else if (event.type === 'entity') {
-      upsertEntity(event.entity);
+    } else if (event.type === 'entity_upsert') {
+      upsertEntity({
+        id: event.entity_id,
+        kind: event.kind,
+        lifecycle: event.lifecycle,
+        snapshot: event.snapshot,
+      });
+    } else if (event.type === 'entity_stream') {
+      applyStreamItem(event.entity_id, event.seq, event.payload);
     } else if (event.type === 'error') {
       addError(event.message);
     } else if (event.type === 'permission') {

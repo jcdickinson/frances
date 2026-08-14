@@ -1,5 +1,6 @@
 use thiserror::Error;
 
+use crate::entities::EntityError;
 use crate::llm::session_provider::SessionConfigWriteError;
 use crate::runtime::RuntimeError;
 use crate::scrollback::ScrollbackError;
@@ -51,6 +52,9 @@ pub enum Error {
 
     #[error(transparent)]
     Scrollback(#[from] ScrollbackError),
+
+    #[error(transparent)]
+    Entity(#[from] EntityError),
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
