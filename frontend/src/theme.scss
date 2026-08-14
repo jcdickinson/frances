@@ -1,0 +1,326 @@
+// Design tokens and surface treatments (raised / recessed / groove) plus the
+// controls built on them. Light is the default; dark applies via
+// [data-mode=dark] or the OS preference, unless [data-mode=light] pins light.
+
+@mixin dark-tokens {
+  --surface-page: #181b20;
+  --surface-card: #21252b;
+  --surface-control: #2c313a;
+  --surface-well: #1c1f25;
+  --text-primary: #e8ebf0;
+  --text-secondary: #99a2ae;
+  --text-muted: #68717e;
+  --border: rgba(214, 226, 243, 0.1);
+  --border-strong: rgba(214, 226, 243, 0.16);
+  --accent: #7ba7d9;
+  --accent-soft: rgba(123, 167, 217, 0.22);
+  --grad-a: 0.2;
+  --hi-a: 0.35;
+  --lo-a: 0;
+  --drop-a: 0.35;
+  --primary-surface: #34608f;
+  --primary-well: #2a4f77;
+  --primary-text: #eaf1f9;
+  --primary-border: #2a4f77;
+  --danger-surface: #3d2b2c;
+  --danger-well: #332224;
+  --danger-text: #e59d96;
+  --danger-border: rgba(229, 157, 150, 0.3);
+  --success-surface: #28352b;
+  --success-well: #202b23;
+  --success-text: #9dc8a2;
+  --success-border: rgba(157, 200, 162, 0.3);
+  --warning-surface: #3a331f;
+  --warning-well: #302a18;
+  --warning-text: #d9ba6c;
+  --warning-border: rgba(217, 186, 108, 0.32);
+}
+
+:root {
+  --surface-page: #dde1e6;
+  --surface-card: #ebeef2;
+  --surface-control: #f1f3f6;
+  --surface-well: #e4e8ed;
+  --text-primary: #171b21;
+  --text-secondary: #626b77;
+  --text-muted: #8f98a5;
+  --border: rgba(23, 42, 71, 0.15);
+  --border-strong: rgba(23, 42, 71, 0.24);
+  --accent: #3d6ea5;
+  --accent-soft: rgba(61, 110, 165, 0.18);
+  --grad-a: 0.08;
+  --hi-a: 0;
+  --lo-a: 0.4;
+  --drop-a: 0.1;
+  --primary-surface: #3d6ea5;
+  --primary-well: #2f5885;
+  --primary-text: #f4f8fc;
+  --primary-border: #2f5885;
+  --danger-surface: #f3e7e5;
+  --danger-well: #e9d6d3;
+  --danger-text: #9c352e;
+  --danger-border: rgba(156, 53, 46, 0.35);
+  --success-surface: #e6efe6;
+  --success-well: #d6e5d7;
+  --success-text: #33663a;
+  --success-border: rgba(51, 102, 58, 0.35);
+  --warning-surface: #f5eedb;
+  --warning-well: #ece0c2;
+  --warning-text: #85610f;
+  --warning-border: rgba(133, 97, 15, 0.4);
+  --radius: 8px;
+}
+
+[data-mode='dark'] {
+  @include dark-tokens;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-mode='light']) {
+    @include dark-tokens;
+  }
+}
+
+// Convex control face: top-light gradient with a highlight/shadow bevel.
+@mixin raised {
+  background-color: var(--surface-control);
+  background-image: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(0, 0, 0, var(--grad-a)) 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow:
+    inset 1px 1px 0 rgba(255, 255, 255, var(--hi-a)),
+    inset -1px -1px 0 rgba(0, 0, 0, var(--lo-a)),
+    0 1px 3px rgba(0, 0, 0, var(--drop-a));
+  color: var(--text-primary);
+  transition: box-shadow 80ms, background-color 80ms;
+}
+
+// Sunken well; used by inputs and panels that hold content.
+@mixin recessed {
+  background-color: var(--surface-well);
+  background-image: linear-gradient(180deg, rgba(0, 0, 0, var(--grad-a)) 0%, rgba(0, 0, 0, 0) 100%);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: inset 1px 1px 2px rgba(0, 0, 0, var(--lo-a));
+}
+
+// Sunken track with a deeper top shadow; used by toggle, slider rail, and
+// progress trough.
+@mixin groove {
+  background-color: var(--surface-well);
+  background-image: linear-gradient(
+    180deg,
+    rgba(0, 0, 0, calc(var(--grad-a) * 2.2)) 0px,
+    rgba(0, 0, 0, calc(var(--grad-a) * 1)) 4px,
+    rgba(0, 0, 0, calc(var(--grad-a) * 0.3)) 8px,
+    rgba(0, 0, 0, calc(var(--grad-a) * 0)) 13px,
+    rgba(0, 0, 0, 0) calc(100% - 3px),
+    rgba(255, 255, 255, calc(var(--hi-a) * 0.18)) 100%
+  );
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius);
+  box-shadow: inset 1px 1px 2px rgba(0, 0, 0, var(--lo-a));
+}
+
+.raised {
+  @include raised;
+
+  &:hover {
+    border-color: var(--text-muted);
+  }
+
+  &:active,
+  &.pressed {
+    background-color: var(--surface-well);
+    background-image: linear-gradient(
+      180deg,
+      rgba(0, 0, 0, calc(var(--grad-a) + 0.04)) 0%,
+      rgba(0, 0, 0, 0) 100%
+    );
+    box-shadow:
+      inset 1px 1px 3px rgba(0, 0, 0, calc(var(--lo-a) + 0.08)),
+      inset -1px -1px 0 rgba(255, 255, 255, calc(var(--hi-a) * 0.35));
+  }
+
+  &:disabled,
+  &.disabled {
+    background-color: var(--surface-control);
+    background-image: none;
+    border: 1px solid var(--border);
+    box-shadow: none;
+    color: var(--text-muted);
+    cursor: not-allowed;
+  }
+}
+
+@each $variant in primary, danger, success, warning {
+  .raised.#{$variant} {
+    background-color: var(--#{$variant}-surface);
+    border-color: var(--#{$variant}-border);
+    color: var(--#{$variant}-text);
+
+    &:hover {
+      border-color: var(--#{$variant}-text);
+    }
+
+    &:active,
+    &.pressed {
+      background-color: var(--#{$variant}-well);
+    }
+  }
+}
+
+.recessed {
+  @include recessed;
+}
+
+.groove {
+  @include groove;
+}
+
+button.raised,
+.button.raised {
+  cursor: pointer;
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 18px;
+
+  &.pill {
+    border-radius: 999px;
+  }
+
+  &.icon {
+    width: 42px;
+    height: 42px;
+    padding: 0;
+    border-radius: 50%;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+  }
+}
+
+.seg {
+  display: inline-flex;
+  gap: 4px;
+
+  button {
+    padding: 7px 14px;
+    font-size: 14px;
+  }
+}
+
+.toggle {
+  @include groove;
+  width: 52px;
+  height: 28px;
+  border-radius: 14px;
+  position: relative;
+  cursor: pointer;
+  flex: none;
+  transition: background-color 150ms;
+
+  .thumb {
+    @include raised;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    position: absolute;
+    top: 2px;
+    left: 2px;
+    transition: left 130ms cubic-bezier(0.3, 1.2, 0.5, 1);
+  }
+
+  &[aria-checked='true'] {
+    background-color: var(--accent-soft);
+
+    .thumb {
+      left: 27px;
+    }
+  }
+}
+
+.rail {
+  @include groove;
+  display: block;
+  height: 16px;
+  border-radius: 8px;
+  position: relative;
+  cursor: pointer;
+
+  // Horizontal centering comes from the thumb's own inline left/translate
+  // (bits-ui sets it); only vertical centering lives here.
+  .thumb {
+    @include raised;
+    width: 22px;
+    height: 22px;
+    border-radius: 50%;
+    top: 50%;
+    transform: translateY(-50%);
+  }
+}
+
+.trough {
+  @include groove;
+  height: 14px;
+  border-radius: 7px;
+  position: relative;
+  overflow: hidden;
+
+  .fill {
+    position: absolute;
+    inset: 2px auto 2px 2px;
+    border-radius: 5px;
+    background-color: var(--accent);
+    background-image: linear-gradient(
+      180deg,
+      rgba(255, 255, 255, 0.25) 0%,
+      rgba(0, 0, 0, 0.15) 100%
+    );
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  }
+}
+
+kbd {
+  font-family: ui-monospace, 'SF Mono', 'Cascadia Code', Menlo, Consolas, monospace;
+  font-size: 12px;
+  padding: 2px 7px;
+  background-color: var(--surface-control);
+  background-image: linear-gradient(180deg, rgba(0, 0, 0, 0), rgba(0, 0, 0, var(--grad-a)));
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, var(--hi-a)), 0 1px 0 rgba(0, 0, 0, var(--lo-a));
+}
+
+input[type='text'].recessed,
+input[type='email'].recessed,
+input[type='password'].recessed,
+input[type='search'].recessed,
+textarea.recessed {
+  font: inherit;
+  font-size: 14px;
+  padding: 8px 12px;
+  width: 100%;
+  box-sizing: border-box;
+  color: var(--text-primary);
+  outline: none;
+
+  &::placeholder {
+    color: var(--text-muted);
+  }
+
+  &:focus {
+    border-color: var(--accent);
+  }
+}
+
+textarea.recessed {
+  resize: vertical;
+  min-height: 64px;
+  line-height: 1.5;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}

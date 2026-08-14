@@ -18,6 +18,13 @@
   let scrollback: HTMLElement;
   let textarea: HTMLTextAreaElement;
 
+  // Grow the textarea with its content; CSS max-height caps it at 5 lines.
+  $effect(() => {
+    void input;
+    textarea.style.height = 'auto';
+    textarea.style.height = `${textarea.scrollHeight}px`;
+  });
+
   onMount(() => {
     let unlisten: (() => void) | undefined;
 
