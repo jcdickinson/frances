@@ -64,8 +64,32 @@ written eagerly during the turn so a partial turn survives the restart.
 ## Per-session database
 
 Each session has its own `frances.db` inside its session dir. The schema
-(`messages`, `blocks`, anchor tables) has **no `session_id` columns** —
-sessions are isolated at the file level, not by row. Don't reintroduce a
-global db at `state_root/frances.db`: turso uses exclusive file locks and
-that caused cross-process contention back when sessions were owned by
-separate daemons. `Session::database_path()` is the source of truth.
+(chat history, scrollback, anchor, and entity tables) has **no
+`session_id` columns** — sessions are isolated at the file level, not by
+row. Don't reintroduce a global db at `state_root/frances.db`: turso uses
+exclusive file locks and that caused cross-process contention back when
+sessions were owned by separate daemons. `Session::database_path()` is
+the source of truth.
+
+## Entities
+
+UI state that outlives a transcript position is an **entity**: a typed
+envelope (`entity_id`, `kind` string, `lifecycle: Live | Settled`) plus
+opaque-JSON facets — a small latest-wins **snapshot**, an optional
+append-only **stream** (seq assigned by the hub; frontend subscriptions
+get a gap-free catch-up + live tail), and **settle artifacts** (bounded
+derived blobs written once at settle, point-read by tag). The
+`EntityHub` (`frances-session/src/entities`) persists all three in the
+per-session db and is a policy-free pipe: kind-specific decisions live
+in producers (workflow JS via `frances:v1/entities`, or the runtime for
+the workspace/session singletons) and in the frontend's per-kind
+`{ Inline, Opened }` component pairs.
+
+Lifecycle is the envelope's only non-identity field because core
+machinery reads it: entities found Live at db open are **force-settled**
+(their producer died with the previous process), and workflow
+finish/dehydrate force-settles whatever the workflow left Live. The
+transcript references entities via one-shot `SectionKind::EntityRef`
+sections; the hub's attach snapshot is queued into the events channel
+ahead of the scrollback replay, so snapshots always arrive before the
+refs that need them.
