@@ -1,10 +1,22 @@
 <script lang="ts">
-  import { workspace } from '../stores/entities.svelte';
+  import { Tabs } from 'bits-ui';
+  import { viewsFor } from '../entities/registry';
+  import { entity, workspace } from '../stores/entities.svelte';
+  import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
+  import { asShellSnapshot } from '../entities/shell/types';
 
   const directories = $derived(workspace()?.directories ?? []);
 
   function basename(path: string): string {
     return path.replace(/\/+$/, '').split('/').pop() || path;
+  }
+
+  /** Trigger label: something recognisable per kind, id as last resort. */
+  function tabTitle(id: string): string {
+    const state = entity(id);
+    if (!state) return id;
+    if (state.kind === 'shell') return asShellSnapshot(state.snapshot).cmd;
+    return state.kind;
   }
 
   let width = $state(240);
@@ -32,6 +44,43 @@
       <li title={directory}>{basename(directory)}</li>
     {/each}
   </ul>
+
+  {#if openTabs().length > 0}
+    <h2>Open</h2>
+    <Tabs.Root
+      value={activeTab() ?? undefined}
+      onValueChange={(value) => focusTab(value)}
+      orientation="vertical"
+      class="entity-tabs"
+    >
+      <Tabs.List class="entity-tab-list">
+        {#each openTabs() as id (id)}
+          <div class="entity-tab-row">
+            <Tabs.Trigger value={id} class="entity-tab" title={tabTitle(id)}>
+              {tabTitle(id)}
+            </Tabs.Trigger>
+            <button
+              class="entity-tab-close"
+              onclick={() => closeTab(id)}
+              aria-label="Close tab"
+              title="Close tab"
+            >×</button>
+          </div>
+        {/each}
+      </Tabs.List>
+      {#each openTabs() as id (id)}
+        {@const state = entity(id)}
+        <Tabs.Content value={id} class="entity-tab-content">
+          {#if state}
+            {@const Opened = viewsFor(state.kind).Opened}
+            <Opened entity={state} />
+          {:else}
+            <div class="label">[entity {id}]</div>
+          {/if}
+        </Tabs.Content>
+      {/each}
+    </Tabs.Root>
+  {/if}
 </aside>
 
 <div

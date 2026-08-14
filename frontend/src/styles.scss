@@ -85,6 +85,99 @@ main {
   }
 }
 
+// Sidebar as a vertical tabbed area: the aside stacks its headers,
+// the trigger list, and the active tab's pane; the pane takes the rest
+// of the column and scrolls on its own.
+.sidebar {
+  display: flex;
+  flex-direction: column;
+}
+
+.entity-tabs {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.entity-tab-list {
+  flex-shrink: 0;
+  margin-bottom: 10px;
+}
+
+.entity-tab-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  margin-bottom: 4px;
+}
+
+.entity-tab {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  padding: 2px 6px;
+  border: 0;
+  border-radius: var(--radius);
+  color: var(--text-secondary);
+  background: none;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+
+  &[data-state='active'] {
+    color: var(--text-primary);
+    background: var(--surface-well);
+  }
+}
+
+.entity-tab-close {
+  flex-shrink: 0;
+  padding: 0 4px;
+  border: 0;
+  color: var(--text-muted);
+  background: none;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--danger-text);
+  }
+}
+
+.entity-tab-content {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  scrollbar-color: var(--border-strong) transparent;
+}
+
+.entity-pane {
+  line-height: 1.55;
+
+  pre {
+    margin: 6px 0;
+  }
+}
+
+.entity-header {
+  overflow-wrap: anywhere;
+}
+
+.entity-meta {
+  margin-top: 2px;
+  color: var(--text-muted);
+
+  .tail {
+    color: var(--accent);
+  }
+}
+
+.teaser {
+  color: var(--text-muted);
+}
+
 .sidebar-handle {
   flex-shrink: 0;
   width: 5px;

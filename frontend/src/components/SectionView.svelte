@@ -1,5 +1,7 @@
 <script lang="ts">
   import type { DiffOp, ShellState } from '../bindings';
+  import { viewsFor } from '../entities/registry';
+  import { entity } from '../stores/entities.svelte';
   import type { Section } from '../types';
 
   let { section }: { section: Section } = $props();
@@ -85,8 +87,15 @@
       {#if tail.hidden > 0}<div class="collapsed">… [{tail.hidden} earlier lines]</div>{/if}
       {#if tail.text}<pre class="reasoning">{tail.text}</pre>{/if}
     {:else if section.kind.type === 'entity_ref'}
-      <!-- Placeholder until the per-kind Inline components land. -->
-      <div class="label">[entity {section.kind.entity_id}]</div>
+      {@const referenced = entity(section.kind.entity_id)}
+      {#if referenced}
+        {@const Inline = viewsFor(referenced.kind).Inline}
+        <Inline entity={referenced} />
+      {:else}
+        <!-- Attach ordering makes this unreachable in practice; keep a
+             visible row rather than a blank if it ever regresses. -->
+        <div class="label">[entity {section.kind.entity_id}]</div>
+      {/if}
     {:else if section.kind.type === 'diff'}
       <div class="diff">
         {#each section.kind.lines as line}
