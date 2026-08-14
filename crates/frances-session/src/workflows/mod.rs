@@ -787,29 +787,43 @@ fn is_one_shot(kind: &SectionKind) -> bool {
     )
 }
 
-/// Workflow-declared chrome, forwarded to the UI as-is. The footer
-/// commands are ephemeral; `SetTitle` is session state — it lands in
-/// the shared title cell (which seeds a booting workflow's `getTitle`)
-/// and session metadata before the frame goes out.
+/// Workflow-declared chrome, published as Session-entity state. The
+/// footer commands are ephemeral; `SetTitle` also lands in session
+/// metadata (the registry seeds a booting workflow's `getTitle`).
 fn emit_surface<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     cmd: SurfaceCmd,
 ) {
-    if let SurfaceCmd::SetTitle { title } = &cmd {
-        *runtime.session_title.lock() = title.clone();
-        if let Err(error) = runtime.session.write_title(title.clone()) {
-            warn!(%error, "persist session title failed");
+    match cmd {
+        SurfaceCmd::SetFooter { text } => {
+            runtime
+                .registry
+                .update_session(|session| session.busy = Some(text));
+        }
+        SurfaceCmd::ClearFooter => {
+            runtime
+                .registry
+                .update_session(|session| session.busy = None);
+        }
+        SurfaceCmd::SetTitle { title } => {
+            if let Err(error) = runtime.session.write_title(title.clone()) {
+                warn!(%error, "persist session title failed");
+            }
+            runtime
+                .registry
+                .update_session(|session| session.title = title);
         }
     }
-    runtime.events.send(StreamFrame::Surface(cmd));
 }
 
-/// LLM token-usage telemetry. Pass-through to the app footer; not persisted.
+/// LLM token-usage telemetry. Session-entity state; not persisted.
 fn emit_usage<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     usage: frances_models_llm::Usage,
 ) {
-    runtime.events.send(StreamFrame::Usage(usage));
+    runtime
+        .registry
+        .update_session(|session| session.usage = Some(usage));
 }
 
 /// A permission request. When `allow_auto`, consult the auto-judge first

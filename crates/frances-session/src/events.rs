@@ -14,7 +14,6 @@ use std::path::PathBuf;
 use uuid::Uuid;
 
 pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
-pub use frances_workflow::SurfaceCmd;
 
 use crate::llm::Usage;
 
@@ -46,16 +45,11 @@ pub enum StreamFrame {
     SectionTruncated {
         id: SectionId,
     },
-    Usage(Usage),
-    /// Current workspace directory set. Emitted once at runtime start
-    /// and again whenever the invocation context is replaced.
-    Workspace {
-        dirs: Vec<PathBuf>,
-    },
-    /// Workflow-declared chrome (the footer busy indicator today).
-    /// `SetFooter`/`ClearFooter`. Driven by `setStatus` in the workflow;
-    /// not persisted, dropped during replay.
-    Surface(SurfaceCmd),
+    /// Whole-entity upsert: latest-wins UI state published by the
+    /// [`crate::runtime::UiRegistry`]. The registry queues one upsert
+    /// per entity at runtime start (the attach snapshot) and re-emits
+    /// the full entity on every change.
+    Entity(Entity),
     Error(String),
     /// Runtime is asking the user for permission; client responds via
     /// [`crate::runtime::SessionRuntime::respond_permission`].
@@ -66,6 +60,31 @@ pub enum StreamFrame {
     /// distinct from the live variants above, so the UI's replay
     /// handler never has to reason about live-only frames.
     Scrollback(ScrollbackFrame),
+}
+
+/// Small, mutable, latest-wins UI state — as opposed to the append-only
+/// section streams. Each variant is one entity; both are singletons
+/// today (instanced entities like shells carry their own key when they
+/// arrive, so an upsert can never mismatch id and payload).
+#[derive(Debug, Clone)]
+pub enum Entity {
+    Workspace(WorkspaceEntity),
+    Session(SessionEntity),
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceEntity {
+    /// Canonical workspace directories; first is the primary dir.
+    pub directories: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionEntity {
+    pub title: Option<String>,
+    pub usage: Option<Usage>,
+    /// Footer busy-indicator text (the workflow's `setStatus`). Not
+    /// persisted, so a fresh session starts with `None`.
+    pub busy: Option<String>,
 }
 
 /// The scrollback-replay sub-protocol: exactly the frames a replay

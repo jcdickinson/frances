@@ -31,8 +31,19 @@ html, body, #app {
   display: flex;
 }
 
+// WebKitGTK still wants the -webkit- prefix for user-select.
 body {
   overflow: hidden;
+  -webkit-user-select: none;
+  user-select: none;
+  cursor: default;
+}
+
+// Real content is selectable; `cursor: auto` restores the text beam over text.
+.content, header, textarea, input {
+  -webkit-user-select: text;
+  user-select: text;
+  cursor: auto;
 }
 
 button, textarea {
@@ -126,7 +137,6 @@ header {
 
 .sigil {
   color: $green;
-  user-select: none;
 }
 .content {
   min-width: 0;
@@ -160,6 +170,8 @@ pre {
   background: none;
   text-align: left;
   cursor: pointer;
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 .pill.pending {

@@ -1763,6 +1763,7 @@ dependencies = [
  "frances-models-ui",
  "frances-session",
  "libc",
+ "parking_lot",
  "serde",
  "serde_json",
  "specta",

@@ -1,5 +1,11 @@
 <script lang="ts">
-  let { directories }: { directories: string[] } = $props();
+  import { workspace } from '../stores/entities.svelte';
+
+  const directories = $derived(workspace()?.directories ?? []);
+
+  function basename(path: string): string {
+    return path.replace(/\/+$/, '').split('/').pop() || path;
+  }
 
   let width = $state(240);
   let dragStart: { x: number; width: number } | null = null;
@@ -23,7 +29,7 @@
   <h2>Directories</h2>
   <ul>
     {#each directories as directory (directory)}
-      <li title={directory}>{directory}</li>
+      <li title={directory}>{basename(directory)}</li>
     {/each}
   </ul>
 </aside>

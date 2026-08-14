@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use dashmap::DashMap;
-use parking_lot::Mutex as StdMutex;
+use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::anchor_store::AnchorStoreImpl;
 use crate::context::InvocationContext;
-use crate::events::{PermissionResponseWire, StreamFrame};
+use crate::events::{PermissionResponseWire, SessionEntity, StreamFrame, WorkspaceEntity};
 use crate::history::TursoHistoryStore;
 use crate::llm::{SessionConfigProvider, SessionConfigWriter};
 use crate::session::Session;
@@ -42,11 +42,13 @@ pub(crate) mod auto_judge;
 mod error;
 mod events;
 mod logging;
+mod registry;
 mod replay;
 
 pub use error::RuntimeError;
 pub use events::EventsChannel;
 pub use logging::install_logging;
+pub use registry::UiRegistry;
 
 /// Concrete `ChatManagerDeps` impl reading from the per-session
 /// `TursoHistoryStore`. Cheap to clone.
@@ -75,7 +77,7 @@ impl ChatManagerDeps for ChatDepsImpl {
 #[derive(Clone)]
 pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     pub chat: ChatSessionManager<ChatDepsImpl>,
-    pub invocation: Arc<StdMutex<InvocationContext>>,
+    pub invocation: Arc<Mutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
     pub db: Database,
     /// Per-workflow `WorkflowDb` cache. First touch under an entity
@@ -83,11 +85,10 @@ pub struct WorkflowDepsImpl<Io: frances_workflow::WorkflowIo = RealIo> {
     /// map. Wrapped in `Arc` so clones (one per workflow invocation)
     /// see the same cache.
     pub workflow_dbs: Arc<DashMap<Uuid, Arc<WorkflowDb>>>,
-    /// Current session title, shared with [`SessionRuntime`]. The
-    /// workflow driver writes it when a `SurfaceCmd::SetTitle` arrives;
-    /// this side only reads it (to seed a booting workflow's
-    /// `getTitle`).
-    pub session_title: Arc<StdMutex<Option<String>>>,
+    /// Same registry [`SessionRuntime`] publishes through. The workflow
+    /// driver writes the session title into it on `SurfaceCmd::SetTitle`;
+    /// this side only reads it (to seed a booting workflow's `getTitle`).
+    pub registry: Arc<UiRegistry>,
     /// IO bundle (timer + shell + fs). Production wires `RealIo`;
     /// tests wire a `StubIo` variant.
     pub io: Io,
@@ -133,7 +134,7 @@ impl<Io: frances_workflow::WorkflowIo> WorkflowDeps for WorkflowDepsImpl<Io> {
     }
 
     fn session_title(&self) -> Option<String> {
-        self.session_title.lock().clone()
+        self.registry.session_title()
     }
 
     fn editable_roots(&self) -> &[PathBuf] {
@@ -191,9 +192,12 @@ impl EditorFactory for SessionEditorFactory {
 /// to `SessionRuntime<RealIo>` via the default parameter.
 pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     pub session: Session,
-    pub invocation: Arc<StdMutex<InvocationContext>>,
+    pub invocation: Arc<Mutex<InvocationContext>>,
     pub editor_factory: SessionEditorFactory,
     pub events: EventsChannel,
+    /// Publish point for latest-wins UI state (workspace dirs, session
+    /// title / usage / busy). Shared with [`WorkflowDepsImpl`].
+    pub registry: Arc<UiRegistry>,
     /// Kept alive so the config-event-processor task stays running for the
     /// runtime's lifetime. The chat manager and provider cache hold their
     /// own bindings, but parking the handle here makes the lifetime
@@ -206,10 +210,6 @@ pub struct SessionRuntime<Io: frances_workflow::WorkflowIo = RealIo> {
     /// has no selected workflow yet.
     pub default_workflow: ConfigBinding<Option<String>>,
     pub workflow_runtime: Arc<WorkflowRuntime<WorkflowDepsImpl<Io>>>,
-    /// Current session title. Same cell [`WorkflowDepsImpl`] reads;
-    /// written by the workflow driver on `SurfaceCmd::SetTitle`
-    /// alongside the metadata persist.
-    pub session_title: Arc<StdMutex<Option<String>>>,
     pub active_workflow: ActiveWorkflow,
     /// Control channel into the long-lived workflow driver task. Slash
     /// workflow switches go here; plain input/interrupts bypass it and
@@ -361,23 +361,33 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         };
         let editable_roots = vec![editable_root];
 
-        let invocation = Arc::new(StdMutex::new(invocation));
         let editor_factory = SessionEditorFactory {
             engine: Arc::new(edit_engine),
         };
-        let session_title = Arc::new(StdMutex::new(session.meta.title.clone()));
+        let (events, events_rx) = EventsChannel::new();
+        let registry = Arc::new(UiRegistry::new(
+            events.clone(),
+            WorkspaceEntity {
+                directories: invocation.workspace.dirs().to_vec(),
+            },
+            SessionEntity {
+                title: session.meta.title.clone(),
+                usage: None,
+                busy: None,
+            },
+        ));
+        let invocation = Arc::new(Mutex::new(invocation));
         let workflow_runtime = Arc::new(WorkflowRuntime::new(WorkflowDepsImpl {
             chat: chat.clone(),
             invocation: invocation.clone(),
             editor_factory: editor_factory.clone(),
             db: db.clone(),
             workflow_dbs: Arc::new(DashMap::new()),
-            session_title: session_title.clone(),
+            registry: registry.clone(),
             io,
             editable_roots,
         })?);
 
-        let (events, events_rx) = EventsChannel::new();
         let (workflow_cmd, cmd_rx) = mpsc::unbounded_channel();
 
         let runtime = Arc::new(Self {
@@ -385,13 +395,13 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             invocation,
             editor_factory,
             events,
+            registry,
             _config: config,
             history,
             cache,
             workflows,
             default_workflow,
             workflow_runtime,
-            session_title,
             active_workflow: ActiveWorkflow::new(db),
             workflow_cmd,
             chat,
@@ -415,9 +425,9 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
         // is scheduled) so `replay_initial_scrollback` sees the
         // active instance immediately.
         runtime.active_workflow.seat_initial(initial.as_ref());
-        // Queue the initial workspace frame; the UI drains it when it
-        // attaches to the events receiver.
-        runtime.publish_workspace();
+        // Queue the attach snapshot; the UI drains it when it attaches
+        // to the events receiver.
+        runtime.registry.publish_all();
 
         tokio::spawn(crate::workflows::run_driver(
             runtime.clone(),
@@ -431,14 +441,9 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
     /// Replace the latest invocation context. Workflows that read
     /// `current_env` / `current_cwd` see the new value on next access.
     pub fn update_invocation(&self, ctx: InvocationContext) {
+        let directories = ctx.workspace.dirs().to_vec();
         *self.invocation.lock() = ctx;
-        self.publish_workspace();
-    }
-
-    /// Send the current workspace directory set into the events channel.
-    fn publish_workspace(&self) {
-        let dirs = self.invocation.lock().workspace.dirs().to_vec();
-        self.events.send(StreamFrame::Workspace { dirs });
+        self.registry.set_workspace(WorkspaceEntity { directories });
     }
 
     /// Run the initial scrollback replay for the currently-active

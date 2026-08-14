@@ -1,17 +1,18 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::Result;
 use frances_models_ui::{SectionId, SectionKind};
 use frances_session::context::InvocationContext;
 use frances_session::events::{
-    PermissionRequest, PermissionResponse, PermissionResponseWire, ScrollbackFrame, StreamFrame,
-    SurfaceCmd,
+    Entity, PermissionRequest, PermissionResponse, PermissionResponseWire, ScrollbackFrame,
+    StreamFrame,
 };
 use frances_session::llm::Usage;
 use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
 use frances_session::session::{Paths, Session};
 use frances_session::store;
 use frances_session::workspace::Workspace;
+use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
@@ -29,7 +30,40 @@ struct Backend {
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     session_id: String,
-    title: Option<String>,
+}
+
+/// Serializable mirror of [`Entity`] — paths become strings at this
+/// boundary. The tag doubles as the frontend store key.
+#[derive(Clone, Serialize, specta::Type)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum EntityWire {
+    Workspace {
+        directories: Vec<String>,
+    },
+    Session {
+        title: Option<String>,
+        usage: Option<Usage>,
+        busy: Option<String>,
+    },
+}
+
+impl From<Entity> for EntityWire {
+    fn from(entity: Entity) -> Self {
+        match entity {
+            Entity::Workspace(workspace) => EntityWire::Workspace {
+                directories: workspace
+                    .directories
+                    .iter()
+                    .map(|dir| dir.display().to_string())
+                    .collect(),
+            },
+            Entity::Session(session) => EntityWire::Session {
+                title: session.title,
+                usage: session.usage,
+                busy: session.busy,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Serialize, specta::Type, tauri_specta::Event)]
@@ -46,14 +80,8 @@ enum UiEvent {
         id: SectionId,
         truncated: bool,
     },
-    Usage {
-        usage: Usage,
-    },
-    Workspace {
-        directories: Vec<String>,
-    },
-    Surface {
-        command: SurfaceCmd,
+    Entity {
+        entity: EntityWire,
     },
     Error {
         message: String,
@@ -154,11 +182,7 @@ async fn frontend_ready(
     app: tauri::AppHandle,
     state: tauri::State<'_, Backend>,
 ) -> Result<AppInfo, String> {
-    let events = state
-        .events
-        .lock()
-        .map_err(|_| "event receiver lock poisoned".to_string())?
-        .take();
+    let events = state.events.lock().take();
 
     if let Some(events) = events {
         let app_handle = app.clone();
@@ -168,7 +192,6 @@ async fn frontend_ready(
 
     Ok(AppInfo {
         session_id: state.runtime.session.id.to_string(),
-        title: state.runtime.session.meta.title.clone(),
     })
 }
 
@@ -227,7 +250,6 @@ fn respond_permission(
     let reply = state
         .permission
         .lock()
-        .map_err(|_| "permission lock poisoned".to_string())?
         .take()
         .ok_or_else(|| "there is no pending permission request".to_string())?;
 
@@ -252,8 +274,8 @@ async fn forward_events(app: tauri::AppHandle, mut events: mpsc::UnboundedReceiv
             continue;
         };
 
-        if let UiEvent::Surface {
-            command: SurfaceCmd::SetTitle { title },
+        if let UiEvent::Entity {
+            entity: EntityWire::Session { title, .. },
         } = &event
             && let Some(window) = app.get_webview_window("main")
         {
@@ -279,11 +301,9 @@ fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> 
             id,
             truncated: true,
         }),
-        StreamFrame::Usage(usage) => Some(UiEvent::Usage { usage }),
-        StreamFrame::Workspace { dirs } => Some(UiEvent::Workspace {
-            directories: dirs.iter().map(|dir| dir.display().to_string()).collect(),
+        StreamFrame::Entity(entity) => Some(UiEvent::Entity {
+            entity: entity.into(),
         }),
-        StreamFrame::Surface(command) => Some(UiEvent::Surface { command }),
         StreamFrame::Error(message) => Some(UiEvent::Error { message }),
         StreamFrame::Permission(request) => store_permission(app, request),
         StreamFrame::Scrollback(frame) => match frame {
@@ -307,15 +327,7 @@ fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> 
 
 fn store_permission(app: &tauri::AppHandle, request: PermissionRequest) -> Option<UiEvent> {
     let state = app.state::<Backend>();
-    let mut pending = match state.permission.lock() {
-        Ok(pending) => pending,
-        Err(_) => {
-            warn!("permission lock poisoned");
-            return Some(UiEvent::Error {
-                message: "permission state unavailable".to_string(),
-            });
-        }
-    };
+    let mut pending = state.permission.lock();
 
     if pending.is_some() {
         warn!("received a second permission request while one is pending");

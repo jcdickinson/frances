@@ -56,12 +56,17 @@ uiEvent: "ui-event"
 
 /** user-defined types **/
 
-export type AppInfo = { sessionId: string; title: string | null }
+export type AppInfo = { sessionId: string }
 /**
  * One entry in a structured diff. `Context` carries the post-side line
  * number (1-based); `Added` / `Removed` carry only the raw line content.
  */
 export type DiffOp = { Context: { text: string; line: number } } | { Added: string } | { Removed: string }
+/**
+ * Serializable mirror of [`Entity`] — paths become strings at this
+ * boundary. The tag doubles as the frontend store key.
+ */
+export type EntityWire = { type: "workspace"; directories: string[] } | { type: "session"; title: string | null; usage: Usage | null; busy: string | null }
 export type JsonValue = null | boolean | number | string | JsonValue[] | Partial<{ [key in string]: JsonValue }>
 /**
  * Terminal status for [`SectionKind::Reasoning`].
@@ -126,28 +131,7 @@ export type ShellState = "Running" | "Success" | { Exit: number }
  * (`source != User`).
  */
 export type Source = "user" | "assistant" | "internal"
-/**
- * Chrome a workflow declares — the `surfaces` output. Declarative
- * Set/Clear, not a stream: a re-`SetFooter` replaces the footer view,
- * `ClearFooter` removes it. This grows a `Region`/`ViewNode` vocabulary
- * only when a richer surface (panel, plan-editor) actually appears.
- */
-export type SurfaceCmd = 
-/**
- * Show `text` (with a spinner) in the footer busy indicator.
- */
-{ type: "set_footer"; text: string } | 
-/**
- * Hide the footer busy indicator.
- */
-{ type: "clear_footer" } | 
-/**
- * Set (`Some`) or clear (`None`) the session title. Unlike the
- * footer this one outlives the workflow: the driver persists it
- * into session metadata before forwarding it to the UI.
- */
-{ type: "set_title"; title: string | null }
-export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | { type: "usage"; usage: Usage } | { type: "workspace"; directories: string[] } | { type: "surface"; command: SurfaceCmd } | { type: "error"; message: string } | { type: "permission"; prompt: string }
+export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | { type: "entity"; entity: EntityWire } | { type: "error"; message: string } | { type: "permission"; prompt: string }
 /**
  * Token-usage report. Universal shape; `cached_input_tokens` mirrors
  * OpenAI's `prompt_tokens_details.cached_tokens` for the wires that

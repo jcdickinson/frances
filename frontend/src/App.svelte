@@ -1,18 +1,16 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { commands as backend, events, type UiEvent, type Usage } from './bindings';
+  import { commands as backend, events, type UiEvent } from './bindings';
   import CommandPalette from './components/CommandPalette.svelte';
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
+  import { session, upsertEntity } from './stores/entities.svelte';
   import type { Command } from './commands';
   import { type Section, unwrap } from './types';
 
   let sections = $state<Section[]>([]);
   let sessionId = $state('starting…');
-  let directories = $state<string[]>([]);
   let input = $state('');
-  let status = $state<string | null>(null);
-  let usage = $state<Usage | null>(null);
   let permission = $state<string | null>(null);
   let historyMode = $state(false);
   let paletteOpen = $state(false);
@@ -89,13 +87,8 @@
         section.truncated = event.truncated;
         sections = [...sections];
       }
-    } else if (event.type === 'usage') {
-      usage = event.usage;
-    } else if (event.type === 'workspace') {
-      directories = event.directories;
-    } else if (event.type === 'surface') {
-      if (event.command.type === 'set_footer') status = event.command.text;
-      if (event.command.type === 'clear_footer') status = null;
+    } else if (event.type === 'entity') {
+      upsertEntity(event.entity);
     } else if (event.type === 'error') {
       addError(event.message);
     } else if (event.type === 'permission') {
@@ -158,13 +151,16 @@
     textarea.focus();
   }
 
+  const busy = $derived(session()?.busy ?? null);
+
   function tokenStatus(): string {
+    const usage = session()?.usage;
     if (!usage) return 'tokens: —';
     return `tokens: ${usage.total_tokens} total · ${usage.prompt_tokens} prompt (${usage.cached_input_tokens} cached) · ${usage.completion_tokens} completion`;
   }
 </script>
 
-<Sidebar {directories} />
+<Sidebar />
 
 <main>
   <section class="scrollback" bind:this={scrollback} aria-live="polite">
@@ -210,7 +206,7 @@
         rows="1"
         aria-label="Message"
       ></textarea>
-      {#if status}<div class="busy"><span class="spinner">⠋</span> [{status}]</div>{/if}
+      {#if busy}<div class="busy"><span class="spinner">⠋</span> [{busy}]</div>{/if}
     </div>
     <div class="tokens">{tokenStatus()}</div>
   </footer>
