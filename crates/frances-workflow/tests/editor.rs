@@ -42,6 +42,7 @@ fn text_of(frame: &SectionTranscript) -> String {
                 spec.seed.clone().unwrap_or_default()
             ),
             SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
+            SectionKind::EntityRef { entity_id } => format!("[entity:{entity_id}]"),
         },
         SectionTranscript::Append { delta, .. } => delta.clone(),
         SectionTranscript::Close { id } => format!("[close:{}]", id.0),

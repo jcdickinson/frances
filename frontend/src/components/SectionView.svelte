@@ -84,6 +84,9 @@
       {@const tail = tailedText()}
       {#if tail.hidden > 0}<div class="collapsed">… [{tail.hidden} earlier lines]</div>{/if}
       {#if tail.text}<pre class="reasoning">{tail.text}</pre>{/if}
+    {:else if section.kind.type === 'entity_ref'}
+      <!-- Placeholder until the per-kind Inline components land. -->
+      <div class="label">[entity {section.kind.entity_id}]</div>
     {:else if section.kind.type === 'diff'}
       <div class="diff">
         {#each section.kind.lines as line}

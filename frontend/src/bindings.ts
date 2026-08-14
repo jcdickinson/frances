@@ -153,7 +153,15 @@ export type SectionKind =
  * `DiffSection` — one-shot structured diff produced by a file-
  * edit tool.
  */
-{ type: "diff"; lines: DiffOp[] }
+{ type: "diff"; lines: DiffOp[] } | 
+/**
+ * `EntityRefSection` — one-shot pointer at an entity. The
+ * transcript carries only the reference; the entity's snapshot
+ * (and, on demand, its stream) render it. Dumb by design: the
+ * entity exists independently via the registry/hub, refs are
+ * optional decoration.
+ */
+{ type: "entity_ref"; entity_id: string }
 /**
  * Snapshot payload of the singleton session entity.
  */

@@ -783,7 +783,10 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
 fn is_one_shot(kind: &SectionKind) -> bool {
     matches!(
         kind,
-        SectionKind::ToolUse { .. } | SectionKind::Json { .. } | SectionKind::Diff { .. }
+        SectionKind::ToolUse { .. }
+            | SectionKind::Json { .. }
+            | SectionKind::Diff { .. }
+            | SectionKind::EntityRef { .. }
     )
 }
 

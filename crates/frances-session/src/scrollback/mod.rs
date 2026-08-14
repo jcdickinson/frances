@@ -124,6 +124,9 @@ enum RowPayload {
     Diff {
         lines: Vec<DiffOp>,
     },
+    EntityRef {
+        entity_id: Uuid,
+    },
 }
 
 /// Insert a finished or truncated section row. `truncated = false`
@@ -266,6 +269,7 @@ fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
         SectionKind::ShellOutput { state, cmd } => RowPayload::ShellOutput { state, cmd, text },
         SectionKind::Reasoning { state } => RowPayload::Reasoning { state, text },
         SectionKind::Diff { lines } => RowPayload::Diff { lines },
+        SectionKind::EntityRef { entity_id } => RowPayload::EntityRef { entity_id },
     }
 }
 
@@ -303,6 +307,11 @@ fn decode_payload(payload: RowPayload, truncated: bool) -> StoredRow {
         },
         RowPayload::Diff { lines } => StoredRow::Section {
             kind: SectionKind::Diff { lines },
+            text: String::new(),
+            truncated,
+        },
+        RowPayload::EntityRef { entity_id } => StoredRow::Section {
+            kind: SectionKind::EntityRef { entity_id },
             text: String::new(),
             truncated,
         },
@@ -371,6 +380,38 @@ mod tests {
         match &frames[3] {
             StreamFrame::Scrollback(ScrollbackFrame::End) => {}
             other => panic!("expected End at [3], got {other:?}"),
+        }
+    }
+
+    /// An `EntityRef` row round-trips: persisted with no text, replayed
+    /// as a single self-describing append carrying the entity id.
+    #[tokio::test]
+    async fn entity_ref_roundtrip() {
+        let db = fresh_db().await;
+        let instance = Uuid::new_v4();
+        let entity_id = Uuid::new_v4();
+        persist_section(
+            &db,
+            instance,
+            SectionKind::EntityRef { entity_id },
+            String::new(),
+            false,
+        )
+        .await
+        .unwrap();
+
+        let frames = collect_replay(&db, instance).await;
+        assert_eq!(frames.len(), 4);
+        match &frames[1] {
+            StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
+                kind: SectionKind::EntityRef { entity_id: got },
+                delta,
+                ..
+            }) => {
+                assert_eq!(*got, entity_id);
+                assert!(delta.is_empty());
+            }
+            other => panic!("expected EntityRef append at [1], got {other:?}"),
         }
     }
 
