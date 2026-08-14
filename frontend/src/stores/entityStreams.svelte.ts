@@ -3,52 +3,65 @@ import { commands as backend, type JsonValue } from '../bindings';
 
 export type StreamItem = { seq: number; payload: JsonValue };
 
-type StreamState = {
-  items: StreamItem[];
+type Sub = {
+  refs: number;
   /** Highest seq seen — drops duplicates across the catch-up/live splice. */
   lastSeq: number;
-  refs: number;
+  /** Whether the backend subscription replayed history. */
+  catchUp: boolean;
 };
 
-const streams = new SvelteMap<string, StreamState>();
+// Split on purpose: `items` is the reactive rendering surface, `subs`
+// is plain bookkeeping. subscribe/unsubscribe are called from inside
+// component `$effect`s — if they *read* reactive state they also
+// *write*, the effect tracks the read, and the write re-triggers it
+// forever (effect_update_depth_exceeded, which kills the whole
+// reactive tree). Only ever read `subs` here; only ever write `items`.
+const subs = new Map<string, Sub>();
+const items = new SvelteMap<string, StreamItem[]>();
 
 /** Route point for `entity_stream` events. Ignored unless subscribed. */
 export function applyStreamItem(entityId: string, seq: number, payload: JsonValue): void {
-  const stream = streams.get(entityId);
-  if (!stream || seq <= stream.lastSeq) return;
-  streams.set(entityId, {
-    ...stream,
-    lastSeq: seq,
-    items: [...stream.items, { seq, payload }],
-  });
+  const sub = subs.get(entityId);
+  if (!sub || seq <= sub.lastSeq) return;
+  sub.lastSeq = seq;
+  items.set(entityId, [...(items.get(entityId) ?? []), { seq, payload }]);
 }
 
 export function streamItems(entityId: string): StreamItem[] {
-  return streams.get(entityId)?.items ?? [];
+  return items.get(entityId) ?? [];
 }
 
 /**
- * Refcounted subscription. The first subscriber decides the mode:
- * `catchUp` replays everything persisted (a tab opening); without it
- * the stream tails from now (an inline view watching from birth).
+ * Refcounted subscription. `catchUp` replays everything persisted (a
+ * tab opening); without it the stream tails from now (an inline view
+ * watching from birth). A catch-up subscriber arriving on top of a
+ * tail-only subscription escalates it: accumulated items reset and the
+ * backend replays from seq 1 so the tab shows full history.
  */
 export async function subscribeStream(entityId: string, catchUp: boolean): Promise<void> {
-  const existing = streams.get(entityId);
+  const existing = subs.get(entityId);
   if (existing) {
-    streams.set(entityId, { ...existing, refs: existing.refs + 1 });
+    existing.refs += 1;
+    if (catchUp && !existing.catchUp) {
+      existing.catchUp = true;
+      existing.lastSeq = 0;
+      items.set(entityId, []);
+      await backend.subscribeEntity(entityId, true);
+    }
     return;
   }
-  streams.set(entityId, { items: [], lastSeq: 0, refs: 1 });
+  subs.set(entityId, { refs: 1, lastSeq: 0, catchUp });
+  items.set(entityId, []);
   await backend.subscribeEntity(entityId, catchUp);
 }
 
 export async function unsubscribeStream(entityId: string): Promise<void> {
-  const existing = streams.get(entityId);
-  if (!existing) return;
-  if (existing.refs > 1) {
-    streams.set(entityId, { ...existing, refs: existing.refs - 1 });
-    return;
-  }
-  streams.delete(entityId);
+  const sub = subs.get(entityId);
+  if (!sub) return;
+  sub.refs -= 1;
+  if (sub.refs > 0) return;
+  subs.delete(entityId);
+  items.delete(entityId);
   await backend.unsubscribeEntity(entityId);
 }
