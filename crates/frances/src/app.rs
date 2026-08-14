@@ -121,6 +121,7 @@ fn specta_builder() -> tauri_specta::Builder {
             frontend_ready,
             send_prompt,
             interrupt,
+            toggle_devtools,
             respond_permission,
             save_workspace,
             subscribe_entity,
@@ -189,6 +190,17 @@ fn send_prompt(state: tauri::State<'_, Backend>, text: String) {
 #[specta::specta]
 fn interrupt(state: tauri::State<'_, Backend>) {
     state.runtime.interrupt();
+}
+
+/// Ctrl+Shift+I in the frontend. Backed by tauri's `devtools` feature.
+#[tauri::command]
+#[specta::specta]
+fn toggle_devtools(window: tauri::WebviewWindow) {
+    if window.is_devtools_open() {
+        window.close_devtools();
+    } else {
+        window.open_devtools();
+    }
 }
 
 /// Show a save dialog and write the current workspace as a workspace

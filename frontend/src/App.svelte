@@ -38,7 +38,10 @@
     })().catch(showError);
 
     const keydown = (event: KeyboardEvent) => {
-      if (event.ctrlKey && event.key.toLowerCase() === 'p') {
+      if (event.ctrlKey && event.shiftKey && event.key.toLowerCase() === 'i') {
+        event.preventDefault();
+        void backend.toggleDevtools().catch(showError);
+      } else if (event.ctrlKey && event.key.toLowerCase() === 'p') {
         event.preventDefault();
         if (paletteOpen) {
           void closePalette();

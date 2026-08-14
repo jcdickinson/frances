@@ -19,6 +19,12 @@ async sendPrompt(text: string) : Promise<void> {
 async interrupt() : Promise<void> {
     await TAURI_INVOKE("interrupt");
 },
+/**
+ * Ctrl+Shift+I in the frontend. Backed by tauri's `devtools` feature.
+ */
+async toggleDevtools() : Promise<void> {
+    await TAURI_INVOKE("toggle_devtools");
+},
 async respondPermission(decision: string, details: string | null) : Promise<Result<null, string>> {
     try {
     return { status: "ok", data: await TAURI_INVOKE("respond_permission", { decision, details }) };
