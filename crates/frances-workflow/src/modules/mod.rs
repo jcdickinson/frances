@@ -33,6 +33,8 @@
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
 //! - `frances:v1/sections`         — `transcript`, `MarkdownSection`, `ErrorSection`,
 //!   `JsonSection` (frame-objects-with-history API).
+//! - `frances:v1/entities`       — `createEntity` producer verb; handles
+//!   publish snapshot/stream/settle for tab-viewable entities.
 //! - `frances:v1/chat`           — `ChatSession` (LLM access).
 //! - `frances:v1/io`             — `Timer` + `TimerError`. The user-facing
 //!   surface is pure JS in `assets/frances/v1/io.js`; Rust exposes a private sleep
@@ -91,6 +93,7 @@ use crate::runtime::{InboxItem, OutputSenders, caught};
 
 pub mod agents;
 pub mod chat;
+pub mod entities;
 pub mod file;
 pub mod file_find_or_grep;
 pub mod inbox;
@@ -283,6 +286,7 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         thought_ctor,
         tool_use_ctor,
         diff_ctor,
+        entity_ref_ctor,
     ) = sections::build_sections(ctx, senders.transcript.clone())?;
     stash.set("transcript", transcript_proxy)?;
     stash.set("MarkdownSection", md_ctor)?;
@@ -292,6 +296,10 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("ReasoningSection", thought_ctor)?;
     stash.set("ToolUseSection", tool_use_ctor)?;
     stash.set("DiffSection", diff_ctor)?;
+    stash.set("EntityRefSection", entity_ref_ctor)?;
+
+    let create_entity = entities::build_create_entity(ctx, senders.transcript.clone())?;
+    stash.set("_createEntity", create_entity)?;
 
     let (chat_ctor, chat_inner_stream, chat_load_session) =
         chat::build_chat_session_ctor(ctx, deps.clone(), senders.usage.clone())?;
@@ -351,6 +359,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/lifecycle")?;
     declare_and_eval(ctx, "frances:v1/inbox")?;
     declare_and_eval(ctx, "frances:v1/sections")?;
+    declare_and_eval(ctx, "frances:v1/entities")?;
     declare_and_eval(ctx, "frances:v1/chat")?;
     declare_and_eval(ctx, "frances:v1/io")?;
     declare_and_eval(ctx, "frances:v1/approval")?;

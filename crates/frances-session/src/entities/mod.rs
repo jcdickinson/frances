@@ -436,21 +436,19 @@ impl EntityHub {
         }
     }
 
-    /// Generic repair: flip every Live entity to Settled (snapshot
-    /// stays as last persisted). Used when producers go away wholesale
-    /// — workflow finish/dehydrate teardown.
+    /// Generic repair for workflow teardown: flip every Live entity to
+    /// Settled (snapshot stays as last persisted), except the
+    /// runtime-owned singletons — the workflow producer going away says
+    /// nothing about the session itself. Rows only on disk (a previous
+    /// process's) are handled by [`EntityHub::open`], so in-memory
+    /// records are the complete live set here.
     pub async fn force_settle_all_live(&self) -> Result<()> {
-        {
-            let conn = self.db.connect().await;
-            conn.execute(
-                "UPDATE entities SET lifecycle = 1, updated_at = ?1 WHERE lifecycle = 0",
-                (now_ns(),),
-            )
-            .await?;
-        }
-
+        let mut flipped = Vec::new();
         for entry in self.records.iter() {
-            let (envelope, snapshot) = {
+            if matches!(*entry.key(), WORKSPACE_ENTITY_ID | SESSION_ENTITY_ID) {
+                continue;
+            }
+            let pair = {
                 let mut record = entry.value().lock();
                 if record.envelope.lifecycle == Lifecycle::Settled {
                     continue;
@@ -458,6 +456,17 @@ impl EntityHub {
                 record.envelope.lifecycle = Lifecycle::Settled;
                 (record.envelope.clone(), record.snapshot.clone())
             };
+            flipped.push(pair);
+        }
+
+        let now = now_ns();
+        let conn = self.db.connect().await;
+        for (envelope, snapshot) in flipped {
+            conn.execute(
+                "UPDATE entities SET lifecycle = 1, updated_at = ?2 WHERE entity_id = ?1",
+                (envelope.entity_id.as_bytes().to_vec(), now),
+            )
+            .await?;
             self.events
                 .send(StreamFrame::EntityUpsert { envelope, snapshot });
         }

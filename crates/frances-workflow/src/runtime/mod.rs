@@ -33,6 +33,7 @@ use tokio::runtime::Builder;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::sync::{Mutex as AsyncMutex, Notify, oneshot};
 use tokio::task::LocalSet;
+use uuid::Uuid;
 
 use crate::WorkflowError;
 use crate::closed::WorkflowClosed;
@@ -69,6 +70,34 @@ pub enum SectionTranscript {
     /// and persists the row. Idempotent on unknown ids (the JS side
     /// suppresses double-close).
     Close { id: SectionId },
+    /// An entity producer verb. Rides the transcript channel — not a
+    /// section — because ordering against sections matters: an
+    /// `EntityRef` `Set` must land after its entity's first `Upsert`,
+    /// and `Settle` after the last `Append`. One FIFO makes that free.
+    Entity(EntityCmd),
+}
+
+/// Producer verbs for the entity protocol, forwarded by the driver to
+/// the session's `EntityHub`. Payloads are opaque JSON end to end.
+#[derive(Debug, Clone)]
+pub enum EntityCmd {
+    /// Create or update an entity's snapshot (lifecycle stays Live).
+    Upsert {
+        entity_id: Uuid,
+        kind: String,
+        snapshot: serde_json::Value,
+    },
+    /// Append one item to the entity's stream.
+    Append {
+        entity_id: Uuid,
+        payload: serde_json::Value,
+    },
+    /// Final snapshot + settle artifacts; flips the entity to Settled.
+    Settle {
+        entity_id: Uuid,
+        snapshot: serde_json::Value,
+        artifacts: Vec<(String, serde_json::Value)>,
+    },
 }
 
 /// Chrome a workflow declares — the `surfaces` output. Declarative

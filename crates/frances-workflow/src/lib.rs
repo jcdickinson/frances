@@ -39,7 +39,7 @@ pub use error::WorkflowError;
 pub use io::mock::{MockFs, MockIo, MockShell, MockTimer, StubIo};
 pub use permission::{PermissionRequest, PermissionResponse, PermissionResponseWire};
 pub use runtime::{
-    InboxItem, Invocation, ReasoningState, Runtime, SectionId, SectionKind, SectionSpec,
+    EntityCmd, InboxItem, Invocation, ReasoningState, Runtime, SectionId, SectionKind, SectionSpec,
     SectionTranscript, ShellState, Source, SurfaceCmd, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;

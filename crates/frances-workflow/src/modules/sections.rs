@@ -75,6 +75,7 @@ pub(crate) type BuiltSections<'js> = (
     Ctor<'js>, // ReasoningSection
     Ctor<'js>, // ToolUseSection
     Ctor<'js>, // DiffSection
+    Ctor<'js>, // EntityRefSection
 );
 
 pub(crate) fn build_sections<'js>(
@@ -97,6 +98,7 @@ pub(crate) fn build_sections<'js>(
     let thought_ctor = build_thought_ctor(ctx, state)?;
     let tool_use_ctor = build_tool_use_ctor(ctx)?;
     let diff_ctor = build_diff_ctor(ctx)?;
+    let entity_ref_ctor = build_entity_ref_ctor(ctx)?;
 
     Ok((
         transcript,
@@ -107,6 +109,7 @@ pub(crate) fn build_sections<'js>(
         thought_ctor,
         tool_use_ctor,
         diff_ctor,
+        entity_ref_ctor,
     ))
 }
 
@@ -304,9 +307,26 @@ fn push_section<'js>(
         }
         return Ok(());
     }
+    if let Some(er) = as_section::<EntityRefSection>(&section) {
+        let new_id = state.assign_id();
+        let borrow = er.borrow();
+        borrow.id.store(new_id, Ordering::Release);
+        let section = SectionSpec {
+            kind: SectionKind::EntityRef {
+                entity_id: borrow.entity_id,
+            },
+            seed: None,
+        };
+        let _ = state.tx.send(SectionTranscript::Set {
+            id: SectionId(new_id),
+            section,
+        });
+        // One-shot — runtime seals on its side, like ToolUseSection.
+        return Ok(());
+    }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ShellOutputSection, ReasoningSection, or ToolUseSection",
+        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ShellOutputSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
     )
 }
 
@@ -706,6 +726,64 @@ fn build_diff_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
                 DiffSection {
                     id: AtomicU64::new(0),
                     ops,
+                },
+            )
+        },
+    )
+}
+
+// ---------------------------------------------------------------------
+// EntityRefSection — one-shot pointer at an entity
+// ---------------------------------------------------------------------
+
+/// One-shot frame carrying nothing but an entity id (as minted by
+/// `frances:v1/entities`' `createEntity`). The entity's snapshot renders
+/// the ref; the transcript only records where it sits.
+pub struct EntityRefSection {
+    id: AtomicU64,
+    entity_id: uuid::Uuid,
+}
+
+impl<'js> Trace<'js> for EntityRefSection {
+    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
+}
+
+unsafe impl<'js> JsLifetime<'js> for EntityRefSection {
+    type Changed<'to> = EntityRefSection;
+}
+
+impl<'js> JsClass<'js> for EntityRefSection {
+    const NAME: &'static str = "EntityRefSection";
+    type Mutable = Readable;
+
+    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
+        Ok(Some(Object::new(ctx.clone())?))
+    }
+
+    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
+        Ok(None)
+    }
+}
+
+fn build_entity_ref_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
+    Constructor::new_class::<EntityRefSection, _, _>(
+        ctx.clone(),
+        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
+            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
+            let Some(obj) = arg.as_object() else {
+                return throw_type(&ctx, "new EntityRefSection: expected { id: string }");
+            };
+            let id: String = obj
+                .get("id")
+                .map_err(|_| throw_err(&ctx, "new EntityRefSection: missing string `id`"))?;
+            let entity_id = id
+                .parse()
+                .map_err(|_| throw_err(&ctx, "new EntityRefSection: `id` is not an entity id"))?;
+            Class::instance(
+                ctx.clone(),
+                EntityRefSection {
+                    id: AtomicU64::new(0),
+                    entity_id,
                 },
             )
         },

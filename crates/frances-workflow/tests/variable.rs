@@ -43,6 +43,7 @@ fn text_of(frame: &SectionTranscript) -> String {
         },
         SectionTranscript::Append { delta, .. } => delta.clone(),
         SectionTranscript::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
 }
 

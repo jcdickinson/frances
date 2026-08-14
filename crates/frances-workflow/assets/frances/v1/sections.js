@@ -11,6 +11,7 @@ export const {
   ReasoningSection,
   ToolUseSection,
   DiffSection,
+  EntityRefSection,
 } = globalThis.__frances_v1_stash__;
 
 // Each writable-capable frame class composes a WHATWG WritableStream

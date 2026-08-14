@@ -15,6 +15,7 @@ mod chat;
 mod complete;
 mod context_sections;
 mod drive;
+mod entities;
 mod frames;
 mod inbox;
 mod main_workflow;
@@ -61,5 +62,6 @@ fn text_of(delta: &SectionTranscript) -> String {
         },
         SectionTranscript::Append { delta, .. } => delta.clone(),
         SectionTranscript::Close { id } => format!("[close:{}]", id.0),
+        SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
 }

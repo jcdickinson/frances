@@ -279,3 +279,80 @@ async fn text_streaming_renders_block_delta_sequence() {
     let captured = h.stub.captured();
     assert_eq!(captured.len(), 1, "expected exactly one provider call");
 }
+
+/// The full entity producer path through the driver: creating upsert
+/// reaches the channel before the transcript ref, appends persist (and
+/// replay via subscribe), settle flips lifecycle and stores artifacts.
+#[tokio::test]
+async fn entity_producer_flows_through_driver_to_hub() {
+    let mut h = harness(
+        r#"
+        import { createEntity } from "frances:v1/entities";
+        import { transcript, EntityRefSection } from "frances:v1/sections";
+        const e = createEntity("shell", { cmd: "demo", state: "running" });
+        transcript.push(new EntityRefSection({ id: e.id }));
+        e.append({ text: "hello" });
+        e.settle({ cmd: "demo", state: "success" }, { artifacts: { llm_digest: "Exit 0" } });
+        "#,
+    )
+    .await;
+
+    use frances_session::events::Lifecycle;
+    let frames = h
+        .recv_until(|f| {
+            matches!(
+                f,
+                StreamFrame::EntityUpsert { envelope, .. }
+                    if envelope.kind == "shell" && envelope.lifecycle == Lifecycle::Settled
+            )
+        })
+        .await;
+
+    let live_pos = frames
+        .iter()
+        .position(|f| {
+            matches!(
+                f,
+                StreamFrame::EntityUpsert { envelope, .. }
+                    if envelope.kind == "shell" && envelope.lifecycle == Lifecycle::Live
+            )
+        })
+        .expect("creating Live upsert");
+    let (ref_pos, entity_id) = frames
+        .iter()
+        .enumerate()
+        .find_map(|(i, f)| match f {
+            StreamFrame::SectionAppend {
+                kind: SectionKind::EntityRef { entity_id },
+                ..
+            } => Some((i, *entity_id)),
+            _ => None,
+        })
+        .expect("EntityRef section");
+    assert!(live_pos < ref_pos, "upsert must precede its ref");
+
+    // No stream frames without a subscription.
+    assert!(
+        !frames
+            .iter()
+            .any(|f| matches!(f, StreamFrame::EntityStream { .. })),
+        "stream items must not broadcast unsubscribed"
+    );
+
+    // Catch-up subscribe replays the persisted append.
+    let hub = h._runtime.entities.clone();
+    hub.subscribe(entity_id, true).await.expect("subscribe");
+    match h.recv_one().await {
+        StreamFrame::EntityStream { seq, payload, .. } => {
+            assert_eq!(seq, 1);
+            assert_eq!(payload["text"], "hello");
+        }
+        other => panic!("expected replayed stream item, got {other:?}"),
+    }
+
+    let digest = hub
+        .read_artifact(entity_id, "llm_digest")
+        .await
+        .expect("read artifact");
+    assert_eq!(digest, Some(serde_json::json!("Exit 0")));
+}

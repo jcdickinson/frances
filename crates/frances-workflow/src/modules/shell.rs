@@ -91,7 +91,10 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
                             .first()
                             .map(|p| p.to_string_lossy().into_owned()),
                     })),
-                    event_rx: Arc::new(AsyncMutex::new(event_rx)),
+                    event_rx: Arc::new(AsyncMutex::new(EventPump {
+                        rx: event_rx,
+                        carry: Vec::new(),
+                    })),
                 },
             )
         },
@@ -105,7 +108,32 @@ pub struct ShellJs<F: WorkflowShell> {
     /// one at a time via `nextEvent`. Held behind its own mutex so
     /// pull calls don't contend with the `state` mutex `runOnce` /
     /// `keepWaiting` hold during a read loop.
-    event_rx: Arc<AsyncMutex<UnboundedReceiver<ReadEvent>>>,
+    event_rx: Arc<AsyncMutex<EventPump>>,
+}
+
+/// Receiver plus the UTF-8 carry: output arrives as raw 4 KiB reads, so
+/// a multi-byte codepoint can be torn across two `Output` events. The
+/// incomplete suffix waits here for the next chunk instead of being
+/// lossy-converted into U+FFFD.
+struct EventPump {
+    rx: UnboundedReceiver<ReadEvent>,
+    carry: Vec<u8>,
+}
+
+/// Decode one output chunk, carrying any incomplete trailing codepoint.
+/// Genuinely invalid bytes (binary output) still degrade to U+FFFD.
+fn decode_stream_chunk(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
+    carry.extend_from_slice(bytes);
+    let buf = std::mem::take(carry);
+    match std::str::from_utf8(&buf) {
+        Ok(text) => text.to_owned(),
+        Err(error) if error.error_len().is_none() => {
+            let valid = error.valid_up_to();
+            carry.extend_from_slice(&buf[valid..]);
+            String::from_utf8_lossy(&buf[..valid]).into_owned()
+        }
+        Err(_) => String::from_utf8_lossy(&buf).into_owned(),
+    }
 }
 
 struct ShellState {
@@ -204,7 +232,20 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
                 let rx = this.0.borrow().event_rx.clone();
                 Ok::<_, rquickjs::Error>(Promised::from(async move {
                     let mut guard = rx.lock().await;
-                    NextEventResult(guard.recv().await)
+                    let event = guard.rx.recv().await;
+                    let text = match &event {
+                        Some(ReadEvent::Output(bytes)) => {
+                            Some(decode_stream_chunk(&mut guard.carry, bytes))
+                        }
+                        // Terminal or channel end: a leftover carry is a
+                        // torn codepoint with no continuation — drop it
+                        // (the outcome's full output still has the bytes).
+                        _ => {
+                            guard.carry.clear();
+                            None
+                        }
+                    };
+                    NextEventResult(event, text)
                 }))
             })?,
         )?;
@@ -719,11 +760,12 @@ fn quiet_reason_str(reason: QuietReason) -> &'static str {
 
 /// Wire form of one `nextEvent` resolution. `None` (all senders gone)
 /// maps to JS `null`. Otherwise:
-/// - `Output(bytes)` → `{ kind: "output", data: string }`
+/// - `Output(bytes)` → `{ kind: "output", data: string }` (`data` is the
+///   carry-aware decode produced by `nextEvent`)
 /// - `Quiet { reason }` → `{ kind: "quiet", reason: "no_output" | "max_elapsed" }`
 /// - `Done { exit_code }` → `{ kind: "done", exit_code }`
 /// - `Dead` → `{ kind: "dead" }`
-struct NextEventResult(Option<ReadEvent>);
+struct NextEventResult(Option<ReadEvent>, Option<String>);
 
 impl<'js> IntoJs<'js> for NextEventResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
@@ -732,9 +774,9 @@ impl<'js> IntoJs<'js> for NextEventResult {
         };
         let obj = Object::new(ctx.clone())?;
         match event {
-            ReadEvent::Output(bytes) => {
+            ReadEvent::Output(_) => {
                 obj.set("kind", "output")?;
-                obj.set("data", String::from_utf8_lossy(&bytes).into_owned())?;
+                obj.set("data", self.1.unwrap_or_default())?;
             }
             ReadEvent::Quiet { reason } => {
                 obj.set("kind", "quiet")?;
@@ -749,5 +791,30 @@ impl<'js> IntoJs<'js> for NextEventResult {
             }
         }
         Ok(obj.into_value())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_stream_chunk;
+
+    #[test]
+    fn carry_reassembles_codepoint_torn_across_chunks() {
+        let heart = "❤".as_bytes(); // 3 bytes
+        let mut carry = Vec::new();
+        let first = decode_stream_chunk(&mut carry, &[b'a', heart[0], heart[1]]);
+        assert_eq!(first, "a");
+        assert_eq!(carry, vec![heart[0], heart[1]]);
+        let second = decode_stream_chunk(&mut carry, &[heart[2], b'b']);
+        assert_eq!(second, "❤b");
+        assert!(carry.is_empty());
+    }
+
+    #[test]
+    fn invalid_bytes_still_degrade_to_replacement() {
+        let mut carry = Vec::new();
+        let text = decode_stream_chunk(&mut carry, &[b'a', 0xFF, b'b']);
+        assert_eq!(text, "a\u{FFFD}b");
+        assert!(carry.is_empty());
     }
 }

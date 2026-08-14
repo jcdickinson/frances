@@ -20,14 +20,14 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::Result;
-use crate::events::StreamFrame;
+use crate::events::{EntityEnvelope, Lifecycle, StreamFrame};
 use crate::runtime::{EventsChannel, SessionRuntime};
 use crate::session::SessionWorkflow;
 use crate::store::Database;
 
 use frances_storage::Migration;
 use frances_workflow::{
-    InboxItem, Invocation, PermissionRequest, SectionId, SectionKind, SectionSpec,
+    EntityCmd, InboxItem, Invocation, PermissionRequest, SectionId, SectionKind, SectionSpec,
     SectionTranscript, SurfaceCmd, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
@@ -568,6 +568,9 @@ async fn finish_done<Io: frances_workflow::WorkflowIo>(
         .emit
         .close_all(CloseMode::Stop(&runtime.events))
         .await?;
+    // The only entity producer just exited; anything it left Live is an
+    // orphan. Same generic repair as the startup forced settle.
+    runtime.entities.force_settle_all_live().await?;
     if let Some(error) = reported {
         let msg = format!("workflow: {error}");
         instance.emit.persist_error(&msg).await?;
@@ -666,6 +669,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                     .emit
                     .close_all(CloseMode::Stop(&runtime.events))
                     .await?;
+                runtime.entities.force_settle_all_live().await?;
                 if let Ok(Err(error)) = done {
                     let msg = format!("workflow shutdown: {error}");
                     instance.emit.persist_error(&msg).await?;
@@ -682,6 +686,7 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                 // truncated. No `BlockStop` event — the UI is about to
                 // be told to clear via `ScrollbackFrame::Reset` by the switch path.
                 instance.emit.close_all(CloseMode::Truncate).await?;
+                runtime.entities.force_settle_all_live().await?;
                 return Ok(());
             }
         }
@@ -774,6 +779,33 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
         SectionTranscript::Close { id } => {
             state.close_one(&runtime.events, id).await?;
         }
+        SectionTranscript::Entity(cmd) => match cmd {
+            EntityCmd::Upsert {
+                entity_id,
+                kind,
+                snapshot,
+            } => {
+                let envelope = EntityEnvelope {
+                    entity_id,
+                    kind,
+                    lifecycle: Lifecycle::Live,
+                };
+                runtime.entities.upsert_snapshot(envelope, snapshot).await?;
+            }
+            EntityCmd::Append { entity_id, payload } => {
+                runtime.entities.append(entity_id, payload).await?;
+            }
+            EntityCmd::Settle {
+                entity_id,
+                snapshot,
+                artifacts,
+            } => {
+                runtime
+                    .entities
+                    .settle(entity_id, snapshot, artifacts, None)
+                    .await?;
+            }
+        },
     }
     Ok(())
 }
