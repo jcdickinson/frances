@@ -49,8 +49,9 @@
 import {
   transcript,
   MarkdownSection,
-  ShellOutputSection,
+  EntityRefSection,
 } from "frances:v1/sections";
+import { createEntity } from "frances:v1/entities";
 import { approve } from "frances:v1/approval";
 import { defineToolFamily } from "frances:v1/tool-family";
 import shellFamilyPrompt from "./shell_family.md";
@@ -85,19 +86,20 @@ const MAX_PROP = {
     "If set at or below quiet, it's raised to quiet + 10s.",
 };
 // `head` / `tail` bound only the copy of the output returned to YOU; the
-// user always sees the full stream in the scrollback. Prefer these over
-// piping to `head`/`tail` in bash, which would discard output for everyone.
+// user keeps their own (byte-capped) view in the shell output pane. Prefer
+// these over piping to `head`/`tail` in bash, which would discard output
+// for everyone.
 const HEAD_PROP = {
   type: "number",
   description:
-    "I receive only the first N lines of output (the full output is always " +
-    "kept in the user's scrollback). Combine with `tail` to see both ends.",
+    "I receive only the first N lines of output (the user keeps their own " +
+    "view of it). Combine with `tail` to see both ends.",
 };
 const TAIL_PROP = {
   type: "number",
   description:
-    "I receive only the last N lines of output (full output kept in " +
-    "scrollback). Combine with `head`. When neither is set, the last ~200 lines " +
+    "I receive only the last N lines of output (the user keeps their own "+
+    "view of it). Combine with `head`. When neither is set, the last ~200 lines " +
     "are returned by default. Prefer this over piping to `tail` in bash.",
 };
 
@@ -151,15 +153,15 @@ const KILL_SCHEMA = {
 };
 
 // Last-N-lines kept for the model when neither `head` nor `tail` is set.
-// The user always sees the full stream in the frame; this only bounds the
-// copy that lands in the model's tool result.
+// The user's shell pane keeps its own byte-capped view; this only bounds
+// the copy that lands in the model's tool result.
 const DEFAULT_TAIL_LINES = 200;
 
 // Trim `output` to a `head` (first N lines) + `tail` (last M lines) view
-// for the model, eliding the middle with a marker that points at the
-// scrollback. Either bound may be 0/unset; when both are unset, fall back
-// to the default tail cap. The full output is never altered upstream —
-// it's already been streamed to the frame.
+// for the model, eliding the middle with a marker. Either bound may be
+// 0/unset; when both are unset, fall back to the default tail cap. The
+// full output is never altered upstream — it's already been streamed to
+// the shell entity.
 function _clampOutput(output, head, tail) {
   const hasHead = Number.isFinite(head) && head > 0;
   const hasTail = Number.isFinite(tail) && tail > 0;
@@ -180,7 +182,7 @@ function _clampOutput(output, head, tail) {
   const elided = lines.length - h - t;
   const kept = [
     ...lines.slice(0, h),
-    `[… ${elided} line${elided === 1 ? "" : "s"} elided — full output in scrollback …]`,
+    `[… ${elided} line${elided === 1 ? "" : "s"} elided — the user has the full view …]`,
     ...lines.slice(lines.length - t),
   ].join("\n");
   return trailingNewline ? `${kept}\n` : kept;
@@ -230,19 +232,172 @@ function _errResult(call_id, err) {
   };
 }
 
+// ---- shell entity: persisted output stream + snapshot ---------------------
+//
+// Every command runs as a `shell` entity: a small latest-wins snapshot
+// (cmd, state, byte counts, teaser) plus a persisted output stream
+// capped producer-side. The transcript carries only an EntityRefSection;
+// the entity's Inline/Opened components render it.
+
+// Persisted-stream byte caps: the head is appended live from the front,
+// the last `tail` bytes ring-buffer in memory and flush at settle, and
+// the middle is dropped with a `{ dropped }` marker item.
+const SHELL_STREAM_HEAD_BYTES = 64 * 1024;
+const SHELL_STREAM_TAIL_BYTES = 64 * 1024;
+// Snapshot teaser: the rolling tail kept small enough for latest-wins.
+const SHELL_TEASER_BYTES = 512;
+// Throttle for teaser/byte-count snapshot refreshes while streaming.
+const SHELL_SNAPSHOT_EVERY_BYTES = 16 * 1024;
+
+function _utf8Length(text) {
+  let n = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    const c = text.codePointAt(i);
+    if (c > 0xffff) i += 1;
+    n += c <= 0x7f ? 1 : c <= 0x7ff ? 2 : c <= 0xffff ? 3 : 4;
+  }
+  return n;
+}
+
+// Pure cap policy, split out so tests can drive it with tiny caps.
+function _capState(caps) {
+  return { caps, headBytes: 0, ring: [], ringBytes: 0, dropped: 0 };
+}
+
+// Feed one chunk; returns the stream items to append right now (the
+// head passes through live, the tail waits in the ring for flush).
+function _capPush(cap, text) {
+  const size = _utf8Length(text);
+  if (cap.headBytes < cap.caps.head) {
+    cap.headBytes += size;
+    return [{ text }];
+  }
+  cap.ring.push({ text, size });
+  cap.ringBytes += size;
+  while (cap.ringBytes > cap.caps.tail && cap.ring.length > 0) {
+    const evicted = cap.ring.shift();
+    cap.ringBytes -= evicted.size;
+    cap.dropped += evicted.size;
+  }
+  return [];
+}
+
+// Settle-time flush: the elision marker (if anything was dropped)
+// followed by the ring's contents.
+function _capFlush(cap) {
+  const out = [];
+  if (cap.dropped > 0) out.push({ dropped: cap.dropped });
+  for (const entry of cap.ring) out.push({ text: entry.text });
+  cap.ring = [];
+  cap.ringBytes = 0;
+  return out;
+}
+
+function _shellSnapshot(ent, state) {
+  return {
+    cmd: ent.cmd,
+    state,
+    bytesTotal: ent.bytesTotal,
+    bytesDropped: ent.cap.dropped,
+    teaser: ent.teaser,
+  };
+}
+
+// Open the entity for a new command: publish the Live snapshot, then
+// point the transcript at it. Ordering on the shared transcript channel
+// guarantees the ref lands after the creating upsert. A Shell runs one
+// command at a time, so `shell._entity` is a single slot — like the old
+// frame slot, it survives Quiet so Wait/Kill keep appending to it.
+function _openShellEntity(shell, cmd, caps) {
+  // Defensive: a previous entity should have been settled by Done/
+  // Dead/kill. If one's still around, settle it before opening a new one.
+  if (shell._entity) {
+    _settleShellEntity(shell, { type: "killed" }, null);
+  }
+  const ent = {
+    cmd,
+    handle: null,
+    cap: _capState(caps),
+    bytesTotal: 0,
+    teaser: "",
+    sinceSnapshot: 0,
+    settled: false,
+  };
+  ent.handle = createEntity("shell", _shellSnapshot(ent, { type: "running" }));
+  transcript.push(new EntityRefSection({ id: ent.handle.id }));
+  shell._entity = ent;
+  return ent;
+}
+
+// Feed one output chunk into the entity: cap-gated stream appends plus
+// a throttled snapshot refresh. Also used for synthetic JS-side text
+// (the "(killed)" tail). No-op once settled or with no entity.
+function _shellChunk(ent, text) {
+  if (!ent || ent.settled || !text) return;
+  const size = _utf8Length(text);
+  ent.bytesTotal += size;
+  ent.sinceSnapshot += size;
+  for (const item of _capPush(ent.cap, text)) {
+    ent.handle.append(item);
+  }
+  ent.teaser = (ent.teaser + text).slice(-SHELL_TEASER_BYTES);
+  if (ent.sinceSnapshot >= SHELL_SNAPSHOT_EVERY_BYTES) {
+    ent.sinceSnapshot = 0;
+    ent.handle.updateSnapshot(_shellSnapshot(ent, { type: "running" }));
+  }
+}
+
+// Settle the shell's entity: flush the ring (with its elision marker),
+// write the final snapshot, and attach the exact tool-result string the
+// model received as the `llm_digest` artifact (skipped when the path
+// has no tool result, e.g. an abort notice).
+function _settleShellEntity(shell, state, resultContent) {
+  const ent = shell._entity;
+  shell._entity = null;
+  if (!ent || ent.settled) return;
+  ent.settled = true;
+  try {
+    for (const item of _capFlush(ent.cap)) {
+      ent.handle.append(item);
+    }
+    const opts =
+      resultContent === null ? {} : { artifacts: { llm_digest: resultContent } };
+    ent.handle.settle(_shellSnapshot(ent, state), opts);
+  } catch (_) {
+    // Handle already settled (e.g. workflow teardown raced us) — fine.
+  }
+}
+
+// Map a terminal outcome onto the snapshot state and settle. `Quiet` is
+// NOT terminal — the entity stays Live across shell_wait/shell_kill.
+function _settleOutcome(shell, outcome, resultContent) {
+  if (outcome.kind === "done") {
+    _settleShellEntity(
+      shell,
+      outcome.exit_code === 0
+        ? { type: "success" }
+        : { type: "exit", code: outcome.exit_code },
+      resultContent,
+    );
+  } else if (outcome.kind === "dead") {
+    // Bash itself exited without reporting — killed or replaced via exec.
+    _settleShellEntity(shell, { type: "killed" }, resultContent);
+  }
+}
+
 // Run `op` (a `runOnce`/`keepWaiting` invocation) while concurrently
 // pulling discrete `ReadEvent`s off the shell's event stream. Output
-// events go straight to `writer` as they arrive; the terminal event
-// (`done` / `quiet` / `dead`) ends the loop and the matching outcome is
-// resolved by `op`'s promise.
+// events feed `ent` (the shell entity) as they arrive; the terminal
+// event (`done` / `quiet` / `dead`) ends the loop and the matching
+// outcome is resolved by `op`'s promise.
 //
-// `writer` is captured by the caller when it opened (or adopted) the
-// frame — NOT re-read from `shell._writer` per chunk. A command's pump
-// must keep targeting its own frame even if a later command swaps
-// `shell._writer` to a new one (e.g. after an interrupt left this pump
+// `ent` is captured by the caller when it opened (or adopted) the
+// entity — NOT re-read from `shell._entity` per chunk. A command's pump
+// must keep targeting its own entity even if a later command swaps
+// `shell._entity` to a new one (e.g. after an interrupt left this pump
 // dangling); reading the shared slot mid-stream would bleed this
-// command's tail output into the next command's frame.
-async function _streamUntilSettled(shell, op, writer) {
+// command's tail output into the next command's entity.
+async function _streamUntilSettled(shell, op, ent) {
   const opPromise = op();
   // A resolved `op` always emits a terminal event, so on the normal path
   // `nextEvent()` drives the loop and no events are ever dropped. But if
@@ -263,13 +418,7 @@ async function _streamUntilSettled(shell, op, writer) {
       break;
     }
     if (event.kind === "output") {
-      if (writer) {
-        try {
-          await writer.write(event.data);
-        } catch (_) {
-          // Writer closed/errored — drop silently.
-        }
-      }
+      _shellChunk(ent, event.data);
       continue;
     }
     // Terminal: "done" / "quiet" / "dead". `op` will resolve with the
@@ -279,98 +428,11 @@ async function _streamUntilSettled(shell, op, writer) {
   return await opPromise;
 }
 
-// The visible frame for the currently-running shell command — Run
-// pushes it, Wait/Kill append to it. A Shell instance only runs one
-// command at a time so a single slot is enough.
-//
-// `frame` is a `ShellOutputSection`; `writer` is its writable's locked
-// writer (acquired once per frame so we don't fight reacquisition).
-function _openShellFrame(shell, cmd) {
-  // Defensive: a previous frame should have been finalized by Done/
-  // Dead/kill. If one's still around, close it before opening a new
-  // one so the scrollback row gets persisted.
-  if (shell._frame) {
-    _closeShellFrame(shell);
-  }
-  const frame = new ShellOutputSection({ cmd });
-  transcript.push(frame);
-  const writer = frame.writable.getWriter();
-  shell._frame = frame;
-  shell._writer = writer;
-  return { frame, writer };
-}
-
-// Append `text` to the open shell frame. The pump owns bash output;
-// this is for synthetic JS-side text (e.g. the "(killed)" tail).
-// No-op if no frame is open.
-async function _appendShellOutput(shell, text) {
-  if (!shell._writer || !text) return;
-  try {
-    await shell._writer.write(text);
-  } catch (_) {
-    // Writer closed/errored — drop silently.
-  }
-}
-
-// Set the frame's terminal state (`Success`/`Exit(N)`) and close the
-// writable. Autoclose on the writable's sink fires `frame.close()`.
-// No-op if there's no open frame.
-async function _closeShellFrame(shell, terminal) {
-  const frame = shell._frame;
-  const writer = shell._writer;
-  shell._frame = null;
-  shell._writer = null;
-  if (!frame) return;
-  if (terminal === "success") {
-    frame.success();
-  } else if (terminal && typeof terminal.exit === "number") {
-    frame.exit(terminal.exit);
-  }
-  if (writer) {
-    try {
-      await writer.close();
-    } catch (_) {
-      // Already closed/errored — fine.
-    }
-  } else {
-    // No writer? Close the frame directly so the runtime gets a Close.
-    try {
-      frame.close();
-    } catch (_) {
-      // Already closed — fine.
-    }
-  }
-}
-
-// Finalise the frame for a `runOnce`/`keepWaiting` outcome. The pump
-// has already streamed `outcome.output` into the frame as bytes
-// arrived; this function only handles the per-outcome epilogue
-// (terminal-state transition + close, optional synthetic "killed"
-// tail). Quiet leaves the frame open. Returns the outcome unchanged.
-async function _frameOutcome(shell, outcome, killedSuffix) {
-  if (killedSuffix) {
-    await _appendShellOutput(shell, killedSuffix);
-  }
-  if (outcome.kind === "done") {
-    await _closeShellFrame(
-      shell,
-      outcome.exit_code === 0 ? "success" : { exit: outcome.exit_code },
-    );
-  } else if (outcome.kind === "dead") {
-    // Bash itself exited. We don't know the cause; use -1 as a
-    // sentinel so the UI renders it red without colliding with a
-    // typical exit code.
-    await _closeShellFrame(shell, { exit: -1 });
-  }
-  // Quiet — leave the frame open.
-  return outcome;
-}
-
 // Stop the in-flight command and return the shell to idle: SIGKILL, drain
-// to the terminal outcome, finalise the frame, then tell the model what
+// to the terminal outcome, settle the entity, then tell the model what
 // happened. Used both when the negotiation scold budget is exhausted and
 // when the negotiation stream itself errors — either way the command must
-// not be left running with its frame open (a still-`running` shell wedges
+// not be left running with its entity Live (a still-`running` shell wedges
 // the next `shell_run` on `busy`).
 async function _abortRunningShell(shell, scope, notice) {
   try {
@@ -382,12 +444,18 @@ async function _abortRunningShell(shell, scope, notice) {
     const drained = await _streamUntilSettled(
       shell,
       () => shell.keepWaiting(),
-      shell._writer,
+      shell._entity,
     );
-    await _frameOutcome(shell, drained, "\n(killed)");
+    _shellChunk(shell._entity, "\n(killed)");
+    if (drained.kind === "quiet") {
+      // Bash never returned to idle; settle anyway — nothing else will.
+      _settleShellEntity(shell, { type: "killed" }, null);
+    } else {
+      _settleOutcome(shell, drained, null);
+    }
   } catch (_) {
-    // Already idle — close the frame defensively if anyone left it open.
-    await _closeShellFrame(shell, { exit: -1 });
+    // Already idle — settle defensively if anyone left the entity Live.
+    _settleShellEntity(shell, { type: "killed" }, null);
   }
   transcript.push(new MarkdownSection({ content: notice, closed: true }));
   scope.push({ role: "user", content: notice });
@@ -433,11 +501,17 @@ class Run {
 
   constructor(
     shell,
-    { wait, kill, maxScolds = 2, approve: approveOpt = true } = {},
+    { wait, kill, maxScolds = 2, approve: approveOpt = true, caps } = {},
   ) {
     this.shell = shell;
     this.wait = wait;
     this.kill = kill;
+    // Persisted-stream caps; overridable for tests only.
+    this.caps = {
+      head: SHELL_STREAM_HEAD_BYTES,
+      tail: SHELL_STREAM_TAIL_BYTES,
+      ...caps,
+    };
     // Number of "no forward progress" rounds we tolerate before giving
     // up and killing the in-flight command. The first round inside the
     // lock turn is free; after that, each non-progress round costs one
@@ -472,10 +546,10 @@ class Run {
       if (gate !== null) return gate;
     }
 
-    // `head`/`tail` bound only what we hand back to the model; the frame
-    // gets the full stream regardless.
+    // `head`/`tail` bound only what we hand back to the model; the
+    // entity's stream gets the cap-policy view of the full output.
     const view = { head: call.arguments.head, tail: call.arguments.tail };
-    const { writer } = _openShellFrame(this.shell, call.arguments.cmd);
+    const ent = _openShellEntity(this.shell, call.arguments.cmd, this.caps);
     let outcome;
     try {
       outcome = await _streamUntilSettled(
@@ -487,16 +561,22 @@ class Run {
             stdin: call.arguments.stdin,
             persist: call.arguments.persist,
           }),
-        writer,
+        ent,
       );
     } catch (err) {
-      // The frame is open but the command never produced an outcome;
-      // close it as exit(-1) so the user sees a terminal state.
-      await _closeShellFrame(this.shell, { exit: -1 });
-      return _errResult(call.id, err);
+      // The entity is Live but the command never produced an outcome;
+      // settle it as killed so the user sees a terminal state.
+      const result = _errResult(call.id, err);
+      _settleShellEntity(this.shell, { type: "killed" }, result.content);
+      return result;
     }
-    await _frameOutcome(this.shell, outcome);
-    if (outcome.kind !== "quiet") return _format(call.id, outcome, view);
+    if (outcome.kind !== "quiet") {
+      // Format first: the exact tool-result string doubles as the
+      // entity's llm_digest artifact.
+      const result = _format(call.id, outcome, view);
+      _settleOutcome(this.shell, outcome, result.content);
+      return result;
+    }
 
     // Quiet: register a post-batch turn to negotiate wait/kill with the
     // model. The initial tool_result for this call still goes out below
@@ -521,7 +601,7 @@ class Run {
       // shell can return to idle.
       let scoldsRemaining = maxScolds;
       while (await shell.isRunning()) {
-        // Render the inner round's LLM text into a frame.
+        // Render the inner round's LLM text into a section.
         const out = new MarkdownSection();
         transcript.push(out);
         let tool_calls;
@@ -556,7 +636,7 @@ class Run {
 
         if (scoldsRemaining <= 0) {
           // Budget exhausted — kill the in-flight command and drain. Both
-          // phases' outputs land in the shell frame so the user sees the
+          // phases' outputs land in the shell entity so the user sees the
           // final state.
           await _abortRunningShell(
             shell,
@@ -603,13 +683,14 @@ class Wait {
             quiet: call.arguments.quiet,
             max: call.arguments.max,
           }),
-        this.shell._writer,
+        this.shell._entity,
       );
-      await _frameOutcome(this.shell, outcome);
-      return _format(call.id, outcome, {
+      const result = _format(call.id, outcome, {
         head: call.arguments.head,
         tail: call.arguments.tail,
       });
+      _settleOutcome(this.shell, outcome, result.content);
+      return result;
     } catch (err) {
       return _errResult(call.id, err);
     }
@@ -651,7 +732,7 @@ class Kill {
           final = await _streamUntilSettled(
             this.shell,
             () => this.shell.keepWaiting(),
-            this.shell._writer,
+            this.shell._entity,
           );
         } catch (_) {
           // Rust says no command in flight — already idle.
@@ -665,12 +746,14 @@ class Kill {
         }
       }
       if (drained && final) {
-        await _frameOutcome(this.shell, final, "\n(killed)");
-        return _format(call.id, final);
+        _shellChunk(this.shell._entity, "\n(killed)");
+        const result = _format(call.id, final);
+        _settleOutcome(this.shell, final, result.content);
+        return result;
       }
       if (drained) {
         // Nothing was in flight by the time we got here.
-        await _closeShellFrame(this.shell, { exit: -1 });
+        _settleShellEntity(this.shell, { type: "killed" }, null);
         return {
           role: "tool",
           call_id: call.id,
@@ -683,8 +766,8 @@ class Kill {
       // shell_run calls fail loudly instead of inheriting a wedged
       // bash, and tell the model directly so it doesn't fire another
       // shell_kill.
-      await _appendShellOutput(this.shell, "\n(killed; shell closed)");
-      await _closeShellFrame(this.shell, { exit: -1 });
+      _shellChunk(this.shell._entity, "\n(killed; shell closed)");
+      _settleShellEntity(this.shell, { type: "killed" }, null);
       try {
         await this.shell.close();
       } catch (_) {
@@ -824,3 +907,5 @@ class Capture {
 }
 
 export { Shell, Run, Wait, Kill, Set, Capture, shellFamily };
+// Cap policy internals, exported for tests.
+export { _capState, _capPush, _capFlush };

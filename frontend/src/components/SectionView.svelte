@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { DiffOp, ShellState } from '../bindings';
+  import type { DiffOp } from '../bindings';
   import { viewsFor } from '../entities/registry';
   import { entity } from '../stores/entities.svelte';
   import type { Section } from '../types';
@@ -14,18 +14,6 @@
     if (section.kind.source === 'user') return '>';
     if (section.kind.source === 'assistant') return '◆';
     return '';
-  }
-
-  function stateLabel(state: ShellState): string {
-    if (state === 'Running') return 'running';
-    if (state === 'Success') return 'success';
-    return `exit ${state.Exit}`;
-  }
-
-  function stateTone(state: ShellState): string {
-    if (state === 'Running') return 'pending';
-    if (state === 'Success') return 'success';
-    return 'failure';
   }
 
   function tailedText(): { hidden: number; text: string } {
@@ -69,14 +57,6 @@
     {:else if section.kind.type === 'json'}
       <div class="label">[{section.kind.tag}]</div>
       <pre>{JSON.stringify(section.kind.value, null, 2)}</pre>
-    {:else if section.kind.type === 'shell_output'}
-      <button class="tail" onclick={() => (expanded = !expanded)} title="Toggle full output">
-        <span class="pill {stateTone(section.kind.state)}">[{stateLabel(section.kind.state)}]</span>
-        <span class="command">{section.kind.cmd}</span>
-      </button>
-      {@const tail = tailedText()}
-      {#if tail.hidden > 0}<div class="collapsed">… [{tail.hidden} earlier lines]</div>{/if}
-      {#if tail.text}<pre>{tail.text}</pre>{/if}
     {:else if section.kind.type === 'reasoning'}
       <button class="tail" onclick={() => (expanded = !expanded)} title="Toggle full reasoning">
         <span class="pill {section.kind.state === 'Streaming' ? 'pending' : 'settled'}">

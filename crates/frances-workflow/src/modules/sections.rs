@@ -4,8 +4,8 @@
 //! a frame object after `transcript.push(frame)` and may call
 //! `frame.write(text)` to extend its content. Frames stay writeable
 //! until they're explicitly closed; the host supports many open blocks
-//! at once, so a long-running [`ShellOutputSection`] can keep streaming
-//! while later [`MarkdownSection`]s are pushed alongside it.
+//! at once, so a long-streaming frame can keep going while later
+//! [`MarkdownSection`]s are pushed alongside it.
 //!
 //! Each writeable frame exposes:
 //!   - `frame.write(text)` — append, throws if `closed`.
@@ -71,7 +71,6 @@ pub(crate) type BuiltSections<'js> = (
     Ctor<'js>, // MarkdownSection
     Ctor<'js>, // ErrorSection
     Ctor<'js>, // JsonSection
-    Ctor<'js>, // ShellOutputSection
     Ctor<'js>, // ReasoningSection
     Ctor<'js>, // ToolUseSection
     Ctor<'js>, // DiffSection
@@ -94,7 +93,6 @@ pub(crate) fn build_sections<'js>(
     let md_ctor = build_markdown_ctor(ctx, state.clone())?;
     let err_ctor = build_error_ctor(ctx)?;
     let json_ctor = build_json_ctor(ctx)?;
-    let shell_output_ctor = build_shell_output_ctor(ctx, state.clone())?;
     let thought_ctor = build_thought_ctor(ctx, state)?;
     let tool_use_ctor = build_tool_use_ctor(ctx)?;
     let diff_ctor = build_diff_ctor(ctx)?;
@@ -105,7 +103,6 @@ pub(crate) fn build_sections<'js>(
         md_ctor,
         err_ctor,
         json_ctor,
-        shell_output_ctor,
         thought_ctor,
         tool_use_ctor,
         diff_ctor,
@@ -256,28 +253,6 @@ fn push_section<'js>(
         });
         return Ok(());
     }
-    if let Some(sh) = as_section::<ShellOutputSection>(&section) {
-        let new_id = state.assign_id();
-        let borrow = sh.borrow();
-        borrow.id.store(new_id, Ordering::Release);
-        let section = SectionSpec {
-            kind: SectionKind::ShellOutput {
-                state: load_shell_state(&borrow.state_atom),
-                cmd: borrow.cmd.clone(),
-            },
-            seed: Some(borrow.content.clone()),
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(SectionTranscript::Close {
-                id: SectionId(new_id),
-            });
-        }
-        return Ok(());
-    }
     if let Some(th) = as_section::<ReasoningSection>(&section) {
         let new_id = state.assign_id();
         let borrow = th.borrow();
@@ -326,7 +301,7 @@ fn push_section<'js>(
     }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ShellOutputSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
+        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
     )
 }
 
@@ -791,140 +766,6 @@ fn build_entity_ref_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 }
 
 // ---------------------------------------------------------------------
-// ShellOutputSection — streaming shell-command output with mutable state
-// ---------------------------------------------------------------------
-
-/// Compact wire encoding for [`crate::runtime::ShellState`] so we can
-/// store it in an `AtomicU64`. `set_shell_state` / `load_shell_state`
-/// translate to and from this format; nothing outside this module
-/// should care about the layout.
-const SHELL_STATE_RUNNING: u64 = 0;
-const SHELL_STATE_SUCCESS: u64 = 1;
-/// Exit codes pack the i32 into the low 32 bits with a discriminator
-/// in the high half (`2 << 32 | code as u32`).
-const SHELL_STATE_EXIT_TAG: u64 = 2;
-
-fn encode_shell_state(state: &crate::runtime::ShellState) -> u64 {
-    match state {
-        crate::runtime::ShellState::Running => SHELL_STATE_RUNNING,
-        crate::runtime::ShellState::Success => SHELL_STATE_SUCCESS,
-        crate::runtime::ShellState::Exit(n) => (SHELL_STATE_EXIT_TAG << 32) | (*n as u32 as u64),
-    }
-}
-
-fn load_shell_state(atom: &AtomicU64) -> crate::runtime::ShellState {
-    let raw = atom.load(Ordering::Acquire);
-    let tag = raw >> 32;
-    if tag == SHELL_STATE_EXIT_TAG {
-        crate::runtime::ShellState::Exit(raw as u32 as i32)
-    } else if raw == SHELL_STATE_SUCCESS {
-        crate::runtime::ShellState::Success
-    } else {
-        crate::runtime::ShellState::Running
-    }
-}
-
-pub struct ShellOutputSection {
-    state: Arc<SectionsState>,
-    id: AtomicU64,
-    /// Bash source that produced this output. Pinned on every wire
-    /// frame so the UI can render it as a header even when the body
-    /// has been truncated.
-    cmd: String,
-    /// Initial body captured at construction. Mirrors `MarkdownSection.content`.
-    content: String,
-    /// Encoded [`crate::runtime::ShellState`]. Mutated by
-    /// `.setState()` / `.success()` / `.exit()`.
-    state_atom: AtomicU64,
-    /// Same close lifecycle as `MarkdownSection`.
-    closed: AtomicBool,
-}
-
-impl<'js> Trace<'js> for ShellOutputSection {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
-unsafe impl<'js> JsLifetime<'js> for ShellOutputSection {
-    type Changed<'to> = ShellOutputSection;
-}
-
-impl<'js> JsClass<'js> for ShellOutputSection {
-    const NAME: &'static str = "ShellOutputSection";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-        proto.set(
-            "write",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>, delta: String| {
-                    let b = this.0.borrow();
-                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
-                },
-            )?,
-        )?;
-        proto.set(
-            "close",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>,
-                 this: This<Class<'js, ShellOutputSection>>|
-                 -> JsResult<Class<'js, ShellOutputSection>> {
-                    {
-                        let b = this.0.borrow();
-                        close_section(&ctx, &b.state, &b.id, &b.closed)?;
-                    }
-                    Ok(this.0.clone())
-                },
-            )?,
-        )?;
-        // `frame.success()` and `frame.exit(code)` set the new state on the wire via a
-        // metadata-only `SectionTranscript::Set`. They do NOT close the frame — an explicit
-        // `frame.close()` or the writable's auto-close hook is still required to seal the block.
-        proto.set(
-            "success",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>| {
-                    let b = this.0.borrow();
-                    set_shell_state(
-                        &ctx,
-                        &b.state,
-                        &b.id,
-                        &b.state_atom,
-                        &b.cmd,
-                        crate::runtime::ShellState::Success,
-                    )
-                },
-            )?,
-        )?;
-        proto.set(
-            "exit",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ShellOutputSection>>, code: i32| {
-                    let b = this.0.borrow();
-                    set_shell_state(
-                        &ctx,
-                        &b.state,
-                        &b.id,
-                        &b.state_atom,
-                        &b.cmd,
-                        crate::runtime::ShellState::Exit(code),
-                    )
-                },
-            )?,
-        )?;
-        Ok(Some(proto))
-    }
-
-    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
-        Ok(None)
-    }
-}
-
-// ---------------------------------------------------------------------
 // ReasoningSection — streaming model reasoning
 // ---------------------------------------------------------------------
 
@@ -1027,42 +868,6 @@ fn finish_thought<'js>(
     Ok(())
 }
 
-/// Update the frame's state and emit a metadata-only [`SectionTranscript::Set`].
-/// Throws if the frame hasn't been pushed yet.
-fn set_shell_state<'js>(
-    ctx: &Ctx<'js>,
-    state: &Arc<SectionsState>,
-    id: &AtomicU64,
-    state_atom: &AtomicU64,
-    cmd: &str,
-    new_state: crate::runtime::ShellState,
-) -> JsResult<()> {
-    let frame_id = id.load(Ordering::Acquire);
-    if frame_id == 0 {
-        return throw_type(
-            ctx,
-            "shellOutput.setState: frame has not been pushed onto the transcript yet",
-        );
-    }
-    state_atom.store(encode_shell_state(&new_state), Ordering::Release);
-    // Metadata-only re-`Set`: no body (`seed: None`), so the runtime
-    // emits a no-text append carrying just the new kind. `cmd` rides
-    // along because `SectionKind::ShellOutput` carries it on every
-    // append.
-    let section = SectionSpec {
-        kind: SectionKind::ShellOutput {
-            state: new_state,
-            cmd: cmd.to_owned(),
-        },
-        seed: None,
-    };
-    let _ = state.tx.send(SectionTranscript::Set {
-        id: SectionId(frame_id),
-        section,
-    });
-    Ok(())
-}
-
 // ---------------------------------------------------------------------
 // Constructors
 // ---------------------------------------------------------------------
@@ -1140,27 +945,6 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     )
 }
 
-fn build_shell_output_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ShellOutputSection, _, _>(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
-            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-            let (cmd, content, closed) = parse_shell_output_arg(&ctx, &arg)?;
-            Class::instance(
-                ctx.clone(),
-                ShellOutputSection {
-                    state: state.clone(),
-                    id: AtomicU64::new(0),
-                    cmd,
-                    content,
-                    state_atom: AtomicU64::new(SHELL_STATE_RUNNING),
-                    closed: AtomicBool::new(closed),
-                },
-            )
-        },
-    )
-}
-
 /// `new ReasoningSection()` — no constructor arguments. Reasoning frames
 /// start empty in `Streaming` state and are filled via `.write()` from
 /// the chat session's `r.reasoning` channel.
@@ -1180,47 +964,6 @@ fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResul
             )
         },
     )
-}
-
-/// Parse `new ShellOutputSection({ cmd, content?, closed? })`. `cmd` is
-/// required — it's the bash source that produced this output and the
-/// UI renders it as a header. `content` is optional; if absent it
-/// defaults to an empty string. `closed: true` pre-seals the frame so
-/// `transcript.push` emits a `Close` right after the `Push`.
-fn parse_shell_output_arg<'js>(
-    ctx: &Ctx<'js>,
-    arg: &Value<'js>,
-) -> JsResult<(String, String, bool)> {
-    let Some(obj) = arg.as_object() else {
-        return throw_type(
-            ctx,
-            "new ShellOutputSection: expected { cmd: string, content?: string, closed?: bool }",
-        );
-    };
-    let cmd_val: Value<'js> = get_or_undefined(ctx, obj, "cmd");
-    let cmd = if let Some(s) = cmd_val.as_string() {
-        s.to_string()
-            .map_err(|_| throw_err(ctx, "new ShellOutputSection: `cmd` must be UTF-8"))?
-    } else {
-        return Err(throw_err(
-            ctx,
-            "new ShellOutputSection: `cmd` is required and must be a string",
-        ));
-    };
-    let content_val: Value<'js> = get_or_undefined(ctx, obj, "content");
-    let content = if content_val.is_undefined() || content_val.is_null() {
-        String::new()
-    } else if let Some(s) = content_val.as_string() {
-        s.to_string()
-            .map_err(|_| throw_err(ctx, "new ShellOutputSection: `content` must be UTF-8"))?
-    } else {
-        return Err(throw_err(
-            ctx,
-            "new ShellOutputSection: `content` must be a string when present",
-        ));
-    };
-    let closed = parse_optional_bool(ctx, obj, "closed", "new ShellOutputSection: `closed`")?;
-    Ok((cmd, content, closed))
 }
 
 fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsResult<String> {

@@ -144,7 +144,7 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
-pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, ShellState, Source};
+pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, Source};
 
 /// What a [`SectionTranscript::Set`] carries: the section's kind +
 /// bounded metadata, plus an optional `seed` — the initial body chunk

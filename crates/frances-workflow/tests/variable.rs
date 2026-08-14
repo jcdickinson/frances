@@ -29,11 +29,6 @@ fn text_of(frame: &SectionTranscript) -> String {
                 None => format!("→ {name}"),
             },
             SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
-            SectionKind::ShellOutput { state, cmd } => format!(
-                "[shell:{state:?}] $ {cmd}
-{}",
-                spec.seed.clone().unwrap_or_default()
-            ),
             SectionKind::Reasoning { state } => format!(
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()

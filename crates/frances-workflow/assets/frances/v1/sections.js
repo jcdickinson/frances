@@ -7,7 +7,6 @@ export const {
   MarkdownSection,
   ErrorSection,
   JsonSection,
-  ShellOutputSection,
   ReasoningSection,
   ToolUseSection,
   DiffSection,
@@ -72,5 +71,4 @@ function installWritable(cls) {
 }
 
 installWritable(MarkdownSection);
-installWritable(ShellOutputSection);
 installWritable(ReasoningSection);

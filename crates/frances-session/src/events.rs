@@ -12,7 +12,7 @@
 use uuid::Uuid;
 
 pub use frances_models_ui::{
-    EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind, ShellState, Source,
+    EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind, Source,
 };
 
 pub use frances_workflow::permission::{
@@ -24,8 +24,8 @@ pub enum StreamFrame {
     /// Self-describing section content. The first append with a
     /// previously-unseen `id` implicitly opens the section; subsequent
     /// appends either grow the text or carry an unchanged delta + new
-    /// kind for metadata transitions (e.g. ShellState `Running` →
-    /// `Success`).
+    /// kind for metadata transitions (e.g. ReasoningState `Streaming`
+    /// → `Done`).
     SectionAppend {
         id: SectionId,
         kind: SectionKind,

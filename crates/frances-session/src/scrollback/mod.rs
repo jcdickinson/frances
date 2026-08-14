@@ -45,9 +45,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{
-    ReasoningState, ScrollbackFrame, SectionId, SectionKind, ShellState, Source, StreamFrame,
-};
+use crate::events::{ReasoningState, ScrollbackFrame, SectionId, SectionKind, Source, StreamFrame};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_sections` table. UUID is permanent;
@@ -111,11 +109,6 @@ enum RowPayload {
     Json {
         tag: String,
         value: serde_json::Value,
-    },
-    ShellOutput {
-        state: ShellState,
-        cmd: String,
-        text: String,
     },
     Reasoning {
         state: ReasoningState,
@@ -266,7 +259,6 @@ fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
         SectionKind::Error => RowPayload::Error { text },
         SectionKind::ToolUse { name, detail } => RowPayload::ToolUse { name, detail },
         SectionKind::Json { tag, value } => RowPayload::Json { tag, value },
-        SectionKind::ShellOutput { state, cmd } => RowPayload::ShellOutput { state, cmd, text },
         SectionKind::Reasoning { state } => RowPayload::Reasoning { state, text },
         SectionKind::Diff { lines } => RowPayload::Diff { lines },
         SectionKind::EntityRef { entity_id } => RowPayload::EntityRef { entity_id },
@@ -295,11 +287,6 @@ fn decode_payload(payload: RowPayload, truncated: bool) -> StoredRow {
                 truncated,
             }
         }
-        RowPayload::ShellOutput { state, cmd, text } => StoredRow::Section {
-            kind: SectionKind::ShellOutput { state, cmd },
-            text,
-            truncated,
-        },
         RowPayload::Reasoning { state, text } => StoredRow::Section {
             kind: SectionKind::Reasoning { state },
             text,

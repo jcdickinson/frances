@@ -138,13 +138,6 @@ export type SectionKind =
  */
 { type: "json"; tag: string; value: JsonValue } | 
 /**
- * `ShellOutputSection` — streaming output from one shell command.
- * `cmd` is pinned in the header. `state` transitions
- * `Running → Success`/`Exit(N)` via a metadata-only Append (empty
- * delta + new kind).
- */
-{ type: "shell_output"; state: ShellState; cmd: string } | 
-/**
  * `ReasoningSection` — streaming model reasoning. `state`
  * transitions `Streaming → Done` on close.
  */
@@ -171,10 +164,6 @@ export type SessionSnapshot = { title: string | null; usage: Usage | null;
  * meaningful after settle; a fresh session starts with `None`.
  */
 busy: string | null }
-/**
- * Terminal status for [`SectionKind::ShellOutput`].
- */
-export type ShellState = "Running" | "Success" | { Exit: number }
 /**
  * Who produced a [`SectionKind::Markdown`] section. The frontend
  * styles each speaker differently and gates markdown rendering

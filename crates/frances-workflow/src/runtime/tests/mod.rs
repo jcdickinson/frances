@@ -51,12 +51,6 @@ fn text_of(delta: &SectionTranscript) -> String {
                 "[reasoning:{state:?}]\n{}",
                 spec.seed.clone().unwrap_or_default()
             ),
-            SectionKind::ShellOutput { state, cmd } => {
-                format!(
-                    "[shell:{state:?}] $ {cmd}\n{}",
-                    spec.seed.clone().unwrap_or_default()
-                )
-            }
             SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             SectionKind::EntityRef { entity_id } => format!("[entity:{entity_id}]"),
         },

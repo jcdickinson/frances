@@ -16,8 +16,8 @@
 //!   Internal). The frontend styles each speaker differently and only
 //!   renders markdown for `source != User`.
 //! - [`SectionId`] — per-invocation section identity.
-//! - [`ShellState`] / [`ReasoningState`] — completion-status enums carried
-//!   inside the matching [`SectionKind`] variants.
+//! - [`ReasoningState`] — completion-status enum carried inside the
+//!   matching [`SectionKind`] variant.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -88,11 +88,6 @@ pub enum SectionKind {
         tag: String,
         value: serde_json::Value,
     },
-    /// `ShellOutputSection` — streaming output from one shell command.
-    /// `cmd` is pinned in the header. `state` transitions
-    /// `Running → Success`/`Exit(N)` via a metadata-only Append (empty
-    /// delta + new kind).
-    ShellOutput { state: ShellState, cmd: String },
     /// `ReasoningSection` — streaming model reasoning. `state`
     /// transitions `Streaming → Done` on close.
     Reasoning { state: ReasoningState },
@@ -105,14 +100,6 @@ pub enum SectionKind {
     /// entity exists independently via the registry/hub, refs are
     /// optional decoration.
     EntityRef { entity_id: Uuid },
-}
-
-/// Terminal status for [`SectionKind::ShellOutput`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
-pub enum ShellState {
-    Running,
-    Success,
-    Exit(i32),
 }
 
 /// Terminal status for [`SectionKind::Reasoning`].

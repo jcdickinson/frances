@@ -282,7 +282,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         md_ctor,
         err_ctor,
         json_ctor,
-        shell_output_ctor,
         thought_ctor,
         tool_use_ctor,
         diff_ctor,
@@ -292,7 +291,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     stash.set("MarkdownSection", md_ctor)?;
     stash.set("ErrorSection", err_ctor)?;
     stash.set("JsonSection", json_ctor)?;
-    stash.set("ShellOutputSection", shell_output_ctor)?;
     stash.set("ReasoningSection", thought_ctor)?;
     stash.set("ToolUseSection", tool_use_ctor)?;
     stash.set("DiffSection", diff_ctor)?;
