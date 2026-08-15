@@ -34,12 +34,14 @@ async respondPermission(decision: string, details: string | null) : Promise<Resu
 }
 },
 /**
- * Show a save dialog and write the current workspace as a workspace
- * file. Returns the saved path, or `None` if the user cancelled.
+ * Write the current workspace as a workspace file. A `path` is taken as
+ * given (relative ones resolve against the primary directory); without
+ * one a save dialog picks it. Returns the saved path, or `None` if the
+ * user cancelled the dialog.
  */
-async saveWorkspace() : Promise<Result<string | null, string>> {
+async saveWorkspace(path: string | null) : Promise<Result<string | null, string>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("save_workspace") };
+    return { status: "ok", data: await TAURI_INVOKE("save_workspace", { path }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };

@@ -10,7 +10,8 @@
   import { entity, session, upsertEntity } from './stores/entities.svelte';
   import { applyStreamItem } from './stores/entityStreams.svelte';
   import { activeTab, openTabs } from './stores/tabs.svelte';
-  import type { Command } from './commands';
+  import CommandForm from './components/CommandForm.svelte';
+  import { commands, type CommandValues, type FormCommand } from './commands';
   import { type Section, unwrap } from './types';
 
   let sections = $state<Section[]>([]);
@@ -18,6 +19,7 @@
   let input = $state('');
   let permission = $state<string | null>(null);
   let paletteOpen = $state(false);
+  let formCommand = $state<FormCommand | null>(null);
   let nextSectionId = 0;
   let scrollback = $state<HTMLElement | undefined>();
   let textarea: HTMLTextAreaElement;
@@ -136,20 +138,29 @@
     textarea.focus();
   }
 
-  const commands: Command[] = [
-    {
-      id: 'workspace::save',
-      title: 'Save Workspace',
-      run: async () => void unwrap(await backend.saveWorkspace()),
-    },
-  ];
+  function runCommand(run: () => void | Promise<void>): void {
+    void closePalette().then(run).catch(showError);
+  }
 
-  function runCommand(command: Command): void {
-    void closePalette().then(() => command.run()).catch(showError);
+  // Tab in the palette swaps it for the command's form popup; submitting
+  // runs the command with what was typed.
+  function openForm(command: FormCommand): void {
+    paletteOpen = false;
+    formCommand = command;
+  }
+
+  function submitForm(command: FormCommand, values: CommandValues): void {
+    void closeForm().then(() => command.run(values)).catch(showError);
   }
 
   async function closePalette(): Promise<void> {
     paletteOpen = false;
+    await tick();
+    textarea.focus();
+  }
+
+  async function closeForm(): Promise<void> {
+    formCommand = null;
     await tick();
     textarea.focus();
   }
@@ -200,7 +211,21 @@
   {/each}
 
   {#if paletteOpen}
-    <CommandPalette {commands} onrun={runCommand} onclose={() => void closePalette()} />
+    <CommandPalette
+      {commands}
+      onrun={runCommand}
+      onform={openForm}
+      onclose={() => void closePalette()}
+    />
+  {/if}
+
+  {#if formCommand}
+    {@const command = formCommand}
+    <CommandForm
+      {command}
+      onsubmit={(values) => submitForm(command, values)}
+      onclose={() => void closeForm()}
+    />
   {/if}
 
   {#if permission}

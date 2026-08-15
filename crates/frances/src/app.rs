@@ -197,15 +197,24 @@ fn toggle_devtools(window: tauri::WebviewWindow) {
     }
 }
 
-/// Show a save dialog and write the current workspace as a workspace
-/// file. Returns the saved path, or `None` if the user cancelled.
+/// Write the current workspace as a workspace file. A `path` is taken as
+/// given (relative ones resolve against the primary directory); without
+/// one a save dialog picks it. Returns the saved path, or `None` if the
+/// user cancelled the dialog.
 #[tauri::command]
 #[specta::specta]
 async fn save_workspace(
     app: tauri::AppHandle,
     state: tauri::State<'_, Backend>,
+    path: Option<String>,
 ) -> Result<Option<String>, String> {
     let workspace = state.runtime.invocation.lock().workspace.clone();
+
+    if let Some(path) = path {
+        let path = workspace.primary_dir().join(path);
+        workspace.save(&path).map_err(|error| error.to_string())?;
+        return Ok(Some(path.display().to_string()));
+    }
 
     let (reply, chosen) = oneshot::channel();
     app.dialog()

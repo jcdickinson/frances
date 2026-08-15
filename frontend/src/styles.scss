@@ -526,37 +526,35 @@ pre {
   background: rgba(0, 0, 0, 0.45);
 }
 
+// A slab lifted clear of the page: the raised rim, plus a long drop that
+// sells the distance. The search field is a recessed tray inset in its face;
+// rows stay flat on it and the selected one takes a soft accent wash.
 .palette {
+  @include theme.raised;
   position: fixed;
   top: 12vh;
   left: 50%;
   transform: translateX(-50%);
   width: min(560px, 90vw);
-  border: 1px solid var(--border-strong);
-  border-radius: var(--radius);
-  background: var(--surface-card);
-  box-shadow: 0 12px 40px rgba(0, 0, 0, calc(var(--drop-a) * 4));
+  overflow: hidden;
+  background-color: var(--surface-card);
+  box-shadow:
+    inset 1px 1px 0 rgba(255, 255, 255, var(--hi-a)),
+    inset -1px -1px 0 rgba(0, 0, 0, var(--lo-a)),
+    0 12px 40px rgba(0, 0, 0, calc(var(--drop-a) * 4));
 
-  input {
-    width: 100%;
-    padding: 11px 14px;
-    border: 0;
-    border-bottom: 1px solid var(--border);
-    outline: 0;
-    font: inherit;
-    color: var(--text-primary);
-    background: transparent;
-    caret-color: var(--accent);
-
-    &::placeholder {
-      color: var(--text-muted);
-    }
+  .palette-search {
+    padding: 12px;
   }
 
   [data-command-list] {
     max-height: 40vh;
     overflow: auto;
-    padding: 4px 0;
+    padding: 14px 8px;
+    // Keyboard selection scrolls rows into view; without a matching
+    // scroll-padding the row lands flush against the scrollport edge and
+    // the panel's own padding is scrolled away.
+    scroll-padding: 14px;
     scrollbar-color: var(--border-strong) transparent;
   }
 
@@ -564,12 +562,18 @@ pre {
     display: flex;
     justify-content: space-between;
     gap: 12px;
-    padding: 7px 14px;
+    // The border is transparent until selected, so the row never reflows.
+    padding: 6px 12px;
+    border: 1px solid transparent;
+    border-radius: var(--radius);
     cursor: pointer;
 
+    // Just enough dimension to lift the row: an accent wash pooled inside a
+    // soft rim. No bevel — a full raised chip per row is far too loud.
     &[data-selected] {
-      color: var(--accent);
+      border-color: var(--accent-soft);
       background: var(--accent-soft);
+      box-shadow: inset 0 0 6px 1px var(--accent-soft);
     }
   }
 
@@ -579,7 +583,65 @@ pre {
   }
 
   [data-command-empty] {
-    padding: 7px 14px;
+    padding: 6px 12px;
+  }
+
+  .palette-hint {
+    padding: 9px 14px;
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
+  // Command form: the title bar the host supplies, then the command's own
+  // fields above a right-aligned submit. It holds only a field or two, so
+  // it sits well inside the palette's width.
+  &.command-popup {
+    width: min(380px, 90vw);
+  }
+
+  .command-form-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 5px 5px 5px 12px;
+
+    h2 {
+      margin: 0;
+      font-size: 14px;
+      font-weight: normal;
+      color: var(--text-secondary);
+    }
+
+    button.icon {
+      width: 24px;
+      height: 24px;
+    }
+  }
+
+  .command-form {
+    padding: 12px;
+  }
+
+  .command-field {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+
+    span {
+      color: var(--text-secondary);
+      white-space: nowrap;
+    }
+  }
+
+  .command-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 12px;
+
+    button {
+      padding: 5px 14px;
+    }
   }
 }
 
