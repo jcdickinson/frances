@@ -68,9 +68,7 @@ main {
   // Raised slab relative to the page: only the right edge is exposed, so
   // that's where the rim and drop shadow live.
   border-right: 1px solid var(--border-strong);
-  box-shadow:
-    inset -1px 0 0 rgba(0, 0, 0, var(--lo-a)),
-    1px 0 3px rgba(0, 0, 0, var(--drop-a));
+  box-shadow: inset -1px 0 0 rgba(0, 0, 0, var(--lo-a)), 1px 0 3px rgba(0, 0, 0, var(--drop-a));
 
   // Collapsible category header (Directories, Shells, …).
   .side-section {
@@ -331,8 +329,36 @@ header {
   line-height: 1.55;
 }
 
-.sigil {
+// Sigil icons. Sized here rather than per-component so they keep the
+// same weight and baseline wherever a sigil is rendered; the tone
+// classes below are what the components choose between.
+.sigil svg,
+.tab-sigil svg {
+  vertical-align: -0.2em;
+  stroke-width: 1.75;
+}
+.sigil svg {
+  width: 15px;
+  height: 15px;
+}
+.tab-sigil svg {
+  width: 12px;
+  height: 12px;
+  margin-right: 3px;
+}
+
+.icon-accent,
+.icon-pending {
+  color: var(--accent);
+}
+.icon-success {
   color: var(--success-text);
+}
+.icon-failure {
+  color: var(--danger-text);
+}
+.icon-muted {
+  color: var(--text-muted);
 }
 .content {
   min-width: 0;
@@ -426,6 +452,9 @@ pre {
 }
 .command {
   margin-left: 8px;
+  color: var(--text-primary);
+}
+.path {
   color: var(--text-primary);
 }
 

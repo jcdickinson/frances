@@ -1,6 +1,7 @@
 {
   "version": "5",
   "specifiers": {
+    "npm:@lucide/svelte@^1.31.0": "1.31.0_svelte@5.56.9",
     "npm:@sveltejs/vite-plugin-svelte@6": "6.2.4_svelte@5.56.9_vite@7.3.6__@types+node@24.13.3__sass@1.102.0_@types+node@24.13.3",
     "npm:@tauri-apps/api@2": "2.11.1",
     "npm:@tauri-apps/cli@2": "2.11.4",
@@ -190,6 +191,12 @@
       "dependencies": [
         "@jridgewell/resolve-uri",
         "@jridgewell/sourcemap-codec"
+      ]
+    },
+    "@lucide/svelte@1.31.0_svelte@5.56.9": {
+      "integrity": "sha512-pgPuLEJdF0UpsajG9eSw0YvqXVuDxB+/x58BRiC4xE/KEHiopOqT1id3KCUvRN/PUmQkN1F26sslcs/1jutlBQ==",
+      "dependencies": [
+        "svelte"
       ]
     },
     "@napi-rs/lzma-linux-x64-gnu@1.5.1": {
@@ -877,6 +884,7 @@
   },
   "workspace": {
     "dependencies": [
+      "npm:@lucide/svelte@^1.31.0",
       "npm:@sveltejs/vite-plugin-svelte@6",
       "npm:@tauri-apps/api@2",
       "npm:@tauri-apps/cli@2",

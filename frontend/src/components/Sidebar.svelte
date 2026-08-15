@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { viewsFor } from '../entities/registry';
   import { entity, workspace } from '../stores/entities.svelte';
   import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
   import { asShellSnapshot } from '../entities/shell/types';
@@ -90,7 +91,9 @@
         class="entity-tab"
         class:active={activeTab() === null}
         onclick={() => focusTab(null)}
-      >transcript</button>
+      >
+        transcript
+      </button>
     </li>
   </ul>
 
@@ -112,6 +115,8 @@
     {#if !collapsed[group.kind]}
       <ul class="entity-tab-list">
         {#each group.ids as id (id)}
+          {@const state = entity(id)}
+          {@const Sigil = state && viewsFor(state.kind).Sigil}
           <li class="entity-tab-row">
             <button
               class="entity-tab"
@@ -123,13 +128,19 @@
                 closeTab(id);
               }}
               title={tabTitle(id)}
-            >{tabTitle(id)}</button>
+            >
+              {#if Sigil && state}<span class="tab-sigil" aria-hidden="true"><Sigil
+                    entity={state}
+                  /></span>{/if}{tabTitle(id)}
+            </button>
             <button
               class="entity-tab-close"
               onclick={() => closeTab(id)}
               aria-label="Close tab"
               title="Close tab"
-            >×</button>
+            >
+              ×
+            </button>
           </li>
         {/each}
       </ul>

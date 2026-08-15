@@ -1,4 +1,7 @@
 <script lang="ts">
+  import Braces from '@lucide/svelte/icons/braces';
+  import FileDiff from '@lucide/svelte/icons/file-diff';
+  import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
   import type { DiffOp } from '../bindings';
   import { isEmptyEntity, viewsFor } from '../entities/registry';
   import { entity } from '../stores/entities.svelte';
@@ -30,7 +33,15 @@
 {#if !empty}
   <article class="section">
     <div class="sigil" aria-hidden="true">
-      {#if Sigil && referenced}<Sigil entity={referenced} />{/if}
+      {#if Sigil && referenced}
+        <Sigil entity={referenced} />
+      {:else if section.kind.type === 'error'}
+        <TriangleAlert class="icon-failure" />
+      {:else if section.kind.type === 'diff'}
+        <FileDiff class="icon-accent" />
+      {:else if section.kind.type === 'json'}
+        <Braces class="icon-muted" />
+      {/if}
     </div>
     <div class="content">
       {#if section.kind.type === 'error'}

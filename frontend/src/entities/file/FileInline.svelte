@@ -17,8 +17,7 @@
 </script>
 
 <button class="tail" onclick={() => openTab(entity.id)} title="Open file">
-  <span class="pill settled">[read]</span>
-  <span class="command">{snapshot.path}</span>
+  <span class="path">{snapshot.path}</span>
 </button>
 <CodeView rows={head} />
 {#if hidden > 0}<div class="collapsed">… {hidden} more lines</div>{/if}

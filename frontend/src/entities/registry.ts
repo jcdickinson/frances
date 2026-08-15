@@ -7,8 +7,10 @@ import FallbackInline from './FallbackInline.svelte';
 import FallbackOpened from './FallbackOpened.svelte';
 import FileInline from './file/FileInline.svelte';
 import FileOpened from './file/FileOpened.svelte';
+import FileSigil from './file/FileSigil.svelte';
 import ShellInline from './shell/ShellInline.svelte';
 import ShellOpened from './shell/ShellOpened.svelte';
+import ShellSigil from './shell/ShellSigil.svelte';
 
 export type EntityViews = {
   /** Transcript gutter mark. Absent means an empty gutter. */
@@ -26,8 +28,8 @@ export type EntityViews = {
 };
 
 const kinds: Record<string, EntityViews> = {
-  shell: { Inline: ShellInline, Opened: ShellOpened },
-  file: { Inline: FileInline, Opened: FileOpened },
+  shell: { Sigil: ShellSigil, Inline: ShellInline, Opened: ShellOpened },
+  file: { Sigil: FileSigil, Inline: FileInline, Opened: FileOpened },
   chat: {
     Sigil: ChatSigil,
     Inline: ChatInline,
