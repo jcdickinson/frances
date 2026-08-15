@@ -1,5 +1,6 @@
 <script lang="ts">
   import { untrack } from 'svelte';
+  import Hr from '../../components/Hr.svelte';
   import type { EntityState } from '../../stores/entities.svelte';
   import { streamItems, subscribeStream, unsubscribeStream } from '../../stores/entityStreams.svelte';
   import { openTab } from '../../stores/tabs.svelte';
@@ -9,6 +10,7 @@
 
   const snapshot = $derived(asShellSnapshot(entity.snapshot));
   const stateView = $derived(shellStateView(snapshot.state, entity.lifecycle));
+  const running = $derived(snapshot.state.type === 'running' && entity.lifecycle === 'live');
 
   // While live the inline view is an expanded streaming pane: tail-only
   // subscription (catchUp false — this view watched from the entity's
@@ -35,11 +37,18 @@
 </script>
 
 <button class="tail" onclick={() => openTab(entity.id)} title="Open shell output">
-  <span class="pill {stateView.tone}">[{stateView.label}]</span>
-  <span class="command">{snapshot.cmd}</span>
+  <span class="path">{snapshot.cmd}</span>
 </button>
 {#if entity.lifecycle === 'live'}
   {#if liveText}<pre>{liveText}</pre>{/if}
 {:else if snapshot.teaser}
   <pre class="teaser">{snapshot.teaser}</pre>
+{/if}
+<!-- Outcome sits under the output, the way the opened view lays it out;
+     while running the gutter sigil's tone is the only state cue. -->
+{#if !running}
+  <Hr />
+  <div class="entity-meta">
+    <span class="pill {stateView.tone}">[{stateView.label}]</span>
+  </div>
 {/if}

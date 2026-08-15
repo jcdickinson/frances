@@ -1,6 +1,5 @@
 <script lang="ts">
   import Markdown from '../../components/Markdown.svelte';
-  import Spinner from '../../components/Spinner.svelte';
   import type { EntityState } from '../../stores/entities.svelte';
   import { asChatSnapshot } from './types';
 
@@ -26,14 +25,14 @@
 {#if snapshot.source === 'user'}
   <div class="prose user">{snapshot.text}</div>
 {:else if snapshot.source === 'reasoning'}
-  <button class="tail" onclick={() => (expanded = !expanded)} title="Toggle full reasoning">
-    <span class="pill {live ? 'pending' : 'settled'}">[{live ? 'reasoning' : 'reasoned'}]</span>
-  </button>
-  {#if tail.hidden > 0}<div class="collapsed">… [{tail.hidden} earlier lines]</div>{/if}
+  {#if tail.hidden > 0 || expanded}
+    <button class="tail collapsed" onclick={() => (expanded = !expanded)} title="Toggle full reasoning">
+      {expanded ? '… show less' : `… ${tail.hidden} earlier lines`}
+    </button>
+  {/if}
   {#if tail.text}<pre class="reasoning">{tail.text}</pre>{/if}
 {:else}
   <div class="prose">
     <Markdown text={snapshot.text} done={!live} />
-    {#if live}<Spinner size={14} thick={5} />{/if}
   </div>
 {/if}

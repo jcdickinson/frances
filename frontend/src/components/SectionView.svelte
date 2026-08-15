@@ -2,6 +2,7 @@
   import Braces from '@lucide/svelte/icons/braces';
   import FileDiff from '@lucide/svelte/icons/file-diff';
   import TriangleAlert from '@lucide/svelte/icons/triangle-alert';
+  import SigilMark from './SigilMark.svelte';
   import type { DiffOp } from '../bindings';
   import { isEmptyEntity, viewsFor } from '../entities/registry';
   import { entity } from '../stores/entities.svelte';
@@ -36,11 +37,11 @@
       {#if Sigil && referenced}
         <Sigil entity={referenced} />
       {:else if section.kind.type === 'error'}
-        <TriangleAlert class="icon-failure" />
+        <SigilMark title="Error"><TriangleAlert class="icon-failure" /></SigilMark>
       {:else if section.kind.type === 'diff'}
-        <FileDiff class="icon-accent" />
+        <SigilMark title="Diff"><FileDiff class="icon-accent" /></SigilMark>
       {:else if section.kind.type === 'json'}
-        <Braces class="icon-muted" />
+        <SigilMark title={section.kind.tag}><Braces class="icon-muted" /></SigilMark>
       {/if}
     </div>
     <div class="content">

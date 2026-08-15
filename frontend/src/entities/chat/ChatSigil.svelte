@@ -3,6 +3,7 @@
   import ChevronRight from '@lucide/svelte/icons/chevron-right';
   import Info from '@lucide/svelte/icons/info';
   import Sparkles from '@lucide/svelte/icons/sparkles';
+  import SigilMark from '../../components/SigilMark.svelte';
   import type { EntityState } from '../../stores/entities.svelte';
   import { asChatSnapshot } from './types';
 
@@ -12,11 +13,11 @@
 </script>
 
 {#if source === 'user'}
-  <ChevronRight class="icon-accent" />
+  <SigilMark {entity} title="You"><ChevronRight class="icon-accent" /></SigilMark>
 {:else if source === 'assistant'}
-  <Sparkles class="icon-success" />
+  <SigilMark {entity} title="Assistant"><Sparkles class="icon-success" /></SigilMark>
 {:else if source === 'reasoning'}
-  <Brain class="icon-muted" />
+  <SigilMark {entity} title="Reasoning"><Brain class="icon-muted" /></SigilMark>
 {:else}
-  <Info class="icon-muted" />
+  <SigilMark {entity} title={source}><Info class="icon-muted" /></SigilMark>
 {/if}

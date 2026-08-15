@@ -124,14 +124,20 @@ main {
 
 .entity-tab {
   @include theme.raised;
+  // Flex so the sigil sits centred against the label rather than on its
+  // baseline; the label keeps the ellipsis.
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  // The tab spans the row so its sigil sits on the left edge; the label
+  // is what packs against the content pane.
+  flex: 1;
   min-width: 0;
   overflow: hidden;
   padding: 3px 10px;
   color: var(--text-secondary);
   font: inherit;
   text-align: left;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   cursor: pointer;
 
   // The right edge is open toward the content: no border, square corners.
@@ -176,6 +182,12 @@ main {
   font: inherit;
   line-height: 1;
   cursor: pointer;
+
+  svg {
+    width: 11px;
+    height: 11px;
+    stroke-width: 2;
+  }
 
   &:hover {
     color: var(--danger-text);
@@ -324,9 +336,26 @@ header {
 
 .section {
   display: grid;
-  grid-template-columns: 24px minmax(0, 1fr);
+  // Gutter holds the spinner slot, its gap, and the icon, plus the
+  // trailing gap before the content column.
+  grid-template-columns: 41px minmax(0, 1fr);
   margin: 0 0 18px;
   line-height: 1.55;
+}
+
+.sigil-mark {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+// Reserved whether or not it spins, so the icon holds its column when
+// an entity settles.
+.sigil-spin {
+  display: inline-flex;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
 }
 
 // Sigil icons. Sized here rather than per-component so they keep the
@@ -334,17 +363,39 @@ header {
 // classes below are what the components choose between.
 .sigil svg,
 .tab-sigil svg {
-  vertical-align: -0.2em;
   stroke-width: 1.75;
+}
+// The mark is the inline box now, so the optical drop onto the text
+// line belongs to it. In a tab it's a flex item and this is inert —
+// there the row centres it.
+.sigil .sigil-mark {
+  vertical-align: -0.2em;
 }
 .sigil svg {
   width: 15px;
   height: 15px;
 }
+.tab-sigil {
+  display: inline-flex;
+  align-items: center;
+
+  // In the gutter the reserved spinner slot leads; in a tab that would
+  // float the icon off the button's left edge, so the slot trails the
+  // icon instead — still reserved, just on the dead side.
+  .sigil-mark {
+    flex-direction: row-reverse;
+  }
+}
 .tab-sigil svg {
   width: 12px;
   height: 12px;
-  margin-right: 3px;
+}
+.tab-label {
+  margin-left: auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .icon-accent,
@@ -406,13 +457,6 @@ pre {
 .markdown > :last-child {
   margin-bottom: 0;
 }
-// streaming marker: the spinner rides inline at the tail of the text.
-.prose .spinner,
-.content .spinner {
-  display: inline-block;
-  vertical-align: -2px;
-  margin-left: 8px;
-}
 pre {
   margin: 6px 0 0;
   font: inherit;
@@ -449,10 +493,6 @@ pre {
 .pill.settled,
 .reasoning {
   color: var(--text-muted);
-}
-.command {
-  margin-left: 8px;
-  color: var(--text-primary);
 }
 .path {
   color: var(--text-primary);

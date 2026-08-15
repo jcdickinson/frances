@@ -10,9 +10,7 @@
 </script>
 
 <div class="entity-pane content">
-  <div class="entity-header">
-    <span class="pill {entity.lifecycle === 'live' ? 'pending' : 'settled'}">[{entity.kind}]</span>
-  </div>
+  <div class="entity-header">{entity.kind}</div>
   <pre>{JSON.stringify(entity.snapshot, null, 2)}</pre>
   {#each streamItems(entity.id) as item (item.seq)}
     <pre>{JSON.stringify(item.payload)}</pre>

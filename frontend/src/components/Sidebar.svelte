@@ -1,4 +1,5 @@
 <script lang="ts">
+  import X from '@lucide/svelte/icons/x';
   import { viewsFor } from '../entities/registry';
   import { entity, workspace } from '../stores/entities.svelte';
   import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
@@ -92,7 +93,7 @@
         class:active={activeTab() === null}
         onclick={() => focusTab(null)}
       >
-        transcript
+        <span class="tab-label">transcript</span>
       </button>
     </li>
   </ul>
@@ -129,9 +130,10 @@
               }}
               title={tabTitle(id)}
             >
-              {#if Sigil && state}<span class="tab-sigil" aria-hidden="true"><Sigil
-                    entity={state}
-                  /></span>{/if}{tabTitle(id)}
+              {#if Sigil && state}
+                <span class="tab-sigil" aria-hidden="true"><Sigil entity={state} /></span>
+              {/if}
+              <span class="tab-label">{tabTitle(id)}</span>
             </button>
             <button
               class="entity-tab-close"
@@ -139,7 +141,7 @@
               aria-label="Close tab"
               title="Close tab"
             >
-              ×
+              <X />
             </button>
           </li>
         {/each}
