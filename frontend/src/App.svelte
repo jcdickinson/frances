@@ -17,7 +17,6 @@
   let sessionId = $state('starting…');
   let input = $state('');
   let permission = $state<string | null>(null);
-  let historyMode = $state(false);
   let paletteOpen = $state(false);
   let nextSectionId = 0;
   let scrollback = $state<HTMLElement | undefined>();
@@ -56,14 +55,7 @@
         // The palette dialog owns the keyboard while open (Escape closes it).
       } else if (event.key === 'Escape') {
         event.preventDefault();
-        if (historyMode) {
-          historyMode = false;
-        } else {
-          void backend.interrupt().catch(showError);
-        }
-      } else if (event.ctrlKey && event.key.toLowerCase() === 'o') {
-        event.preventDefault();
-        historyMode = !historyMode;
+        void backend.interrupt().catch(showError);
       } else if (permission && event.altKey && event.key.toLowerCase() === 'y') {
         event.preventDefault();
         void answerPermission('yes');
@@ -101,7 +93,7 @@
     }
 
     await tick();
-    if (!historyMode) scrollback?.scrollTo({ top: scrollback.scrollHeight });
+    scrollback?.scrollTo({ top: scrollback.scrollHeight });
   }
 
   function pushSection(kind: SectionKind): void {
@@ -186,8 +178,8 @@
     <header>
       <div>frances session {sessionId}</div>
       <div>
-        Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for
-        history. Ctrl-P for commands.
+        Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-P for
+        commands.
       </div>
     </header>
 
@@ -209,10 +201,6 @@
 
   {#if paletteOpen}
     <CommandPalette {commands} onrun={runCommand} onclose={() => void closePalette()} />
-  {/if}
-
-  {#if historyMode}
-    <div class="history-bar">history · Ctrl-O or Esc to return to live output</div>
   {/if}
 
   {#if permission}
