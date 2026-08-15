@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use frances_workflow::{
-    Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
+    EntityCmd, Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 
@@ -31,6 +31,19 @@ fn text_of(frame: &SectionTranscript) -> String {
         },
         SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
+}
+
+/// Content of the first `ErrorSection` push. Tests that drive the `Read`
+/// tool class need this rather than `frames[0]`: a read also publishes a
+/// `file` entity and its `EntityRefSection`.
+fn first_error_push(frames: &[SectionTranscript]) -> String {
+    frames
+        .iter()
+        .find_map(|f| match f {
+            SectionTranscript::Push(SectionKind::Error { text }) => Some(text.clone()),
+            _ => None,
+        })
+        .expect("an ErrorSection push")
 }
 
 fn deps_with_cwd(cwd: PathBuf) -> StubDeps {
@@ -502,7 +515,7 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let rendered = text_of(&frames[0]);
+    let rendered = first_error_push(&frames);
     let lines: Vec<&str> = rendered.lines().collect();
 
     assert_eq!(lines.len(), 6, "got: {rendered:?}");
@@ -512,6 +525,118 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
     assert!(lines[3].ends_with("§8"), "line 3: {}", lines[3]);
     assert!(lines[4].ends_with("§9"), "line 4: {}", lines[4]);
     assert!(lines[5].ends_with("§10"), "line 5: {}", lines[5]);
+}
+
+#[tokio::test]
+async fn read_publishes_file_entity_with_anchor_stripped_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("ranges.txt"),
+        "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n",
+    )
+    .unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, Read } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        const editor = new Editor();
+        const read = new Read(editor, new Variables());
+        await read.handler({
+            call: { id: "c1", name: "file_read",
+                    arguments: { path: "ranges.txt", ranges: [[1, 2], [8, 9]] } },
+            scope: null,
+        });
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let snapshot = frames
+        .iter()
+        .find_map(|f| match f {
+            SectionTranscript::Entity(EntityCmd::Settle { snapshot, .. }) => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("a settled entity");
+    assert_eq!(snapshot["path"], "ranges.txt");
+
+    let rows = snapshot["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 5, "rows: {rows:?}");
+    // Content survives; the elision between the two ranges becomes a gap
+    // row; both ranges are numbered from the range they were asked for.
+    assert_eq!(rows[0]["text"], "1");
+    assert_eq!(rows[1]["text"], "2");
+    assert_eq!(rows[2]["kind"], "gap");
+    assert_eq!(rows[3]["text"], "8");
+    assert_eq!(rows[4]["text"], "9");
+    assert_eq!(rows[0]["line"], 1);
+    assert_eq!(rows[1]["line"], 2);
+    assert_eq!(rows[3]["line"], 8);
+    assert_eq!(rows[4]["line"], 9);
+    // The anchor word rides along as the row's tooltip.
+    for row in [&rows[0], &rows[3]] {
+        let anchor = row["anchor"].as_str().expect("anchor");
+        assert!(
+            !anchor.is_empty() && !anchor.contains('§'),
+            "anchor: {anchor}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn whole_file_read_numbers_entity_rows_from_one() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("hello.txt"), "alpha\nbeta\ngamma\n").unwrap();
+
+    let deps = deps_with_cwd(dir.path().to_path_buf());
+    let rt = Runtime::new(deps).unwrap();
+    let file = write_source(
+        r#"
+        import { Editor, Read } from "frances:v1/tools/file";
+        import { Variables } from "frances:v1/tools/variable";
+        const editor = new Editor();
+        const read = new Read(editor, new Variables());
+        await read.handler({
+            call: { id: "c1", name: "file_read", arguments: { path: "hello.txt" } },
+            scope: null,
+        });
+        "#,
+    );
+    let mut handle = rt
+        .start(Invocation {
+            source_path: file.path().to_path_buf(),
+            args: Vec::new(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (frames, done) = drive_one_cycle(&mut handle).await;
+    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+    let snapshot = frames
+        .iter()
+        .find_map(|f| match f {
+            SectionTranscript::Entity(EntityCmd::Settle { snapshot, .. }) => Some(snapshot.clone()),
+            _ => None,
+        })
+        .expect("a settled entity");
+    let rows = snapshot["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 3, "rows: {rows:?}");
+    for (i, text) in ["alpha", "beta", "gamma"].iter().enumerate() {
+        assert_eq!(rows[i]["line"], i + 1);
+        assert_eq!(rows[i]["text"], *text);
+    }
 }
 
 #[tokio::test]
@@ -889,7 +1014,7 @@ async fn out_of_repo_read_with_ranges_returns_plain_numbered_lines() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let rendered = text_of(&frames[0]);
+    let rendered = first_error_push(&frames);
     let lines: Vec<&str> = rendered.lines().collect();
     // Should have: 2:…, 3:…, separator "…", 7:…, 8:…, 9:…
     assert_eq!(lines.len(), 6, "got: {rendered:?}");

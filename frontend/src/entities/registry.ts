@@ -5,6 +5,8 @@ import ChatInline from './chat/ChatInline.svelte';
 import ChatSigil from './chat/ChatSigil.svelte';
 import FallbackInline from './FallbackInline.svelte';
 import FallbackOpened from './FallbackOpened.svelte';
+import FileInline from './file/FileInline.svelte';
+import FileOpened from './file/FileOpened.svelte';
 import ShellInline from './shell/ShellInline.svelte';
 import ShellOpened from './shell/ShellOpened.svelte';
 
@@ -25,6 +27,7 @@ export type EntityViews = {
 
 const kinds: Record<string, EntityViews> = {
   shell: { Inline: ShellInline, Opened: ShellOpened },
+  file: { Inline: FileInline, Opened: FileOpened },
   chat: {
     Sigil: ChatSigil,
     Inline: ChatInline,

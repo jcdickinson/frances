@@ -217,6 +217,48 @@ main {
   }
 }
 
+// Opened file tab: path pinned above, line count pinned below, code
+// scrolling between the two.
+.file-opened {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+
+  .output {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+}
+
+// Two columns so every gutter (anchor word or line number) aligns
+// regardless of width, with the code wrapping in the second.
+.code {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  margin: 6px 0 0;
+}
+
+.code-gutter {
+  padding-right: 12px;
+  color: var(--text-muted);
+  text-align: right;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+.code-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.code-gap {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+}
+
 .entity-meta {
   margin-top: 2px;
   color: var(--text-muted);

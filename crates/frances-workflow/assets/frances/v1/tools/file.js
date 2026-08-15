@@ -33,7 +33,8 @@
 //     new Overwrite(editor, vars),
 //   );
 
-import { transcript, DiffSection } from "frances:v1/sections";
+import { transcript, DiffSection, EntityRefSection } from "frances:v1/sections";
+import { createEntity } from "frances:v1/entities";
 import { defineToolFamily } from "frances:v1/tool-family";
 import editingFamilyPrompt from "./editing_family.md";
 import fileReadDescription from "./file_read.md";
@@ -62,6 +63,94 @@ function _pushDiffSection(diff) {
   if (Array.isArray(diff) && diff.length > 0) {
     transcript.push(new DiffSection({ lines: diff }));
   }
+}
+
+// Split a `file_read` render into blocks of parsed lines. Each rendered
+// line is `prefix<sep>content`: an anchor word before `§` in-repo, a
+// 1-indexed line number before `:` out-of-repo (anchor words are never
+// all digits, so the two never get confused). A lone `…§` / `…` line
+// separates the blocks of two non-adjacent ranges.
+function _readBlocks(rendered) {
+  const blocks = [[]];
+  for (const raw of rendered.split("\n")) {
+    if (raw === "…§" || raw === "…") {
+      blocks.push([]);
+      continue;
+    }
+    const colon = raw.indexOf(":");
+    if (colon > 0 && /^\d+$/.test(raw.slice(0, colon))) {
+      blocks[blocks.length - 1].push({
+        line: Number(raw.slice(0, colon)),
+        anchor: null,
+        text: raw.slice(colon + 1),
+      });
+      continue;
+    }
+    const sep = raw.indexOf("§");
+    if (sep < 0) continue; // trailing "" from the final newline
+    blocks[blocks.length - 1].push({
+      line: null,
+      anchor: raw.slice(0, sep),
+      text: raw.slice(sep + 1),
+    });
+  }
+  return blocks;
+}
+
+// The requested ranges as Rust rendered them: sorted, with adjacent and
+// overlapping ones joined. Rust also clamps to EOF, which needs the
+// file's length — see `_numberBlocks` for how that's absorbed. No ranges
+// means the whole file, i.e. one block starting at line 1.
+function _mergeRanges(ranges) {
+  if (!ranges || ranges.length === 0) return [[1, Infinity]];
+  const merged = [];
+  for (const [start, end] of [...ranges].sort((a, b) => a[0] - b[0])) {
+    const last = merged[merged.length - 1];
+    if (last && start <= last[1] + 1) {
+      last[1] = Math.max(last[1], end);
+    } else {
+      merged.push([start, end]);
+    }
+  }
+  return merged;
+}
+
+// Fill in the line numbers an anchored render doesn't carry, taking each
+// block's first line from the matching requested range. Clamping to EOF
+// can leave the final block short and drop ranges past the end, so those
+// are tolerated; any other disagreement means the merge above didn't
+// reproduce what Rust rendered, and the numbers are left off rather than
+// guessed at.
+function _numberBlocks(blocks, ranges) {
+  const merged = _mergeRanges(ranges);
+  if (blocks.length > merged.length) return;
+  for (const [i, lines] of blocks.entries()) {
+    const [start, end] = merged[i];
+    const requested = end - start + 1;
+    const short = lines.length < requested;
+    if (lines.length > requested || (short && i < blocks.length - 1)) return;
+  }
+  for (const [i, lines] of blocks.entries()) {
+    lines.forEach((row, offset) => (row.line = merged[i][0] + offset));
+  }
+}
+
+// Publish a read as a `file` entity so the UI can render the code the
+// model just looked at. A read is complete the moment it returns, so the
+// entity is born settled — nothing ever streams into it.
+function _pushReadEntity(path, rendered, ranges) {
+  const blocks = _readBlocks(rendered);
+  const anchored = blocks.flat().some((row) => row.line === null);
+  if (anchored) _numberBlocks(blocks, ranges);
+  const rows = [];
+  for (const lines of blocks) {
+    if (rows.length > 0) rows.push({ kind: "gap" });
+    for (const row of lines) rows.push({ kind: "line", ...row });
+  }
+  const snapshot = { path, rows };
+  const handle = createEntity("file", snapshot);
+  handle.settle(snapshot);
+  transcript.push(new EntityRefSection({ id: handle.id }));
 }
 
 // ---- schemas --------------------------------------------------------------
@@ -225,6 +314,7 @@ class Read {
         args.ranges = ranges;
       }
       const content = await this.editor.readFile(args);
+      _pushReadEntity(path, content, ranges);
       return _okResult(call.id, content);
     } catch (err) {
       return _errResult(call.id, err);

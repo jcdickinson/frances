@@ -2,6 +2,7 @@
   import { entity, workspace } from '../stores/entities.svelte';
   import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
   import { asShellSnapshot } from '../entities/shell/types';
+  import { asFileSnapshot } from '../entities/file/types';
 
   const directories = $derived(workspace()?.directories ?? []);
 
@@ -14,13 +15,14 @@
     const state = entity(id);
     if (!state) return id;
     if (state.kind === 'shell') return asShellSnapshot(state.snapshot).cmd;
+    if (state.kind === 'file') return basename(asFileSnapshot(state.snapshot).path);
     return state.kind;
   }
 
   // Open tabs grouped into one category per entity kind. A category
   // only exists while it has tabs; new kinds get their raw kind string
   // as a label until they earn a nicer one.
-  const KIND_LABELS: Record<string, string> = { shell: 'Shells' };
+  const KIND_LABELS: Record<string, string> = { shell: 'Shells', file: 'Files' };
 
   const groups = $derived.by(() => {
     const byKind = new Map<string, string[]>();
