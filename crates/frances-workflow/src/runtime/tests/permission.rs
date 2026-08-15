@@ -61,13 +61,12 @@ async fn approve_yes_round_trip() {
         .iter()
         .rev()
         .find_map(|d| match d {
-            SectionTranscript::Set { section, .. } => Some(section),
+            SectionTranscript::Push(kind) => Some(kind),
             _ => None,
         })
-        .expect("expected an error set after approval");
+        .expect("expected an error push after approval");
     assert!(
-        matches!(&last.kind, SectionKind::Error)
-            && last.seed.as_deref() == Some("yes:scoped to /tmp"),
+        matches!(last, SectionKind::Error { text } if text == "yes:scoped to /tmp"),
         "got {last:?}",
     );
 }

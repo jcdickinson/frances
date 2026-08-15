@@ -4,7 +4,7 @@
 
   let { entity }: { entity: EntityState } = $props();
 
-  const sigils = { user: '>', assistant: '◆', internal: '' } as const;
+  const sigils = { user: '>', assistant: '◆', reasoning: '', internal: '' } as const;
   const sigil = $derived(sigils[asChatSnapshot(entity.snapshot).source] ?? '');
 </script>
 

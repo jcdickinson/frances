@@ -193,22 +193,6 @@ function _resolveText(args, vars) {
   return args.text;
 }
 
-// Format a list of [start, end] line-range pairs as `[1-50, 100]`, with
-// single-line ranges collapsed to one number. Returns `null` if the
-// shape isn't an array of `[number, number]` so describe() can fall
-// back gracefully on malformed input.
-function _formatRanges(ranges) {
-  if (!Array.isArray(ranges) || ranges.length === 0) return null;
-  const parts = [];
-  for (const r of ranges) {
-    if (!Array.isArray(r) || r.length !== 2) return null;
-    const [a, b] = r;
-    if (typeof a !== "number" || typeof b !== "number") return null;
-    parts.push(a === b ? String(a) : `${a}-${b}`);
-  }
-  return `[${parts.join(", ")}]`;
-}
-
 // ---- tool classes ---------------------------------------------------------
 
 class Read {
@@ -220,14 +204,6 @@ class Read {
     this.name = "file_read";
     this.description = fileReadDescription;
     this.parameters = READ_SCHEMA;
-  }
-
-  describe(call) {
-    const { path, into, ranges } = call.arguments || {};
-    if (!path) return "";
-    if (into) return `${path} → ${into}`;
-    const fmt = _formatRanges(ranges);
-    return fmt ? `${path} ${fmt}` : path;
   }
 
   handler = async ({ call }) => {
@@ -268,10 +244,6 @@ class ReplaceLines {
     this.family = editingFamily;
   }
 
-  describe(call) {
-    return (call.arguments && call.arguments.path) || "";
-  }
-
   handler = async ({ call }) => {
     let text;
     try {
@@ -307,12 +279,6 @@ class ReplaceAll {
     this.family = editingFamily;
   }
 
-  describe(call) {
-    const a = call.arguments || {};
-    if (!a.path) return "";
-    return typeof a.count === "number" ? `${a.path} ×${a.count}` : a.path;
-  }
-
   handler = async ({ call }) => {
     try {
       const { text: content, diff } = await this.editor.edit({
@@ -340,10 +306,6 @@ class InsertAfter {
     this.description = fileInsertAfterDescription;
     this.parameters = INSERT_SCHEMA;
     this.family = editingFamily;
-  }
-
-  describe(call) {
-    return (call.arguments && call.arguments.path) || "";
   }
 
   handler = async ({ call }) => {
@@ -380,10 +342,6 @@ class InsertBefore {
     this.family = editingFamily;
   }
 
-  describe(call) {
-    return (call.arguments && call.arguments.path) || "";
-  }
-
   handler = async ({ call }) => {
     let text;
     try {
@@ -418,10 +376,6 @@ class New {
     this.family = editingFamily;
   }
 
-  describe(call) {
-    return (call.arguments && call.arguments.path) || "";
-  }
-
   handler = async ({ call }) => {
     let text;
     try {
@@ -453,10 +407,6 @@ class Overwrite {
     this.description = fileOverwriteDescription;
     this.parameters = WHOLE_FILE_SCHEMA;
     this.family = editingFamily;
-  }
-
-  describe(call) {
-    return (call.arguments && call.arguments.path) || "";
   }
 
   handler = async ({ call }) => {

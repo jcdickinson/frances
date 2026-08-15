@@ -2,15 +2,11 @@
 //!
 //! ## Writes
 //!
-//! - **Clean close** (a `SectionClose` event): [`persist_section`]
-//!   with `truncated = false`. Called from the `EmitState`'s normal
-//!   close path inside `workflows::emit`.
-//! - **Dehydrate-interrupted close**: same call with
-//!   `truncated = true`. Triggered when a workflow is pushed off the
-//!   top with an in-flight section.
-//! - **Error sections**: [`persist_error`] writes a row whose payload
-//!   has `kind = "error"` whenever the runtime emits a
-//!   [`StreamFrame::Error`]. `truncated` is ignored for these.
+//! [`persist_section`] writes one row per section the workflow pushes,
+//! called from the emit path in `workflows::emit`. Sections are
+//! one-shot, so a row is complete the moment it's written — there is no
+//! open/close bookkeeping and nothing to reconcile if a workflow is
+//! dehydrated mid-flight.
 //!
 //! ## Reads
 //!
@@ -20,32 +16,21 @@
 //!
 //! 1. [`ScrollbackFrame::Reset`] — UI clears its in-memory
 //!    scrollback and begins the burst.
-//! 2. For each row: a single self-describing
-//!    [`ScrollbackFrame::SectionAppend`] (the dispatcher constructs
-//!    the section on first sight of the id) followed by
-//!    [`ScrollbackFrame::SectionClose`] or
-//!    [`ScrollbackFrame::SectionTruncated`]. Error rows emit a single
-//!    [`ScrollbackFrame::Error`].
+//! 2. One [`ScrollbackFrame::Section`] per row, except error rows,
+//!    which replay as [`ScrollbackFrame::Error`] to match how they
+//!    were emitted live.
 //! 3. [`ScrollbackFrame::End`] — UI returns to live mode.
-//!
-//! Replay's id allocator is independent of live-side `SectionId`s:
-//! each replayed section opens and closes within the burst before the
-//! next one starts, so the UI's section map is empty at
-//! [`ScrollbackFrame::End`] and live ids after replay collide with
-//! nothing.
 
 use std::borrow::Cow;
 
 use frances_core::now_ns;
-use frances_edit::DiffOp;
-use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{ReasoningState, ScrollbackFrame, SectionId, SectionKind, StreamFrame};
+use crate::events::{ScrollbackFrame, SectionKind, StreamFrame};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_sections` table. UUID is permanent;
@@ -73,93 +58,19 @@ pub enum ScrollbackError {
     },
 }
 
-/// Decoded scrollback row. Either a real section (in which case
-/// `kind`/`text` reconstruct the section on replay) or an
-/// error-side-channel row (rendered as [`ScrollbackFrame::Error`]).
-#[derive(Debug, Clone, PartialEq)]
-pub enum StoredRow {
-    Section {
-        kind: SectionKind,
-        text: String,
-        truncated: bool,
-    },
-    Error {
-        text: String,
-    },
-}
-
-/// On-disk payload. The tag-internal serde derives mean the row's
-/// JSON column directly identifies its variant — no parallel `kind`
-/// column needed.
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-enum RowPayload {
-    Error {
-        text: String,
-    },
-    ToolUse {
-        name: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        detail: Option<String>,
-    },
-    Json {
-        tag: String,
-        value: serde_json::Value,
-    },
-    Reasoning {
-        state: ReasoningState,
-        text: String,
-    },
-    Diff {
-        lines: Vec<DiffOp>,
-    },
-    EntityRef {
-        entity_id: Uuid,
-    },
-}
-
-/// Insert a finished or truncated section row. `truncated = false`
-/// corresponds to a clean `SectionClose`; `truncated = true`
-/// corresponds to a workflow dehydrated mid-stream.
+/// Insert one section row.
 pub async fn persist_section(
     db: &Database,
     instance: Uuid,
-    kind: SectionKind,
-    text: String,
-    truncated: bool,
+    kind: &SectionKind,
 ) -> std::result::Result<(), ScrollbackError> {
-    let payload = encode_payload(kind, text);
-    let payload_json = serde_json::to_string(&payload).map_err(ScrollbackError::Encode)?;
-    let instance_bytes = instance.as_bytes().to_vec();
-    let now = now_ns();
-    let truncated_i = if truncated { 1 } else { 0 };
-    let conn = db.connect().await;
-    conn.execute(
-        "INSERT INTO scrollback_sections (instance_id, payload, truncated, created_at) \
-         VALUES (?1, jsonb(?2), ?3, ?4)",
-        (instance_bytes, payload_json, truncated_i, now),
-    )
-    .await?;
-    Ok(())
-}
-
-/// Insert an error row. The replay path emits a single
-/// [`StreamFrame::Error`] for each such row.
-pub async fn persist_error(
-    db: &Database,
-    instance: Uuid,
-    text: &str,
-) -> std::result::Result<(), ScrollbackError> {
-    let payload = RowPayload::Error {
-        text: text.to_owned(),
-    };
-    let payload_json = serde_json::to_string(&payload).map_err(ScrollbackError::Encode)?;
+    let payload_json = serde_json::to_string(kind).map_err(ScrollbackError::Encode)?;
     let instance_bytes = instance.as_bytes().to_vec();
     let now = now_ns();
     let conn = db.connect().await;
     conn.execute(
-        "INSERT INTO scrollback_sections (instance_id, payload, truncated, created_at) \
-         VALUES (?1, jsonb(?2), 0, ?3)",
+        "INSERT INTO scrollback_sections (instance_id, payload, created_at) \
+         VALUES (?1, jsonb(?2), ?3)",
         (instance_bytes, payload_json, now),
     )
     .await?;
@@ -171,11 +82,11 @@ pub async fn persist_error(
 pub async fn load_for_instance(
     db: &Database,
     instance: Uuid,
-) -> std::result::Result<Vec<StoredRow>, ScrollbackError> {
+) -> std::result::Result<Vec<SectionKind>, ScrollbackError> {
     let conn = db.connect().await;
     let mut rows = conn
         .query(
-            "SELECT json(payload), truncated FROM scrollback_sections \
+            "SELECT json(payload) FROM scrollback_sections \
              WHERE instance_id = ?1 ORDER BY id ASC",
             (instance.as_bytes().to_vec(),),
         )
@@ -191,10 +102,7 @@ pub async fn load_for_instance(
                 });
             }
         };
-        let truncated = matches!(row.get_value(1)?, turso::Value::Integer(n) if n != 0);
-        let payload: RowPayload =
-            serde_json::from_str(&payload_text).map_err(ScrollbackError::Decode)?;
-        out.push(decode_payload(payload, truncated));
+        out.push(serde_json::from_str(&payload_text).map_err(ScrollbackError::Decode)?);
     }
     Ok(out)
 }
@@ -214,85 +122,16 @@ pub async fn replay_to_channel(
         instance_id: instance,
     }));
 
-    let mut next_id: u64 = 1;
-    for row in rows {
-        match row {
-            StoredRow::Section {
-                kind,
-                text,
-                truncated,
-            } => {
-                let id = SectionId(next_id);
-                next_id += 1;
-                events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                    id,
-                    kind,
-                    delta: text,
-                }));
-                if truncated {
-                    events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionTruncated {
-                        id,
-                    }));
-                } else {
-                    events.send(StreamFrame::Scrollback(ScrollbackFrame::SectionClose {
-                        id,
-                    }));
-                }
-            }
-            StoredRow::Error { text } => {
-                events.send(StreamFrame::Scrollback(ScrollbackFrame::Error(text)));
-            }
-        }
+    for kind in rows {
+        let frame = match kind {
+            SectionKind::Error { text } => ScrollbackFrame::Error(text),
+            kind => ScrollbackFrame::Section(kind),
+        };
+        events.send(StreamFrame::Scrollback(frame));
     }
 
     events.send(StreamFrame::Scrollback(ScrollbackFrame::End));
     Ok(())
-}
-
-fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
-    match kind {
-        SectionKind::Error => RowPayload::Error { text },
-        SectionKind::ToolUse { name, detail } => RowPayload::ToolUse { name, detail },
-        SectionKind::Json { tag, value } => RowPayload::Json { tag, value },
-        SectionKind::Reasoning { state } => RowPayload::Reasoning { state, text },
-        SectionKind::Diff { lines } => RowPayload::Diff { lines },
-        SectionKind::EntityRef { entity_id } => RowPayload::EntityRef { entity_id },
-    }
-}
-
-fn decode_payload(payload: RowPayload, truncated: bool) -> StoredRow {
-    match payload {
-        RowPayload::Error { text } => StoredRow::Error { text },
-        RowPayload::ToolUse { name, detail } => StoredRow::Section {
-            kind: SectionKind::ToolUse { name, detail },
-            text: String::new(),
-            truncated,
-        },
-        RowPayload::Json { tag, value } => {
-            let body = serde_json::to_string(&value).unwrap_or_else(|_| "<unserializable>".into());
-            let text = format!("[{tag}] {body}");
-            StoredRow::Section {
-                kind: SectionKind::Json { tag, value },
-                text,
-                truncated,
-            }
-        }
-        RowPayload::Reasoning { state, text } => StoredRow::Section {
-            kind: SectionKind::Reasoning { state },
-            text,
-            truncated,
-        },
-        RowPayload::Diff { lines } => StoredRow::Section {
-            kind: SectionKind::Diff { lines },
-            text: String::new(),
-            truncated,
-        },
-        RowPayload::EntityRef { entity_id } => StoredRow::Section {
-            kind: SectionKind::EntityRef { entity_id },
-            text: String::new(),
-            truncated,
-        },
-    }
 }
 
 #[cfg(test)]
@@ -317,7 +156,7 @@ mod tests {
         out
     }
 
-    /// Replay of one stored section is `[Reset, SectionAppend, SectionClose, End]`.
+    /// Replay of one stored section is `[Reset, Section, End]`.
     #[tokio::test]
     async fn replay_frames_for_single_section_is_minimal() {
         let db = fresh_db().await;
@@ -325,74 +164,57 @@ mod tests {
         persist_section(
             &db,
             instance,
-            SectionKind::ToolUse {
-                name: "shell".into(),
-                detail: None,
+            &SectionKind::Json {
+                tag: "plan".into(),
+                value: serde_json::json!({ "step": 1 }),
             },
-            String::new(),
-            false,
         )
         .await
         .unwrap();
 
         let frames = collect_replay(&db, instance).await;
-        assert_eq!(frames.len(), 4);
+        assert_eq!(frames.len(), 3);
         match &frames[0] {
             StreamFrame::Scrollback(ScrollbackFrame::Reset { .. }) => {}
             other => panic!("expected Reset at [0], got {other:?}"),
         }
         match &frames[1] {
-            StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::ToolUse { name, .. },
-                ..
-            }) => {
-                assert_eq!(name, "shell");
+            StreamFrame::Scrollback(ScrollbackFrame::Section(SectionKind::Json {
+                tag, ..
+            })) => {
+                assert_eq!(tag, "plan");
             }
-            other => panic!("expected SectionAppend with ToolUse kind at [1], got {other:?}"),
+            other => panic!("expected Section with Json kind at [1], got {other:?}"),
         }
         match &frames[2] {
-            StreamFrame::Scrollback(ScrollbackFrame::SectionClose { .. }) => {}
-            other => panic!("expected SectionClose at [2], got {other:?}"),
-        }
-        match &frames[3] {
             StreamFrame::Scrollback(ScrollbackFrame::End) => {}
-            other => panic!("expected End at [3], got {other:?}"),
+            other => panic!("expected End at [2], got {other:?}"),
         }
     }
 
-    /// An `EntityRef` row round-trips: persisted with no text, replayed
-    /// as a single self-describing append carrying the entity id.
+    /// An `EntityRef` row round-trips: persisted and replayed as a
+    /// single self-describing section carrying the entity id.
     #[tokio::test]
     async fn entity_ref_roundtrip() {
         let db = fresh_db().await;
         let instance = Uuid::new_v4();
         let entity_id = Uuid::new_v4();
-        persist_section(
-            &db,
-            instance,
-            SectionKind::EntityRef { entity_id },
-            String::new(),
-            false,
-        )
-        .await
-        .unwrap();
+        persist_section(&db, instance, &SectionKind::EntityRef { entity_id })
+            .await
+            .unwrap();
 
         let frames = collect_replay(&db, instance).await;
-        assert_eq!(frames.len(), 4);
+        assert_eq!(frames.len(), 3);
         match &frames[1] {
-            StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::EntityRef { entity_id: got },
-                delta,
-                ..
-            }) => {
-                assert_eq!(*got, entity_id);
-                assert!(delta.is_empty());
-            }
-            other => panic!("expected EntityRef append at [1], got {other:?}"),
+            StreamFrame::Scrollback(ScrollbackFrame::Section(SectionKind::EntityRef {
+                entity_id: got,
+            })) => assert_eq!(*got, entity_id),
+            other => panic!("expected EntityRef section at [1], got {other:?}"),
         }
     }
 
-    /// Multi-row instance: text section + error + tool-use + truncated section.
+    /// Error rows replay as `Error` frames; everything else as sections,
+    /// in insertion order.
     #[tokio::test]
     async fn replay_mixed_rows() {
         let db = fresh_db().await;
@@ -400,38 +222,25 @@ mod tests {
         persist_section(
             &db,
             instance,
-            SectionKind::Reasoning {
-                state: ReasoningState::Done,
+            &SectionKind::Json {
+                tag: "plan".into(),
+                value: serde_json::json!({ "step": 1 }),
             },
-            "hi".into(),
-            false,
-        )
-        .await
-        .unwrap();
-        persist_error(&db, instance, "boom").await.unwrap();
-        persist_section(
-            &db,
-            instance,
-            SectionKind::ToolUse {
-                name: "shell".into(),
-                detail: None,
-            },
-            String::new(),
-            false,
         )
         .await
         .unwrap();
         persist_section(
             &db,
             instance,
-            SectionKind::Reasoning {
-                state: ReasoningState::Streaming,
+            &SectionKind::Error {
+                text: "boom".into(),
             },
-            "partial".into(),
-            true,
         )
         .await
         .unwrap();
+        persist_section(&db, instance, &SectionKind::Diff { lines: Vec::new() })
+            .await
+            .unwrap();
 
         let frames = collect_replay(&db, instance).await;
         assert!(matches!(
@@ -440,50 +249,23 @@ mod tests {
         ));
         assert!(matches!(
             frames.get(1),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::Reasoning {
-                    state: ReasoningState::Done,
-                },
-                ..
-            })),
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Section(
+                SectionKind::Json { .. }
+            ))),
         ));
         assert!(matches!(
             frames.get(2),
-            Some(StreamFrame::Scrollback(
-                ScrollbackFrame::SectionClose { .. }
-            ))
-        ));
-        assert!(matches!(
-            frames.get(3),
             Some(StreamFrame::Scrollback(ScrollbackFrame::Error(_)))
         ));
         assert!(matches!(
+            frames.get(3),
+            Some(StreamFrame::Scrollback(ScrollbackFrame::Section(
+                SectionKind::Diff { .. }
+            ))),
+        ));
+        assert!(matches!(
             frames.get(4),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::ToolUse { .. },
-                ..
-            })),
-        ));
-        assert!(matches!(
-            frames.get(5),
-            Some(StreamFrame::Scrollback(
-                ScrollbackFrame::SectionClose { .. }
-            ))
-        ));
-        assert!(matches!(
-            frames.get(6),
-            Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::Reasoning {
-                    state: ReasoningState::Streaming,
-                },
-                ..
-            })),
-        ));
-        assert!(matches!(
-            frames.get(7),
-            Some(StreamFrame::Scrollback(
-                ScrollbackFrame::SectionTruncated { .. }
-            )),
+            Some(StreamFrame::Scrollback(ScrollbackFrame::End))
         ));
     }
 }

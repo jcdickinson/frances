@@ -21,12 +21,7 @@
 
 import { inbox, INTERRUPT } from "frances:v1/inbox";
 import { AbortController } from "whatwg:abortcontroller";
-import {
-  transcript,
-  ErrorSection,
-  ReasoningSection,
-  ToolUseSection,
-} from "frances:v1/sections";
+import { transcript, ErrorSection } from "frances:v1/sections";
 import { postMessage, openMessage } from "frances:v1/messages";
 import { ChatSession, complete, loadChatSession } from "frances:v1/chat";
 import { db } from "frances:v1/storage";
@@ -36,7 +31,7 @@ import {
   Wait,
   Kill,
   Set as ShellSet,
-  Capture as ShellCapture,
+  Get as ShellGet,
 } from "frances:v1/tools/shell";
 import {
   Editor,
@@ -52,7 +47,7 @@ import {
   Variables,
   Get as VarGet,
   Set as VarSet,
-  Assign as VarAssign,
+  Edit as VarEdit,
 } from "frances:v1/tools/variable";
 import { exit, setStatus } from "frances:v1/workflow";
 import { envBlock, cwdBlock } from "frances:v1/context-sections";
@@ -479,7 +474,9 @@ async function pipeAssistantTextToFrame(
   return textOut;
 }
 
-// Reasoning channel: pipe straight to a ReasoningSection.
+// Reasoning channel: stream it into a "reasoning" chat message. The
+// message is opened on the first delta, so non-thinking models leave
+// no empty row behind.
 //
 // Two different model-feedback loops to keep straight:
 //   1. Provider history round-trip — reasoning still rides back to the
@@ -490,23 +487,22 @@ async function pipeAssistantTextToFrame(
 //      one we *deliberately* exclude reasoning from. Reasoning is bulky
 //      model-internal scratch work; folding it into the step summary
 //      would dilute the summary and burn tokens for no real benefit.
-async function pipeReasoningToFrame(
+async function pipeReasoningToMessage(
   reasoning: ReadableStream<string>,
-  out: ReasoningSection,
 ): Promise<void> {
   const reader = reasoning.getReader();
-  const writer = out.writable.getWriter();
+  let out: ReturnType<typeof openMessage> | null = null;
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      await writer.write(value);
+      if (!value) continue;
+      if (!out) out = openMessage("reasoning");
+      out.write(value);
     }
-    await writer.close();
+    out?.close();
   } catch (err) {
-    try {
-      await writer.abort(err);
-    } catch (_) {}
+    out?.close();
     throw err;
   } finally {
     reader.releaseLock();
@@ -1004,14 +1000,15 @@ const stepTranscriptEntries: string[] = [];
 let stepTranscriptSummary: string | null = null;
 const vars = new Variables();
 
-// Wrap a tool's handler to mirror its calls/results into the transcript and the
-// step summary. Each tool must be wrapped exactly once — wrapping is not
-// idempotent (it captures the current handler), so only ever wrap a fresh
-// instance.
+// Wrap a tool's handler to mirror its calls/results into the step summary.
+// Nothing about the call itself reaches the transcript: tools that produce
+// something worth seeing render it themselves (a shell entity, a diff), and
+// a "→ tool_name" marker next to that is just the same thing twice.
+// Each tool must be wrapped exactly once — wrapping is not idempotent (it
+// captures the current handler), so only ever wrap a fresh instance.
 function wrapTool(tool: any): void {
   const original = tool.handler.bind(tool);
   tool.handler = async ({ call, scope }: any) => {
-    transcript.push(new ToolUseSection({ call, tool }));
     recordStepTranscript(
       `Tool call: ${call.name}`,
       `id: ${call.id}\narguments:\n${textToString(call.arguments)}`,
@@ -1034,10 +1031,10 @@ function wrapTool(tool: any): void {
 // wrapped once.
 const run = new Run(sh, { wait, kill });
 const shellSet = new ShellSet(sh, vars);
-const shellCapture = new ShellCapture(sh, vars);
+const shellGet = new ShellGet(sh, vars);
 const varGet = new VarGet(vars);
 const varSet = new VarSet(vars);
-const varAssign = new VarAssign(vars);
+const varEdit = new VarEdit(vars);
 const planUpdate = new PlanUpdate();
 const planFinishStep = new PlanFinishStep();
 const planExit = new PlanExit();
@@ -1047,10 +1044,10 @@ const persistentTools = [
   wait,
   kill,
   shellSet,
-  shellCapture,
+  shellGet,
   varGet,
   varSet,
-  varAssign,
+  varEdit,
   planUpdate,
   planFinishStep,
   planExit,
@@ -1085,12 +1082,12 @@ function freshContext(): void {
     wait,
     kill,
     shellSet,
-    shellCapture,
+    shellGet,
     read,
     search,
     varGet,
     varSet,
-    varAssign,
+    varEdit,
   ];
   planningTools = [...explore, planUpdate, planExit];
   executingTools = [...explore, ...editTools, planUpdate, planFinishStep, planBegin];
@@ -1325,17 +1322,14 @@ async function turn(): Promise<TurnEnd> {
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
     // Open the assistant message eagerly with empty text; each delta
-    // refreshes its snapshot. The `thought` frame sits alongside it for
-    // the reasoning channel; for non-thinking models it stays empty and
-    // closes immediately.
+    // refreshes its snapshot. The reasoning channel opens its own
+    // message the first time it produces anything.
     const out = openMessage("assistant");
-    const thought = new ReasoningSection();
-    transcript.push(thought);
 
     const round = (async () => {
       await Promise.all([
         pipeAssistantTextToFrame(r.text, out),
-        pipeReasoningToFrame(r.reasoning, thought),
+        pipeReasoningToMessage(r.reasoning),
       ]);
       return await r.completed;
     })();

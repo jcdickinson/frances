@@ -44,8 +44,8 @@ async fn post_message_creates_refs_and_settles() {
     assert!(
         matches!(
             &frames[1],
-            SectionTranscript::Set { section, .. }
-                if matches!(section.kind, SectionKind::EntityRef { entity_id } if entity_id == created_id)
+            SectionTranscript::Push(SectionKind::EntityRef { entity_id })
+                if *entity_id == created_id
         ),
         "expected the transcript ref second: {frames:?}"
     );

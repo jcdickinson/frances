@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { commands as backend, events, type UiEvent } from './bindings';
+  import { commands as backend, events, type SectionKind, type UiEvent } from './bindings';
   import CommandPalette from './components/CommandPalette.svelte';
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
@@ -19,7 +19,7 @@
   let permission = $state<string | null>(null);
   let historyMode = $state(false);
   let paletteOpen = $state(false);
-  let errorId = -1;
+  let nextSectionId = 0;
   let scrollback = $state<HTMLElement | undefined>();
   let textarea: HTMLTextAreaElement;
 
@@ -83,25 +83,8 @@
   async function applyEvent(event: UiEvent): Promise<void> {
     if (event.type === 'reset') {
       sections = [];
-    } else if (event.type === 'section_append') {
-      const existing = sections.find((section) => section.id === event.id);
-      if (existing) {
-        existing.kind = event.kind;
-        existing.text += event.delta;
-        sections = [...sections];
-      } else {
-        sections = [
-          ...sections,
-          { id: event.id, kind: event.kind, text: event.delta, closed: false, truncated: false },
-        ];
-      }
-    } else if (event.type === 'section_close') {
-      const section = sections.find((candidate) => candidate.id === event.id);
-      if (section) {
-        section.closed = true;
-        section.truncated = event.truncated;
-        sections = [...sections];
-      }
+    } else if (event.type === 'section') {
+      pushSection(event.kind);
     } else if (event.type === 'entity_upsert') {
       upsertEntity({
         id: event.entity_id,
@@ -121,11 +104,12 @@
     if (!historyMode) scrollback?.scrollTo({ top: scrollback.scrollHeight });
   }
 
+  function pushSection(kind: SectionKind): void {
+    sections = [...sections, { id: nextSectionId++, kind }];
+  }
+
   function addError(message: string): void {
-    sections = [
-      ...sections,
-      { id: errorId--, kind: { type: 'error' }, text: message, closed: true, truncated: false },
-    ];
+    pushSection({ type: 'error', text: message });
   }
 
   function showError(error: unknown): void {

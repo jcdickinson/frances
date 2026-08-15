@@ -1,33 +1,17 @@
 //! `frances:v1/sections` — transcript + frame classes.
 //!
-//! The transcript is an append-only sequence of frames. The user holds
-//! a frame object after `transcript.push(frame)` and may call
-//! `frame.write(text)` to extend its content. Frames stay writeable
-//! until they're explicitly closed; the host supports many open blocks
-//! at once, so a long-streaming frame can keep going while later
-//! frames are pushed alongside it.
-//!
-//! Each writeable frame (today just `ReasoningSection`) exposes:
-//!   - `frame.write(text)` — append, throws if `closed`.
-//!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
-//!   - `frame.close()` — emit [`SectionTranscript::Close`], flip `closed`,
-//!     return `this` so `new ReasoningSection().close()` chains (a
-//!     pre-push close is remembered and emitted right after the push).
-//!   - `frame.autoclose` (default `true`) — when truthy, the writable's
-//!     `close`/`abort` hook calls `frame.close()` so a finished pipe
-//!     seals the frame automatically.
+//! The transcript is an append-only sequence of frames. Every frame is
+//! one-shot: `transcript.push(frame)` hands the host a finished section
+//! and the frame object is inert afterwards. Anything that streams is
+//! an entity (see `frances:v1/entities`), referenced from the
+//! transcript by an `EntityRefSection`.
 //!
 //! For v1 there is exactly one transcript (the live binding behind the
 //! `transcript` import). The `Transcript` class is exported as a type
 //! for future rotation work; users can't construct one in v1.
 //!
-//! Wire contract: the host receives a [`SectionTranscript::Set`] for each
-//! frame (the first creates it; a later one re-upserts kind + metadata,
-//! e.g. shell state going terminal), [`SectionTranscript::Append`] for each
-//! text delta, and [`SectionTranscript::Close`] when a frame is sealed.
-
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+//! Wire contract: the host receives one [`SectionTranscript::Push`] per
+//! pushed frame.
 
 use super::{throw_js as throw_err, throw_js_type as throw_type};
 use frances_edit::DiffOp;
@@ -38,36 +22,12 @@ use rquickjs::{Class, Ctx, Function, JsLifetime, Object, Result as JsResult, Val
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{SectionId, SectionKind, SectionSpec, SectionTranscript};
-
-/// Shared state for the v1 frames surface. One per workflow invocation.
-pub(crate) struct SectionsState {
-    /// Monotonically-increasing frame id. Bumped by `transcript.push`.
-    next_id: AtomicU64,
-    /// Where push/append events go.
-    tx: UnboundedSender<SectionTranscript>,
-}
-
-impl SectionsState {
-    fn new(tx: UnboundedSender<SectionTranscript>) -> Arc<Self> {
-        Arc::new(Self {
-            next_id: AtomicU64::new(0),
-            tx,
-        })
-    }
-
-    fn assign_id(&self) -> u64 {
-        // Pre-increment so id == 0 means "never pushed".
-        self.next_id.fetch_add(1, Ordering::AcqRel) + 1
-    }
-}
+use crate::runtime::{SectionKind, SectionTranscript};
 
 pub(crate) type BuiltSections<'js> = (
     Class<'js, TranscriptHandle>,
     Ctor<'js>, // ErrorSection
     Ctor<'js>, // JsonSection
-    Ctor<'js>, // ReasoningSection
-    Ctor<'js>, // ToolUseSection
     Ctor<'js>, // DiffSection
     Ctor<'js>, // EntityRefSection
 );
@@ -76,31 +36,14 @@ pub(crate) fn build_sections<'js>(
     ctx: &Ctx<'js>,
     tx: UnboundedSender<SectionTranscript>,
 ) -> JsResult<BuiltSections<'js>> {
-    let state = SectionsState::new(tx);
-
-    let transcript = Class::instance(
-        ctx.clone(),
-        TranscriptHandle {
-            state: state.clone(),
-        },
-    )?;
+    let transcript = Class::instance(ctx.clone(), TranscriptHandle { tx })?;
 
     let err_ctor = build_error_ctor(ctx)?;
     let json_ctor = build_json_ctor(ctx)?;
-    let thought_ctor = build_thought_ctor(ctx, state)?;
-    let tool_use_ctor = build_tool_use_ctor(ctx)?;
     let diff_ctor = build_diff_ctor(ctx)?;
     let entity_ref_ctor = build_entity_ref_ctor(ctx)?;
 
-    Ok((
-        transcript,
-        err_ctor,
-        json_ctor,
-        thought_ctor,
-        tool_use_ctor,
-        diff_ctor,
-        entity_ref_ctor,
-    ))
+    Ok((transcript, err_ctor, json_ctor, diff_ctor, entity_ref_ctor))
 }
 
 // ---------------------------------------------------------------------
@@ -110,7 +53,8 @@ pub(crate) fn build_sections<'js>(
 /// `Transcript` — for v1 just `push(frame)`. Users get a singleton via
 /// the `transcript` export; the constructor is intentionally absent.
 pub struct TranscriptHandle {
-    state: Arc<SectionsState>,
+    /// Where pushed sections go.
+    tx: UnboundedSender<SectionTranscript>,
 }
 
 impl<'js> Trace<'js> for TranscriptHandle {
@@ -149,127 +93,53 @@ fn push_section<'js>(
     handle: &Class<'js, TranscriptHandle>,
     section: Value<'js>,
 ) -> JsResult<()> {
-    let state = handle.borrow().state.clone();
+    let tx = handle.borrow().tx.clone();
 
     if let Some(err) = as_section::<ErrorSection>(&section) {
-        let new_id = state.assign_id();
-        err.borrow().id.store(new_id, Ordering::Release);
-        let section = SectionSpec {
-            kind: SectionKind::Error,
-            seed: Some(err.borrow().content.clone()),
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        return Ok(());
-    }
-    if let Some(tu) = as_section::<ToolUseSection>(&section) {
-        let borrow = tu.borrow();
-        if borrow.hidden {
-            return Ok(());
-        }
-        let new_id = state.assign_id();
-        borrow.id.store(new_id, Ordering::Release);
-        let section = SectionSpec {
-            kind: SectionKind::ToolUse {
-                name: borrow.name.clone(),
-                detail: borrow.detail.clone(),
+        let borrow = err.borrow();
+        push_kind(
+            &tx,
+            SectionKind::Error {
+                text: borrow.content.clone(),
             },
-            seed: None,
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        // One-shot: the runtime closes + persists this frame on its end
-        // (see emit() for SectionKind::ToolUse). No SectionTranscript::Close from
-        // the workflow side — keeps the JS API simple.
+        );
         return Ok(());
     }
     if let Some(df) = as_section::<DiffSection>(&section) {
         let mut borrow = df.borrow_mut();
-        let new_id = state.assign_id();
-        borrow.id.store(new_id, Ordering::Release);
         let ops = std::mem::take(&mut borrow.ops);
-        let section = SectionSpec {
-            kind: SectionKind::Diff { lines: ops },
-            seed: None,
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        // One-shot — runtime seals on its side. Same shape as ToolUseSection.
+        push_kind(&tx, SectionKind::Diff { lines: ops });
         return Ok(());
     }
     if let Some(json) = as_section::<JsonSection>(&section) {
-        let new_id = state.assign_id();
-        json.borrow().id.store(new_id, Ordering::Release);
         let borrow = json.borrow();
-        let section = SectionSpec {
-            kind: SectionKind::Json {
+        push_kind(
+            &tx,
+            SectionKind::Json {
                 tag: borrow.tag.clone(),
                 value: borrow.value.clone(),
             },
-            seed: None,
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        return Ok(());
-    }
-    if let Some(th) = as_section::<ReasoningSection>(&section) {
-        let new_id = state.assign_id();
-        let borrow = th.borrow();
-        borrow.id.store(new_id, Ordering::Release);
-        // Body content rides as `seed` (typically empty — reasoning is
-        // streamed in via `.write()`). State is whatever `done` reports
-        // at push time so a pre-closed frame goes straight to `Done`.
-        let reasoning_state = if borrow.done.load(Ordering::Acquire) {
-            crate::runtime::ReasoningState::Done
-        } else {
-            crate::runtime::ReasoningState::Streaming
-        };
-        let section = SectionSpec {
-            kind: SectionKind::Reasoning {
-                state: reasoning_state,
-            },
-            seed: Some(borrow.content.clone()),
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(SectionTranscript::Close {
-                id: SectionId(new_id),
-            });
-        }
+        );
         return Ok(());
     }
     if let Some(er) = as_section::<EntityRefSection>(&section) {
-        let new_id = state.assign_id();
         let borrow = er.borrow();
-        borrow.id.store(new_id, Ordering::Release);
-        let section = SectionSpec {
-            kind: SectionKind::EntityRef {
+        push_kind(
+            &tx,
+            SectionKind::EntityRef {
                 entity_id: borrow.entity_id,
             },
-            seed: None,
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        // One-shot — runtime seals on its side, like ToolUseSection.
+        );
         return Ok(());
     }
     throw_type(
         ctx,
-        "transcript.push: expected an ErrorSection, JsonSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
+        "transcript.push: expected an ErrorSection, JsonSection, DiffSection, or EntityRefSection",
     )
+}
+
+fn push_kind(tx: &UnboundedSender<SectionTranscript>, kind: SectionKind) {
+    let _ = tx.send(SectionTranscript::Push(kind));
 }
 
 fn as_section<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
@@ -282,7 +152,6 @@ fn as_section<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
 
 /// `ErrorSection` — one-shot error message.
 pub struct ErrorSection {
-    id: AtomicU64,
     content: String,
 }
 
@@ -308,36 +177,11 @@ impl<'js> JsClass<'js> for ErrorSection {
     }
 }
 
-fn append_text<'js>(
-    ctx: &Ctx<'js>,
-    state: &Arc<SectionsState>,
-    id: &AtomicU64,
-    closed: &AtomicBool,
-    delta: String,
-) -> JsResult<()> {
-    let frame_id = id.load(Ordering::Acquire);
-    if frame_id == 0 {
-        return throw_type(
-            ctx,
-            "frame.write: frame has not been pushed onto the transcript yet",
-        );
-    }
-    if closed.load(Ordering::Acquire) {
-        return throw_type(ctx, "frame.write: frame is closed");
-    }
-    let _ = state.tx.send(SectionTranscript::Append {
-        id: SectionId(frame_id),
-        delta,
-    });
-    Ok(())
-}
-
 // ---------------------------------------------------------------------
 // JsonSection — single tagged value, no write
 // ---------------------------------------------------------------------
 
 pub struct JsonSection {
-    id: AtomicU64,
     tag: String,
     value: serde_json::Value,
 }
@@ -365,128 +209,6 @@ impl<'js> JsClass<'js> for JsonSection {
 }
 
 // ---------------------------------------------------------------------
-// ToolUseSection — one-shot "→ tool_name" marker
-// ---------------------------------------------------------------------
-
-/// Hard cap on the length of the `detail` string returned by a tool's
-/// `describe(call)`. The detail rides on every tool-call wire frame and
-/// is shown inline in the UI; an unbounded value could flood the
-/// scrollback row or push the whole block off-screen. Anything past the
-/// cap is truncated with a trailing `…`.
-const TOOL_DETAIL_MAX: usize = 160;
-
-pub struct ToolUseSection {
-    id: AtomicU64,
-    name: String,
-    /// When `true`, `transcript.push` skips the frame entirely — no wire `Push` is emitted.
-    hidden: bool,
-    /// Optional human-readable suffix produced by `tool.describe(call)`.
-    detail: Option<String>,
-}
-
-impl<'js> Trace<'js> for ToolUseSection {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
-unsafe impl<'js> JsLifetime<'js> for ToolUseSection {
-    type Changed<'to> = ToolUseSection;
-}
-
-impl<'js> JsClass<'js> for ToolUseSection {
-    const NAME: &'static str = "ToolUseSection";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-        Ok(Some(proto))
-    }
-
-    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
-        Ok(None)
-    }
-}
-
-/// Call `tool.describe(call)` if `tool` exposes a callable `describe`.
-/// Returns the raw string the function produced, or `None` if there is
-/// no `describe`, the property is not callable, it threw, or it
-/// returned a non-string. Errors are swallowed by design — a broken
-/// `describe` must never break the tool-call flow.
-fn invoke_describe<'js>(tool: &Object<'js>, call: &Object<'js>) -> Option<String> {
-    let describe = tool.get::<_, Function<'js>>("describe").ok()?;
-    let result: Value<'js> = describe.call((call.clone(),)).ok()?;
-    if result.is_string() {
-        result.get::<String>().ok()
-    } else {
-        None
-    }
-}
-
-/// Trim whitespace, collapse to `None` when empty, and truncate to
-/// `TOOL_DETAIL_MAX` characters (replacing the tail with `…`). The cap
-/// is enforced on Unicode scalar values, not bytes, so multi-byte
-/// characters don't silently push the result past the limit.
-fn normalise_detail(raw: String) -> Option<String> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let mut out = String::with_capacity(trimmed.len().min(TOOL_DETAIL_MAX * 4));
-    for (i, ch) in trimmed.chars().enumerate() {
-        if i >= TOOL_DETAIL_MAX {
-            out.push('…');
-            return Some(out);
-        }
-        out.push(ch);
-    }
-    Some(out)
-}
-
-fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ToolUseSection, _, _>(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
-            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-            let Some(obj) = arg.as_object() else {
-                return throw_type(
-                    &ctx,
-                    "new ToolUseSection: expected { call: { name: string }, tool? }",
-                );
-            };
-            let call: Object<'js> = obj
-                .get("call")
-                .map_err(|_| throw_err(&ctx, "new ToolUseSection: missing object `call`"))?;
-            let name: String = call.get("name").map_err(|_| {
-                throw_err(
-                    &ctx,
-                    "new ToolUseSection: missing or non-string `call.name`",
-                )
-            })?;
-            let tool: Option<Object<'js>> = match obj.get::<_, Value<'js>>("tool") {
-                Ok(v) if v.is_object() => v.into_object(),
-                _ => None,
-            };
-            let hidden = tool
-                .as_ref()
-                .and_then(|t| t.get::<_, bool>("hidden").ok())
-                .unwrap_or(false);
-            let detail = tool
-                .as_ref()
-                .and_then(|t| invoke_describe(t, &call))
-                .and_then(normalise_detail);
-            Class::instance(
-                ctx.clone(),
-                ToolUseSection {
-                    id: AtomicU64::new(0),
-                    name,
-                    hidden,
-                    detail,
-                },
-            )
-        },
-    )
-}
-
-// ---------------------------------------------------------------------
 // DiffSection — one-shot structured diff produced by a file-edit tool
 // ---------------------------------------------------------------------
 
@@ -494,7 +216,6 @@ fn build_tool_use_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 /// JS file tools after a successful mutation; the runtime moves the ops
 /// into a [`SectionKind::Diff`] section.
 pub struct DiffSection {
-    id: AtomicU64,
     /// Drained on push — the runtime moves the ops into `SectionKind::Diff` rather than cloning.
     ops: Vec<DiffOp>,
 }
@@ -578,13 +299,7 @@ fn build_diff_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
                 .get("lines")
                 .map_err(|_| throw_err(&ctx, "new DiffSection: missing `lines`"))?;
             let ops = parse_diff_ops(&ctx, lines)?;
-            Class::instance(
-                ctx.clone(),
-                DiffSection {
-                    id: AtomicU64::new(0),
-                    ops,
-                },
-            )
+            Class::instance(ctx.clone(), DiffSection { ops })
         },
     )
 }
@@ -597,7 +312,6 @@ fn build_diff_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 /// `frances:v1/entities`' `createEntity`). The entity's snapshot renders
 /// the ref; the transcript only records where it sits.
 pub struct EntityRefSection {
-    id: AtomicU64,
     entity_id: uuid::Uuid,
 }
 
@@ -636,118 +350,9 @@ fn build_entity_ref_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
             let entity_id = id
                 .parse()
                 .map_err(|_| throw_err(&ctx, "new EntityRefSection: `id` is not an entity id"))?;
-            Class::instance(
-                ctx.clone(),
-                EntityRefSection {
-                    id: AtomicU64::new(0),
-                    entity_id,
-                },
-            )
+            Class::instance(ctx.clone(), EntityRefSection { entity_id })
         },
     )
-}
-
-// ---------------------------------------------------------------------
-// ReasoningSection — streaming model reasoning
-// ---------------------------------------------------------------------
-
-/// `ReasoningSection` — streaming model reasoning. `state` transitions `Streaming → Done` on close.
-pub struct ReasoningSection {
-    state: Arc<SectionsState>,
-    id: AtomicU64,
-    /// Initial body captured at construction (always empty in v1).
-    content: String,
-    /// Encoded [`crate::runtime::ReasoningState`]. `false` ⇒ Streaming,
-    /// `true` ⇒ Done. Flipped by `.close()`.
-    done: AtomicBool,
-    /// Flipped by `.close()`. Subsequent writes throw; subsequent closes are no-ops.
-    closed: AtomicBool,
-}
-
-impl<'js> Trace<'js> for ReasoningSection {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
-unsafe impl<'js> JsLifetime<'js> for ReasoningSection {
-    type Changed<'to> = ReasoningSection;
-}
-
-impl<'js> JsClass<'js> for ReasoningSection {
-    const NAME: &'static str = "ReasoningSection";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-        proto.set(
-            "write",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, ReasoningSection>>, delta: String| {
-                    let b = this.0.borrow();
-                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
-                },
-            )?,
-        )?;
-        // `close()` performs both the `Streaming → Done` state transition
-        // (metadata-only `Set`) and the block seal (`Close`). Idempotent.
-        proto.set(
-            "close",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>,
-                 this: This<Class<'js, ReasoningSection>>|
-                 -> JsResult<Class<'js, ReasoningSection>> {
-                    {
-                        let b = this.0.borrow();
-                        finish_thought(&ctx, &b.state, &b.id, &b.done, &b.closed)?;
-                    }
-                    Ok(this.0.clone())
-                },
-            )?,
-        )?;
-        Ok(Some(proto))
-    }
-
-    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
-        Ok(None)
-    }
-}
-
-/// Transition a thought frame to `Done` (metadata `Set`) and seal it
-/// (`Close`) in one call. Idempotent on repeated invocation.
-fn finish_thought<'js>(
-    _ctx: &Ctx<'js>,
-    state: &Arc<SectionsState>,
-    id: &AtomicU64,
-    done: &AtomicBool,
-    closed: &AtomicBool,
-) -> JsResult<()> {
-    let frame_id = id.load(Ordering::Acquire);
-    if frame_id == 0 {
-        // Frame never pushed; record close-on-push intent.
-        closed.store(true, Ordering::Release);
-        done.store(true, Ordering::Release);
-        return Ok(());
-    }
-    if !done.swap(true, Ordering::AcqRel) {
-        // Metadata-only re-`Set` carrying the new state.
-        let section = SectionSpec {
-            kind: SectionKind::Reasoning {
-                state: crate::runtime::ReasoningState::Done,
-            },
-            seed: None,
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(frame_id),
-            section,
-        });
-    }
-    if !closed.swap(true, Ordering::AcqRel) {
-        let _ = state.tx.send(SectionTranscript::Close {
-            id: SectionId(frame_id),
-        });
-    }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------
@@ -760,13 +365,7 @@ fn build_error_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
         move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
             let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
             let content = parse_content_arg(&ctx, &arg, "ErrorSection")?;
-            Class::instance(
-                ctx.clone(),
-                ErrorSection {
-                    id: AtomicU64::new(0),
-                    content,
-                },
-            )
+            Class::instance(ctx.clone(), ErrorSection { content })
         },
     )
 }
@@ -795,35 +394,7 @@ fn build_json_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
             let parsed: serde_json::Value =
                 serde_json::from_str(&json_str).unwrap_or(serde_json::Value::Null);
 
-            Class::instance(
-                ctx.clone(),
-                JsonSection {
-                    id: AtomicU64::new(0),
-                    tag,
-                    value: parsed,
-                },
-            )
-        },
-    )
-}
-
-/// `new ReasoningSection()` — no constructor arguments. Reasoning frames
-/// start empty in `Streaming` state and are filled via `.write()` from
-/// the chat session's `r.reasoning` channel.
-fn build_thought_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<ReasoningSection, _, _>(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, _arg: Opt<Value<'js>>| {
-            Class::instance(
-                ctx.clone(),
-                ReasoningSection {
-                    state: state.clone(),
-                    id: AtomicU64::new(0),
-                    content: String::new(),
-                    done: AtomicBool::new(false),
-                    closed: AtomicBool::new(false),
-                },
-            )
+            Class::instance(ctx.clone(), JsonSection { tag, value: parsed })
         },
     )
 }

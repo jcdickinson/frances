@@ -8,7 +8,6 @@
 //! On first boot, empty workflow metadata is seeded from `default_workflow`, which
 //! defaults to `"main"` when unset.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -21,14 +20,14 @@ use uuid::Uuid;
 
 use crate::Result;
 use crate::events::{EntityEnvelope, Lifecycle, StreamFrame};
-use crate::runtime::{EventsChannel, SessionRuntime};
+use crate::runtime::SessionRuntime;
 use crate::session::SessionWorkflow;
 use crate::store::Database;
 
 use frances_storage::Migration;
 use frances_workflow::{
-    EntityCmd, InboxItem, Invocation, PermissionRequest, SectionId, SectionKind, SectionSpec,
-    SectionTranscript, SurfaceCmd, UserInput, WorkflowHandle, parse_slash_command,
+    EntityCmd, InboxItem, Invocation, PermissionRequest, SectionKind, SectionTranscript,
+    SurfaceCmd, UserInput, WorkflowHandle, parse_slash_command,
 };
 pub use frances_workflow::{Runtime as WorkflowRuntime, WorkflowConfig, WorkflowError};
 
@@ -128,37 +127,13 @@ pub(crate) struct WorkflowInstance {
     emit: EmitState,
 }
 
-/// Block-tracking state for a single hydrated workflow's lifetime.
+/// Scrollback-writing state for a single hydrated workflow's lifetime.
 ///
-/// Workflow frames map to event blocks like this:
-///
-/// - Streaming-frame push (e.g. `ReasoningSection`): open a new block,
-///   write initial content; the block stays open so subsequent
-///   `append`s stream into it. Multiple blocks can be open
-///   concurrently.
-/// - `Append`: carries the [`SectionId`]; the emit state looks up the
-///   matching open block and writes a `BlockDelta` against it.
-/// - `Close { id }`: emit `BlockStop` for the block, persist a clean
-///   scrollback row, remove from `open`.
-/// - `UpdateKind { id, kind }`: emit a no-text `BlockDelta` carrying
-///   the new kind. Used for in-place metadata transitions (ShellOutput
-///   Running → Success/Exit(N)).
-/// - `ErrorSection` push: emit a one-shot `StreamFrame::Error` and
-///   persist a scrollback row of kind 'error'. Does NOT touch any
-///   open block — error frames are side-channel.
-/// - `JsonSection` push: open + immediately close a one-shot
-///   `Text { source: Source::Internal }` block rendering `[tag] body`.
-///
-/// On workflow termination every remaining open block is closed so the
-/// UI's `BlockState` ends up Idle. `EmitState` accumulates the delta
-/// text for each open block so we can persist the full body on close
-/// — either clean (a `BlockStop`) or truncated (workflow was dehydrated
-/// while a block was in flight).
+/// Sections are one-shot: each pushed frame is emitted to the UI and
+/// persisted in the same step, so there's no open-block bookkeeping.
+/// `ErrorSection` pushes are the one special case — they're emitted as
+/// a side-channel `StreamFrame::Error` rather than a rendered section.
 struct EmitState {
-    /// Open sections keyed by the workflow-side [`SectionId`]. Emit is
-    /// single-threaded (one task per workflow instance) so a plain
-    /// `HashMap` is enough.
-    open: HashMap<SectionId, OpenSection>,
     /// Shared per-session [`Database`] used for scrollback writes. Cheap
     /// clone; the underlying connection lock serialises overlapping
     /// writes.
@@ -169,104 +144,15 @@ struct EmitState {
     instance_id: Uuid,
 }
 
-/// A section whose first `SectionAppend` has been emitted but whose
-/// `SectionClose` has not. We buffer the delta text here so that on
-/// close we can write one scrollback row with the full body.
-///
-/// `text` accumulates from successive Appends; an Append with empty
-/// `delta` is a metadata-only update (kind changed, e.g. shell state
-/// `Running` → `Success`). On `Close` we persist the accumulated text
-/// against the most recent kind.
-struct OpenSection {
-    kind: SectionKind,
-    text: String,
-    /// `true` when the section has received any non-empty body delta.
-    /// Sections that only ever saw metadata-only updates aren't
-    /// persisted on close — they're empty placeholders by construction.
-    materialised: bool,
-}
-
-/// Why a set of open sections is being closed. The two variants carry
-/// exactly what differs between a clean stop and a mid-stream dehydrate,
-/// so the nonsense combinations (truncated-but-emit-close, or
-/// clean-but-silent) can't be written.
-enum CloseMode<'a> {
-    /// The workflow body exited cleanly. Emit a `SectionClose` per
-    /// section; persist non-truncated rows.
-    Stop(&'a EventsChannel),
-    /// The workflow is dehydrating mid-stream. Emit nothing; persist
-    /// each row truncated.
-    Truncate,
-}
-
-impl CloseMode<'_> {
-    fn truncated(&self) -> bool {
-        matches!(self, CloseMode::Truncate)
-    }
-}
-
 impl EmitState {
     fn new(db: Database, instance_id: Uuid) -> Self {
-        Self {
-            open: HashMap::new(),
-            db,
-            instance_id,
-        }
+        Self { db, instance_id }
     }
 
-    /// Persist one closing section's row (if it ever received body
-    /// content) and, for a clean stop, emit its `SectionClose`. The
-    /// `open` is consumed — its `kind`/`text` move straight into the
-    /// row.
-    async fn close_section(
-        &self,
-        mode: &CloseMode<'_>,
-        id: SectionId,
-        open: OpenSection,
-    ) -> Result<()> {
-        if let CloseMode::Stop(events) = mode {
-            events.send(StreamFrame::SectionClose { id });
-        }
-        if open.materialised {
-            crate::scrollback::persist_section(
-                &self.db,
-                self.instance_id,
-                open.kind,
-                open.text,
-                mode.truncated(),
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    /// Clean close for a single section: emit `SectionClose`, persist
-    /// a finished row (if the section ever received body content),
-    /// drop the entry. Idempotent on unknown ids.
-    async fn close_one(&mut self, events: &EventsChannel, id: SectionId) -> Result<()> {
-        let Some(open) = self.open.remove(&id) else {
-            return Ok(());
-        };
-        self.close_section(&CloseMode::Stop(events), id, open).await
-    }
-
-    /// Close every remaining open section. `Stop` emits a `SectionClose`
-    /// per section and persists clean rows; `Truncate` emits nothing
-    /// (the UI is about to clear and replay via `ScrollbackFrame::Reset`,
-    /// which surfaces these rows as `SectionTruncated`) and marks each
-    /// row truncated.
-    async fn close_all(&mut self, mode: CloseMode<'_>) -> Result<()> {
-        let drained: Vec<(SectionId, OpenSection)> = self.open.drain().collect();
-        for (id, open) in drained {
-            self.close_section(&mode, id, open).await?;
-        }
-        Ok(())
-    }
-
-    /// Persist an error row alongside the in-flight stream's `Error`
-    /// frame so it survives process restarts and workflow switches.
-    async fn persist_error(&self, text: &str) -> Result<()> {
-        crate::scrollback::persist_error(&self.db, self.instance_id, text).await?;
+    /// Persist one pushed section so it survives process restarts and
+    /// workflow switches.
+    async fn persist(&self, kind: &SectionKind) -> Result<()> {
+        crate::scrollback::persist_section(&self.db, self.instance_id, kind).await?;
         Ok(())
     }
 }
@@ -553,25 +439,18 @@ async fn drain_transcript<Io: frances_workflow::WorkflowIo>(
 }
 
 /// Genuine-termination handling for the active instance: drain any tail
-/// frames, emit a clean `BlockStop` for every still-open block, and
-/// surface a workflow error if the body settled with one.
+/// frames and surface a workflow error if the body settled with one.
 async fn finish_done<Io: frances_workflow::WorkflowIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     instance: &mut WorkflowInstance,
     reported: Option<WorkflowError>,
 ) -> Result<()> {
     drain_transcript(runtime, instance).await?;
-    instance
-        .emit
-        .close_all(CloseMode::Stop(&runtime.events))
-        .await?;
     // The only entity producer just exited; anything it left Live is an
     // orphan. Same generic repair as the startup forced settle.
     runtime.entities.force_settle_all_live().await?;
     if let Some(error) = reported {
-        let msg = format!("workflow: {error}");
-        instance.emit.persist_error(&msg).await?;
-        runtime.events.send(StreamFrame::Error(msg));
+        emit_error(runtime, instance, format!("workflow: {error}")).await?;
     }
     Ok(())
 }
@@ -660,17 +539,10 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                 // Drain any tail transcript the lifecycle hook pushed
                 // immediately before settling.
                 drain_transcript(runtime, &mut instance).await?;
-                // Body exited cleanly: every remaining open block gets
-                // a clean `BlockStop` event and a non-truncated row.
-                instance
-                    .emit
-                    .close_all(CloseMode::Stop(&runtime.events))
-                    .await?;
                 runtime.entities.force_settle_all_live().await?;
                 if let Ok(Err(error)) = done {
-                    let msg = format!("workflow shutdown: {error}");
-                    instance.emit.persist_error(&msg).await?;
-                    runtime.events.send(StreamFrame::Error(msg));
+                    emit_error(runtime, &mut instance, format!("workflow shutdown: {error}"))
+                        .await?;
                 }
                 return Ok(());
             }
@@ -679,15 +551,28 @@ async fn dehydrate<Io: frances_workflow::WorkflowIo>(
                     instance = %instance.handle.instance,
                     "workflow shutdown timed out; force-dropping handle"
                 );
-                // Body never settled. Mark every in-flight block
-                // truncated. No `BlockStop` event — the UI is about to
-                // be told to clear via `ScrollbackFrame::Reset` by the switch path.
-                instance.emit.close_all(CloseMode::Truncate).await?;
                 runtime.entities.force_settle_all_live().await?;
                 return Ok(());
             }
         }
     }
+}
+
+/// Persist and emit a driver-side error (workflow body failure). Same
+/// treatment a workflow's own `ErrorSection` gets.
+async fn emit_error<Io: frances_workflow::WorkflowIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    instance: &mut WorkflowInstance,
+    message: String,
+) -> Result<()> {
+    instance
+        .emit
+        .persist(&SectionKind::Error {
+            text: message.clone(),
+        })
+        .await?;
+    runtime.events.send(StreamFrame::Error(message));
+    Ok(())
 }
 
 /// Project a transcript delta onto the `StreamFrame` event stream and
@@ -698,83 +583,13 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
     delta: SectionTranscript,
 ) -> Result<()> {
     match delta {
-        SectionTranscript::Set {
-            id,
-            section: SectionSpec { kind, seed },
-        } => {
-            // Error is side-channel (not a streaming section).
-            if matches!(kind, SectionKind::Error) {
-                let content = seed.unwrap_or_default();
-                state.persist_error(&content).await?;
-                runtime.events.send(StreamFrame::Error(content));
-                return Ok(());
+        SectionTranscript::Push(kind) => {
+            state.persist(&kind).await?;
+            // Error is side-channel — a banner, not a rendered section.
+            match kind {
+                SectionKind::Error { text } => runtime.events.send(StreamFrame::Error(text)),
+                kind => runtime.events.send(StreamFrame::Section(kind)),
             }
-            // One-shot kinds: emit Append + Close + persist immediately.
-            if is_one_shot(&kind) {
-                let delta = match &kind {
-                    SectionKind::Json { tag, value } => {
-                        let body = serde_json::to_string(value)
-                            .unwrap_or_else(|_| "<unserializable>".into());
-                        format!("[{tag}] {body}")
-                    }
-                    _ => String::new(),
-                };
-                runtime.events.send(StreamFrame::SectionAppend {
-                    id,
-                    kind: kind.clone(),
-                    delta: delta.clone(),
-                });
-                runtime.events.send(StreamFrame::SectionClose { id });
-                crate::scrollback::persist_section(
-                    &state.db,
-                    state.instance_id,
-                    kind,
-                    delta,
-                    false,
-                )
-                .await?;
-                return Ok(());
-            }
-            // Streaming kinds: Set is either an opener or a metadata update.
-            let initial = seed.unwrap_or_default();
-            let materialised = !initial.is_empty();
-            if let Some(open) = state.open.get_mut(&id) {
-                open.kind = kind.clone();
-                runtime.events.send(StreamFrame::SectionAppend {
-                    id,
-                    kind,
-                    delta: String::new(),
-                });
-            } else {
-                runtime.events.send(StreamFrame::SectionAppend {
-                    id,
-                    kind: kind.clone(),
-                    delta: initial.clone(),
-                });
-                state.open.insert(
-                    id,
-                    OpenSection {
-                        kind,
-                        text: initial,
-                        materialised,
-                    },
-                );
-            }
-        }
-        SectionTranscript::Append { id, delta } => {
-            if let Some(open) = state.open.get_mut(&id) {
-                if !delta.is_empty() {
-                    open.text.push_str(&delta);
-                    open.materialised = true;
-                }
-                let kind = open.kind.clone();
-                runtime
-                    .events
-                    .send(StreamFrame::SectionAppend { id, kind, delta });
-            }
-        }
-        SectionTranscript::Close { id } => {
-            state.close_one(&runtime.events, id).await?;
         }
         SectionTranscript::Entity(cmd) => match cmd {
             EntityCmd::Upsert {
@@ -805,18 +620,6 @@ async fn emit_transcript<Io: frances_workflow::WorkflowIo>(
         },
     }
     Ok(())
-}
-
-/// True for [`SectionKind`] variants that don't stream — the workflow
-/// pushes them once and they're sealed in the same batch.
-fn is_one_shot(kind: &SectionKind) -> bool {
-    matches!(
-        kind,
-        SectionKind::ToolUse { .. }
-            | SectionKind::Json { .. }
-            | SectionKind::Diff { .. }
-            | SectionKind::EntityRef { .. }
-    )
 }
 
 /// Workflow-declared chrome, published as session-entity state. The

@@ -1,10 +1,9 @@
--- Per-workflow scrollback sections. One row per finished or truncated
--- section plus one row per emitted Error frame. The UI replays these
--- straight into the alt-screen scrollback inspector on attach and
--- whenever the active workflow changes.
+-- Per-workflow scrollback sections. One row per pushed section. The UI
+-- replays these straight into the alt-screen scrollback inspector on
+-- attach and whenever the active workflow changes.
 --
 -- The payload column carries the full `SectionKind` variant inline
--- via `#[serde(tag = "kind")]`, so there's no parallel discriminator
+-- via `#[serde(tag = "type")]`, so there's no parallel discriminator
 -- column.
 
 CREATE TABLE IF NOT EXISTS scrollback_sections (
@@ -15,12 +14,8 @@ CREATE TABLE IF NOT EXISTS scrollback_sections (
     -- Replay filters on this so each workflow has its own scrollback.
     instance_id  BLOB    NOT NULL,
     -- `SectionKind`-shaped JSON; serde-on-read decides the variant via
-    -- the embedded `kind` tag.
+    -- the embedded `type` tag.
     payload      JSONB   NOT NULL,
-    -- 1 = the section did not reach `SectionClose` (workflow was
-    -- dehydrated mid-stream). DEFAULTs to 0; the dehydrate path sets
-    -- it explicitly.
-    truncated    INTEGER NOT NULL DEFAULT 0,
     created_at   INTEGER NOT NULL
 );
 

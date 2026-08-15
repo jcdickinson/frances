@@ -10,11 +10,7 @@
 //!
 //! - [`SectionKind`] — the typed payload that identifies + describes a
 //!   section. Workflows construct it via JS classes (`ErrorSection`
-//!   etc.); the frontend picks a rendering by kind on first appearance
-//!   of a new section id.
-//! - [`SectionId`] — per-invocation section identity.
-//! - [`ReasoningState`] — completion-status enum carried inside the
-//!   matching [`SectionKind`] variant.
+//!   etc.); the frontend picks a rendering by kind.
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -43,36 +39,21 @@ pub struct EntityEnvelope {
     pub lifecycle: Lifecycle,
 }
 
-/// Section identity, scoped to one workflow invocation. Monotonically
-/// assigned by `transcript.push` on the workflow side. The frontend
-/// uses it to route subsequent events to the right rendered section.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash, Serialize, Deserialize, specta::Type)]
-#[serde(transparent)]
-pub struct SectionId(pub u64);
-
-/// What kind of section, and any bounded metadata that rides with it.
-/// One variant per section presentation in the UI. The frontend
-/// matches on this to pick a rendering when a new section id is seen.
+/// What kind of section, and the data that rides with it. Every
+/// section is one-shot: the workflow pushes it fully formed and the
+/// frontend matches on this to pick a rendering.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SectionKind {
-    /// `ErrorSection` — one-shot error message.
-    Error,
-    /// `ToolUseSection` — one-shot "→ tool_name" marker. `detail` is
-    /// the optional human-readable suffix produced by the tool's
-    /// `describe(call)` method.
-    ToolUse {
-        name: String,
-        detail: Option<String>,
-    },
-    /// `JsonSection` — single tagged JSON value. Immutable after push.
+    /// `ErrorSection` — one-shot error message. Side-channel: the
+    /// session driver turns it into an error frame rather than a
+    /// rendered section.
+    Error { text: String },
+    /// `JsonSection` — single tagged JSON value.
     Json {
         tag: String,
         value: serde_json::Value,
     },
-    /// `ReasoningSection` — streaming model reasoning. `state`
-    /// transitions `Streaming → Done` on close.
-    Reasoning { state: ReasoningState },
     /// `DiffSection` — one-shot structured diff produced by a file-
     /// edit tool.
     Diff { lines: Vec<frances_edit::DiffOp> },
@@ -82,11 +63,4 @@ pub enum SectionKind {
     /// entity exists independently via the registry/hub, refs are
     /// optional decoration.
     EntityRef { entity_id: Uuid },
-}
-
-/// Terminal status for [`SectionKind::Reasoning`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
-pub enum ReasoningState {
-    Streaming,
-    Done,
 }

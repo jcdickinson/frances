@@ -1,6 +1,6 @@
 //! Integration tests for `frances:v1/tools/shell`'s variable bridges:
-//! the `Set` (shell_set with `set:`/`export:`) and `Capture`
-//! (shell_capture) tool classes. Drives a real bash subprocess via
+//! the `Set` (shell_set with `set:`/`export:`) and `Get`
+//! (shell_get) tool classes. Drives a real bash subprocess via
 //! `StubDepsRealShell` so we exercise the actual tmpfile-trick paths
 //! end to end.
 
@@ -24,22 +24,12 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
 
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
-            SectionKind::ToolUse { name, detail } => match detail {
-                Some(d) => format!("→ {name}  {d}"),
-                None => format!("→ {name}"),
-            },
+        SectionTranscript::Push(kind) => match kind {
+            SectionKind::Error { text } => text.clone(),
             SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
-            SectionKind::Reasoning { state } => format!(
-                "[reasoning:{state:?}]\n{}",
-                spec.seed.clone().unwrap_or_default()
-            ),
             SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             SectionKind::EntityRef { entity_id } => format!("[entity:{entity_id}]"),
         },
-        SectionTranscript::Append { delta, .. } => delta.clone(),
-        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
         SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
 }
@@ -51,10 +41,7 @@ fn error_pushes(frames: &[SectionTranscript]) -> Vec<String> {
     frames
         .iter()
         .filter_map(|f| match f {
-            SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-                SectionKind::Error => Some(spec.seed.clone().unwrap_or_default()),
-                _ => None,
-            },
+            SectionTranscript::Push(SectionKind::Error { text }) => Some(text.clone()),
             _ => None,
         })
         .collect()
@@ -291,12 +278,12 @@ async fn shell_set_validates_names_and_from() {
 }
 
 #[tokio::test]
-async fn shell_capture_round_trip_via_variable_assign() {
+async fn shell_get_round_trip_via_var_edit() {
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"
-        import { Shell, Run, Wait, Kill, Capture as ShellCapture } from "frances:v1/tools/shell";
-        import { Variables, Assign as VarAssign } from "frances:v1/tools/variable";
+        import { Shell, Run, Wait, Kill, Get as ShellGet } from "frances:v1/tools/shell";
+        import { Variables, Edit as VarEdit } from "frances:v1/tools/variable";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
@@ -304,29 +291,29 @@ async fn shell_capture_round_trip_via_variable_assign() {
         const kill = new Kill(sh);
         const vars = new Variables();
         const run = new Run(sh, { wait, kill, approve: false });
-        const capture = new ShellCapture(sh, vars);
-        const assign = new VarAssign(vars);
+        const get = new ShellGet(sh, vars);
+        const edit = new VarEdit(vars);
 
         // Each run is a fresh bash: OUT must be exported and persisted
-        // for the capture (a separate run) to see it.
+        // for the get (a separate run) to see it.
         await run.handler({
             call: { id: "r1", name: "shell_run",
                     arguments: { cmd: "export OUT='{\"a\":1,\"b\":[2,3]}'",
                                  persist: ["OUT"] } },
             scope: null,
         });
-        await capture.handler({
-            call: { id: "c1", name: "shell_capture",
+        await get.handler({
+            call: { id: "c1", name: "shell_get",
                     arguments: { name: "snapshot", from: "OUT" } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: vars.get("snapshot") }));
 
-        // Parse via variable_assign + fromjson. The captured value is
+        // Parse via var_edit + fromjson. The stored value is
         // always a string, so we route it through $snapshot rather
         // than `.` (which would be the destination's prior value, null).
-        await assign.handler({
-            call: { id: "a1", name: "variable_assign",
+        await edit.handler({
+            call: { id: "a1", name: "var_edit",
                     arguments: { name: "parsed", filter: "$snapshot | fromjson",
                                  inputs: ["snapshot"] } },
             scope: null,
@@ -353,20 +340,20 @@ async fn shell_capture_round_trip_via_variable_assign() {
 }
 
 #[tokio::test]
-async fn shell_capture_unset_var_errors() {
+async fn shell_get_unset_var_errors() {
     let rt = Runtime::new(StubDepsRealShell::default()).unwrap();
     let file = write_source(
         r#"
-        import { Shell, Capture as ShellCapture } from "frances:v1/tools/shell";
+        import { Shell, Get as ShellGet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const vars = new Variables();
-        const capture = new ShellCapture(sh, vars);
+        const get = new ShellGet(sh, vars);
 
-        const r = await capture.handler({
-            call: { id: "c1", name: "shell_capture",
+        const r = await get.handler({
+            call: { id: "c1", name: "shell_get",
                     arguments: { name: "x", from: "DEFINITELY_UNSET_VAR_NAME" } },
             scope: null,
         });
@@ -468,9 +455,7 @@ async fn shell_run_approve_yes_executes_command() {
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
     let pushes = error_pushes(&frames);
-    let out = pushes
-        .first()
-        .expect("expected a push after approval");
+    let out = pushes.first().expect("expected a push after approval");
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("approved-and-ran"), "got `{out}`");
 }
@@ -524,7 +509,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let out = frames
         .iter()
         .find_map(|f| match f {
-            set @ SectionTranscript::Set { .. } => Some(text_of(set)),
+            push @ SectionTranscript::Push(_) => Some(text_of(push)),
             _ => None,
         })
         .expect("expected a tool result transcript push");
@@ -749,8 +734,7 @@ async fn shell_run_produces_settled_entity_with_digest() {
         .iter()
         .position(|f| matches!(
             f,
-            SectionTranscript::Set { section, .. }
-                if matches!(&section.kind, SectionKind::EntityRef { entity_id: id } if id == entity_id)
+            SectionTranscript::Push(SectionKind::EntityRef { entity_id: id }) if *id == *entity_id
         ))
         .expect("EntityRef section for the shell entity");
     assert!(upsert_pos < ref_pos);
@@ -848,8 +832,7 @@ async fn shell_quiet_keeps_entity_live_until_wait_settles() {
         .position(|f| {
             matches!(
                 f,
-                SectionTranscript::Set { section, .. }
-                    if section.seed.as_deref() == Some("MARK-QUIET")
+                SectionTranscript::Push(SectionKind::Error { text }) if text == "MARK-QUIET"
             )
         })
         .expect("marker section");

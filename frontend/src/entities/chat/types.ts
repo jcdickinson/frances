@@ -4,7 +4,7 @@ import type { JsonValue } from '../../bindings';
 // shape has no Rust source for specta to export. Keep in sync with
 // crates/frances-workflow/assets/frances/v1/messages.js.
 export type ChatSnapshot = {
-  source: 'user' | 'assistant' | 'internal';
+  source: 'user' | 'assistant' | 'reasoning' | 'internal';
   text: string;
 };
 

@@ -652,17 +652,17 @@ async fn tool_family_shell_tools_import_shell_family() {
     let file = write_source(
         "js",
         r#"
-        import { Run, Wait, Kill, Set, Capture } from "frances:v1/tools/shell";
+        import { Run, Wait, Kill, Set, Get } from "frances:v1/tools/shell";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const runHas = Run.toString().includes("shellFamily");
         const waitHas = Wait.toString().includes("shellFamily");
         const killHas = Kill.toString().includes("shellFamily");
         const setHas = Set.toString().includes("shellFamily");
-        const captureHas = Capture.toString().includes("shellFamily");
+        const getHas = Get.toString().includes("shellFamily");
 
         transcript.push(new ErrorSection({ content: JSON.stringify({
-            runHas, waitHas, killHas, setHas, captureHas,
+            runHas, waitHas, killHas, setHas, getHas,
         }) }));
         "#,
     );
@@ -694,8 +694,8 @@ async fn tool_family_shell_tools_import_shell_family() {
         "Set constructor should reference shellFamily"
     );
     assert_eq!(
-        result["captureHas"], true,
-        "Capture constructor should reference shellFamily"
+        result["getHas"], true,
+        "Get constructor should reference shellFamily"
     );
 }
 

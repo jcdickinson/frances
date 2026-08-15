@@ -36,15 +36,15 @@
 //
 // The leaf `Wait` and `Kill` tools are unchanged from before.
 //
-// Two more leaf tools — `Set` and `Capture` — bridge Frances variables
+// Two more leaf tools — `Set` and `Get` — bridge Frances variables
 // to/from bash variables. `Set` exports a Frances var into the shell's
 // persisted environment (subsequent runs and their subprocesses see
-// it); `Capture` reads a bash variable back into a Frances var. They
+// it); `Get` reads a bash variable back into a Frances var. They
 // run short deterministic bash commands through the same `Shell` and
 // share its busy/closed state. Both take a `Variables` instance:
 //
 //   const vars = new Variables();
-//   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
+//   chat.tools.push(new Set(sh, vars), new Get(sh, vars));
 
 import { transcript, EntityRefSection } from "frances:v1/sections";
 import { createEntity } from "frances:v1/entities";
@@ -53,7 +53,7 @@ import { approve } from "frances:v1/approval";
 import { defineToolFamily } from "frances:v1/tool-family";
 import shellFamilyPrompt from "./shell_family.md";
 import shellSetDescription from "./shell_set.md";
-import shellCaptureDescription from "./shell_capture.md";
+import shellGetDescription from "./shell_get.md";
 
 const { Shell } = globalThis.__frances_v1_stash__;
 
@@ -532,11 +532,6 @@ class Run {
     this.family = shellFamily;
   }
 
-  describe(call) {
-    const cmd = call.arguments && call.arguments.cmd;
-    return typeof cmd === "string" ? cmd : "";
-  }
-
   handler = async ({ call, scope }) => {
     if (this.requireApproval) {
       const gate = await _askApproval(call);
@@ -665,7 +660,6 @@ class Wait {
       "I continue waiting on the in-flight shell command. Returns when it finishes or goes quiet again.";
     this.parameters = WAIT_SCHEMA;
     this.family = shellFamily;
-    this.hidden = true;
   }
 
   handler = async ({ call }) => {
@@ -799,12 +793,12 @@ const SET_SCHEMA = {
   required: ["name", "from"],
 };
 
-const CAPTURE_SCHEMA = {
+const GET_SCHEMA = {
   type: "object",
   properties: {
     name: {
       type: "string",
-      description: "Frances variable name to store the captured value into.",
+      description: "Frances variable name to store the value into.",
     },
     from: {
       type: "string",
@@ -828,13 +822,6 @@ class Set {
     this.description = shellSetDescription;
     this.parameters = SET_SCHEMA;
     this.family = shellFamily;
-  }
-
-  describe(call) {
-    const a = call.arguments || {};
-    if (!a.name) return "";
-    const from = a.from ? ` ← ${a.from}` : "";
-    return `$${a.name}${from}`;
   }
 
   handler = async ({ call }) => {
@@ -864,33 +851,27 @@ class Set {
   };
 }
 
-class Capture {
-  static schema = CAPTURE_SCHEMA;
+class Get {
+  static schema = GET_SCHEMA;
 
   constructor(shell, vars) {
     this.shell = shell;
     this.vars = vars;
-    this.name = "shell_capture";
-    this.description = shellCaptureDescription;
-    this.parameters = CAPTURE_SCHEMA;
+    this.name = "shell_get";
+    this.description = shellGetDescription;
+    this.parameters = GET_SCHEMA;
     this.family = shellFamily;
-  }
-
-  describe(call) {
-    const a = call.arguments || {};
-    if (!a.name || !a.from) return a.name || "";
-    return `${a.name} ← $${a.from}`;
   }
 
   handler = async ({ call }) => {
     const { name, from } = call.arguments;
-    let captured;
+    let value;
     try {
-      captured = await this.shell.captureVar(from);
+      value = await this.shell.getVar(from);
     } catch (err) {
       return _errResult(call.id, err);
     }
-    this.vars.set(name, captured);
+    this.vars.set(name, value);
     return {
       role: "tool",
       call_id: call.id,
@@ -900,6 +881,6 @@ class Capture {
   };
 }
 
-export { Shell, Run, Wait, Kill, Set, Capture, shellFamily };
+export { Shell, Run, Wait, Kill, Set, Get, shellFamily };
 // Cap policy internals, exported for tests.
 export { _capState, _capPush, _capFlush };

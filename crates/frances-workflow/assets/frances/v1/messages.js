@@ -1,10 +1,11 @@
 // `frances:v1/messages` — chat-message entities (kind "chat").
 //
 // Snapshot-only producer: `{ source, text }` where source is "user",
-// "assistant", or "internal". Streaming updates the snapshot with the
-// full accumulated text on every write; there is no entity stream.
-// The frontend's chat components render `snapshot.text` directly,
-// live or settled, so a forced settle after a crash loses nothing.
+// "assistant", "reasoning", or "internal". Streaming updates the
+// snapshot with the full accumulated text on every write; there is no
+// entity stream. The frontend's chat components render `snapshot.text`
+// directly, live or settled, so a forced settle after a crash loses
+// nothing.
 
 import { WritableStream } from "whatwg:web-streams";
 import { createEntity } from "frances:v1/entities";
@@ -19,7 +20,7 @@ export function postMessage({ source = "internal", content }) {
 }
 
 // Streaming message. Returns `{ write(delta), writable, close() }`;
-// `writable` mirrors the frame classes' composition in sections.js: a
+// `writable` composes a WHATWG WritableStream over the same sink so a
 // finished (or aborted) pipe settles the message.
 export function openMessage(source = "internal") {
   const handle = createEntity("chat", { source, text: "" });

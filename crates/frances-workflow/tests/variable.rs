@@ -20,22 +20,12 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
 
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
-            SectionKind::ToolUse { name, detail } => match detail {
-                Some(d) => format!("→ {name}  {d}"),
-                None => format!("→ {name}"),
-            },
+        SectionTranscript::Push(kind) => match kind {
+            SectionKind::Error { text } => text.clone(),
             SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
-            SectionKind::Reasoning { state } => format!(
-                "[reasoning:{state:?}]\n{}",
-                spec.seed.clone().unwrap_or_default()
-            ),
             SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             SectionKind::EntityRef { entity_id } => format!("[entity:{entity_id}]"),
         },
-        SectionTranscript::Append { delta, .. } => delta.clone(),
-        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
         SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
 }
@@ -71,37 +61,37 @@ async fn variables_round_trip_from_js() {
 }
 
 #[tokio::test]
-async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
+async fn var_edit_evaluates_jq_against_dot_and_bindings() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         r#"
-        import { Variables, Set, Assign } from "frances:v1/tools/variable";
+        import { Variables, Set, Edit } from "frances:v1/tools/variable";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
-        const assign = new Assign(vars);
+        const edit = new Edit(vars);
 
-        await assign.handler({
-            call: { id: "a1", name: "variable_assign",
+        await edit.handler({
+            call: { id: "a1", name: "var_edit",
                     arguments: { name: "plan",
                                  filter: "{steps: [\"a\",\"b\"], done: false}" } },
             scope: null,
         });
 
-        await assign.handler({
-            call: { id: "a2", name: "variable_assign",
+        await edit.handler({
+            call: { id: "a2", name: "var_edit",
                     arguments: { name: "plan", filter: ".steps += [\"c\"]" } },
             scope: null,
         });
 
         await set.handler({
-            call: { id: "s1", name: "variable_set",
+            call: { id: "s1", name: "var_set",
                     arguments: { name: "extra", value: 7 } },
             scope: null,
         });
-        const r = await assign.handler({
-            call: { id: "a3", name: "variable_assign",
+        const r = await edit.handler({
+            call: { id: "a3", name: "var_edit",
                     arguments: { name: "summary",
                                  filter: "{count: ($plan.steps | length), extra: $extra}",
                                  inputs: ["plan", "extra"] } },
@@ -138,20 +128,20 @@ async fn variable_assign_evaluates_jq_against_dot_and_bindings() {
 }
 
 #[tokio::test]
-async fn set_and_assign_responses_report_type_summary() {
+async fn set_and_edit_responses_report_type_summary() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         r#"
-        import { Variables, Set, Assign } from "frances:v1/tools/variable";
+        import { Variables, Set, Edit } from "frances:v1/tools/variable";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
-        const assign = new Assign(vars);
+        const edit = new Edit(vars);
 
         async function run(name, value) {
             const r = await set.handler({
-                call: { id: "c", name: "variable_set", arguments: { name, value } },
+                call: { id: "c", name: "var_set", arguments: { name, value } },
                 scope: null,
             });
             transcript.push(new ErrorSection({ content: r.content }));
@@ -165,8 +155,8 @@ async fn set_and_assign_responses_report_type_summary() {
 
         await run("encoded", "[1,2,3]");
 
-        const recovered = await assign.handler({
-            call: { id: "a1", name: "variable_assign",
+        const recovered = await edit.handler({
+            call: { id: "a1", name: "var_edit",
                     arguments: { name: "encoded", filter: "fromjson" } },
             scope: null,
         });
@@ -195,39 +185,39 @@ async fn set_and_assign_responses_report_type_summary() {
 }
 
 #[tokio::test]
-async fn variable_assign_introspection_and_errors() {
+async fn var_edit_introspection_and_errors() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         r#"
-        import { Variables, Set, Assign } from "frances:v1/tools/variable";
+        import { Variables, Set, Edit } from "frances:v1/tools/variable";
         import { transcript, ErrorSection } from "frances:v1/sections";
 
         const vars = new Variables();
         const set = new Set(vars);
-        const assign = new Assign(vars);
+        const edit = new Edit(vars);
 
         await set.handler({
-            call: { id: "s1", name: "variable_set",
+            call: { id: "s1", name: "var_set",
                     arguments: { name: "obj", value: { a: 1, b: 2 } } },
             scope: null,
         });
 
-        await assign.handler({
-            call: { id: "a1", name: "variable_assign",
+        await edit.handler({
+            call: { id: "a1", name: "var_edit",
                     arguments: { name: "obj_keys",
                                  filter: "$obj | keys",
                                  inputs: ["obj"] } },
             scope: null,
         });
 
-        const multi = await assign.handler({
-            call: { id: "a2", name: "variable_assign",
+        const multi = await edit.handler({
+            call: { id: "a2", name: "var_edit",
                     arguments: { name: "x", filter: "1, 2, 3" } },
             scope: null,
         });
 
-        const missing = await assign.handler({
-            call: { id: "a3", name: "variable_assign",
+        const missing = await edit.handler({
+            call: { id: "a3", name: "var_edit",
                     arguments: { name: "x", filter: ".",
                                  inputs: ["nope"] } },
             scope: null,
@@ -261,7 +251,7 @@ async fn variable_assign_introspection_and_errors() {
 }
 
 #[tokio::test]
-async fn variable_get_with_filter_lenses_into_stored_value() {
+async fn var_get_with_filter_lenses_into_stored_value() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         r#"
@@ -273,25 +263,25 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
         const set = new Set(vars);
 
         await set.handler({
-            call: { id: "s1", name: "variable_set",
+            call: { id: "s1", name: "var_set",
                     arguments: { name: "plan", value: { steps: ["a","b","c"], done: false } } },
             scope: null,
         });
         await set.handler({
-            call: { id: "s2", name: "variable_set",
+            call: { id: "s2", name: "var_set",
                     arguments: { name: "text", value: "L1\nL2\nL3\nL4\nL5" } },
             scope: null,
         });
 
         const objLens = await get.handler({
-            call: { id: "g1", name: "variable_get",
+            call: { id: "g1", name: "var_get",
                     arguments: { name: "plan", filter: ".steps" } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: JSON.stringify(objLens) }));
 
         const textLens = await get.handler({
-            call: { id: "g2", name: "variable_get",
+            call: { id: "g2", name: "var_get",
                     arguments: { name: "text",
                                  filter: "split(\"\n\") | .[1:4] | join(\"\n\")" } },
             scope: null,
@@ -299,14 +289,14 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
         transcript.push(new ErrorSection({ content: JSON.stringify(textLens) }));
 
         const broken = await get.handler({
-            call: { id: "g3", name: "variable_get",
+            call: { id: "g3", name: "var_get",
                     arguments: { name: "plan", filter: "this is not jq" } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: JSON.stringify(broken) }));
 
         const missing = await get.handler({
-            call: { id: "g4", name: "variable_get",
+            call: { id: "g4", name: "var_get",
                     arguments: { name: "nope", filter: "." } },
             scope: null,
         });
@@ -345,7 +335,7 @@ async fn variable_get_with_filter_lenses_into_stored_value() {
 }
 
 #[tokio::test]
-async fn variable_get_and_set_tool_handlers_work() {
+async fn var_get_and_set_tool_handlers_work() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         r#"
@@ -357,19 +347,19 @@ async fn variable_get_and_set_tool_handlers_work() {
         const set = new Set(vars);
 
         const setResult = await set.handler({
-            call: { id: "c1", name: "variable_set", arguments: { name: "x", value: { n: 42 } } },
+            call: { id: "c1", name: "var_set", arguments: { name: "x", value: { n: 42 } } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: JSON.stringify(setResult) }));
 
         const getResult = await get.handler({
-            call: { id: "c2", name: "variable_get", arguments: { name: "x" } },
+            call: { id: "c2", name: "var_get", arguments: { name: "x" } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: JSON.stringify(getResult) }));
 
         const missing = await get.handler({
-            call: { id: "c3", name: "variable_get", arguments: { name: "nope" } },
+            call: { id: "c3", name: "var_get", arguments: { name: "nope" } },
             scope: null,
         });
         transcript.push(new ErrorSection({ content: JSON.stringify(missing) }));

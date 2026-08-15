@@ -73,6 +73,11 @@ the source of truth.
 
 ## Entities
 
+Sections are one-shot: a workflow pushes a fully-formed `SectionKind`
+and the driver emits + persists it in the same step. Nothing in the
+transcript is opened, appended to, or sealed. Anything that streams is
+an entity, referenced from the transcript by an `EntityRef` section.
+
 UI state that outlives a transcript position is an **entity**: a typed
 envelope (`entity_id`, `kind` string, `lifecycle: Live | Settled`) plus
 opaque-JSON facets — a small latest-wins **snapshot**, an optional

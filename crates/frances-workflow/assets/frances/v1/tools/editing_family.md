@@ -21,8 +21,8 @@ All write tools accept `text` or `from` (exactly one):
   from:  a Frances variable name. Its value is used as the content
          (string values pass through verbatim; non-string values are
          JSON-encoded). I use this when the content was prepared via
-         `variable_set` / `variable_assign` / `file_read into:` /
-         `shell_capture`, to avoid re-emitting a long payload in a
+         `var_set` / `var_edit` / `file_read into:` /
+         `shell_get`, to avoid re-emitting a long payload in a
          tool-call.
 
 Anchor protocol: every line in a `file_read` (or post-edit diff) is

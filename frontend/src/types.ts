@@ -1,12 +1,10 @@
 import type { Result, SectionKind } from './bindings.ts';
 
-/** A rendered section: the streamed wire kind plus accumulated text. */
+/** A rendered section: the wire kind plus a local key. Sections are
+ *  one-shot, so `id` exists only to key the `{#each}`. */
 export interface Section {
   id: number;
   kind: SectionKind;
-  text: string;
-  closed: boolean;
-  truncated: boolean;
 }
 
 /** Throw a command's error so callers can handle every failure in one catch. */

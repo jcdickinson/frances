@@ -37,22 +37,12 @@ fn migration(name: &'static str, sql: &str) -> Migration {
 
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
-        SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
-            SectionKind::ToolUse { name, detail } => match detail {
-                Some(d) => format!("→ {name}  {d}"),
-                None => format!("→ {name}"),
-            },
+        SectionTranscript::Push(kind) => match kind {
+            SectionKind::Error { text } => text.clone(),
             SectionKind::Json { tag, value } => format!("[{tag}] {value}"),
-            SectionKind::Reasoning { state } => format!(
-                "[reasoning:{state:?}]\n{}",
-                spec.seed.clone().unwrap_or_default()
-            ),
             SectionKind::Diff { lines } => format!("[diff:{} lines]", lines.len()),
             SectionKind::EntityRef { entity_id } => format!("[entity:{entity_id}]"),
         },
-        SectionTranscript::Append { delta, .. } => delta.clone(),
-        SectionTranscript::Close { id } => format!("[close:{}]", id.0),
         SectionTranscript::Entity(cmd) => format!("[entity:{cmd:?}]"),
     }
 }

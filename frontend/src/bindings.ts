@@ -108,40 +108,21 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
  */
 export type Lifecycle = "live" | "settled"
 /**
- * Terminal status for [`SectionKind::Reasoning`].
- */
-export type ReasoningState = "Streaming" | "Done"
-/**
- * Section identity, scoped to one workflow invocation. Monotonically
- * assigned by `transcript.push` on the workflow side. The frontend
- * uses it to route subsequent events to the right rendered section.
- */
-export type SectionId = number
-/**
- * What kind of section, and any bounded metadata that rides with it.
- * One variant per section presentation in the UI. The frontend
- * matches on this to pick a rendering when a new section id is seen.
+ * What kind of section, and the data that rides with it. Every
+ * section is one-shot: the workflow pushes it fully formed and the
+ * frontend matches on this to pick a rendering.
  */
 export type SectionKind = 
 /**
- * `ErrorSection` — one-shot error message.
+ * `ErrorSection` — one-shot error message. Side-channel: the
+ * session driver turns it into an error frame rather than a
+ * rendered section.
  */
-{ type: "error" } | 
+{ type: "error"; text: string } | 
 /**
- * `ToolUseSection` — one-shot "→ tool_name" marker. `detail` is
- * the optional human-readable suffix produced by the tool's
- * `describe(call)` method.
- */
-{ type: "tool_use"; name: string; detail: string | null } | 
-/**
- * `JsonSection` — single tagged JSON value. Immutable after push.
+ * `JsonSection` — single tagged JSON value.
  */
 { type: "json"; tag: string; value: JsonValue } | 
-/**
- * `ReasoningSection` — streaming model reasoning. `state`
- * transitions `Streaming → Done` on close.
- */
-{ type: "reasoning"; state: ReasoningState } | 
 /**
  * `DiffSection` — one-shot structured diff produced by a file-
  * edit tool.
@@ -164,7 +145,7 @@ export type SessionSnapshot = { title: string | null; usage: Usage | null;
  * meaningful after settle; a fresh session starts with `None`.
  */
 busy: string | null }
-export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | 
+export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section"; kind: SectionKind } | 
 /**
  * Latest-wins entity state. `snapshot` is opaque at this boundary;
  * the frontend picks a renderer by `kind` and interprets it there.

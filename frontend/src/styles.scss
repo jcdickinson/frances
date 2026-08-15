@@ -352,16 +352,9 @@ pre {
 .error {
   color: var(--danger-text);
 }
-.tool {
-  color: var(--text-secondary);
-}
 .label,
-.collapsed,
-.truncation {
+.collapsed {
   color: var(--text-muted);
-}
-.truncation {
-  margin-left: 8px;
 }
 
 .tail {

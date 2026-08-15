@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use frances_models_ui::{Lifecycle, SectionId, SectionKind};
+use frances_models_ui::{Lifecycle, SectionKind};
 use frances_session::context::InvocationContext;
 use frances_session::entities::{SESSION_KIND, SessionSnapshot};
 use frances_session::events::{
@@ -36,14 +36,8 @@ struct AppInfo {
 enum UiEvent {
     Reset,
     ReplayEnd,
-    SectionAppend {
-        id: SectionId,
+    Section {
         kind: SectionKind,
-        delta: String,
-    },
-    SectionClose {
-        id: SectionId,
-        truncated: bool,
     },
     /// Latest-wins entity state. `snapshot` is opaque at this boundary;
     /// the frontend picks a renderer by `kind` and interprets it there.
@@ -330,17 +324,7 @@ async fn forward_events(app: tauri::AppHandle, mut events: mpsc::UnboundedReceiv
 
 fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> {
     match frame {
-        StreamFrame::SectionAppend { id, kind, delta } => {
-            Some(UiEvent::SectionAppend { id, kind, delta })
-        }
-        StreamFrame::SectionClose { id } => Some(UiEvent::SectionClose {
-            id,
-            truncated: false,
-        }),
-        StreamFrame::SectionTruncated { id } => Some(UiEvent::SectionClose {
-            id,
-            truncated: true,
-        }),
+        StreamFrame::Section(kind) => Some(UiEvent::Section { kind }),
         StreamFrame::EntityUpsert { envelope, snapshot } => Some(UiEvent::EntityUpsert {
             entity_id: envelope.entity_id.to_string(),
             kind: envelope.kind,
@@ -360,17 +344,7 @@ fn convert_frame(app: &tauri::AppHandle, frame: StreamFrame) -> Option<UiEvent> 
         StreamFrame::Permission(request) => store_permission(app, request),
         StreamFrame::Scrollback(frame) => match frame {
             ScrollbackFrame::Reset { .. } => Some(UiEvent::Reset),
-            ScrollbackFrame::SectionAppend { id, kind, delta } => {
-                Some(UiEvent::SectionAppend { id, kind, delta })
-            }
-            ScrollbackFrame::SectionClose { id } => Some(UiEvent::SectionClose {
-                id,
-                truncated: false,
-            }),
-            ScrollbackFrame::SectionTruncated { id } => Some(UiEvent::SectionClose {
-                id,
-                truncated: true,
-            }),
+            ScrollbackFrame::Section(kind) => Some(UiEvent::Section { kind }),
             ScrollbackFrame::Error(message) => Some(UiEvent::Error { message }),
             ScrollbackFrame::End => Some(UiEvent::ReplayEnd),
         },

@@ -185,18 +185,6 @@ class Search {
     this.parameters = SEARCH_SCHEMA;
   }
 
-  describe(call) {
-    const a = call.arguments || {};
-    const parts = [];
-    if (typeof a.search === "string" && a.search.length > 0) {
-      parts.push(`/${a.search}/`);
-    }
-    if (Array.isArray(a.paths) && a.paths.length > 0) {
-      parts.push(a.paths.join(" "));
-    }
-    return parts.join(" in ");
-  }
-
   handler = async ({ call }) => {
     const args = { ...call.arguments };
     const into = args.into;

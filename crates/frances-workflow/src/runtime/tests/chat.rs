@@ -425,22 +425,22 @@ async fn chat_session_stream_text_locks_events() {
 }
 
 #[tokio::test]
-async fn chat_session_stream_pipes_into_reasoning_frame_writable() {
+async fn chat_session_stream_pipes_into_message_writable() {
     // Stub emits zero events, so the pipe completes when the
     // source closes (Rust drops the sender after the run errors).
     // We're verifying the wiring: pipeTo from `r.text` into a
-    // ReasoningSection's `.writable` resolves without throwing.
+    // message's `.writable` resolves without throwing.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, ErrorSection, ReasoningSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        import { openMessage } from "frances:v1/messages";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
-        const out = new ReasoningSection();
-        transcript.push(out);
+        const out = openMessage("reasoning");
         await r.text.pipeTo(out.writable);
         try { await r.completed; } catch (_) { /* stub error — expected */ }
         transcript.push(new ErrorSection({ content: "piped-ok" }));
@@ -456,15 +456,14 @@ async fn chat_session_stream_pipes_into_reasoning_frame_writable() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    // Second push frame carries the "piped-ok" sentinel; the first
-    // push is the empty `out` frame. No Append frames since stub
-    // emits no text deltas.
+    // Last push carries the "piped-ok" sentinel. No text deltas from
+    // the stub, so the message settles empty.
     let last = text_of(frames.last().expect("at least one frame"));
     assert_eq!(last, "piped-ok");
 }
 
 #[tokio::test]
-async fn chat_session_text_pipe_closes_reasoning_frame_on_completion() {
+async fn chat_session_text_pipe_settles_message_on_completion() {
     use frances_models_llm::{CompletionOutcome, StreamEvent};
 
     let deps = StubDeps::default();
@@ -480,12 +479,11 @@ async fn chat_session_text_pipe_closes_reasoning_frame_on_completion() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, ReasoningSection } from "frances:v1/sections";
+        import { openMessage } from "frances:v1/messages";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
-        const out = new ReasoningSection();
-        transcript.push(out);
+        const out = openMessage("reasoning");
         await r.text.pipeTo(out.writable);
         await r.completed;
         "#,
@@ -500,21 +498,13 @@ async fn chat_session_text_pipe_closes_reasoning_frame_on_completion() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    let push_id = match frames.first() {
-        Some(SectionTranscript::Set { id, .. }) => *id,
-        other => panic!("expected first frame push, got {other:?}"),
-    };
     assert!(
-        frames
-            .iter()
-            .any(|f| matches!(f, SectionTranscript::Append { id, delta } if *id == push_id && delta == "hello")),
-        "expected text append for reasoning frame: {frames:?}"
-    );
-    assert!(
-        frames
-            .iter()
-            .any(|f| matches!(f, SectionTranscript::Close { id } if *id == push_id)),
-        "expected reasoning frame to close after text pipe: {frames:?}"
+        frames.iter().any(|f| matches!(
+            f,
+            SectionTranscript::Entity(EntityCmd::Settle { snapshot, .. })
+                if snapshot["source"] == "reasoning" && snapshot["text"] == "hello"
+        )),
+        "expected the reasoning message to settle with the piped text: {frames:?}"
     );
 }
 

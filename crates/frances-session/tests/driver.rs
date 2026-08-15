@@ -16,8 +16,7 @@ use tempfile::{NamedTempFile, TempDir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use frances_config::{ConfigProvider, InMemoryProvider, Value as ConfigValue};
-use frances_llm::test_util::{StubProvider, StubScript};
-use frances_models_llm::{CompletionOutcome, StreamEvent};
+use frances_llm::test_util::StubProvider;
 use frances_session::context::{InvocationContext, ProcessContext};
 use frances_session::events::{SectionKind, StreamFrame};
 use frances_session::runtime::{SessionRuntime, StartOverrides};
@@ -29,7 +28,6 @@ use frances_session::workspace::Workspace;
 struct Harness {
     _runtime: Arc<SessionRuntime>,
     events: UnboundedReceiver<StreamFrame>,
-    stub: Arc<StubProvider>,
     _src: NamedTempFile,
     _tempdir: TempDir,
 }
@@ -98,7 +96,6 @@ async fn harness(workflow_src: &str) -> Harness {
     let in_memory = build_in_memory_config(&src_path, "test");
 
     let stub = Arc::new(StubProvider::new());
-    let stub_for_hook = stub.clone();
     let (runtime, events) = SessionRuntime::start_with(
         session,
         db,
@@ -106,7 +103,7 @@ async fn harness(workflow_src: &str) -> Harness {
         StartOverrides {
             extra_config_providers: vec![Arc::new(in_memory) as Arc<dyn ConfigProvider>],
             on_cache: Some(Box::new(move |cache| {
-                cache.insert_stub("test", stub_for_hook);
+                cache.insert_stub("test", stub);
             })),
             ..StartOverrides::default()
         },
@@ -117,7 +114,6 @@ async fn harness(workflow_src: &str) -> Harness {
     Harness {
         _runtime: runtime,
         events,
-        stub,
         _src: src,
         _tempdir: tempdir,
     }
@@ -206,74 +202,16 @@ async fn smoke_workflow_starts_and_pushes_frame() {
     .await;
 
     let frames = h
-        .recv_until(|f| matches!(f, StreamFrame::SectionClose { .. }))
+        .recv_until(|f| matches!(f, StreamFrame::Section { .. }))
         .await;
     assert!(
         frames.iter().any(|f| matches!(
             f,
-            StreamFrame::SectionAppend {
-                delta,
-                ..
-            } if delta == "[harness] \"hello\""
+            StreamFrame::Section(SectionKind::Json { tag, value })
+                if tag == "harness" && value == "hello"
         )),
         "expected the harness json frame; got: {frames:?}"
     );
-}
-
-/// Three scripted TextDeltas produce a BlockDelta sequence on the events channel.
-#[tokio::test]
-#[ignore = "frame plumbing for chat.stream() needs more wiring; left as a stub for the next session"]
-async fn text_streaming_renders_block_delta_sequence() {
-    let mut h = harness(
-        r#"
-        import { ChatSession } from "frances:v1/chat";
-        const chat = new ChatSession();
-        await chat.stream({ system: "test", user: "hi" });
-        "#,
-    )
-    .await;
-
-    h.stub.push_script(StubScript {
-        events: vec![
-            StreamEvent::TextDelta("alpha".into()),
-            StreamEvent::TextDelta(" beta".into()),
-            StreamEvent::TextDelta(" gamma".into()),
-        ],
-        outcome: CompletionOutcome {
-            text: "alpha beta gamma".to_owned(),
-            tool_calls: Vec::new(),
-        },
-    });
-
-    let frames = h
-        .recv_until(|f| matches!(f, StreamFrame::SectionClose { .. }))
-        .await;
-
-    let texts: Vec<String> = frames
-        .iter()
-        .filter_map(|f| match f {
-            StreamFrame::SectionAppend { delta, .. } => Some(delta.clone()),
-            _ => None,
-        })
-        .collect();
-    assert!(
-        texts.contains(&"alpha".to_owned()),
-        "missing first delta: frames = {:?}",
-        frames
-    );
-    assert!(
-        texts.contains(&" beta".to_owned()),
-        "missing second delta: frames = {:?}",
-        frames
-    );
-    assert!(
-        texts.contains(&" gamma".to_owned()),
-        "missing third delta: frames = {:?}",
-        frames
-    );
-
-    let captured = h.stub.captured();
-    assert_eq!(captured.len(), 1, "expected exactly one provider call");
 }
 
 /// The full entity producer path through the driver: creating upsert
@@ -318,10 +256,7 @@ async fn entity_producer_flows_through_driver_to_hub() {
         .iter()
         .enumerate()
         .find_map(|(i, f)| match f {
-            StreamFrame::SectionAppend {
-                kind: SectionKind::EntityRef { entity_id },
-                ..
-            } => Some((i, *entity_id)),
+            StreamFrame::Section(SectionKind::EntityRef { entity_id }) => Some((i, *entity_id)),
             _ => None,
         })
         .expect("EntityRef section");

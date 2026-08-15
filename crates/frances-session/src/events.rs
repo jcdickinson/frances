@@ -11,7 +11,7 @@
 
 use uuid::Uuid;
 
-pub use frances_models_ui::{EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind};
+pub use frances_models_ui::{EntityEnvelope, Lifecycle, SectionKind};
 
 pub use frances_workflow::permission::{
     PermissionRequest, PermissionResponse, PermissionResponseWire,
@@ -19,28 +19,9 @@ pub use frances_workflow::permission::{
 
 #[derive(Debug)]
 pub enum StreamFrame {
-    /// Self-describing section content. The first append with a
-    /// previously-unseen `id` implicitly opens the section; subsequent
-    /// appends either grow the text or carry an unchanged delta + new
-    /// kind for metadata transitions (e.g. ReasoningState `Streaming`
-    /// → `Done`).
-    SectionAppend {
-        id: SectionId,
-        kind: SectionKind,
-        delta: String,
-    },
-    /// Workflow sealed the section.
-    SectionClose {
-        id: SectionId,
-    },
-    /// Replay-only sibling of `SectionClose`: the section was in
-    /// flight when its workflow was dehydrated, so it never received
-    /// a clean close. The session runtime emits this in place of
-    /// `SectionClose` from [`crate::scrollback::replay_to_channel`]
-    /// for rows whose `truncated` column is set.
-    SectionTruncated {
-        id: SectionId,
-    },
+    /// A finished section. Sections are one-shot — everything the UI
+    /// renders rides in `kind` — so there's nothing to open or seal.
+    Section(SectionKind),
     /// Whole-entity upsert: latest-wins envelope + opaque snapshot
     /// published by the [`crate::entities::EntityHub`]. The hub queues
     /// one upsert per entity at runtime start (the attach snapshot)
@@ -79,19 +60,9 @@ pub enum ScrollbackFrame {
     /// Burst opener: the UI clears its rendered sections and replays
     /// `instance_id`'s persisted history from scratch.
     Reset { instance_id: Uuid },
-    /// A persisted section's content (same shape as a live
-    /// [`StreamFrame::SectionAppend`]). Today each persisted row
-    /// replays as exactly one Append + one Close/Truncated.
-    SectionAppend {
-        id: SectionId,
-        kind: SectionKind,
-        delta: String,
-    },
-    /// Clean end of a persisted section.
-    SectionClose { id: SectionId },
-    /// Truncated end — the section was in flight when its workflow
-    /// was dehydrated and never received a clean close.
-    SectionTruncated { id: SectionId },
+    /// A persisted section (same shape as a live
+    /// [`StreamFrame::Section`]) — one frame per stored row.
+    Section(SectionKind),
     /// A persisted error row.
     Error(String),
     /// Burst closer: the UI returns to live-mode handling.

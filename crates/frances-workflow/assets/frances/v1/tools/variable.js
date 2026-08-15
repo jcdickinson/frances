@@ -7,11 +7,11 @@
 //
 // Other JS code (workflows, custom tools) can import `Variables` and
 // call `.get(name)` / `.set(name, value)` directly. The `Get` / `Set` /
-// `Assign` classes are thin LLM-facing wrappers that shape those
-// methods into the `variable_get` / `variable_set` / `variable_assign`
+// `Edit` classes are thin LLM-facing wrappers that shape those
+// methods into the `var_get` / `var_set` / `var_edit`
 // tool surface.
 //
-// `Assign` evaluates a jq filter through a Rust-side jaq bridge
+// `Edit` evaluates a jq filter through a Rust-side jaq bridge
 // (`_jaqEval` on the install stash) — the filter's `.` is the
 // destination's current value (or null) and `$name` bindings expose
 // other stored variables. This gives the LLM a single tool for
@@ -20,11 +20,11 @@
 // Typical wiring:
 //
 //   const vars = new Variables();
-//   chat.tools.push(new Get(vars), new Set(vars), new Assign(vars));
+//   chat.tools.push(new Get(vars), new Set(vars), new Edit(vars));
 
-import variableGetDescription from "./variable_get.md";
-import variableSetDescription from "./variable_set.md";
-import variableAssignDescription from "./variable_assign.md";
+import varGetDescription from "./var_get.md";
+import varSetDescription from "./var_set.md";
+import varEditDescription from "./var_edit.md";
 
 const { _jaqEval } = globalThis.__frances_v1_stash__;
 
@@ -37,7 +37,7 @@ const GET_SCHEMA = {
     filter: {
       type: "string",
       description:
-        "Optional jq filter. The stored value is bound as `.`; the filter's single output is returned instead of the whole value. No `$name` bindings — use variable_assign to combine variables.",
+        "Optional jq filter. The stored value is bound as `.`; the filter's single output is returned instead of the whole value. No `$name` bindings — use var_edit to combine variables.",
     },
   },
   required: ["name"],
@@ -55,7 +55,7 @@ const SET_SCHEMA = {
   required: ["name", "value"],
 };
 
-const ASSIGN_SCHEMA = {
+const EDIT_SCHEMA = {
   type: "object",
   properties: {
     name: { type: "string" },
@@ -135,13 +135,9 @@ class Get {
 
   constructor(vars) {
     this.vars = vars;
-    this.name = "variable_get";
-    this.description = variableGetDescription;
+    this.name = "var_get";
+    this.description = varGetDescription;
     this.parameters = GET_SCHEMA;
-  }
-
-  describe(call) {
-    return (call.arguments && call.arguments.name) || "";
   }
 
   handler = async ({ call }) => {
@@ -169,13 +165,9 @@ class Set {
 
   constructor(vars) {
     this.vars = vars;
-    this.name = "variable_set";
-    this.description = variableSetDescription;
+    this.name = "var_set";
+    this.description = varSetDescription;
     this.parameters = SET_SCHEMA;
-  }
-
-  describe(call) {
-    return (call.arguments && call.arguments.name) || "";
   }
 
   handler = async ({ call }) => {
@@ -185,18 +177,14 @@ class Set {
   };
 }
 
-class Assign {
-  static schema = ASSIGN_SCHEMA;
+class Edit {
+  static schema = EDIT_SCHEMA;
 
   constructor(vars) {
     this.vars = vars;
-    this.name = "variable_assign";
-    this.description = variableAssignDescription;
-    this.parameters = ASSIGN_SCHEMA;
-  }
-
-  describe(call) {
-    return (call.arguments && call.arguments.name) || "";
+    this.name = "var_edit";
+    this.description = varEditDescription;
+    this.parameters = EDIT_SCHEMA;
   }
 
   handler = async ({ call }) => {
@@ -227,4 +215,4 @@ class Assign {
   };
 }
 
-export { Variables, Get, Set, Assign };
+export { Variables, Get, Set, Edit };

@@ -45,32 +45,21 @@ use crate::transpile::{SourceKind, ts_to_js};
 /// Internal name we declare the user script under.
 const USER_MODULE_NAME: &str = "frances:user-script";
 
-/// The transcript stream — ordered block-lifecycle deltas from the
-/// workflow body. One consumer (the driver's emit path); cross-variant
-/// order matters (a `Close` must follow its `Push`), so it's a union enum
-/// on its own channel. The host maps these onto the wire `StreamFrame`
-/// protocol; this enum is the host-API contract, not the protocol itself.
+/// The transcript stream — ordered deltas from the workflow body. One
+/// consumer (the driver's emit path); cross-variant order matters (an
+/// `EntityRef` section must land after its entity's first `Upsert`), so
+/// it's a union enum on its own channel. The host maps these onto the
+/// wire `StreamFrame` protocol; this enum is the host-API contract, not
+/// the protocol itself.
 #[derive(Debug, Clone)]
 pub enum SectionTranscript {
-    /// Declarative upsert of the frame with the given id. The first
-    /// `Set` for an id creates the block (with `frame.seed` as its
-    /// initial body, if any); a later `Set` replaces its kind + bounded
-    /// metadata — e.g. ShellOutput's state going `Running → Success` —
-    /// carrying no body (`seed: None`). Does NOT seal anything: each
-    /// frame type chooses when it's done (e.g. reasoning `Close`s when
-    /// the model's thinking channel ends).
-    Set { id: SectionId, section: SectionSpec },
-    /// Append text to the frame with the given id. Valid for as long
-    /// as the frame remains open. The body grows by delta — a
-    /// full-value `Set` per chunk would be O(n²).
-    Append { id: SectionId, delta: String },
-    /// Close the frame with the given id. The host emits a `BlockStop`
-    /// and persists the row. Idempotent on unknown ids (the JS side
-    /// suppresses double-close).
-    Close { id: SectionId },
+    /// A finished section. Sections are one-shot: everything they
+    /// render with rides in the kind, so the host emits and persists
+    /// each one in the same step, and nothing refers back to it.
+    Push(SectionKind),
     /// An entity producer verb. Rides the transcript channel — not a
     /// section — because ordering against sections matters: an
-    /// `EntityRef` `Set` must land after its entity's first `Upsert`,
+    /// `EntityRef` push must land after its entity's first `Upsert`,
     /// and `Settle` after the last `Append`. One FIFO makes that free.
     Entity(EntityCmd),
 }
@@ -142,19 +131,7 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
-pub use frances_models_ui::{ReasoningState, SectionId, SectionKind};
-
-/// What a [`SectionTranscript::Set`] carries: the section's kind +
-/// bounded metadata, plus an optional `seed` — the initial body chunk
-/// for text-bodied kinds (Reasoning / Error). One-shot
-/// data kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave
-/// it `None`. The streaming body never lives here; it grows via
-/// [`SectionTranscript::Append`].
-#[derive(Debug, Clone)]
-pub struct SectionSpec {
-    pub kind: SectionKind,
-    pub seed: Option<String>,
-}
+pub use frances_models_ui::SectionKind;
 
 /// A single user input event delivered to `inbox`.
 #[derive(Debug, Clone)]

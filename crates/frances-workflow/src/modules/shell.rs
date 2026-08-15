@@ -32,11 +32,11 @@
 //!   persist the exported value into the stored snapshot so subsequent
 //!   runs (and their subprocesses) see it. Awaits Done; errors on
 //!   non-zero exit.
-//! - `captureVar(name)` — bridge a bash variable back into Frances:
+//! - `getVar(name)` — bridge a bash variable back into Frances:
 //!   run `( set -u; printf '%s' "$<name>" > 'tmp' )`, await Done,
 //!   return the temp file's contents as a string. Errors if the bash
 //!   var is unset (the `set -u` subshell makes that visible instead of
-//!   silently capturing `""`) — with fresh bash per run, that means
+//!   silently returning `""`) — with fresh bash per run, that means
 //!   persisted env, wrapper-restored state, or bash builtins.
 //!
 //! The wait/quiet thresholds aren't exposed yet — `runOnce` /
@@ -278,7 +278,7 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
         )?;
 
         proto.set(
-            "captureVar",
+            "getVar",
             Function::new(
                 ctx.clone(),
                 |this: This<Class<'js, ShellJs<F>>>, name: String| {
@@ -287,7 +287,7 @@ impl<'js, F: WorkflowShell> JsClass<'js> for ShellJs<F> {
                     let factory = borrow.factory.clone();
                     drop(borrow);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
-                        ShellStringResult(capture_var_inner(&factory, &state, name).await)
+                        ShellStringResult(get_var_inner(&factory, &state, name).await)
                     }))
                 },
             )?,
@@ -325,21 +325,21 @@ enum ShellToolError {
     WriteTempfile(#[source] io::Error),
     #[error("flush tempfile: {0}")]
     FlushTempfile(#[source] io::Error),
-    #[error("read captured tempfile: {0}")]
-    ReadCaptured(#[source] io::Error),
+    #[error("read value tempfile: {0}")]
+    ReadValue(#[source] io::Error),
     #[error("export {name}: exit {exit}\n{output}")]
     SetVarFailed {
         name: String,
         exit: i32,
         output: String,
     },
-    #[error("capture {name}: unset or expansion failed (exit {exit})\n{output}")]
-    CaptureFailed {
+    #[error("get {name}: unset or expansion failed (exit {exit})\n{output}")]
+    GetVarFailed {
         name: String,
         exit: i32,
         output: String,
     },
-    #[error("command went quiet (export/capture expect immediate Done):\n{output}")]
+    #[error("command went quiet (export/get expect immediate Done):\n{output}")]
     WentQuiet { output: String },
     #[error("bash died mid-command:\n{output}")]
     Died { output: String },
@@ -561,7 +561,7 @@ async fn set_var_inner<F: WorkflowShell>(
 /// empty and we'd store `""` indistinguishably from a real empty
 /// value. The subshell scopes the option change so the persistent
 /// shell's settings aren't disturbed.
-async fn capture_var_inner<F: WorkflowShell>(
+async fn get_var_inner<F: WorkflowShell>(
     factory: &F,
     state: &Arc<AsyncMutex<ShellState>>,
     name: String,
@@ -574,15 +574,15 @@ async fn capture_var_inner<F: WorkflowShell>(
     );
     let (exit, output) = run_to_done(factory, state, &cmd, Vec::new()).await?;
     if exit != 0 {
-        return Err(ShellToolError::CaptureFailed { name, exit, output });
+        return Err(ShellToolError::GetVarFailed { name, exit, output });
     }
-    let captured = fs::read_to_string(tmp.path()).map_err(ShellToolError::ReadCaptured)?;
+    let value = fs::read_to_string(tmp.path()).map_err(ShellToolError::ReadValue)?;
     drop(tmp);
-    Ok(captured)
+    Ok(value)
 }
 
 /// Issue a one-shot bash command and require a `Done` outcome. Used
-/// by export/capture, both of which run short deterministic commands
+/// by export/get, both of which run short deterministic commands
 /// where Quiet would be a tool-side bug (an infinite-output trap or equivalent).
 async fn run_to_done<F: WorkflowShell>(
     factory: &F,

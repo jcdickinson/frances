@@ -115,13 +115,10 @@ async fn entity_ref_section_follows_upsert() {
         .iter()
         .enumerate()
         .find_map(|(i, f)| match f {
-            SectionTranscript::Set { section, .. } => match &section.kind {
-                SectionKind::EntityRef { entity_id } => Some((i, *entity_id)),
-                _ => None,
-            },
+            SectionTranscript::Push(SectionKind::EntityRef { entity_id }) => Some((i, *entity_id)),
             _ => None,
         })
-        .expect("EntityRef Set");
+        .expect("EntityRef push");
     assert!(upsert_pos < ref_pos, "Upsert must precede the ref");
 
     let SectionTranscript::Entity(EntityCmd::Upsert { entity_id, .. }) = &frames[upsert_pos] else {
@@ -164,11 +161,7 @@ async fn settled_handle_rejects_further_verbs() {
     let verdicts = frames
         .iter()
         .find_map(|f| match f {
-            SectionTranscript::Set { section, .. }
-                if matches!(section.kind, SectionKind::Error) =>
-            {
-                section.seed.clone()
-            }
+            SectionTranscript::Push(SectionKind::Error { text }) => Some(text.clone()),
             _ => None,
         })
         .expect("verdict section");

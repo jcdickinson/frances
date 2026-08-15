@@ -31,8 +31,9 @@
 //! - `frances:v1/workflow`       — `exit` lifecycle function, `setStatus`
 //!   busy indicator, `setTitle`/`getTitle` session title.
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
-//! - `frances:v1/sections`         — `transcript`, `ErrorSection`,
-//!   `JsonSection` (frame-objects-with-history API).
+//! - `frances:v1/sections`       — `transcript` plus the one-shot frame
+//!   classes (`ErrorSection`, `JsonSection`, `DiffSection`,
+//!   `EntityRefSection`).
 //! - `frances:v1/entities`       — `createEntity` producer verb; handles
 //!   publish snapshot/stream/settle for tab-viewable entities.
 //! - `frances:v1/messages`       — `postMessage`/`openMessage` chat-message
@@ -279,20 +280,11 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
     )?;
     stash.set("inbox", inbox_instance)?;
 
-    let (
-        transcript_proxy,
-        err_ctor,
-        json_ctor,
-        thought_ctor,
-        tool_use_ctor,
-        diff_ctor,
-        entity_ref_ctor,
-    ) = sections::build_sections(ctx, senders.transcript.clone())?;
+    let (transcript_proxy, err_ctor, json_ctor, diff_ctor, entity_ref_ctor) =
+        sections::build_sections(ctx, senders.transcript.clone())?;
     stash.set("transcript", transcript_proxy)?;
     stash.set("ErrorSection", err_ctor)?;
     stash.set("JsonSection", json_ctor)?;
-    stash.set("ReasoningSection", thought_ctor)?;
-    stash.set("ToolUseSection", tool_use_ctor)?;
     stash.set("DiffSection", diff_ctor)?;
     stash.set("EntityRefSection", entity_ref_ctor)?;
 
