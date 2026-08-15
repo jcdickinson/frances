@@ -47,6 +47,20 @@
     collapsed[section] = !collapsed[section];
   }
 
+  // Temporary home for the theme toggle; auto = follow the OS preference.
+  type Mode = 'auto' | 'dark' | 'light';
+  const MODES: Mode[] = ['auto', 'dark', 'light'];
+  let mode = $state<Mode>('auto');
+
+  function setMode(next: Mode): void {
+    mode = next;
+    if (next === 'auto') {
+      delete document.documentElement.dataset.mode;
+    } else {
+      document.documentElement.dataset.mode = next;
+    }
+  }
+
   let width = $state(240);
   let dragStart: { x: number; width: number } | null = null;
 
@@ -101,6 +115,11 @@
               class="entity-tab"
               class:active={activeTab() === id}
               onclick={() => focusTab(id)}
+              onauxclick={(event) => {
+                if (event.button !== 1) return;
+                event.preventDefault();
+                closeTab(id);
+              }}
               title={tabTitle(id)}
             >{tabTitle(id)}</button>
             <button
@@ -114,6 +133,12 @@
       </ul>
     {/if}
   {/each}
+
+  <div class="mode-toggle">
+    {#each MODES as m (m)}
+      <button class:active={mode === m} onclick={() => setMode(m)}>{m}</button>
+    {/each}
+  </div>
 </aside>
 
 <div

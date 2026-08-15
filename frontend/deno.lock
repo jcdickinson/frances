@@ -7,6 +7,7 @@
     "npm:@types/node@24": "24.13.3",
     "npm:bits-ui@2": "2.18.1_@internationalized+date@3.12.3_svelte@5.56.9",
     "npm:sass@1": "1.102.0",
+    "npm:streaming-markdown@~0.2.15": "0.2.15",
     "npm:svelte-check@4": "4.7.4_svelte@5.56.9_typescript@6.0.3",
     "npm:svelte@5": "5.56.9",
     "npm:vite@7": "7.3.6_@types+node@24.13.3_sass@1.102.0"
@@ -767,6 +768,9 @@
     "source-map-js@1.2.1": {
       "integrity": "sha512-UXWMKhLOwVKb728IUtQPXxfYU+usdybtUrK/8uGE8CQMvrhOpwvzDBwj0QhSL7MQc7vIsISBG8VQ8+IDQxpfQA=="
     },
+    "streaming-markdown@0.2.15": {
+      "integrity": "sha512-eSWjdvLSTznl2+FIzuxw1TRXwhjZiY1RfSygGCMpcNY8CrsaUM2zHtxe/JFcPoXCQxeO3TSJ72QMDIN5B/Ui1w=="
+    },
     "style-to-object@1.0.14": {
       "integrity": "sha512-LIN7rULI0jBscWQYaSswptyderlarFkjQ+t79nzty8tcIAceVomEVlLzH5VP4Cmsv6MtKhs7qaAiwlcp+Mgaxw==",
       "dependencies": [
@@ -879,6 +883,7 @@
       "npm:@types/node@24",
       "npm:bits-ui@2",
       "npm:sass@1",
+      "npm:streaming-markdown@~0.2.15",
       "npm:svelte@5",
       "npm:vite@7"
     ]

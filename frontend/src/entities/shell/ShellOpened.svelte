@@ -1,15 +1,15 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
-  import { commands as backend } from '../../bindings';
+  import Hr from '../../components/Hr.svelte';
   import type { EntityState } from '../../stores/entities.svelte';
   import { streamItems, subscribeStream, unsubscribeStream } from '../../stores/entityStreams.svelte';
-  import { unwrap } from '../../types';
   import { asShellSnapshot, asShellStreamItem, shellStateView } from './types';
 
   let { entity }: { entity: EntityState } = $props();
 
   const snapshot = $derived(asShellSnapshot(entity.snapshot));
   const stateView = $derived(shellStateView(snapshot.state, entity.lifecycle));
+  const running = $derived(snapshot.state.type === 'running' && entity.lifecycle === 'live');
 
   onMount(() => void subscribeStream(entity.id, true));
   onDestroy(() => void unsubscribeStream(entity.id));
@@ -32,18 +32,6 @@
     return out;
   });
 
-  // The exact tool result the model received, fetched on demand.
-  let modelView = $state<string | null>(null);
-  let showModelView = $state(false);
-
-  async function toggleModelView(): Promise<void> {
-    showModelView = !showModelView;
-    if (showModelView && modelView === null) {
-      const digest = unwrap(await backend.readEntityArtifact(entity.id, 'llm_digest'));
-      modelView = typeof digest === 'string' ? digest : '(not available)';
-    }
-  }
-
   function formatBytes(count: number): string {
     if (count >= 1024 * 1024) return `${(count / (1024 * 1024)).toFixed(1)} MiB`;
     if (count >= 1024) return `${(count / 1024).toFixed(1)} KiB`;
@@ -51,21 +39,10 @@
   }
 </script>
 
-<div class="entity-pane content">
-  <div class="entity-header">
-    <span class="pill {stateView.tone}">[{stateView.label}]</span>
-    <span class="command">{snapshot.cmd}</span>
-  </div>
-  <div class="entity-meta">
-    {formatBytes(snapshot.bytesTotal)} total
-    {#if snapshot.bytesDropped > 0}· {formatBytes(snapshot.bytesDropped)} elided{/if}
-    · <button class="tail" onclick={() => void toggleModelView()}>
-      {showModelView ? 'output' : 'model view'}
-    </button>
-  </div>
-  {#if showModelView}
-    <pre>{modelView ?? 'loading…'}</pre>
-  {:else}
+<div class="entity-pane shell-opened">
+  <div class="entity-header">{snapshot.cmd}</div>
+  <Hr />
+  <div class="output">
     {#each blocks as block (block.key)}
       {#if block.kind === 'gap'}
         <div class="collapsed">… {block.value} elided …</div>
@@ -73,5 +50,13 @@
         <pre>{block.value}</pre>
       {/if}
     {/each}
+  </div>
+  {#if !running}
+    <Hr />
+    <div class="entity-meta">
+      <span class="pill {stateView.tone}">[{stateView.label}]</span>
+      · {formatBytes(snapshot.bytesTotal)} total
+      {#if snapshot.bytesDropped > 0}· {formatBytes(snapshot.bytesDropped)} elided{/if}
+    </div>
   {/if}
 </div>

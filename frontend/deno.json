@@ -7,6 +7,7 @@
     "@types/node": "npm:@types/node@^24.0.0",
     "bits-ui": "npm:bits-ui@^2.0.0",
     "sass": "npm:sass@^1.0.0",
+    "streaming-markdown": "npm:streaming-markdown@^0.2.15",
     "svelte": "npm:svelte@^5.0.0",
     "vite": "npm:vite@^7.0.0"
   },

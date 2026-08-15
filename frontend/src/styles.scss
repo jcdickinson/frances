@@ -57,11 +57,20 @@ main {
 }
 
 .sidebar {
+  display: flex;
+  flex-direction: column;
   flex-shrink: 0;
   overflow: auto;
   padding: 30px 16px 22px;
   background: var(--surface-card);
   scrollbar-color: var(--border-strong) transparent;
+
+  // Raised slab relative to the page: only the right edge is exposed, so
+  // that's where the rim and drop shadow live.
+  border-right: 1px solid var(--border-strong);
+  box-shadow:
+    inset -1px 0 0 rgba(0, 0, 0, var(--lo-a)),
+    1px 0 3px rgba(0, 0, 0, var(--drop-a));
 
   // Collapsible category header (Directories, Shells, …).
   .side-section {
@@ -105,44 +114,78 @@ main {
 // content renders in the main area (the transcript is the first,
 // uncloseable tab).
 
+// Tabs pack against the sidebar's right edge (bleeding through its padding)
+// so they read as attached to the content pane they select.
 .entity-tab-row {
   display: flex;
+  justify-content: flex-end;
   align-items: center;
   gap: 4px;
-  margin-bottom: 4px;
+  margin: 0 -16px 6px 0;
 }
 
 .entity-tab {
-  flex: 1;
+  @include theme.raised;
   min-width: 0;
   overflow: hidden;
-  padding: 2px 6px;
-  border: 0;
-  border-radius: var(--radius);
+  padding: 3px 10px;
   color: var(--text-secondary);
-  background: none;
   font: inherit;
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
   cursor: pointer;
 
+  // The right edge is open toward the content: no border, square corners.
+  // The raised mixin's inset edge shadow stays.
+  border-right: 0;
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+
+  &:hover {
+    border-color: var(--text-muted);
+  }
+
+  &:active {
+    @include theme.pressed;
+  }
+
+  // The selected tab glows accent from within; pressed stays reserved for
+  // actual presses.
   &.active {
+    @include theme.glow;
     color: var(--text-primary);
-    background: var(--surface-well);
+
+    &:active {
+      @include theme.pressed;
+    }
   }
 }
 
+// Sits left of its tab, outside the tab's bevel, with a bevel of its own.
 .entity-tab-close {
+  @include theme.raised;
   flex-shrink: 0;
-  padding: 0 4px;
-  border: 0;
+  order: -1;
+  width: 18px;
+  height: 18px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border-radius: 50%;
   color: var(--text-muted);
-  background: none;
+  font: inherit;
+  line-height: 1;
   cursor: pointer;
 
   &:hover {
     color: var(--danger-text);
+    border-color: var(--danger-text);
+  }
+
+  &:active {
+    @include theme.pressed;
   }
 }
 
@@ -158,6 +201,22 @@ main {
   overflow-wrap: anywhere;
 }
 
+// Opened shell tab: command pinned above, state/byte line pinned below,
+// output scrolling between the two.
+.shell-opened {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+
+  .output {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    scrollbar-color: var(--border-strong) transparent;
+  }
+}
+
 .entity-meta {
   margin-top: 2px;
   color: var(--text-muted);
@@ -171,15 +230,35 @@ main {
   color: var(--text-muted);
 }
 
+// The sidebar's own right rim is the visible edge; the handle is an
+// invisible grab strip over it.
+// Temporary theme switcher pinned to the sidebar's bottom.
+.mode-toggle {
+  display: flex;
+  gap: 4px;
+  margin-top: auto;
+  padding-top: 16px;
+
+  button {
+    @include theme.raised;
+    flex: 1;
+    padding: 3px 0;
+    cursor: pointer;
+
+    &.active {
+      @include theme.glow;
+    }
+  }
+}
+
 .sidebar-handle {
   flex-shrink: 0;
   width: 5px;
   margin-left: -2px;
-  border-left: 1px solid var(--border);
   cursor: col-resize;
 
   &:hover {
-    border-color: var(--accent);
+    background: var(--accent-soft);
   }
 }
 
@@ -208,12 +287,6 @@ header {
   grid-template-columns: 24px minmax(0, 1fr);
   margin: 0 0 18px;
   line-height: 1.55;
-
-  &.streaming .content::after {
-    content: ' ⠋';
-    color: var(--accent);
-    animation: pulse 900ms steps(2, end) infinite;
-  }
 }
 
 .sigil {
@@ -230,10 +303,47 @@ pre {
 .prose.user {
   color: var(--accent);
 }
-.prose.streaming::after {
-  content: ' ⠋';
+// streaming-markdown output: tame browser block margins for chat density.
+.markdown :is(p, ul, ol, pre, blockquote, h1, h2, h3, h4, h5, h6) {
+  margin: 6px 0;
+}
+// Subtle color to break up the wall of text, terminal-style: headings in
+// accent, bold in gold, italics in green (reusing the variant text tokens
+// purely as a palette — no semantic weight here).
+.markdown :is(h1, h2, h3, h4, h5, h6) {
   color: var(--accent);
-  animation: pulse 900ms steps(2, end) infinite;
+}
+.markdown strong {
+  color: var(--warning-text);
+}
+.markdown em {
+  color: var(--success-text);
+}
+.markdown a {
+  color: var(--accent);
+}
+.markdown :not(pre) > code {
+  background: var(--surface-well);
+  border-radius: 3px;
+  padding: 1px 4px;
+}
+.markdown blockquote {
+  border-left: 3px solid var(--accent-soft);
+  padding-left: 8px;
+  color: var(--text-secondary);
+}
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+// streaming marker: the spinner rides inline at the tail of the text.
+.prose .spinner,
+.content .spinner {
+  display: inline-block;
+  vertical-align: -2px;
+  margin-left: 8px;
 }
 pre {
   margin: 6px 0 0;
@@ -410,11 +520,21 @@ footer {
 
 footer {
   padding: 10px clamp(20px, 5vw, 72px) 8px;
+
+  // Raised slab relative to the page: only the top edge is exposed, so the
+  // rim highlight and drop shadow live there.
+  border-top: 1px solid var(--border-strong);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, var(--hi-a)),
+    0 -1px 3px rgba(0, 0, 0, var(--drop-a));
 }
 
 .input-shell {
   @include theme.recessed;
-  position: relative;
+  display: flex;
+  align-items: stretch;
+  // The shell's rounded corners clip the square send button flush inside.
+  overflow: hidden;
 
   &:focus-within {
     border-color: var(--accent);
@@ -427,6 +547,26 @@ footer {
   textarea:focus-visible {
     outline: none;
   }
+
+  textarea {
+    flex: 1;
+  }
+}
+
+.send {
+  @include theme.raised;
+  border: 0;
+  border-radius: 0;
+  // Clean seam against the textarea: no left border, and the rim highlight
+  // runs along the top only (raised would also put it on the left edge).
+  // The button casts leftward into the well, reading as an inner shadow
+  // on the textarea's right edge.
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, var(--hi-a)),
+    inset -1px -1px 0 rgba(0, 0, 0, var(--lo-a)),
+    -2px 0 3px rgba(0, 0, 0, var(--drop-a));
+  padding: 0 16px;
+  cursor: pointer;
 }
 
 textarea {
@@ -449,17 +589,12 @@ textarea {
 }
 
 .busy {
-  position: absolute;
-  right: 10px;
-  bottom: 7px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding-right: 10px;
   color: var(--text-muted);
   pointer-events: none;
-}
-
-.spinner {
-  display: inline-block;
-  color: var(--accent);
-  animation: spin 800ms linear infinite;
 }
 
 .tokens {
@@ -467,17 +602,6 @@ textarea {
   padding-top: 5px;
   color: var(--text-muted);
   font-size: 12px;
-}
-
-@keyframes pulse {
-  50% {
-    opacity: 0.25;
-  }
-}
-@keyframes spin {
-  to {
-    transform: rotate(360deg);
-  }
 }
 
 @media (max-width: 700px) {

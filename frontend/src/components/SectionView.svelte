@@ -1,5 +1,6 @@
 <script lang="ts">
   import type { DiffOp } from '../bindings';
+  import Spinner from './Spinner.svelte';
   import { viewsFor } from '../entities/registry';
   import { entity } from '../stores/entities.svelte';
   import type { Section } from '../types';
@@ -36,7 +37,7 @@
   }
 </script>
 
-<article class:streaming={!section.closed} class:truncated={section.truncated} class="section">
+<article class:truncated={section.truncated} class="section">
   <div class="sigil" aria-hidden="true">
     {#if Sigil && referenced}<Sigil entity={referenced} />{/if}
   </div>
@@ -76,6 +77,7 @@
         {/each}
       </div>
     {/if}
+    {#if !section.closed}<Spinner size={14} thick={5} />{/if}
     {#if section.truncated}<span class="truncation">[truncated]</span>{/if}
   </div>
 </article>

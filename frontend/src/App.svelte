@@ -4,6 +4,7 @@
   import CommandPalette from './components/CommandPalette.svelte';
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
+  import Spinner from './components/Spinner.svelte';
   import FallbackOpened from './entities/FallbackOpened.svelte';
   import { viewsFor } from './entities/registry';
   import { entity, session, upsertEntity } from './stores/entities.svelte';
@@ -131,8 +132,13 @@
     addError(error instanceof Error ? error.message : String(error));
   }
 
-  async function submit(event: KeyboardEvent): Promise<void> {
+  function enterSubmits(event: KeyboardEvent): void {
     if (event.key !== 'Enter' || event.shiftKey || event.altKey) return;
+    event.preventDefault();
+    textarea.form?.requestSubmit();
+  }
+
+  async function submit(event: SubmitEvent): Promise<void> {
     event.preventDefault();
     const text = input.trim();
     if (!text) return;
@@ -237,17 +243,18 @@
   {/if}
 
   <footer>
-    <div class="input-shell">
+    <form class="input-shell" onsubmit={submit}>
       <textarea
         bind:this={textarea}
         bind:value={input}
-        onkeydown={submit}
+        onkeydown={enterSubmits}
         placeholder={permission ? 'Add details, or type a message for chat…' : 'type a message…'}
         rows="1"
         aria-label="Message"
       ></textarea>
-      {#if busy}<div class="busy"><span class="spinner">⠋</span> [{busy}]</div>{/if}
-    </div>
+      {#if busy}<div class="busy"><Spinner size={16} thick={5} /> [{busy}]</div>{/if}
+      <button type="submit" class="send">Send</button>
+    </form>
     <div class="tokens">{tokenStatus()}</div>
   </footer>
 </main>
