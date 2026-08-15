@@ -28,6 +28,10 @@ tauri-plugin-dialog.workspace = true
 tauri-specta.workspace = true
 xdg.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+gdk.workspace = true
+gtk.workspace = true
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

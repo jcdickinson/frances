@@ -11,13 +11,15 @@ use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
 use frances_session::session::{Paths, Session};
 use frances_session::store;
 use frances_session::workspace::Workspace;
+#[cfg(target_os = "linux")]
+use gdk::prelude::*;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_specta::Event as _;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 struct Backend {
     runtime: Arc<SessionRuntime>,
@@ -67,6 +69,7 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
     let session = paths.create_session(&workspace)?;
     let invocation = InvocationContext::capture(workspace);
     install_logging(&session)?;
+    ensure_valid_font_dpi()?;
 
     let specta = specta_builder();
     #[cfg(debug_assertions)]
@@ -106,6 +109,40 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
             handle.state::<Backend>().runtime.shutdown();
         }
     });
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_valid_font_dpi() -> Result<()> {
+    // HACK: WebKitGTK 2.52 can turn GDK's unavailable-resolution sentinel
+    // (-1) into a -1/96 page scale under Wayland. Set GDK's resolution before
+    // Tauri creates the webview; remove this once WebKitGTK rejects invalid DPI.
+    gtk::init()?;
+
+    let Some(screen) = gdk::Screen::default() else {
+        return Ok(());
+    };
+    let current_dpi = screen.resolution();
+    if current_dpi > 0.0 {
+        return Ok(());
+    }
+
+    let configured_dpi = gtk::Settings::default()
+        .map(|settings| settings.property::<i32>("gtk-xft-dpi"))
+        .filter(|dpi| *dpi > 0)
+        .map(|dpi| f64::from(dpi) / 1024.0)
+        .unwrap_or(96.0);
+
+    info!(
+        current_dpi,
+        configured_dpi, "repairing invalid GDK font DPI"
+    );
+    screen.set_resolution(configured_dpi);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn ensure_valid_font_dpi() -> Result<()> {
     Ok(())
 }
 

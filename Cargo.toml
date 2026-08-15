@@ -44,6 +44,8 @@ jaq-std = "3"
 libc = "0.2"
 genai = "0.6.0-beta.20"
 chrono = "0.4"
+gdk = "0.18"
+gtk = "0.18"
 parking_lot = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 regex = "1"
