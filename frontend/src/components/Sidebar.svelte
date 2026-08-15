@@ -17,6 +17,36 @@
     return state.kind;
   }
 
+  // Open tabs grouped into one category per entity kind. A category
+  // only exists while it has tabs; new kinds get their raw kind string
+  // as a label until they earn a nicer one.
+  const KIND_LABELS: Record<string, string> = { shell: 'Shells' };
+
+  const groups = $derived.by(() => {
+    const byKind = new Map<string, string[]>();
+    for (const id of openTabs()) {
+      const kind = entity(id)?.kind ?? 'entity';
+      const ids = byKind.get(kind);
+      if (ids) {
+        ids.push(id);
+      } else {
+        byKind.set(kind, [id]);
+      }
+    }
+    return [...byKind].map(([kind, ids]) => ({
+      kind,
+      label: KIND_LABELS[kind] ?? kind,
+      ids,
+    }));
+  });
+
+  // Collapsed-state per section, keyed by 'directories' or the kind.
+  let collapsed = $state<Record<string, boolean>>({});
+
+  function toggle(section: string): void {
+    collapsed[section] = !collapsed[section];
+  }
+
   let width = $state(240);
   let dragStart: { x: number; width: number } | null = null;
 
@@ -36,7 +66,8 @@
 </script>
 
 <aside class="sidebar" style:width="{width}px">
-  <h2>Tabs</h2>
+  <!-- The transcript sits alone at the top until directories become
+       sessions with transcripts of their own. -->
   <ul class="entity-tab-list">
     <li class="entity-tab-row">
       <button
@@ -45,30 +76,44 @@
         onclick={() => focusTab(null)}
       >transcript</button>
     </li>
-    {#each openTabs() as id (id)}
-      <li class="entity-tab-row">
-        <button
-          class="entity-tab"
-          class:active={activeTab() === id}
-          onclick={() => focusTab(id)}
-          title={tabTitle(id)}
-        >{tabTitle(id)}</button>
-        <button
-          class="entity-tab-close"
-          onclick={() => closeTab(id)}
-          aria-label="Close tab"
-          title="Close tab"
-        >×</button>
-      </li>
-    {/each}
   </ul>
 
-  <h2>Directories</h2>
-  <ul>
-    {#each directories as directory (directory)}
-      <li title={directory}>{basename(directory)}</li>
-    {/each}
-  </ul>
+  <button class="side-section" onclick={() => toggle('directories')}>
+    <span class="chevron">{collapsed['directories'] ? '▸' : '▾'}</span> Directories
+  </button>
+  {#if !collapsed['directories']}
+    <ul class="side-list">
+      {#each directories as directory (directory)}
+        <li title={directory}>{basename(directory)}</li>
+      {/each}
+    </ul>
+  {/if}
+
+  {#each groups as group (group.kind)}
+    <button class="side-section" onclick={() => toggle(group.kind)}>
+      <span class="chevron">{collapsed[group.kind] ? '▸' : '▾'}</span> {group.label}
+    </button>
+    {#if !collapsed[group.kind]}
+      <ul class="entity-tab-list">
+        {#each group.ids as id (id)}
+          <li class="entity-tab-row">
+            <button
+              class="entity-tab"
+              class:active={activeTab() === id}
+              onclick={() => focusTab(id)}
+              title={tabTitle(id)}
+            >{tabTitle(id)}</button>
+            <button
+              class="entity-tab-close"
+              onclick={() => closeTab(id)}
+              aria-label="Close tab"
+              title="Close tab"
+            >×</button>
+          </li>
+        {/each}
+      </ul>
+    {/if}
+  {/each}
 </aside>
 
 <div

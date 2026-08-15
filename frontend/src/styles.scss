@@ -63,17 +63,33 @@ main {
   background: var(--surface-card);
   scrollbar-color: var(--border-strong) transparent;
 
-  h2 {
-    margin: 0 0 12px;
+  // Collapsible category header (Directories, Shells, …).
+  .side-section {
+    display: block;
+    width: 100%;
+    margin: 0 0 10px;
+    padding: 0;
+    border: 0;
+    background: none;
     color: var(--text-muted);
-    font-size: inherit;
-    font-weight: normal;
+    font: inherit;
+    text-align: left;
     text-transform: uppercase;
     letter-spacing: 0.08em;
+    cursor: pointer;
+
+    &:hover {
+      color: var(--text-secondary);
+    }
+  }
+
+  .chevron {
+    display: inline-block;
+    width: 1em;
   }
 
   ul {
-    margin: 0;
+    margin: 0 0 18px;
     padding: 0;
     list-style: none;
   }
@@ -85,12 +101,9 @@ main {
   }
 }
 
-// Sidebar tab list: vertical triggers only — the active tab's content
-// renders in the main area (the transcript is the first, uncloseable
-// tab).
-.sidebar .entity-tab-list {
-  margin-bottom: 18px;
-}
+// Sidebar tab lists are vertical triggers only — the active tab's
+// content renders in the main area (the transcript is the first,
+// uncloseable tab).
 
 .entity-tab-row {
   display: flex;
