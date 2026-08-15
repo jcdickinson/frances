@@ -7,7 +7,7 @@ async fn context_sections_env_block_emits_environment_info() {
         "js",
         r#"
         import { envBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         // Simulate the ctx that ChatSession builds from _envInfo() + tools
         const ctx = {
@@ -21,7 +21,7 @@ async fn context_sections_env_block_emits_environment_info() {
         };
 
         const result = envBlock.prompt(ctx);
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -72,7 +72,7 @@ async fn context_sections_env_block_omits_repo_root_when_null() {
         "js",
         r#"
         import { envBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const ctx = {
             os: "macos",
@@ -85,7 +85,7 @@ async fn context_sections_env_block_omits_repo_root_when_null() {
         };
 
         const result = envBlock.prompt(ctx);
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -113,14 +113,14 @@ async fn context_sections_cwd_block_emits_cwd() {
         "js",
         r#"
         import { cwdBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const ctx = {
             cwd: "/home/user/project/src",
         };
 
         const result = cwdBlock.prompt(ctx);
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -144,14 +144,14 @@ async fn context_sections_cwd_block_returns_null_when_no_cwd() {
         "js",
         r#"
         import { cwdBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const ctx = {
             cwd: null,
         };
 
         const result = cwdBlock.prompt(ctx);
-        transcript.push(new MarkdownSection({ content: String(result) }));
+        transcript.push(new ErrorSection({ content: String(result) }));
         "#,
     );
     let mut handle = rt
@@ -175,7 +175,7 @@ async fn context_sections_are_stable_objects() {
         "js",
         r#"
         import { envBlock, cwdBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         // Import twice — must be the same object (=== identity)
         const env1 = envBlock;
@@ -183,7 +183,7 @@ async fn context_sections_are_stable_objects() {
         const cwd1 = cwdBlock;
         const cwd2 = cwdBlock;
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             envStable: env1 === env2,
             cwdStable: cwd1 === cwd2,
             envHasName: "name" in envBlock,
@@ -223,7 +223,7 @@ async fn context_sections_env_block_always_returns_string() {
         "js",
         r#"
         import { envBlock } from "frances:v1/context-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         // Even with minimal ctx
         const ctx = {
@@ -237,7 +237,7 @@ async fn context_sections_env_block_always_returns_string() {
         };
 
         const result = envBlock.prompt(ctx);
-        transcript.push(new MarkdownSection({ content: typeof result }));
+        transcript.push(new ErrorSection({ content: typeof result }));
         "#,
     );
     let mut handle = rt

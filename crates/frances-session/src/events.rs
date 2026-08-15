@@ -11,9 +11,7 @@
 
 use uuid::Uuid;
 
-pub use frances_models_ui::{
-    EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind, Source,
-};
+pub use frances_models_ui::{EntityEnvelope, Lifecycle, ReasoningState, SectionId, SectionKind};
 
 pub use frances_workflow::permission::{
     PermissionRequest, PermissionResponse, PermissionResponseWire,

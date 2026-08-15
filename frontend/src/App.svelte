@@ -4,6 +4,7 @@
   import CommandPalette from './components/CommandPalette.svelte';
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
+  import FallbackOpened from './entities/FallbackOpened.svelte';
   import { viewsFor } from './entities/registry';
   import { entity, session, upsertEntity } from './stores/entities.svelte';
   import { applyStreamItem } from './stores/entityStreams.svelte';
@@ -208,7 +209,7 @@
     {@const opened = entity(id)}
     <section class="scrollback" class:hidden-tab={activeTab() !== id}>
       {#if opened}
-        {@const Opened = viewsFor(opened.kind).Opened}
+        {@const Opened = viewsFor(opened.kind).Opened ?? FallbackOpened}
         <Opened entity={opened} />
       {:else}
         <div class="label">[entity {id}]</div>

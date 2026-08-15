@@ -25,9 +25,7 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
         SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Markdown { .. } | SectionKind::Error => {
-                spec.seed.clone().unwrap_or_default()
-            }
+            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
             SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
@@ -46,15 +44,15 @@ fn text_of(frame: &SectionTranscript) -> String {
     }
 }
 
-/// Collect content from every `MarkdownSection` push in order, filtering out
-/// non-markdown frames so indices remain stable regardless of other section
+/// Collect content from every `ErrorSection` push in order, filtering out
+/// other frames so indices remain stable regardless of other section
 /// types. Empty-content pushes collapse to "".
-fn markdown_pushes(frames: &[SectionTranscript]) -> Vec<String> {
+fn error_pushes(frames: &[SectionTranscript]) -> Vec<String> {
     frames
         .iter()
         .filter_map(|f| match f {
             SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-                SectionKind::Markdown { .. } => Some(spec.seed.clone().unwrap_or_default()),
+                SectionKind::Error => Some(spec.seed.clone().unwrap_or_default()),
                 _ => None,
             },
             _ => None,
@@ -69,7 +67,7 @@ async fn shell_set_persists_across_runs_and_subprocesses() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -90,7 +88,7 @@ async fn shell_set_persists_across_runs_and_subprocesses() {
             call: { id: "r1", name: "shell_run", arguments: { cmd: "echo \"[$FOO]\"" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: seen.content }));
+        transcript.push(new ErrorSection({ content: seen.content }));
 
         // Subprocesses inherit it too.
         const sub = await run.handler({
@@ -98,7 +96,7 @@ async fn shell_set_persists_across_runs_and_subprocesses() {
                     arguments: { cmd: "bash -c 'echo \"[${FOO:-unset}]\"'" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: sub.content }));
+        transcript.push(new ErrorSection({ content: sub.content }));
 
         await sh.close();
         "#,
@@ -114,7 +112,7 @@ async fn shell_set_persists_across_runs_and_subprocesses() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     assert!(
         pushes[0].contains("[abc]"),
         "expected [abc] in {:?}",
@@ -134,7 +132,7 @@ async fn shell_set_multiline_value_survives() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -157,7 +155,7 @@ async fn shell_set_multiline_value_survives() {
                     arguments: { cmd: "bash -c 'echo \"$PAYLOAD\"'" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: out.content }));
+        transcript.push(new ErrorSection({ content: out.content }));
 
         await sh.close();
         "#,
@@ -173,7 +171,7 @@ async fn shell_set_multiline_value_survives() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let out = &pushes[0];
     assert!(out.contains("alpha\nbeta\ngamma"), "got: {out}");
 }
@@ -185,7 +183,7 @@ async fn shell_set_object_value_is_json_encoded() {
         r#"
         import { Shell, Run, Wait, Kill, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -205,7 +203,7 @@ async fn shell_set_object_value_is_json_encoded() {
             call: { id: "r1", name: "shell_run", arguments: { cmd: "echo \"$OBJ\"" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: out.content }));
+        transcript.push(new ErrorSection({ content: out.content }));
 
         await sh.close();
         "#,
@@ -221,7 +219,7 @@ async fn shell_set_object_value_is_json_encoded() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let out = &pushes[0];
     assert!(out.contains(r#"{"a":1,"b":[2,3]}"#), "got: {out}");
 }
@@ -233,7 +231,7 @@ async fn shell_set_validates_names_and_from() {
         r#"
         import { Shell, Set as ShellSet } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const vars = new Variables();
@@ -261,10 +259,10 @@ async fn shell_set_validates_names_and_from() {
             scope: null,
         });
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify(noName) }));
-        transcript.push(new MarkdownSection({ content: JSON.stringify(missing) }));
-        transcript.push(new MarkdownSection({ content: JSON.stringify(bad) }));
-        transcript.push(new MarkdownSection({ content: JSON.stringify(reserved) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(noName) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(missing) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(bad) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(reserved) }));
 
         await sh.close();
         "#,
@@ -299,7 +297,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
         r#"
         import { Shell, Run, Wait, Kill, Capture as ShellCapture } from "frances:v1/tools/shell";
         import { Variables, Assign as VarAssign } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -322,7 +320,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
                     arguments: { name: "snapshot", from: "OUT" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: vars.get("snapshot") }));
+        transcript.push(new ErrorSection({ content: vars.get("snapshot") }));
 
         // Parse via variable_assign + fromjson. The captured value is
         // always a string, so we route it through $snapshot rather
@@ -333,7 +331,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
                                  inputs: ["snapshot"] } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(vars.get("parsed")) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(vars.get("parsed")) }));
 
         await sh.close();
         "#,
@@ -349,7 +347,7 @@ async fn shell_capture_round_trip_via_variable_assign() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     assert_eq!(pushes[0], r#"{"a":1,"b":[2,3]}"#);
     assert_eq!(pushes[1], r#"{"a":1,"b":[2,3]}"#);
 }
@@ -361,7 +359,7 @@ async fn shell_capture_unset_var_errors() {
         r#"
         import { Shell, Capture as ShellCapture } from "frances:v1/tools/shell";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const vars = new Variables();
@@ -372,7 +370,7 @@ async fn shell_capture_unset_var_errors() {
                     arguments: { name: "x", from: "DEFINITELY_UNSET_VAR_NAME" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
 
         await sh.close();
         "#,
@@ -416,7 +414,7 @@ async fn shell_run_approve_yes_executes_command() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -428,7 +426,7 @@ async fn shell_run_approve_yes_executes_command() {
                     arguments: { cmd: "echo approved-and-ran" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: out.content }));
+        transcript.push(new ErrorSection({ content: out.content }));
         await sh.close();
         "#,
     );
@@ -469,10 +467,10 @@ async fn shell_run_approve_yes_executes_command() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let out = pushes
         .first()
-        .expect("expected a markdown push after approval");
+        .expect("expected a push after approval");
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("approved-and-ran"), "got `{out}`");
 }
@@ -484,7 +482,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -496,7 +494,7 @@ async fn shell_run_approve_no_skips_command_and_returns_error() {
                     arguments: { cmd: "rm -rf /" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(out) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(out) }));
         await sh.close();
         "#,
     );
@@ -541,7 +539,7 @@ async fn shell_run_approve_false_skips_gate() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -553,7 +551,7 @@ async fn shell_run_approve_false_skips_gate() {
                     arguments: { cmd: "echo no-gate" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: out.content }));
+        transcript.push(new ErrorSection({ content: out.content }));
         await sh.close();
         "#,
     );
@@ -572,7 +570,7 @@ async fn shell_run_approve_false_skips_gate() {
         handle.outputs.permissions.try_recv().is_err(),
         "approve:false should not emit a permission ask",
     );
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let out = &pushes[0];
     assert!(out.starts_with("Exit 0"), "got `{out}`");
     assert!(out.contains("no-gate"), "got `{out}`");
@@ -584,7 +582,7 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
     let file = write_source(
         r#"
         import { Shell, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const kill = new Kill(sh);
@@ -610,7 +608,7 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
         const revived = await sh.runOnce("echo revived");
 
         await sh.close();
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `r1Kind=${r1.kind} isErr=${result.is_error} hasStillRunning=${result.content.includes("Still running")} running=${stillRunning} revivedKind=${revived.kind} revivedExit=${revived.exit_code} content=${JSON.stringify(result.content)}`,
         }));
         "#,
@@ -625,7 +623,7 @@ async fn shell_kill_after_quiet_does_not_return_still_running() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let summary = pushes.last().expect("summary frame");
     assert!(summary.contains("r1Kind=quiet"), "got `{summary}`");
     assert!(
@@ -663,7 +661,7 @@ async fn shell_cap_policy_head_ring_flush() {
     let file = write_source(
         r#"
         import { _capState, _capPush, _capFlush } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const cap = _capState({ head: 4, tail: 6 });
         const r = [];
@@ -673,7 +671,7 @@ async fn shell_cap_policy_head_ring_flush() {
         r.push(JSON.stringify(_capPush(cap, "ghij"))); // ring (6 bytes)
         r.push(JSON.stringify(_capPush(cap, "kl")));   // evicts "ef"
         r.push(JSON.stringify(_capFlush(cap)));
-        transcript.push(new MarkdownSection({ content: r.join("|") }));
+        transcript.push(new ErrorSection({ content: r.join("|") }));
         "#,
     );
     let mut handle = rt
@@ -686,7 +684,7 @@ async fn shell_cap_policy_head_ring_flush() {
         .unwrap();
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     let got = pushes.first().expect("cap summary");
     let want = concat!(
         r#"[{"text":"ab"}]|[{"text":"cd"}]|[]|[]|[]|"#,
@@ -705,7 +703,7 @@ async fn shell_run_produces_settled_entity_with_digest() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const run = new Run(sh, { approve: false });
@@ -714,7 +712,7 @@ async fn shell_run_produces_settled_entity_with_digest() {
                     arguments: { cmd: "echo hello-entity" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: out.content }));
+        transcript.push(new ErrorSection({ content: out.content }));
         await sh.close();
         "#,
     );
@@ -768,8 +766,8 @@ async fn shell_run_produces_settled_entity_with_digest() {
     );
 
     // Settle: terminal state + digest === the tool-result content.
-    let digest = markdown_pushes(&frames);
-    let tool_result_content = digest.first().expect("tool result markdown");
+    let digest = error_pushes(&frames);
+    let tool_result_content = digest.first().expect("tool result push");
     let settle = cmds
         .iter()
         .find_map(|cmd| match cmd {
@@ -800,7 +798,7 @@ async fn shell_quiet_keeps_entity_live_until_wait_settles() {
     let file = write_source(
         r#"
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -814,14 +812,14 @@ async fn shell_quiet_keeps_entity_live_until_wait_settles() {
                     arguments: { cmd: "echo start; sleep 30", quiet: 0.3 } },
             scope,
         });
-        transcript.push(new MarkdownSection({ content: "MARK-QUIET", closed: true }));
+        transcript.push(new ErrorSection({ content: "MARK-QUIET", closed: true }));
 
         await sh.kill();
         const r2 = await wait.handler({
             call: { id: "w1", name: "shell_wait", arguments: {} },
             scope: null,
         });
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `r1Still=${r1.content.includes("Still running")}`,
             closed: true,
         }));
@@ -839,7 +837,7 @@ async fn shell_quiet_keeps_entity_live_until_wait_settles() {
     let (frames, done) = drive_one_cycle(&mut handle).await;
     assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
 
-    let pushes = markdown_pushes(&frames);
+    let pushes = error_pushes(&frames);
     assert!(
         pushes.iter().any(|p| p.contains("r1Still=true")),
         "run should have gone quiet: {pushes:?}"

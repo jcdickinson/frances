@@ -31,10 +31,12 @@
 //! - `frances:v1/workflow`       — `exit` lifecycle function, `setStatus`
 //!   busy indicator, `setTitle`/`getTitle` session title.
 //! - `frances:v1/inbox`          — `inbox` async-iterable user-input stream.
-//! - `frances:v1/sections`         — `transcript`, `MarkdownSection`, `ErrorSection`,
+//! - `frances:v1/sections`         — `transcript`, `ErrorSection`,
 //!   `JsonSection` (frame-objects-with-history API).
 //! - `frances:v1/entities`       — `createEntity` producer verb; handles
 //!   publish snapshot/stream/settle for tab-viewable entities.
+//! - `frances:v1/messages`       — `postMessage`/`openMessage` chat-message
+//!   entities (pure JS over sections + entities).
 //! - `frances:v1/chat`           — `ChatSession` (LLM access).
 //! - `frances:v1/io`             — `Timer` + `TimerError`. The user-facing
 //!   surface is pure JS in `assets/frances/v1/io.js`; Rust exposes a private sleep
@@ -279,7 +281,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
 
     let (
         transcript_proxy,
-        md_ctor,
         err_ctor,
         json_ctor,
         thought_ctor,
@@ -288,7 +289,6 @@ pub(crate) fn install_stash<'js, D: WorkflowDeps>(
         entity_ref_ctor,
     ) = sections::build_sections(ctx, senders.transcript.clone())?;
     stash.set("transcript", transcript_proxy)?;
-    stash.set("MarkdownSection", md_ctor)?;
     stash.set("ErrorSection", err_ctor)?;
     stash.set("JsonSection", json_ctor)?;
     stash.set("ReasoningSection", thought_ctor)?;
@@ -358,6 +358,7 @@ pub(crate) fn install_v1_modules<'js>(ctx: &Ctx<'js>) -> Result<(), WorkflowErro
     declare_and_eval(ctx, "frances:v1/inbox")?;
     declare_and_eval(ctx, "frances:v1/sections")?;
     declare_and_eval(ctx, "frances:v1/entities")?;
+    declare_and_eval(ctx, "frances:v1/messages")?;
     declare_and_eval(ctx, "frances:v1/chat")?;
     declare_and_eval(ctx, "frances:v1/io")?;
     declare_and_eval(ctx, "frances:v1/approval")?;

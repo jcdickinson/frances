@@ -7,11 +7,11 @@ async fn timer_fires_after_interval() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const start = Date.now();
         await new Timer(20);
         const elapsed = Date.now() - start;
-        transcript.push(new MarkdownSection({ content: elapsed >= 15 ? "ok" : `too fast: ${elapsed}` }));
+        transcript.push(new ErrorSection({ content: elapsed >= 15 ? "ok" : `too fast: ${elapsed}` }));
         "#,
     );
     let mut handle = rt
@@ -34,13 +34,13 @@ async fn timer_fire_resolves_pending_await() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);  // long enough that the test would hang if fire() didn't work
         queueMicrotask(() => t.fire());
         const start = Date.now();
         await t;
         const elapsed = Date.now() - start;
-        transcript.push(new MarkdownSection({ content: elapsed < 1000 ? "fast" : `slow: ${elapsed}` }));
+        transcript.push(new ErrorSection({ content: elapsed < 1000 ? "fast" : `slow: ${elapsed}` }));
         "#,
     );
     let mut handle = rt
@@ -63,7 +63,7 @@ async fn timer_disable_then_fire_wakes_await() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         queueMicrotask(() => {
             t.disable();
@@ -72,7 +72,7 @@ async fn timer_disable_then_fire_wakes_await() {
         const start = Date.now();
         await t;
         const elapsed = Date.now() - start;
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: elapsed < 1000 ? "fast" : `slow: ${elapsed}`,
         }));
         "#,
@@ -97,15 +97,15 @@ async fn timer_reject_preserves_error_identity() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         const original = new Error("nope");
         queueMicrotask(() => t.reject(original));
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `same=${e === original} msg=${e.message}`,
             }));
         }
@@ -132,7 +132,7 @@ async fn timer_rejected_is_terminal() {
         "js",
         r#"
         import { Timer, TimerError } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         t.reject(new Error("done"));
         const results = [];
@@ -146,7 +146,7 @@ async fn timer_rejected_is_terminal() {
             try { op[1](); results.push(`${op[0]}: no-throw`); }
             catch (e) { results.push(`${op[0]}: threw`); }
         }
-        transcript.push(new MarkdownSection({ content: results.join("; ") }));
+        transcript.push(new ErrorSection({ content: results.join("; ") }));
         "#,
     );
     let mut handle = rt
@@ -172,14 +172,14 @@ async fn timer_reject_with_timer_error_is_instance() {
         "js",
         r#"
         import { Timer, TimerError } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         queueMicrotask(() => t.reject(new TimerError("boom")));
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `te=${e instanceof TimerError} err=${e instanceof Error} msg=${e.message}`,
             }));
         }
@@ -205,14 +205,14 @@ async fn timer_reject_with_no_arg_rejects_with_default_timer_error() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         queueMicrotask(() => t.reject());
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `caught: error=${e instanceof Error} name=${e.name} msg=${e.message}`,
             }));
         }
@@ -241,12 +241,12 @@ async fn timer_disable_then_enable_revives() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer({ delay: 10 });
         t.disable();
         t.enable();
         await t;
-        transcript.push(new MarkdownSection({ content: t.enabled ? "enabled" : "still-off" }));
+        transcript.push(new ErrorSection({ content: t.enabled ? "enabled" : "still-off" }));
         "#,
     );
     let mut handle = rt
@@ -269,12 +269,12 @@ async fn timer_getters_reflect_schedule_and_state() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer({ delay: 100, interval: 50 });
         const before = `enabled=${t.enabled} delay=${t.delay} interval=${t.interval}`;
         t.disable();
         const after = `enabled=${t.enabled} delay=${t.delay} interval=${t.interval}`;
-        transcript.push(new MarkdownSection({ content: `${before} | ${after}` }));
+        transcript.push(new ErrorSection({ content: `${before} | ${after}` }));
         "#,
     );
     let mut handle = rt
@@ -300,12 +300,12 @@ async fn timer_repeat_ticks_multiple_times() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const tick = new Timer({ interval: 5 });
         let count = 0;
         for (let i = 0; i < 3; i += 1) { await tick; count += 1; }
         tick.disable();
-        transcript.push(new MarkdownSection({ content: `count=${count}` }));
+        transcript.push(new ErrorSection({ content: `count=${count}` }));
         "#,
     );
     let mut handle = rt
@@ -328,13 +328,13 @@ async fn timer_non_repeat_second_await_resolves_immediately() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(10);
         await t;
         const start = Date.now();
         await t;  // already fired — no wait
         const elapsed = Date.now() - start;
-        transcript.push(new MarkdownSection({ content: elapsed < 5 ? "instant" : `slow: ${elapsed}` }));
+        transcript.push(new ErrorSection({ content: elapsed < 5 ? "instant" : `slow: ${elapsed}` }));
         "#,
     );
     let mut handle = rt
@@ -383,9 +383,9 @@ async fn timer_object_delay_form() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         await new Timer({ delay: 5 });
-        transcript.push(new MarkdownSection({ content: "fired" }));
+        transcript.push(new ErrorSection({ content: "fired" }));
         "#,
     );
     let mut handle = rt
@@ -408,7 +408,7 @@ async fn timer_delay_then_interval_combo() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const tick = new Timer({ delay: 30, interval: 5 });
         const t0 = Date.now();
         await tick;
@@ -419,7 +419,7 @@ async fn timer_delay_then_interval_combo() {
         const third = Date.now() - t0;
         tick.disable();
         const ok = first >= 25 && (second - first) < 25 && (third - second) < 25;
-        transcript.push(new MarkdownSection({ content: ok ? "ok" : `bad: ${first} ${second} ${third}` }));
+        transcript.push(new ErrorSection({ content: ok ? "ok" : `bad: ${first} ${second} ${third}` }));
         "#,
     );
     let mut handle = rt
@@ -468,13 +468,13 @@ async fn timer_set_after_cancel_reuses_timer() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         t.disable();
         // Cancelled — without set(), the next await would reject.
         t.set({ delay: 10 });
         await t;
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -497,7 +497,7 @@ async fn timer_set_changes_schedule_and_resets_fired_once() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer({ delay: 5 });
         await t;             // fires, fired_once = true
         t.set({ interval: 15 });
@@ -505,7 +505,7 @@ async fn timer_set_changes_schedule_and_resets_fired_once() {
         await t;
         await t;
         const elapsed = Date.now() - t0;
-        transcript.push(new MarkdownSection({ content: elapsed >= 25 ? "ok" : `too fast: ${elapsed}` }));
+        transcript.push(new ErrorSection({ content: elapsed >= 25 ? "ok" : `too fast: ${elapsed}` }));
         "#,
     );
     let mut handle = rt
@@ -555,12 +555,12 @@ async fn timer_exit_unblocks_pending_await() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { exit } from "frances:v1/workflow";
         const t = new Timer(60_000);
         queueMicrotask(() => exit());
         await t;  // should resolve when the workflow closes, not reject
-        transcript.push(new MarkdownSection({ content: "after-await" }));
+        transcript.push(new ErrorSection({ content: "after-await" }));
         "#,
     );
     let mut handle = rt
@@ -583,15 +583,15 @@ async fn timer_reject_with_object_preserves_identity() {
         "js",
         r#"
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const t = new Timer(60_000);
         const payload = { kind: "custom", n: 42 };
         queueMicrotask(() => t.reject(payload));
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `same=${e === payload} kind=${e.kind} n=${e.n}`,
             }));
         }
@@ -618,17 +618,17 @@ async fn timer_signal_already_aborted_rejects_immediately() {
         r#"
         import { Timer } from "frances:v1/io";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const ac = new AbortController();
         ac.abort("pre-aborted");
         const t = new Timer({ delay: 60_000, signal: ac.signal });
         const start = Date.now();
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `caught=${e} fast=${elapsed < 100}`,
             }));
         }
@@ -655,17 +655,17 @@ async fn timer_signal_aborts_mid_wait() {
         r#"
         import { Timer } from "frances:v1/io";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const ac = new AbortController();
         const t = new Timer({ delay: 60_000, signal: ac.signal });
         queueMicrotask(() => ac.abort(new Error("user cancelled")));
         const start = Date.now();
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `err=${e instanceof Error} msg=${e.message} fast=${elapsed < 1000}`,
             }));
         }
@@ -692,16 +692,16 @@ async fn timer_signal_reason_preserved_verbatim() {
         r#"
         import { Timer } from "frances:v1/io";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const ac = new AbortController();
         const reason = { kind: "signal-reason", id: 7 };
         const t = new Timer({ delay: 60_000, signal: ac.signal });
         queueMicrotask(() => ac.abort(reason));
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `same=${e === reason} kind=${e.kind} id=${e.id}`,
             }));
         }
@@ -731,7 +731,7 @@ async fn timer_signal_listener_removed_on_terminal() {
         r#"
         import { Timer, TimerError } from "frances:v1/io";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const ac = new AbortController();
         const t = new Timer({ delay: 60_000, signal: ac.signal });
         t.reject(new Error("manual"));
@@ -740,11 +740,11 @@ async fn timer_signal_listener_removed_on_terminal() {
         ac.abort("late");
         try {
             await t;
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
             // We rejected with our own Error before abort fired —
             // the late abort must not have replaced the reason.
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `msg=${e.message} aborted=${ac.signal.aborted}`,
             }));
         }

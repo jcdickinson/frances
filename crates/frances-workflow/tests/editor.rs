@@ -2,7 +2,7 @@
 //! primitive. Each test drives a JS script through the workflow
 //! runtime against a `StubDeps` with a real `EditSession<FakeStore>`
 //! and a tempdir cwd, then asserts on what the script pushed back via
-//! `MarkdownSection` / `ErrorSection`.
+//! `ErrorSection` / `ErrorSection`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,9 +24,7 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
         SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Markdown { .. } | SectionKind::Error => {
-                spec.seed.clone().unwrap_or_default()
-            }
+            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
             SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
@@ -61,10 +59,10 @@ async fn editor_read_returns_anchored_lines() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const content = await editor.readFile("hello.txt");
-        transcript.push(new MarkdownSection({ content }));
+        transcript.push(new ErrorSection({ content }));
         "#,
     );
     let mut handle = rt
@@ -97,7 +95,7 @@ async fn editor_edit_replace_writes_disk() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const read = await editor.readFile("file.txt");
         const line_b = read.split("\n")[1];
@@ -108,7 +106,7 @@ async fn editor_edit_replace_writes_disk() {
             end_anchor: line_b,
             text: "B2",
         });
-        transcript.push(new MarkdownSection({ content: result.text }));
+        transcript.push(new ErrorSection({ content: result.text }));
         "#,
     );
     let mut handle = rt
@@ -140,7 +138,7 @@ async fn editor_edit_replace_all_writes_disk_and_honors_count() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         await editor.readFile("file.txt");
         const result = await editor.edit({
@@ -150,7 +148,7 @@ async fn editor_edit_replace_all_writes_disk_and_honors_count() {
             replacement: "new_$1",
             count: 2,
         });
-        transcript.push(new MarkdownSection({ content: result.text }));
+        transcript.push(new ErrorSection({ content: result.text }));
         "#,
     );
     let mut handle = rt
@@ -184,7 +182,7 @@ async fn replace_all_tool_class_reports_count_cap_error_without_writing() {
         r#"
         import { Editor, ReplaceAll } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const replace = new ReplaceAll(editor, new Variables());
         await editor.readFile("file.txt");
@@ -193,7 +191,7 @@ async fn replace_all_tool_class_reports_count_cap_error_without_writing() {
                     arguments: { path: "file.txt", find: "x", replacement: "y", count: 2 } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -224,7 +222,7 @@ async fn editor_anchor_not_found_throws() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         await editor.readFile("file.txt");
         let caught = "";
@@ -239,7 +237,7 @@ async fn editor_anchor_not_found_throws() {
         } catch (e) {
             caught = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
         "#,
     );
     let mut handle = rt
@@ -271,7 +269,7 @@ async fn read_into_var_stores_raw_and_skips_registration() {
         r#"
         import { Editor, Read, ReplaceLines } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const editor = new Editor();
         const vars = new Variables();
@@ -282,8 +280,8 @@ async fn read_into_var_stores_raw_and_skips_registration() {
             call: { id: "c1", name: "file_read", arguments: { path: "note.txt", into: "blob" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
-        transcript.push(new MarkdownSection({ content: vars.get("blob") }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: vars.get("blob") }));
 
         const edit = await replace.handler({
             call: { id: "c2", name: "file_replace_lines",
@@ -293,7 +291,7 @@ async fn read_into_var_stores_raw_and_skips_registration() {
                                  text: "X" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(edit) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(edit) }));
         "#,
     );
     let mut handle = rt
@@ -380,7 +378,7 @@ async fn write_text_and_from_both_set_errors() {
         r#"
         import {{ Editor, New }} from "frances:v1/tools/file";
         import {{ Variables }} from "frances:v1/tools/variable";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         const vars = new Variables();
         const create = new New(editor, vars);
@@ -401,9 +399,9 @@ async fn write_text_and_from_both_set_errors() {
                      arguments: {{ path: {path:?}, from: "nope" }} }},
             scope: null,
         }});
-        transcript.push(new MarkdownSection({{ content: JSON.stringify(both) }}));
-        transcript.push(new MarkdownSection({{ content: JSON.stringify(neither) }}));
-        transcript.push(new MarkdownSection({{ content: JSON.stringify(missing) }}));
+        transcript.push(new ErrorSection({{ content: JSON.stringify(both) }}));
+        transcript.push(new ErrorSection({{ content: JSON.stringify(neither) }}));
+        transcript.push(new ErrorSection({{ content: JSON.stringify(missing) }}));
         "#,
         path = path_arg,
     );
@@ -443,14 +441,14 @@ async fn editor_new_creates_parent_directory() {
     let script = format!(
         r#"
         import {{ Editor }} from "frances:v1/tools/file";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         const out = await editor.edit({{
             kind: "New",
             path: {path:?},
             text: "hello\nworld",
         }});
-        transcript.push(new MarkdownSection({{ content: out.text }}));
+        transcript.push(new ErrorSection({{ content: out.text }}));
         "#,
         path = nested_str,
     );
@@ -490,7 +488,7 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
         r#"
         import { Editor, Read } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         
         const editor = new Editor();
         const vars = new Variables();
@@ -500,7 +498,7 @@ async fn editor_read_ranges_returns_disjoint_anchored_lines() {
             call: { id: "c1", name: "file_read", arguments: { path: "ranges.txt", ranges: [[1, 2], [8, 12]] } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: r.content || JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: r.content || JSON.stringify(r) }));
         "#,
     );
     let mut handle = rt
@@ -537,7 +535,7 @@ async fn read_into_and_ranges_mutually_exclusive() {
         r#"
         import { Editor, Read } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         
         const editor = new Editor();
         const vars = new Variables();
@@ -547,7 +545,7 @@ async fn read_into_and_ranges_mutually_exclusive() {
             call: { id: "c1", name: "file_read", arguments: { path: "mut.txt", into: "blob", ranges: [[1, 2]] } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
         "#,
     );
     let mut handle = rt
@@ -583,7 +581,7 @@ async fn editor_read_ranges_reversed_throws() {
         r#"
         import { Editor, Read } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         
         const editor = new Editor();
         const vars = new Variables();
@@ -593,7 +591,7 @@ async fn editor_read_ranges_reversed_throws() {
             call: { id: "c1", name: "file_read", arguments: { path: "ranges.txt", ranges: [[2, 1]] } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
         "#,
     );
     let mut handle = rt
@@ -628,7 +626,7 @@ async fn loop_guard_blocks_identical_read_on_unchanged_file() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         await editor.readFile("loop.txt");
         let caught = "no-throw";
@@ -637,7 +635,7 @@ async fn loop_guard_blocks_identical_read_on_unchanged_file() {
         } catch (e) {
             caught = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
         "#,
     );
     let mut handle = rt
@@ -667,7 +665,7 @@ async fn loop_guard_clears_after_edit() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const first = await editor.readFile("loop.txt");
         const line_b = first.split("\n")[1];
@@ -679,7 +677,7 @@ async fn loop_guard_clears_after_edit() {
             text: "B2",
         });
         const second = await editor.readFile("loop.txt");
-        transcript.push(new MarkdownSection({ content: second }));
+        transcript.push(new ErrorSection({ content: second }));
         "#,
     );
     let mut handle = rt
@@ -710,10 +708,10 @@ async fn loop_guard_lets_through_after_size_change() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const first = await editor.readFile("loop.txt");
-        transcript.push(new MarkdownSection({ content: first }));
+        transcript.push(new ErrorSection({ content: first }));
         "#,
     );
     let mut handle = rt
@@ -732,10 +730,10 @@ async fn loop_guard_lets_through_after_size_change() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const second = await editor.readFile("loop.txt");
-        transcript.push(new MarkdownSection({ content: second }));
+        transcript.push(new ErrorSection({ content: second }));
         "#,
     );
     let mut handle = rt
@@ -769,11 +767,11 @@ async fn loop_guard_distinguishes_ranges() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const a = await editor.readFile({ path: "ranges.txt", ranges: [[1, 2]] });
         const b = await editor.readFile({ path: "ranges.txt", ranges: [[5, 6]] });
-        transcript.push(new MarkdownSection({ content: a + "|||" + b }));
+        transcript.push(new ErrorSection({ content: a + "|||" + b }));
         "#,
     );
     let mut handle = rt
@@ -825,10 +823,10 @@ async fn out_of_repo_read_returns_plain_line_numbers() {
     let file = write_source(&format!(
         r#"
         import {{ Editor }} from "frances:v1/tools/file";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         const content = await editor.readFile({path:?});
-        transcript.push(new MarkdownSection({{ content }}));
+        transcript.push(new ErrorSection({{ content }}));
         "#,
         path = path_str,
     ));
@@ -877,7 +875,7 @@ async fn out_of_repo_read_with_ranges_returns_plain_numbered_lines() {
         r#"
         import {{ Editor, Read }} from "frances:v1/tools/file";
         import {{ Variables }} from "frances:v1/tools/variable";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         const vars = new Variables();
         const read = new Read(editor, vars);
@@ -886,7 +884,7 @@ async fn out_of_repo_read_with_ranges_returns_plain_numbered_lines() {
                      arguments: {{ path: {path:?}, ranges: [[2, 3], [7, 9]] }} }},
             scope: null,
         }});
-        transcript.push(new MarkdownSection({{ content: r.content || JSON.stringify(r) }}));
+        transcript.push(new ErrorSection({{ content: r.content || JSON.stringify(r) }}));
         "#,
         path = path_str,
     ));
@@ -935,7 +933,7 @@ async fn out_of_repo_edit_is_rejected() {
     let file = write_source(&format!(
         r#"
         import {{ Editor }} from "frances:v1/tools/file";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         let caught = "";
         try {{
@@ -950,7 +948,7 @@ async fn out_of_repo_edit_is_rejected() {
         }} catch (e) {{
             caught = String((e && e.message) || e);
         }}
-        transcript.push(new MarkdownSection({{ content: caught }}));
+        transcript.push(new ErrorSection({{ content: caught }}));
         "#,
         path = path_str,
     ));
@@ -984,7 +982,7 @@ async fn out_of_repo_file_new_is_rejected() {
     let file = write_source(&format!(
         r#"
         import {{ Editor }} from "frances:v1/tools/file";
-        import {{ transcript, MarkdownSection }} from "frances:v1/sections";
+        import {{ transcript, ErrorSection }} from "frances:v1/sections";
         const editor = new Editor();
         let caught = "";
         try {{
@@ -997,7 +995,7 @@ async fn out_of_repo_file_new_is_rejected() {
         }} catch (e) {{
             caught = String((e && e.message) || e);
         }}
-        transcript.push(new MarkdownSection({{ content: caught }}));
+        transcript.push(new ErrorSection({{ content: caught }}));
         "#,
         path = path_str,
     ));
@@ -1032,10 +1030,10 @@ async fn in_repo_read_still_gets_anchors_with_explicit_root() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const content = await editor.readFile("inside.txt");
-        transcript.push(new MarkdownSection({ content }));
+        transcript.push(new ErrorSection({ content }));
         "#,
     );
     let mut handle = rt
@@ -1076,7 +1074,7 @@ async fn in_repo_edit_still_works_with_explicit_root() {
     let file = write_source(
         r#"
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const read = await editor.readFile("editme.txt");
         const line_b = read.split("\n")[1];
@@ -1087,7 +1085,7 @@ async fn in_repo_edit_still_works_with_explicit_root() {
             end_anchor: line_b,
             text: "B2",
         });
-        transcript.push(new MarkdownSection({ content: result.text }));
+        transcript.push(new ErrorSection({ content: result.text }));
         "#,
     );
     let mut handle = rt

@@ -38,9 +38,7 @@ fn migration(name: &'static str, sql: &str) -> Migration {
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
         SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Markdown { .. } | SectionKind::Error => {
-                spec.seed.clone().unwrap_or_default()
-            }
+            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
             SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
@@ -65,13 +63,13 @@ async fn exec_query_and_query_stream_round_trip() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, MarkdownSection, JsonSection } from "frances:v1/sections";
+        import { transcript, ErrorSection, JsonSection } from "frances:v1/sections";
 
         const inserted = await db.exec(
             `INSERT INTO notes (text) VALUES (?)`,
             ["alpha"],
         );
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `inserted:${inserted.rowsAffected}:${inserted.lastInsertRowid}`,
         }));
 
@@ -223,7 +221,7 @@ async fn unsupported_param_type_throws_typeerror() {
     let file = write_source(
         r#"
         import { db } from "frances:v1/storage";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         let caught;
         try {
@@ -231,7 +229,7 @@ async fn unsupported_param_type_throws_typeerror() {
         } catch (e) {
             caught = e.message;
         }
-        transcript.push(new MarkdownSection({ content: caught ?? "no error" }));
+        transcript.push(new ErrorSection({ content: caught ?? "no error" }));
         "#,
     );
     let mut handle = rt

@@ -194,13 +194,13 @@ fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) ->
 // Tests
 // =========================================================================
 
-/// Workflow starts, pushes a MarkdownSection, ends.
+/// Workflow starts, pushes a one-shot JsonSection, ends.
 #[tokio::test]
 async fn smoke_workflow_starts_and_pushes_frame() {
     let mut h = harness(
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "hello from harness" }));
+        import { transcript, JsonSection } from "frances:v1/sections";
+        transcript.push(new JsonSection({ tag: "harness", value: "hello" }));
         "#,
     )
     .await;
@@ -214,9 +214,9 @@ async fn smoke_workflow_starts_and_pushes_frame() {
             StreamFrame::SectionAppend {
                 delta,
                 ..
-            } if delta == "hello from harness"
+            } if delta == "[harness] \"hello\""
         )),
-        "expected hello-from-harness text frame; got: {frames:?}"
+        "expected the harness json frame; got: {frames:?}"
     );
 }
 
@@ -252,11 +252,7 @@ async fn text_streaming_renders_block_delta_sequence() {
     let texts: Vec<String> = frames
         .iter()
         .filter_map(|f| match f {
-            StreamFrame::SectionAppend {
-                kind: SectionKind::Markdown { .. },
-                delta,
-                ..
-            } => Some(delta.clone()),
+            StreamFrame::SectionAppend { delta, .. } => Some(delta.clone()),
             _ => None,
         })
         .collect();

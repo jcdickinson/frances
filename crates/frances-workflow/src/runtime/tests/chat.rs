@@ -7,11 +7,11 @@ async fn chat_session_accepts_system_and_user_roles() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["summarize"] });
         s._pushSystem("you are a summariser");
         s.push({ role: "user", content: "hi" });
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -94,7 +94,7 @@ async fn chat_session_can_be_persisted_and_loaded_by_id() {
         "js",
         r#"
         import { ChatSession, loadChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const created = new ChatSession({ model_intents: ["x"] });
         if (created.id() !== null) throw new Error("fresh chat should not have id yet");
@@ -104,7 +104,7 @@ async fn chat_session_can_be_persisted_and_loaded_by_id() {
 
         const loaded = await loadChatSession(id);
         if (loaded.id() !== id) throw new Error(`loaded wrong id ${loaded.id()}`);
-        transcript.push(new MarkdownSection({ content: `loaded ${loaded.id()}` }));
+        transcript.push(new ErrorSection({ content: `loaded ${loaded.id()}` }));
         "#,
     );
     let mut handle = rt
@@ -128,7 +128,7 @@ async fn chat_session_effort_can_be_set_cleared_and_loaded() {
         "js",
         r#"
         import { ChatSession, loadChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const created = new ChatSession({ model_intents: ["x"] });
         if (created.effort !== null) throw new Error("fresh effort should be null");
@@ -141,7 +141,7 @@ async fn chat_session_effort_can_be_set_cleared_and_loaded() {
         const loaded = await loadChatSession(id);
         if (loaded.effort !== null) throw new Error("loaded effort should start null");
         loaded.effort = 100;
-        transcript.push(new MarkdownSection({ content: `effort ${loaded.effort}` }));
+        transcript.push(new ErrorSection({ content: `effort ${loaded.effort}` }));
         "#,
     );
     let mut handle = rt
@@ -261,12 +261,12 @@ async fn chat_session_push_system_bypass_allows_multiple() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s._pushSystem("be terse");
         s._pushSystem("answer in english");
         s.push({ role: "user", content: "hi" });
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -359,11 +359,11 @@ async fn chat_session_raw_inner_stream_is_not_exposed() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const protoKeys = Object.getOwnPropertyNames(ChatSession.prototype)
             .filter((k) => k !== "constructor");
         const stashGone = typeof globalThis.__frances_v1_stash__ === "undefined";
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `proto=${protoKeys.sort().join(",")} stash=${stashGone}`,
         }));
         "#,
@@ -398,7 +398,7 @@ async fn chat_session_stream_text_locks_events() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
@@ -406,7 +406,7 @@ async fn chat_session_stream_text_locks_events() {
         let locked = false;
         try { r.events.getReader(); }
         catch (_) { locked = true; }
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `locked=${locked} stableText=${r.text === _text}`,
         }));
         "#,
@@ -425,25 +425,25 @@ async fn chat_session_stream_text_locks_events() {
 }
 
 #[tokio::test]
-async fn chat_session_stream_pipes_into_markdown_frame_writable() {
+async fn chat_session_stream_pipes_into_reasoning_frame_writable() {
     // Stub emits zero events, so the pipe completes when the
     // source closes (Rust drops the sender after the run errors).
     // We're verifying the wiring: pipeTo from `r.text` into a
-    // MarkdownSection's `.writable` resolves without throwing.
+    // ReasoningSection's `.writable` resolves without throwing.
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection, ReasoningSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
-        const out = new MarkdownSection({ content: "" });
+        const out = new ReasoningSection();
         transcript.push(out);
         await r.text.pipeTo(out.writable);
         try { await r.completed; } catch (_) { /* stub error — expected */ }
-        transcript.push(new MarkdownSection({ content: "piped-ok" }));
+        transcript.push(new ErrorSection({ content: "piped-ok" }));
         "#,
     );
     let mut handle = rt
@@ -464,7 +464,7 @@ async fn chat_session_stream_pipes_into_markdown_frame_writable() {
 }
 
 #[tokio::test]
-async fn chat_session_text_pipe_closes_markdown_frame_on_completion() {
+async fn chat_session_text_pipe_closes_reasoning_frame_on_completion() {
     use frances_models_llm::{CompletionOutcome, StreamEvent};
 
     let deps = StubDeps::default();
@@ -480,11 +480,11 @@ async fn chat_session_text_pipe_closes_markdown_frame_on_completion() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ReasoningSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
-        const out = new MarkdownSection({ source: "assistant" });
+        const out = new ReasoningSection();
         transcript.push(out);
         await r.text.pipeTo(out.writable);
         await r.completed;
@@ -508,13 +508,13 @@ async fn chat_session_text_pipe_closes_markdown_frame_on_completion() {
         frames
             .iter()
             .any(|f| matches!(f, SectionTranscript::Append { id, delta } if *id == push_id && delta == "hello")),
-        "expected text append for markdown frame: {frames:?}"
+        "expected text append for reasoning frame: {frames:?}"
     );
     assert!(
         frames
             .iter()
             .any(|f| matches!(f, SectionTranscript::Close { id } if *id == push_id)),
-        "expected markdown frame to close after text pipe: {frames:?}"
+        "expected reasoning frame to close after text pipe: {frames:?}"
     );
 }
 
@@ -528,7 +528,7 @@ async fn chat_session_stream_aborts_with_signal() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const ac = new AbortController();
@@ -541,7 +541,7 @@ async fn chat_session_stream_aborts_with_signal() {
         } catch (e) {
             caught = String(e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
         "#,
     );
     let mut handle = rt
@@ -568,7 +568,7 @@ async fn chat_session_completed_rejects_with_abort_reason_on_cancel() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const ac = new AbortController();
@@ -581,7 +581,7 @@ async fn chat_session_completed_rejects_with_abort_reason_on_cancel() {
         } catch (e) {
             caught = String(e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
         "#,
     );
     let mut handle = rt
@@ -604,11 +604,11 @@ async fn chat_tools_array_is_per_instance_and_initially_empty() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const a = new ChatSession({ model_intents: ["x"] });
         const b = new ChatSession({ model_intents: ["x"] });
         const shape = `a=${Array.isArray(a.tools)} len=${a.tools.length} distinct=${a.tools !== b.tools} ps=${Array.isArray(a.promptSections)} psLen=${a.promptSections.length} psDistinct=${a.promptSections !== b.promptSections}`;
-        transcript.push(new MarkdownSection({ content: shape }));
+        transcript.push(new ErrorSection({ content: shape }));
         "#,
     );
     let mut handle = rt
@@ -634,7 +634,7 @@ async fn chat_tools_duplicate_names_throw_on_stream() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
         s.tools.push({ name: "echo", description: "d", parameters: {}, handler: () => {} });
@@ -643,7 +643,7 @@ async fn chat_tools_duplicate_names_throw_on_stream() {
             await s.stream();
             transcript.push(new ErrorSection({ content: "BUG: stream did not throw" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({ content: String(e) }));
+            transcript.push(new ErrorSection({ content: String(e) }));
         }
         "#,
     );
@@ -668,7 +668,7 @@ async fn chat_tools_missing_fields_throw_on_stream() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({ name: "echo" }); // missing description / parameters
         s.push({ role: "user", content: "hi" });
@@ -676,7 +676,7 @@ async fn chat_tools_missing_fields_throw_on_stream() {
             await s.stream();
             transcript.push(new ErrorSection({ content: "BUG: stream did not throw" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({ content: String(e) }));
+            transcript.push(new ErrorSection({ content: String(e) }));
         }
         "#,
     );
@@ -726,7 +726,7 @@ async fn chat_stream_surfaces_tool_calls_in_completed_and_events() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let handlerCalls = 0;
         s.tools.push({
@@ -753,7 +753,7 @@ async fn chat_stream_surfaces_tool_calls_in_completed_and_events() {
         }
         const final = await r.completed;
         const summary = `events=${toolCallSeen} text="${final.text}" calls=${final.tool_calls.length} first=${final.tool_calls[0].name}(${final.tool_calls[0].arguments.text}) handlerCalls=${handlerCalls}`;
-        transcript.push(new MarkdownSection({ content: summary }));
+        transcript.push(new ErrorSection({ content: summary }));
         "#,
     );
     let mut handle = rt
@@ -780,11 +780,11 @@ async fn chat_push_tool_role_queues_result() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         s.push({ role: "tool", call_id: "abc", content: "result body", is_error: false });
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -830,7 +830,7 @@ async fn chat_push_tool_role_validates_fields() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection, ErrorSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let caught = "";
         try {
@@ -839,7 +839,7 @@ async fn chat_push_tool_role_validates_fields() {
         } catch (e) {
             caught = String(e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
         "#,
     );
     let mut handle = rt
@@ -897,7 +897,7 @@ async fn stream_dispatches_tool_calls_internally() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let handlerCalls = 0;
         s.tools.push({
@@ -924,7 +924,7 @@ async fn stream_dispatches_tool_calls_internally() {
             finalText = text;
             if (tool_calls.length === 0) break;
         }
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `text="${finalText}" handlerCalls=${handlerCalls}`,
         }));
         "#,
@@ -997,7 +997,7 @@ async fn stream_interrupt_during_dispatch_leaves_dangling_call_for_provider() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { AbortController } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         // Handler never settles on its own — only the interrupt resolves it.
         s.tools.push({
@@ -1017,7 +1017,7 @@ async fn stream_interrupt_during_dispatch_leaves_dangling_call_for_provider() {
         // Abort mid-dispatch — the hang handler is still in flight.
         ac.abort("stop");
         const { tool_calls } = await r.completed;
-        transcript.push(new MarkdownSection({ content: `calls=${tool_calls.length}` }));
+        transcript.push(new ErrorSection({ content: `calls=${tool_calls.length}` }));
         "#,
     );
     let mut handle = rt
@@ -1079,7 +1079,7 @@ async fn tool_call_hook_intercepts_dispatch() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let preCount = 0, postCount = 0;
         s.tools.push({
@@ -1100,7 +1100,7 @@ async fn tool_call_hook_intercepts_dispatch() {
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `pre=${preCount} post=${postCount}`,
         }));
         "#,
@@ -1157,7 +1157,7 @@ async fn tool_call_hook_throw_becomes_error_result() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({
             name: "echo", description: "", parameters: {},
@@ -1169,7 +1169,7 @@ async fn tool_call_hook_throw_becomes_error_result() {
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1225,12 +1225,12 @@ async fn missing_tool_pushes_synthetic_error_result() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1307,7 +1307,7 @@ async fn scope_tool_call_hook_isolated_to_nested_stream() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let scopeHookCalls = 0;
         s.tools.push({
@@ -1334,7 +1334,7 @@ async fn scope_tool_call_hook_isolated_to_nested_stream() {
         s.push({ role: "user", content: "hi" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1385,14 +1385,14 @@ async fn chat_push_system_leads_even_when_pushed_after_user() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.push({ role: "user", content: "hi" });
         // Regular push({ role: "system" }) would throw here, but
         // _pushSystem bypasses the guard.
         s._pushSystem("injected by section assembly");
         s._pushSystem("second system message");
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -1440,11 +1440,11 @@ async fn chat_push_system_bypass_works_before_user_message() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s._pushSystem("early system");
         s.push({ role: "user", content: "hi" });
-        transcript.push(new MarkdownSection({ content: "ok" }));
+        transcript.push(new ErrorSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -1488,7 +1488,7 @@ async fn chat_env_info_returns_correct_shape() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         const info = s._envInfo();
         const keys = Object.keys(info).sort();
@@ -1498,7 +1498,7 @@ async fn chat_env_info_returns_correct_shape() {
         const hasRepoRoot = info.repoRoot === "/my/repo";
         const hasCwd = info.cwd === "/my/repo/src";
         const hasDate = /^\d{4}-\d{2}-\d{2}$/.test(info.date);
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             keys, hasOs, hasShell, hasPlatform, hasRepoRoot, hasCwd, hasDate,
         }) }));
         "#,
@@ -1545,10 +1545,10 @@ async fn chat_env_info_null_repo_root_and_cwd_when_missing() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         const info = s._envInfo();
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             repoRoot: info.repoRoot,
             cwd: info.cwd,
         }) }));
@@ -1593,7 +1593,7 @@ async fn chat_prompt_sections_render_before_stream() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.promptSections.push({
             name: "test-section",
@@ -1603,7 +1603,7 @@ async fn chat_prompt_sections_render_before_stream() {
         // Trigger section rendering by calling stream (will error on stub,
         // but sections are rendered before the provider call).
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1645,7 +1645,7 @@ async fn chat_prompt_sections_skip_null_results() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.promptSections.push({
             name: "null-section",
@@ -1657,7 +1657,7 @@ async fn chat_prompt_sections_skip_null_results() {
         });
         s.push({ role: "user", content: "hi" });
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1700,7 +1700,7 @@ async fn chat_prompt_sections_all_null_no_system_push() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.promptSections.push({
             name: "null-a",
@@ -1712,7 +1712,7 @@ async fn chat_prompt_sections_all_null_no_system_push() {
         });
         s.push({ role: "user", content: "hi" });
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1750,7 +1750,7 @@ async fn chat_prompt_sections_render_in_push_order() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.promptSections.push({
             name: "first",
@@ -1766,7 +1766,7 @@ async fn chat_prompt_sections_render_in_push_order() {
         });
         s.push({ role: "user", content: "hi" });
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1812,7 +1812,7 @@ async fn chat_prompt_sections_ctx_includes_tools() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({ name: "my_tool", description: "test", parameters: {}, handler: async () => ({}) });
         let capturedCtx = null;
@@ -1825,7 +1825,7 @@ async fn chat_prompt_sections_ctx_includes_tools() {
         // capturedCtx is populated synchronously before the stream errors
         const hasTools = Array.isArray(capturedCtx.tools) && capturedCtx.tools.length === 1;
         const hasTool = capturedCtx && capturedCtx.tools[0].name === "my_tool";
-        transcript.push(new MarkdownSection({ content: JSON.stringify({ hasTools, hasTool }) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify({ hasTools, hasTool }) }));
         "#,
     );
     let mut handle = rt
@@ -1861,7 +1861,7 @@ async fn chat_prompt_sections_ctx_includes_env_info() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let capturedCtx = null;
         s.promptSections.push({
@@ -1875,7 +1875,7 @@ async fn chat_prompt_sections_ctx_includes_env_info() {
         const hasPlatform = typeof capturedCtx.platform === "string";
         const hasDate = typeof capturedCtx.date === "string";
         const hasCwd = capturedCtx.cwd === "/test/dir";
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             hasOs, hasShell, hasPlatform, hasDate, hasCwd,
         }) }));
         "#,
@@ -1908,7 +1908,7 @@ async fn chat_prompt_sections_support_async_prompt() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.promptSections.push({
             name: "async-section",
@@ -1919,7 +1919,7 @@ async fn chat_prompt_sections_support_async_prompt() {
         });
         s.push({ role: "user", content: "hi" });
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -1954,12 +1954,12 @@ async fn chat_empty_prompt_sections_no_system_push() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         // promptSections is [] by default — no sections pushed
         s.push({ role: "user", content: "hi" });
         try { await s.stream(); } catch (_) {}
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt

@@ -16,10 +16,10 @@ async fn agents_discover_local_agents_finds_agents_md() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -53,10 +53,10 @@ async fn agents_discover_local_agents_returns_null_when_empty() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -82,10 +82,10 @@ async fn agents_discover_local_agents_returns_null_no_roots() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -117,10 +117,10 @@ async fn agents_discover_local_agents_priority_order() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -157,10 +157,10 @@ async fn agents_discover_local_agents_content_dedup() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -202,10 +202,10 @@ async fn agents_discover_nested_agents_finds_nested_files() {
         "js",
         r#"
         import { discoverNestedAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverNestedAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -238,10 +238,10 @@ async fn agents_discover_nested_agents_returns_null_when_empty() {
         "js",
         r#"
         import { discoverNestedAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverNestedAgents();
-        transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
         "#,
     );
     let mut handle = rt
@@ -280,10 +280,10 @@ async fn agents_discover_global_agents_null_then_found() {
             "js",
             r#"
             import { discoverGlobalAgents } from "frances:v1/agents";
-            import { transcript, MarkdownSection } from "frances:v1/sections";
+            import { transcript, ErrorSection } from "frances:v1/sections";
 
             const result = await discoverGlobalAgents();
-            transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+            transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
             "#,
         );
         let mut handle = rt
@@ -317,10 +317,10 @@ async fn agents_discover_global_agents_null_then_found() {
             "js",
             r#"
             import { discoverGlobalAgents } from "frances:v1/agents";
-            import { transcript, MarkdownSection } from "frances:v1/sections";
+            import { transcript, ErrorSection } from "frances:v1/sections";
 
             const result = await discoverGlobalAgents();
-            transcript.push(new MarkdownSection({ content: JSON.stringify(result) }));
+            transcript.push(new ErrorSection({ content: JSON.stringify(result) }));
             "#,
         );
         let mut handle = rt
@@ -376,11 +376,11 @@ async fn agents_local_candidates_cover_claude_and_agents_and_local() {
         "js",
         r#"
         import { discoverLocalAgents } from "frances:v1/agents";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await discoverLocalAgents();
         const paths = result.map(r => r.path.split("/").pop());
-        transcript.push(new MarkdownSection({ content: JSON.stringify(paths) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(paths) }));
         "#,
     );
     let mut handle = rt

@@ -19,6 +19,7 @@ mod entities;
 mod frames;
 mod inbox;
 mod main_workflow;
+mod messages;
 mod permission;
 mod scope;
 mod shell;
@@ -36,12 +37,26 @@ fn write_source(ext: &str, body: &str) -> tempfile::NamedTempFile {
     f
 }
 
+/// Final texts of chat-message entities, one per settled message.
+/// Chat snapshots are the only ones carrying a `source` field.
+fn chat_message_texts(frames: &[SectionTranscript]) -> Vec<String> {
+    frames
+        .iter()
+        .filter_map(|f| match f {
+            SectionTranscript::Entity(crate::runtime::EntityCmd::Settle { snapshot, .. })
+                if snapshot.get("source").is_some() =>
+            {
+                Some(snapshot["text"].as_str().unwrap_or_default().to_owned())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn text_of(delta: &SectionTranscript) -> String {
     match delta {
         SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Markdown { .. } | SectionKind::Error => {
-                spec.seed.clone().unwrap_or_default()
-            }
+            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
             SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),

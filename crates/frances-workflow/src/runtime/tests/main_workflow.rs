@@ -266,14 +266,14 @@ async fn variables_entries_replace_round_trip_store_contents() {
     let file = write_source(
         "js",
         r####"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { Variables } from "frances:v1/tools/variable";
 
         const vars = new Variables();
         vars.replace([["restart_marker", { survived: true, count: 1 }]]);
         const restored = new Variables();
         restored.replace(vars.entries());
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
           content: JSON.stringify(restored.get("restart_marker")),
           closed: true
         }));

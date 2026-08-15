@@ -18,8 +18,8 @@ async fn tool_family_define_tool_family_returns_frozen_identity() {
         const fam2 = defineToolFamily({ prompt: (ctx) => "world" });
         let identity_different = fam !== fam2;
 
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: JSON.stringify({ frozen, keys, identity_different }) }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: JSON.stringify({ frozen, keys, identity_different }) }));
         "#,
     );
     let mut handle = rt
@@ -45,7 +45,7 @@ async fn tool_family_define_tool_creates_tool_object() {
         "js",
         r#"
         import { defineToolFamily, defineTool } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const fam = defineToolFamily({ prompt: (ctx) => "family prompt" });
 
@@ -57,7 +57,7 @@ async fn tool_family_define_tool_creates_tool_object() {
             handler: async () => ({ role: "tool", call_id: "1", content: "ok", is_error: false }),
         });
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             name: tool.name,
             description: tool.description,
             hasParameters: "parameters" in tool,
@@ -93,7 +93,7 @@ async fn tool_family_define_tool_without_family() {
         "js",
         r#"
         import { defineTool } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const tool = defineTool({
             name: "standalone",
@@ -102,7 +102,7 @@ async fn tool_family_define_tool_without_family() {
             handler: async () => ({ role: "tool", call_id: "1", content: "ok", is_error: false }),
         });
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             hasFamily: "family" in tool,
         }) }));
         "#,
@@ -128,7 +128,7 @@ async fn tool_family_dedupe_by_identity() {
         "js",
         r#"
         import { defineToolFamily, defineTool } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const editing = defineToolFamily({ prompt: (ctx) => "editing preamble" });
 
@@ -140,7 +140,7 @@ async fn tool_family_dedupe_by_identity() {
         const tools = [t1, t2, t3];
         const families = new Set(tools.map(t => t.family).filter(Boolean));
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             familyCount: families.size,
             hasEditing: families.has(editing),
         }) }));
@@ -171,14 +171,14 @@ async fn tool_family_define_tool_family_rejects_non_function_prompt() {
         "js",
         r#"
         import { defineToolFamily } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         let msg = "no error";
         try {
             defineToolFamily({ prompt: "not a function" });
         } catch (e) {
             msg = e.message;
         }
-        transcript.push(new MarkdownSection({ content: msg }));
+        transcript.push(new ErrorSection({ content: msg }));
         "#,
     );
     let mut handle = rt
@@ -201,7 +201,7 @@ async fn tool_family_define_tool_rejects_bad_family() {
         "js",
         r#"
         import { defineTool } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         let msg = "no error";
         try {
             defineTool({
@@ -214,7 +214,7 @@ async fn tool_family_define_tool_rejects_bad_family() {
         } catch (e) {
             msg = e.message;
         }
-        transcript.push(new MarkdownSection({ content: msg }));
+        transcript.push(new ErrorSection({ content: msg }));
         "#,
     );
     let mut handle = rt
@@ -237,7 +237,7 @@ async fn tool_guidance_folds_families_from_tools() {
         "js",
         r#"
         import { defineToolFamily, defineTool, toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const editing = defineToolFamily({ prompt: (ctx) => "editing preamble" });
         const shell = defineToolFamily({ prompt: (ctx) => "shell preamble" });
@@ -249,7 +249,7 @@ async fn tool_guidance_folds_families_from_tools() {
         const ctx = { tools: [t1, t2, t3] };
         const result = toolGuidance.prompt(ctx);
 
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -283,14 +283,14 @@ async fn tool_guidance_returns_null_when_no_families() {
         "js",
         r#"
         import { defineTool, toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const t1 = defineTool({ name: "standalone", description: "no family", parameters: { type: "object" }, handler: async () => ({}) });
 
         const ctx = { tools: [t1] };
         const result = toolGuidance.prompt(ctx);
 
-        transcript.push(new MarkdownSection({ content: String(result) }));
+        transcript.push(new ErrorSection({ content: String(result) }));
         "#,
     );
     let mut handle = rt
@@ -317,12 +317,12 @@ async fn tool_guidance_returns_null_on_empty_tools() {
         "js",
         r#"
         import { toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const ctx = { tools: [] };
         const result = toolGuidance.prompt(ctx);
 
-        transcript.push(new MarkdownSection({ content: String(result) }));
+        transcript.push(new ErrorSection({ content: String(result) }));
         "#,
     );
     let mut handle = rt
@@ -345,13 +345,13 @@ async fn tool_guidance_is_stable_object() {
         "js",
         r#"
         import { toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         // Import twice — must be the same object (=== identity)
         const tg1 = toolGuidance;
         const tg2 = toolGuidance;
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             stable: tg1 === tg2,
             hasName: "name" in toolGuidance,
             name: toolGuidance.name,
@@ -383,7 +383,7 @@ async fn tool_guidance_skips_family_returning_null() {
         "js",
         r#"
         import { defineToolFamily, defineTool, toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const noisy = defineToolFamily({ prompt: (ctx) => "visible" });
         const quiet = defineToolFamily({ prompt: (ctx) => null });
@@ -394,7 +394,7 @@ async fn tool_guidance_skips_family_returning_null() {
         const ctx = { tools: [t1, t2] };
         const result = toolGuidance.prompt(ctx);
 
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -428,8 +428,8 @@ async fn tool_families_editing_family_exists_and_is_frozen() {
         let shellHasPrompt = typeof shellFamily.prompt === "function";
         let different = editingFamily !== shellFamily;
 
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             editFrozen, shellFrozen, editHasPrompt, shellHasPrompt, different,
         }) }));
         "#,
@@ -459,7 +459,7 @@ async fn tool_families_editing_family_emits_preamble() {
         "js",
         r#"
         import { editingFamily } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const text = editingFamily.prompt({});
         let hasCritical = text.includes("CRITICAL");
@@ -467,7 +467,7 @@ async fn tool_families_editing_family_emits_preamble() {
         let hasAnchorProtocol = text.includes("Anchor protocol");
         let hasFormatter = text.includes("project formatter");
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             hasCritical, hasWrongRight, hasAnchorProtocol, hasFormatter,
         }) }));
         "#,
@@ -502,7 +502,7 @@ async fn tool_families_shell_family_emits_preamble() {
         "js",
         r#"
         import { shellFamily } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const text = shellFamily.prompt({});
         let hasQuasiPersistent = text.includes("quasi-persistent");
@@ -510,7 +510,7 @@ async fn tool_families_shell_family_emits_preamble() {
         let hasFrancesRoot = text.includes("FRANCES_ROOT");
         let hasPrefer = text.includes("Prefer dedicated tools");
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             hasQuasiPersistent, hasPersist, hasFrancesRoot, hasPrefer,
         }) }));
         "#,
@@ -542,12 +542,12 @@ async fn tool_families_identity_is_stable_across_imports() {
         import { editingFamily as e2 } from "frances:v1/tools/file";
         import { shellFamily as s1 } from "frances:v1/tools/shell";
         import { shellFamily as s2 } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         let editingStable = e1 === e2;
         let shellStable = s1 === s2;
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             editingStable, shellStable,
         }) }));
         "#,
@@ -582,7 +582,7 @@ async fn tool_families_work_with_tool_guidance_dedup() {
         import { editingFamily } from "frances:v1/tools/file";
         import { shellFamily } from "frances:v1/tools/shell";
         import { defineTool, toolGuidance } from "frances:v1/tool-family";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const tool1 = defineTool({
             name: "t1", description: "d1",
@@ -616,7 +616,7 @@ async fn tool_families_work_with_tool_guidance_dedup() {
         const shellMarker = "Shell tools";
         while ((idx = text.indexOf(shellMarker, idx)) !== -1) { shellCount++; idx += shellMarker.length; }
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             editCount, shellCount,
         }) }));
         "#,
@@ -653,7 +653,7 @@ async fn tool_family_shell_tools_import_shell_family() {
         "js",
         r#"
         import { Run, Wait, Kill, Set, Capture } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const runHas = Run.toString().includes("shellFamily");
         const waitHas = Wait.toString().includes("shellFamily");
@@ -661,7 +661,7 @@ async fn tool_family_shell_tools_import_shell_family() {
         const setHas = Set.toString().includes("shellFamily");
         const captureHas = Capture.toString().includes("shellFamily");
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             runHas, waitHas, killHas, setHas, captureHas,
         }) }));
         "#,
@@ -706,7 +706,7 @@ async fn tool_family_file_tools_import_editing_family() {
         "js",
         r#"
         import { Read, ReplaceLines, ReplaceAll, InsertAfter, InsertBefore, New, Overwrite } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const readNoFamily = !Read.toString().includes("editingFamily");
         const replaceHas = ReplaceLines.toString().includes("editingFamily");
@@ -716,7 +716,7 @@ async fn tool_family_file_tools_import_editing_family() {
         const newHas = New.toString().includes("editingFamily");
         const overwriteHas = Overwrite.toString().includes("editingFamily");
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             readNoFamily, replaceHas, replaceAllHas,
             insertAfterHas, insertBeforeHas,
             newHas, overwriteHas,

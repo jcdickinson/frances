@@ -2,7 +2,7 @@
 //! `FileSearch` primitive and the LLM-facing `Search` tool class. Each
 //! test drives a JS script through the workflow runtime against a
 //! `StubDeps` with a tempdir cwd, then asserts on what the script
-//! pushed back via `MarkdownSection`.
+//! pushed back via `ErrorSection`.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -24,9 +24,7 @@ fn write_source(body: &str) -> tempfile::NamedTempFile {
 fn text_of(frame: &SectionTranscript) -> String {
     match frame {
         SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-            SectionKind::Markdown { .. } | SectionKind::Error => {
-                spec.seed.clone().unwrap_or_default()
-            }
+            SectionKind::Error => spec.seed.clone().unwrap_or_default(),
             SectionKind::ToolUse { name, detail } => match detail {
                 Some(d) => format!("→ {name}  {d}"),
                 None => format!("→ {name}"),
@@ -68,14 +66,14 @@ async fn run_script(deps: StubDeps, script: &str) -> Vec<SectionTranscript> {
 }
 
 /// Runs the FileSearch primitive directly and emits the raw JSON
-/// payload via a MarkdownSection so tests can parse it.
+/// payload via a ErrorSection so tests can parse it.
 const DUMP_RAW: &str = r#"
 import { FileSearch } from "frances:v1/tools/file_find_or_grep";
 import { Editor } from "frances:v1/tools/file";
-import { transcript, MarkdownSection } from "frances:v1/sections";
+import { transcript, ErrorSection } from "frances:v1/sections";
 const fs = new FileSearch(new Editor());
 const json = await fs.search(ARGS);
-transcript.push(new MarkdownSection({ content: json }));
+transcript.push(new ErrorSection({ content: json }));
 "#;
 
 fn dump_raw_script(args_literal: &str) -> String {
@@ -136,7 +134,7 @@ async fn empty_paths_without_search_rejects() {
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const fs = new FileSearch(new Editor());
         let msg;
         try {
@@ -145,7 +143,7 @@ async fn empty_paths_without_search_rejects() {
         } catch (e) {
             msg = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownSection({ content: msg }));
+        transcript.push(new ErrorSection({ content: msg }));
     "#;
     let frames = run_script(deps, script).await;
     let msg = text_of(&frames[0]);
@@ -343,7 +341,7 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const fs = new FileSearch(new Editor());
         const vars = new Variables();
         const tool = new Search(fs, vars);
@@ -352,9 +350,9 @@ async fn search_tool_into_stores_in_variables_and_returns_summary() {
                     arguments: { search: "hello", into: "hits" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
         const stashed = vars.get("hits");
-        transcript.push(new MarkdownSection({ content: JSON.stringify(stashed) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(stashed) }));
     "#;
     let frames = run_script(deps, script).await;
 
@@ -385,14 +383,14 @@ async fn search_tool_without_into_returns_compact_text() {
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const tool = new Search(new FileSearch(new Editor()), new Variables());
         const r = await tool.handler({
             call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "hello" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
     "#;
     let frames = run_script(deps, script).await;
     let tool_result = text_of(&frames[0]);
@@ -419,14 +417,14 @@ async fn search_tool_caps_aggregate_inline_output() {
         import { FileSearch, Search } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
         import { Variables } from "frances:v1/tools/variable";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const tool = new Search(new FileSearch(new Editor()), new Variables());
         const r = await tool.handler({
             call: { id: "c1", name: "file_find_or_grep",
                     arguments: { search: "needle" } },
             scope: null,
         });
-        transcript.push(new MarkdownSection({ content: JSON.stringify(r) }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(r) }));
     "#;
     let frames = run_script(deps, script).await;
     let result: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
@@ -453,7 +451,7 @@ async fn loop_guard_blocks_identical_search() {
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const fs = new FileSearch(new Editor());
         await fs.search({ search: "hello" });
         let caught = "no-throw";
@@ -462,7 +460,7 @@ async fn loop_guard_blocks_identical_search() {
         } catch (e) {
             caught = String((e && e.message) || e);
         }
-        transcript.push(new MarkdownSection({ content: caught }));
+        transcript.push(new ErrorSection({ content: caught }));
     "#;
     let frames = run_script(deps, script).await;
     let msg = text_of(&frames[0]);
@@ -482,7 +480,7 @@ async fn loop_guard_search_clears_after_edit() {
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const editor = new Editor();
         const fs = new FileSearch(editor);
         await fs.search({ search: "hello" });
@@ -496,7 +494,7 @@ async fn loop_guard_search_clears_after_edit() {
             text: "WORLD",
         });
         const second = await fs.search({ search: "hello" });
-        transcript.push(new MarkdownSection({ content: second }));
+        transcript.push(new ErrorSection({ content: second }));
     "#;
     let frames = run_script(deps, script).await;
     let payload = text_of(&frames[0]);
@@ -516,11 +514,11 @@ async fn loop_guard_search_distinguishes_query() {
     let script = r#"
         import { FileSearch } from "frances:v1/tools/file_find_or_grep";
         import { Editor } from "frances:v1/tools/file";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const fs = new FileSearch(new Editor());
         await fs.search({ search: "hello" });
         const second = await fs.search({ search: "world" });
-        transcript.push(new MarkdownSection({ content: second }));
+        transcript.push(new ErrorSection({ content: second }));
     "#;
     let frames = run_script(deps, script).await;
     let payload = text_of(&frames[0]);

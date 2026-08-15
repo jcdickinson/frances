@@ -29,7 +29,7 @@ async fn scope_lock_runs_after_batch_push() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         let turnRan = false;
         s.tools.push({
@@ -42,7 +42,7 @@ async fn scope_lock_runs_after_batch_push() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: `turnRan=${turnRan}` }));
+        transcript.push(new ErrorSection({ content: `turnRan=${turnRan}` }));
         "#,
     );
     let mut handle = rt
@@ -112,7 +112,7 @@ async fn scope_lock_turns_run_in_finish_order() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         const turnOrder = [];
         s.tools.push({
@@ -133,7 +133,7 @@ async fn scope_lock_turns_run_in_finish_order() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: `turns=${turnOrder.join(",")}` }));
+        transcript.push(new ErrorSection({ content: `turns=${turnOrder.join(",")}` }));
         "#,
     );
     let mut handle = rt
@@ -195,7 +195,7 @@ async fn scope_lock_turn_can_drive_followup_stream() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({
             name: "starter", description: "", parameters: { type: "object" },
@@ -219,7 +219,7 @@ async fn scope_lock_turn_can_drive_followup_stream() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -299,7 +299,7 @@ async fn scope_lock_gating_hook_scolds_off_script_calls() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({
             name: "gated", description: "", parameters: { type: "object" },
@@ -326,7 +326,7 @@ async fn scope_lock_gating_hook_scolds_off_script_calls() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -387,7 +387,7 @@ async fn scope_lock_double_register_throws() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({
             name: "double", description: "", parameters: { type: "object" },
@@ -409,7 +409,7 @@ async fn scope_lock_double_register_throws() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -463,7 +463,7 @@ async fn scope_lock_turn_fn_throw_does_not_crash_round() {
         "js",
         r#"
         import { ChatSession } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const s = new ChatSession({ model_intents: ["x"] });
         s.tools.push({
             name: "thrower", description: "", parameters: { type: "object" },
@@ -475,7 +475,7 @@ async fn scope_lock_turn_fn_throw_does_not_crash_round() {
         s.push({ role: "user", content: "go" });
         const r = await s.stream();
         await r.completed;
-        transcript.push(new MarkdownSection({ content: "survived" }));
+        transcript.push(new ErrorSection({ content: "survived" }));
         "#,
     );
     let mut handle = rt

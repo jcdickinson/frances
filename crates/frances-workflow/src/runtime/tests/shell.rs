@@ -8,12 +8,12 @@ async fn shell_run_once_returns_done_for_short_command() {
         "js",
         r#"
         import { Shell } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const sh = new Shell();
         const outcome = await sh.runOnce("echo hello-shell");
         const summary = `kind=${outcome.kind} exit=${outcome.exit_code} hasOutput=${outcome.output.includes("hello-shell")}`;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: summary }));
+        transcript.push(new ErrorSection({ content: summary }));
         "#,
     );
     let mut handle = rt
@@ -37,7 +37,7 @@ async fn shell_busy_errors_on_double_run() {
         "js",
         r#"
         import { Shell } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const sh = new Shell();
         // First run goes Quiet (short quiet, sleep still silent).
         const first = await sh.runOnce("sleep 3", { quiet: 0.3 });
@@ -53,7 +53,7 @@ async fn shell_busy_errors_on_double_run() {
         await sh.kill();
         try { await sh.keepWaiting(); } catch (_) {}
         await sh.close();
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `firstKind=${first.kind} caught=${caught.includes("busy") ? "busy" : caught}`,
         }));
         "#,
@@ -79,7 +79,7 @@ async fn shell_keep_waiting_resumes_quiet_command() {
         "js",
         r#"
         import { Shell } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const sh = new Shell();
         // Background a sleep + then echo. With a short quiet the first
         // runOnce goes Quiet while the sleep is still silent, and
@@ -92,7 +92,7 @@ async fn shell_keep_waiting_resumes_quiet_command() {
             final_ = await sh.keepWaiting();
         }
         await sh.close();
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `firstKind=${first.kind} finalKind=${final_.kind} exit=${final_.exit_code} hasFinished=${final_.output.includes("finished")}`,
         }));
         "#,
@@ -149,7 +149,7 @@ async fn shell_run_tool_handler_formats_done_outcome() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
@@ -160,7 +160,7 @@ async fn shell_run_tool_handler_formats_done_outcome() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -223,7 +223,7 @@ async fn shell_run_head_and_tail_clamp_model_output() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
@@ -234,7 +234,7 @@ async fn shell_run_head_and_tail_clamp_model_output() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -301,7 +301,7 @@ async fn shell_run_head_tail_larger_than_doc_returns_all() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         chat.tools.push(new Run(sh, { approve: false }), new Wait(sh), new Kill(sh));
@@ -312,7 +312,7 @@ async fn shell_run_head_tail_larger_than_doc_returns_all() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -408,7 +408,7 @@ async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -421,7 +421,7 @@ async fn shell_run_quiet_registers_turn_for_wait_kill_negotiation() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -512,7 +512,7 @@ async fn shell_negotiation_provider_error_reconciles_shell() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -526,7 +526,7 @@ async fn shell_negotiation_provider_error_reconciles_shell() {
         await r.completed;
         const stillRunning = await sh.isRunning();
         await sh.close();
-        transcript.push(new MarkdownSection({ content: `stillRunning=${stillRunning}` }));
+        transcript.push(new ErrorSection({ content: `stillRunning=${stillRunning}` }));
         "#,
     );
     let mut handle = rt
@@ -603,7 +603,7 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -616,7 +616,7 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -659,20 +659,20 @@ async fn shell_run_quiet_scolds_then_kills_when_model_silent() {
     });
     assert!(killed, "expected 'Killed' message in pending: {pending:?}");
 
-    let scold_frames = frames
+    let messages = chat_message_texts(&frames);
+    let scold_messages = messages
         .iter()
-        .filter(|f| text_of(f).contains("still running"))
+        .filter(|m| m.contains("still running"))
         .count();
     assert_eq!(
-        scold_frames, 2,
-        "expected 2 scold frames, got {scold_frames}: {frames:?}"
+        scold_messages, 2,
+        "expected 2 scold messages, got {scold_messages}: {messages:?}"
     );
-    let kill_frame_present = frames
-        .iter()
-        .any(|f| text_of(f).contains("Killed the shell command"));
     assert!(
-        kill_frame_present,
-        "expected a kill notice frame: {frames:?}"
+        messages
+            .iter()
+            .any(|m| m.contains("Killed the shell command")),
+        "expected a kill notice message: {messages:?}"
     );
 }
 
@@ -730,7 +730,7 @@ async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
         r#"
         import { ChatSession } from "frances:v1/chat";
         import { Shell, Run, Wait, Kill } from "frances:v1/tools/shell";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const chat = new ChatSession({ model_intents: ["x"] });
         const sh = new Shell();
         const wait = new Wait(sh);
@@ -743,7 +743,7 @@ async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
         reader.releaseLock();
         await r.completed;
         await sh.close();
-        transcript.push(new MarkdownSection({ content: "done" }));
+        transcript.push(new ErrorSection({ content: "done" }));
         "#,
     );
     let mut handle = rt
@@ -807,19 +807,19 @@ async fn shell_run_quiet_scolds_off_script_calls_then_kills() {
     });
     assert!(killed, "expected 'Killed' message in pending: {pending:?}");
 
-    let scold_frames = frames
+    let messages = chat_message_texts(&frames);
+    let scold_messages = messages
         .iter()
-        .filter(|f| text_of(f).contains("still running"))
+        .filter(|m| m.contains("still running"))
         .count();
     assert_eq!(
-        scold_frames, 2,
-        "expected 2 scold frames, got {scold_frames}: {frames:?}"
+        scold_messages, 2,
+        "expected 2 scold messages, got {scold_messages}: {messages:?}"
     );
-    let kill_frame_present = frames
-        .iter()
-        .any(|f| text_of(f).contains("Killed the shell command"));
     assert!(
-        kill_frame_present,
-        "expected a kill notice frame: {frames:?}"
+        messages
+            .iter()
+            .any(|m| m.contains("Killed the shell command")),
+        "expected a kill notice message: {messages:?}"
     );
 }

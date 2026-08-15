@@ -124,12 +124,6 @@ export type SectionId = number
  */
 export type SectionKind = 
 /**
- * `MarkdownSection` — streaming text. `source` names the speaker;
- * the frontend renders markdown for `source != User` and plain
- * text for User source.
- */
-{ type: "markdown"; source: Source } | 
-/**
  * `ErrorSection` — one-shot error message.
  */
 { type: "error" } | 
@@ -170,12 +164,6 @@ export type SessionSnapshot = { title: string | null; usage: Usage | null;
  * meaningful after settle; a fresh session starts with `None`.
  */
 busy: string | null }
-/**
- * Who produced a [`SectionKind::Markdown`] section. The frontend
- * styles each speaker differently and gates markdown rendering
- * (`source != User`).
- */
-export type Source = "user" | "assistant" | "internal"
 export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section_append"; id: SectionId; kind: SectionKind; delta: string } | { type: "section_close"; id: SectionId; truncated: boolean } | 
 /**
  * Latest-wins entity state. `snapshot` is opaque at this boundary;

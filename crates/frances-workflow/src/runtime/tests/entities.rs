@@ -138,7 +138,7 @@ async fn settled_handle_rejects_further_verbs() {
         "js",
         r#"
         import { createEntity } from "frances:v1/entities";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const e = createEntity("shell", {});
         e.settle({ state: "success" });
         const throws = (fn) => { try { fn(); return false; } catch { return true; } };
@@ -147,7 +147,7 @@ async fn settled_handle_rejects_further_verbs() {
             throws(() => e.updateSnapshot({})),
             throws(() => e.settle({})),
         ];
-        transcript.push(new MarkdownSection({ content: JSON.stringify(results), closed: true }));
+        transcript.push(new ErrorSection({ content: JSON.stringify(results), closed: true }));
         "#,
     );
     let mut handle = rt
@@ -165,7 +165,7 @@ async fn settled_handle_rejects_further_verbs() {
         .iter()
         .find_map(|f| match f {
             SectionTranscript::Set { section, .. }
-                if matches!(section.kind, SectionKind::Markdown { .. }) =>
+                if matches!(section.kind, SectionKind::Error) =>
             {
                 section.seed.clone()
             }

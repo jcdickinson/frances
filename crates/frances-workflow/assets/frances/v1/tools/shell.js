@@ -46,12 +46,9 @@
 //   const vars = new Variables();
 //   chat.tools.push(new Set(sh, vars), new Capture(sh, vars));
 
-import {
-  transcript,
-  MarkdownSection,
-  EntityRefSection,
-} from "frances:v1/sections";
+import { transcript, EntityRefSection } from "frances:v1/sections";
 import { createEntity } from "frances:v1/entities";
+import { postMessage, openMessage } from "frances:v1/messages";
 import { approve } from "frances:v1/approval";
 import { defineToolFamily } from "frances:v1/tool-family";
 import shellFamilyPrompt from "./shell_family.md";
@@ -457,7 +454,7 @@ async function _abortRunningShell(shell, scope, notice) {
     // Already idle — settle defensively if anyone left the entity Live.
     _settleShellEntity(shell, { type: "killed" }, null);
   }
-  transcript.push(new MarkdownSection({ content: notice, closed: true }));
+  postMessage({ content: notice });
   scope.push({ role: "user", content: notice });
 }
 
@@ -601,9 +598,8 @@ class Run {
       // shell can return to idle.
       let scoldsRemaining = maxScolds;
       while (await shell.isRunning()) {
-        // Render the inner round's LLM text into a section.
-        const out = new MarkdownSection();
-        transcript.push(out);
+        // Render the inner round's LLM text into a chat entity.
+        const out = openMessage("internal");
         let tool_calls;
         try {
           const r = await scope.stream();
@@ -650,9 +646,7 @@ class Run {
         const scoldMsg =
           `Shell from ${call.id} is still running. ` +
           `I MUST call ${waitName} or ${killName} now.`;
-        transcript.push(
-          new MarkdownSection({ content: scoldMsg, closed: true }),
-        );
+        postMessage({ content: scoldMsg });
         scope.push({ role: "user", content: scoldMsg });
       }
     });

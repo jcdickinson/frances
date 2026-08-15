@@ -9,12 +9,9 @@
 //! What lives here:
 //!
 //! - [`SectionKind`] — the typed payload that identifies + describes a
-//!   section. Workflows construct it via JS classes (`MarkdownSection`
+//!   section. Workflows construct it via JS classes (`ErrorSection`
 //!   etc.); the frontend picks a rendering by kind on first appearance
 //!   of a new section id.
-//! - [`Source`] — who produced a Markdown section (User / Assistant /
-//!   Internal). The frontend styles each speaker differently and only
-//!   renders markdown for `source != User`.
 //! - [`SectionId`] — per-invocation section identity.
 //! - [`ReasoningState`] — completion-status enum carried inside the
 //!   matching [`SectionKind`] variant.
@@ -53,27 +50,12 @@ pub struct EntityEnvelope {
 #[serde(transparent)]
 pub struct SectionId(pub u64);
 
-/// Who produced a [`SectionKind::Markdown`] section. The frontend
-/// styles each speaker differently and gates markdown rendering
-/// (`source != User`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, specta::Type)]
-#[serde(rename_all = "snake_case")]
-pub enum Source {
-    User,
-    Assistant,
-    Internal,
-}
-
 /// What kind of section, and any bounded metadata that rides with it.
 /// One variant per section presentation in the UI. The frontend
 /// matches on this to pick a rendering when a new section id is seen.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, specta::Type)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SectionKind {
-    /// `MarkdownSection` — streaming text. `source` names the speaker;
-    /// the frontend renders markdown for `source != User` and plain
-    /// text for User source.
-    Markdown { source: Source },
     /// `ErrorSection` — one-shot error message.
     Error,
     /// `ToolUseSection` — one-shot "→ tool_name" marker. `detail` is

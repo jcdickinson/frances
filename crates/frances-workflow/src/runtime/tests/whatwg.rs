@@ -7,9 +7,9 @@ async fn whatwg_dom_exports_dom_exception() {
         "js",
         r#"
         import { DOMException } from "whatwg:dom";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const e = new DOMException("nope", "AbortError");
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `err=${e instanceof Error} name=${e.name} msg=${e.message}`,
         }));
         "#,
@@ -38,13 +38,13 @@ async fn whatwg_web_streams_exports_constructors() {
             WritableStream,
             TransformStream,
         } from "whatwg:web-streams";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const shape = [
             typeof ReadableStream,
             typeof WritableStream,
             typeof TransformStream,
         ].join(",");
-        transcript.push(new MarkdownSection({ content: shape }));
+        transcript.push(new ErrorSection({ content: shape }));
         "#,
     );
     let mut handle = rt
@@ -67,7 +67,7 @@ async fn whatwg_abortcontroller_basic_lifecycle() {
         "js",
         r#"
         import { AbortController, AbortSignal } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const ac = new AbortController();
         const before = ac.signal.aborted;
         let fired = false;
@@ -76,7 +76,7 @@ async fn whatwg_abortcontroller_basic_lifecycle() {
         const after = ac.signal.aborted;
         const reason = ac.signal.reason;
         const isSignal = ac.signal instanceof AbortSignal;
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `before=${before} after=${after} fired=${fired} reason=${reason} sig=${isSignal}`,
         }));
         "#,
@@ -106,12 +106,12 @@ async fn abortsignal_timeout_fires_after_delay() {
         import { AbortSignal } from "whatwg:abortcontroller";
         import { DOMException } from "whatwg:dom";
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const start = Date.now();
         const s = AbortSignal.timeout(15);
         await new Timer(60);
         const elapsed = Date.now() - start;
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `aborted=${s.aborted} name=${s.reason && s.reason.name} dom=${s.reason instanceof DOMException} fast=${elapsed < 200}`,
         }));
         "#,
@@ -142,14 +142,14 @@ async fn abortsignal_timeout_composes_with_timer_signal() {
         r#"
         import { AbortSignal } from "whatwg:abortcontroller";
         import { Timer } from "frances:v1/io";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const start = Date.now();
         try {
             await new Timer({ delay: 60_000, signal: AbortSignal.timeout(15) });
-            transcript.push(new MarkdownSection({ content: "BUG: resolved" }));
+            transcript.push(new ErrorSection({ content: "BUG: resolved" }));
         } catch (e) {
             const elapsed = Date.now() - start;
-            transcript.push(new MarkdownSection({
+            transcript.push(new ErrorSection({
                 content: `name=${e.name} msg=${e.message} fast=${elapsed < 1000}`,
             }));
         }
@@ -178,13 +178,13 @@ async fn abortsignal_timeout_rejects_garbage() {
         "js",
         r#"
         import { AbortSignal } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const cases = ["nope", -5, NaN, undefined, {}];
         const threw = cases.map((c) => {
             try { AbortSignal.timeout(c); return "no-throw"; }
             catch (_) { return "threw"; }
         });
-        transcript.push(new MarkdownSection({ content: threw.join(",") }));
+        transcript.push(new ErrorSection({ content: threw.join(",") }));
         "#,
     );
     let mut handle = rt
@@ -210,7 +210,7 @@ async fn abortsignal_any_first_source_wins_and_listener_cleaned_up() {
         "js",
         r#"
         import { AbortController, AbortSignal } from "whatwg:abortcontroller";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const a = new AbortController();
         const b = new AbortController();
         const out = AbortSignal.any([a.signal, b.signal]);
@@ -221,7 +221,7 @@ async fn abortsignal_any_first_source_wins_and_listener_cleaned_up() {
         // aborted, but it would still re-fire the listener walk).
         // The observable signal: out.reason must stay "first".
         b.abort("second");
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `first=${reasonAfterFirst} after=${out.reason} aborted=${out.aborted}`,
         }));
         "#,

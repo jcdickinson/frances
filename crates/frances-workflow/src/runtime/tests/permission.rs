@@ -10,9 +10,9 @@ async fn approve_yes_round_trip() {
         "js",
         r#"
         import { approve } from "frances:v1/approval";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const choice = await approve({ prompt: "delete /tmp/foo?" });
-        transcript.push(new MarkdownSection({
+        transcript.push(new ErrorSection({
             content: `${choice.type}:${choice.details ?? ""}`,
         }));
         "#,
@@ -64,9 +64,9 @@ async fn approve_yes_round_trip() {
             SectionTranscript::Set { section, .. } => Some(section),
             _ => None,
         })
-        .expect("expected a markdown set after approval");
+        .expect("expected an error set after approval");
     assert!(
-        matches!(&last.kind, SectionKind::Markdown { .. })
+        matches!(&last.kind, SectionKind::Error)
             && last.seed.as_deref() == Some("yes:scoped to /tmp"),
         "got {last:?}",
     );

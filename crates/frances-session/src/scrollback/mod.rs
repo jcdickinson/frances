@@ -45,7 +45,7 @@ use uuid::Uuid;
 use frances_storage::{Database, EntitySchema, Migration};
 
 use crate::Result;
-use crate::events::{ReasoningState, ScrollbackFrame, SectionId, SectionKind, Source, StreamFrame};
+use crate::events::{ReasoningState, ScrollbackFrame, SectionId, SectionKind, StreamFrame};
 use crate::runtime::EventsChannel;
 
 /// Owns the per-session `scrollback_sections` table. UUID is permanent;
@@ -94,10 +94,6 @@ pub enum StoredRow {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum RowPayload {
-    Markdown {
-        source: Source,
-        text: String,
-    },
     Error {
         text: String,
     },
@@ -255,7 +251,6 @@ pub async fn replay_to_channel(
 
 fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
     match kind {
-        SectionKind::Markdown { source } => RowPayload::Markdown { source, text },
         SectionKind::Error => RowPayload::Error { text },
         SectionKind::ToolUse { name, detail } => RowPayload::ToolUse { name, detail },
         SectionKind::Json { tag, value } => RowPayload::Json { tag, value },
@@ -267,11 +262,6 @@ fn encode_payload(kind: SectionKind, text: String) -> RowPayload {
 
 fn decode_payload(payload: RowPayload, truncated: bool) -> StoredRow {
     match payload {
-        RowPayload::Markdown { source, text } => StoredRow::Section {
-            kind: SectionKind::Markdown { source },
-            text,
-            truncated,
-        },
         RowPayload::Error { text } => StoredRow::Error { text },
         RowPayload::ToolUse { name, detail } => StoredRow::Section {
             kind: SectionKind::ToolUse { name, detail },
@@ -410,8 +400,8 @@ mod tests {
         persist_section(
             &db,
             instance,
-            SectionKind::Markdown {
-                source: Source::User,
+            SectionKind::Reasoning {
+                state: ReasoningState::Done,
             },
             "hi".into(),
             false,
@@ -434,8 +424,8 @@ mod tests {
         persist_section(
             &db,
             instance,
-            SectionKind::Markdown {
-                source: Source::Assistant,
+            SectionKind::Reasoning {
+                state: ReasoningState::Streaming,
             },
             "partial".into(),
             true,
@@ -451,8 +441,8 @@ mod tests {
         assert!(matches!(
             frames.get(1),
             Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::Markdown {
-                    source: Source::User,
+                kind: SectionKind::Reasoning {
+                    state: ReasoningState::Done,
                 },
                 ..
             })),
@@ -483,8 +473,8 @@ mod tests {
         assert!(matches!(
             frames.get(6),
             Some(StreamFrame::Scrollback(ScrollbackFrame::SectionAppend {
-                kind: SectionKind::Markdown {
-                    source: Source::Assistant,
+                kind: SectionKind::Reasoning {
+                    state: ReasoningState::Streaming,
                 },
                 ..
             })),

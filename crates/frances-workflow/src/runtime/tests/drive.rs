@@ -44,12 +44,12 @@ async fn set_title_emits_title_frames_and_get_title_tracks() {
         "js",
         r#"
         import { setTitle, getTitle } from "frances:v1/workflow";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: `before:${getTitle()}` }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: `before:${getTitle()}` }));
         setTitle("fixing the bug");
-        transcript.push(new MarkdownSection({ content: `after:${getTitle()}` }));
+        transcript.push(new ErrorSection({ content: `after:${getTitle()}` }));
         setTitle(null);
-        transcript.push(new MarkdownSection({ content: `cleared:${getTitle()}` }));
+        transcript.push(new ErrorSection({ content: `cleared:${getTitle()}` }));
         "#,
     );
     let mut handle = rt
@@ -96,8 +96,8 @@ async fn body_returns_terminates_workflow() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "hi" }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: "hi" }));
         "#,
     );
     let mut handle = rt
@@ -123,10 +123,10 @@ async fn dangling_promise_does_not_keep_workflow_alive() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "before" }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: "before" }));
         await new Promise(() => {});
-        transcript.push(new MarkdownSection({ content: "unreachable" }));
+        transcript.push(new ErrorSection({ content: "unreachable" }));
         "#,
     );
     let mut handle = rt
@@ -156,8 +156,8 @@ async fn import_meta_args_populated() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: import.meta.args.join('|') }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: import.meta.args.join('|') }));
         "#,
     );
     let mut handle = rt
@@ -180,8 +180,8 @@ async fn import_meta_instance_populated() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: import.meta.instance }));
+        import { transcript, ErrorSection } from "frances:v1/sections";
+        transcript.push(new ErrorSection({ content: import.meta.instance }));
         "#,
     );
     let instance = uuid::Uuid::from_u128(0xfeed_face_0000_0000_0000_0000_0000_0001);
@@ -210,14 +210,14 @@ async fn lifecycle_shutdown_runs_on_request() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { lifecycle } from "frances:v1/lifecycle";
 
         lifecycle.shutdown = async () => {
-            transcript.push(new MarkdownSection({ content: "bye" }));
+            transcript.push(new ErrorSection({ content: "bye" }));
         };
         for await (const _ of inbox) {
-            transcript.push(new MarkdownSection({ content: "got input" }));
+            transcript.push(new ErrorSection({ content: "got input" }));
         }
         "#,
     );
@@ -247,16 +247,16 @@ async fn lifecycle_shutdown_runs_on_exit() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { lifecycle } from "frances:v1/lifecycle";
         import { exit } from "frances:v1/workflow";
 
         lifecycle.shutdown = async () => {
-            transcript.push(new MarkdownSection({ content: "bye" }));
+            transcript.push(new ErrorSection({ content: "bye" }));
         };
         queueMicrotask(() => exit());
         for await (const _ of inbox) {
-            transcript.push(new MarkdownSection({ content: "got input" }));
+            transcript.push(new ErrorSection({ content: "got input" }));
         }
         "#,
     );
@@ -306,9 +306,9 @@ async fn fresh_context_per_invocation() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         globalThis.__counter = (globalThis.__counter ?? 0) + 1;
-        transcript.push(new MarkdownSection({ content: String(globalThis.__counter) }));
+        transcript.push(new ErrorSection({ content: String(globalThis.__counter) }));
         "#,
     );
     let path = file.path().to_path_buf();
@@ -338,9 +338,9 @@ async fn ts_transpile_strips_types() {
     let file = write_source(
         "ts",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const args: string[] = import.meta.args;
-        transcript.push(new MarkdownSection({ content: args.length.toString() }));
+        transcript.push(new ErrorSection({ content: args.length.toString() }));
         "#,
     );
     let mut handle = rt

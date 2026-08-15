@@ -40,7 +40,7 @@ pub use io::mock::{MockFs, MockIo, MockShell, MockTimer, StubIo};
 pub use permission::{PermissionRequest, PermissionResponse, PermissionResponseWire};
 pub use runtime::{
     EntityCmd, InboxItem, Invocation, ReasoningState, Runtime, SectionId, SectionKind, SectionSpec,
-    SectionTranscript, Source, SurfaceCmd, UserInput, WorkflowHandle, WorkflowOutputs,
+    SectionTranscript, SurfaceCmd, UserInput, WorkflowHandle, WorkflowOutputs,
 };
 pub use slash::parse_slash_command;
 pub use storage::{ExecResult, Row, RowStream, WorkflowDb, WorkflowDbError, WorkflowTx};

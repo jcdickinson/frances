@@ -132,15 +132,12 @@ pub(crate) struct WorkflowInstance {
 ///
 /// Workflow frames map to event blocks like this:
 ///
-/// - `MarkdownSection` push: open a new `Text { source }` block, write
-///   initial content; the block stays open so subsequent `append`s
-///   stream into it. The JS side sends `Close` for the prior active
-///   markdown before pushing a new one — multiple blocks can be open
-///   concurrently (e.g. a shell-output block running while the LLM
-///   streams text into a markdown block above it).
-/// - `MarkdownSection.append`: `Append` carries the [`SectionId`]; the
-///   emit state looks up the matching open block and writes a
-///   `BlockDelta` against it.
+/// - Streaming-frame push (e.g. `ReasoningSection`): open a new block,
+///   write initial content; the block stays open so subsequent
+///   `append`s stream into it. Multiple blocks can be open
+///   concurrently.
+/// - `Append`: carries the [`SectionId`]; the emit state looks up the
+///   matching open block and writes a `BlockDelta` against it.
 /// - `Close { id }`: emit `BlockStop` for the block, persist a clean
 ///   scrollback row, remove from `open`.
 /// - `UpdateKind { id, kind }`: emit a no-text `BlockDelta` carrying

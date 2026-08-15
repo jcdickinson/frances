@@ -7,10 +7,10 @@ async fn iterator_delivers_messages_in_order() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { exit } from "frances:v1/workflow";
         for await (const input of inbox) {
-            transcript.push(new MarkdownSection({ content: "got:" + input.content }));
+            transcript.push(new ErrorSection({ content: "got:" + input.content }));
             if (input.content === "stop") { exit(); break; }
         }
         "#,
@@ -66,13 +66,13 @@ async fn exit_unblocks_pending_next() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { exit } from "frances:v1/workflow";
         queueMicrotask(() => exit());
         for await (const _ of inbox) {
-            transcript.push(new MarkdownSection({ content: "got input" }));
+            transcript.push(new ErrorSection({ content: "got input" }));
         }
-        transcript.push(new MarkdownSection({ content: "after-loop" }));
+        transcript.push(new ErrorSection({ content: "after-loop" }));
         "#,
     );
     let mut handle = rt
@@ -95,10 +95,10 @@ async fn symbol_async_iterator_returns_self() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { exit } from "frances:v1/workflow";
         const it = inbox[Symbol.asyncIterator]();
-        transcript.push(new MarkdownSection({ content: it === inbox ? "same" : "different" }));
+        transcript.push(new ErrorSection({ content: it === inbox ? "same" : "different" }));
         exit();
         "#,
     );
@@ -122,12 +122,12 @@ async fn concurrent_next_fifo() {
         "js",
         r#"
         import { inbox } from "frances:v1/inbox";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         import { exit } from "frances:v1/workflow";
         const a = inbox.next();
         const b = inbox.next();
         const [ra, rb] = await Promise.all([a, b]);
-        transcript.push(new MarkdownSection({ content: `${ra.value.content},${rb.value.content}` }));
+        transcript.push(new ErrorSection({ content: `${ra.value.content},${rb.value.content}` }));
         exit();
         "#,
     );

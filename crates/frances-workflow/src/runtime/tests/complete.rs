@@ -28,12 +28,12 @@ async fn complete_plain_returns_text() {
         "js",
         r#"
         import { complete } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const r = await complete({
             intents: ["default"],
             input: [{ role: "user", content: "hi" }],
         });
-        transcript.push(new MarkdownSection({ content: r.text }));
+        transcript.push(new ErrorSection({ content: r.text }));
         "#,
     );
     let mut handle = rt
@@ -58,14 +58,14 @@ async fn complete_required_returns_tool_call() {
         "js",
         r#"
         import { complete } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const r = await complete({
             intents: ["default"],
             input: [{ role: "user", content: "decide please" }],
             tools: [{ name: "decide", description: "d", parameters: { type: "object" } }],
             requireToolCall: true,
         });
-        transcript.push(new MarkdownSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
+        transcript.push(new ErrorSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
         "#,
     );
     let mut handle = rt
@@ -92,13 +92,13 @@ async fn complete_enforced_retries_then_succeeds() {
         "js",
         r#"
         import { complete } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const r = await complete({
             intents: ["default"],
             input: [{ role: "user", content: "decide" }],
             toolChoice: "decide",
         });
-        transcript.push(new MarkdownSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
+        transcript.push(new ErrorSection({ content: r.tool_calls.map((c) => c.name).join(",") }));
         "#,
     );
     let mut handle = rt
@@ -125,16 +125,16 @@ async fn complete_unsatisfied_rejects() {
         "js",
         r#"
         import { complete } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         try {
             await complete({
                 intents: ["default"],
                 input: [{ role: "user", content: "decide" }],
                 requireToolCall: true,
             });
-            transcript.push(new MarkdownSection({ content: "NO THROW" }));
+            transcript.push(new ErrorSection({ content: "NO THROW" }));
         } catch (e) {
-            transcript.push(new MarkdownSection({ content: "threw:" + String((e && e.message) || e) }));
+            transcript.push(new ErrorSection({ content: "threw:" + String((e && e.message) || e) }));
         }
         "#,
     );
@@ -166,7 +166,7 @@ async fn complete_flags_schema_invalid_tool_call() {
         "js",
         r#"
         import { complete } from "frances:v1/chat";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
         const r = await complete({
             intents: ["default"],
             input: [{ role: "user", content: "decide" }],
@@ -179,7 +179,7 @@ async fn complete_flags_schema_invalid_tool_call() {
         });
         const c = r.tool_calls[0];
         const ok = c.error && c.expectedSchema && c.expectedSchema.required.includes("reason");
-        transcript.push(new MarkdownSection({ content: ok ? "flagged:" + c.name : "clean" }));
+        transcript.push(new ErrorSection({ content: ok ? "flagged:" + c.name : "clean" }));
         "#,
     );
     let mut handle = rt

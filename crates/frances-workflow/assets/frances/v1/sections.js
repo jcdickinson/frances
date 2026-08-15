@@ -4,7 +4,6 @@ import { WritableStream } from "whatwg:web-streams";
 
 export const {
   transcript,
-  MarkdownSection,
   ErrorSection,
   JsonSection,
   ReasoningSection,
@@ -70,5 +69,4 @@ function installWritable(cls) {
   });
 }
 
-installWritable(MarkdownSection);
 installWritable(ReasoningSection);

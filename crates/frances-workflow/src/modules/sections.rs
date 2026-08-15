@@ -5,21 +5,17 @@
 //! `frame.write(text)` to extend its content. Frames stay writeable
 //! until they're explicitly closed; the host supports many open blocks
 //! at once, so a long-streaming frame can keep going while later
-//! [`MarkdownSection`]s are pushed alongside it.
+//! frames are pushed alongside it.
 //!
-//! Each writeable frame exposes:
+//! Each writeable frame (today just `ReasoningSection`) exposes:
 //!   - `frame.write(text)` — append, throws if `closed`.
 //!   - `frame.writable` — WHATWG `WritableStream` over the same sink.
 //!   - `frame.close()` — emit [`SectionTranscript::Close`], flip `closed`,
-//!     return `this` so `new MarkdownSection(...).close()` chains.
+//!     return `this` so `new ReasoningSection().close()` chains (a
+//!     pre-push close is remembered and emitted right after the push).
 //!   - `frame.autoclose` (default `true`) — when truthy, the writable's
 //!     `close`/`abort` hook calls `frame.close()` so a finished pipe
 //!     seals the frame automatically.
-//!
-//! Constructors also accept `{ ..., closed: true }` to pre-seal a
-//! frame: `transcript.push` then emits a `Close` immediately after the
-//! `Push`, which is the convenient way to write one-shot frames like
-//! a greeting or an echoed user message.
 //!
 //! For v1 there is exactly one transcript (the live binding behind the
 //! `transcript` import). The `Transcript` class is exported as a type
@@ -33,7 +29,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::{get_or_undefined, throw_js as throw_err, throw_js_type as throw_type};
+use super::{throw_js as throw_err, throw_js_type as throw_type};
 use frances_edit::DiffOp;
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, Opt, This};
@@ -42,7 +38,7 @@ use rquickjs::{Class, Ctx, Function, JsLifetime, Object, Result as JsResult, Val
 type Ctor<'js> = Constructor<'js>;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::runtime::{SectionId, SectionKind, SectionSpec, SectionTranscript, Source};
+use crate::runtime::{SectionId, SectionKind, SectionSpec, SectionTranscript};
 
 /// Shared state for the v1 frames surface. One per workflow invocation.
 pub(crate) struct SectionsState {
@@ -68,7 +64,6 @@ impl SectionsState {
 
 pub(crate) type BuiltSections<'js> = (
     Class<'js, TranscriptHandle>,
-    Ctor<'js>, // MarkdownSection
     Ctor<'js>, // ErrorSection
     Ctor<'js>, // JsonSection
     Ctor<'js>, // ReasoningSection
@@ -90,7 +85,6 @@ pub(crate) fn build_sections<'js>(
         },
     )?;
 
-    let md_ctor = build_markdown_ctor(ctx, state.clone())?;
     let err_ctor = build_error_ctor(ctx)?;
     let json_ctor = build_json_ctor(ctx)?;
     let thought_ctor = build_thought_ctor(ctx, state)?;
@@ -100,7 +94,6 @@ pub(crate) fn build_sections<'js>(
 
     Ok((
         transcript,
-        md_ctor,
         err_ctor,
         json_ctor,
         thought_ctor,
@@ -158,32 +151,6 @@ fn push_section<'js>(
 ) -> JsResult<()> {
     let state = handle.borrow().state.clone();
 
-    if let Some(md) = as_section::<MarkdownSection>(&section) {
-        let new_id = state.assign_id();
-        let borrow = md.borrow();
-        borrow.id.store(new_id, Ordering::Release);
-        let section = SectionSpec {
-            kind: SectionKind::Markdown {
-                source: borrow.source,
-            },
-            seed: borrow.content.clone(),
-        };
-        let _ = state.tx.send(SectionTranscript::Set {
-            id: SectionId(new_id),
-            section,
-        });
-        // Pre-closed frame (either `{ ..., closed: true }` at
-        // construction or `frame.close()` called before push) — seal
-        // it on the wire now that it has an id. The UI sees Push +
-        // Close in the same batch and never paints the spinner over
-        // it.
-        if borrow.closed.load(Ordering::Acquire) {
-            let _ = state.tx.send(SectionTranscript::Close {
-                id: SectionId(new_id),
-            });
-        }
-        return Ok(());
-    }
     if let Some(err) = as_section::<ErrorSection>(&section) {
         let new_id = state.assign_id();
         err.borrow().id.store(new_id, Ordering::Release);
@@ -301,7 +268,7 @@ fn push_section<'js>(
     }
     throw_type(
         ctx,
-        "transcript.push: expected a MarkdownSection, ErrorSection, JsonSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
+        "transcript.push: expected an ErrorSection, JsonSection, ReasoningSection, ToolUseSection, DiffSection, or EntityRefSection",
     )
 }
 
@@ -310,67 +277,8 @@ fn as_section<'js, C: JsClass<'js>>(v: &Value<'js>) -> Option<Class<'js, C>> {
 }
 
 // ---------------------------------------------------------------------
-// MarkdownSection / ErrorSection — writeable text frames
+// ErrorSection — one-shot error message
 // ---------------------------------------------------------------------
-
-pub struct MarkdownSection {
-    state: Arc<SectionsState>,
-    /// Set by `transcript.push`; 0 means "not yet pushed".
-    id: AtomicU64,
-    /// Initial content captured at construction. `None` when the workflow omitted `content`.
-    content: Option<String>,
-    /// Speaker for the frame. Drives frontend styling and the markdown gate. Defaults to [`Source::Internal`].
-    source: Source,
-    /// Flipped by [`close_section`]. Subsequent writes throw; subsequent closes are no-ops.
-    closed: AtomicBool,
-}
-
-impl<'js> Trace<'js> for MarkdownSection {
-    fn trace<'a>(&self, _tracer: Tracer<'a, 'js>) {}
-}
-
-unsafe impl<'js> JsLifetime<'js> for MarkdownSection {
-    type Changed<'to> = MarkdownSection;
-}
-
-impl<'js> JsClass<'js> for MarkdownSection {
-    const NAME: &'static str = "MarkdownSection";
-    type Mutable = Readable;
-
-    fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-        proto.set(
-            "write",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>, this: This<Class<'js, MarkdownSection>>, delta: String| {
-                    let b = this.0.borrow();
-                    append_text(&ctx, &b.state, &b.id, &b.closed, delta)
-                },
-            )?,
-        )?;
-        proto.set(
-            "close",
-            Function::new(
-                ctx.clone(),
-                |ctx: Ctx<'js>,
-                 this: This<Class<'js, MarkdownSection>>|
-                 -> JsResult<Class<'js, MarkdownSection>> {
-                    {
-                        let b = this.0.borrow();
-                        close_section(&ctx, &b.state, &b.id, &b.closed)?;
-                    }
-                    Ok(this.0.clone())
-                },
-            )?,
-        )?;
-        Ok(Some(proto))
-    }
-
-    fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
-        Ok(None)
-    }
-}
 
 /// `ErrorSection` — one-shot error message.
 pub struct ErrorSection {
@@ -421,32 +329,6 @@ fn append_text<'js>(
         id: SectionId(frame_id),
         delta,
     });
-    Ok(())
-}
-
-/// Mark the frame closed and (if it has been pushed) emit
-/// [`SectionTranscript::Close`] exactly once. Idempotent: a second call is a
-/// silent no-op. When called before `transcript.push`, just records
-/// the intent — `transcript.push` notices the pre-set flag and emits
-/// the close right after the push so `new MarkdownSection(...).close()`
-/// chains the same way `new MarkdownSection({ ..., closed: true })`
-/// does.
-fn close_section<'js>(
-    _ctx: &Ctx<'js>,
-    state: &Arc<SectionsState>,
-    id: &AtomicU64,
-    closed: &AtomicBool,
-) -> JsResult<()> {
-    let frame_id = id.load(Ordering::Acquire);
-    if frame_id == 0 {
-        closed.store(true, Ordering::Release);
-        return Ok(());
-    }
-    if !closed.swap(true, Ordering::AcqRel) {
-        let _ = state.tx.send(SectionTranscript::Close {
-            id: SectionId(frame_id),
-        });
-    }
     Ok(())
 }
 
@@ -773,12 +655,12 @@ fn build_entity_ref_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
 pub struct ReasoningSection {
     state: Arc<SectionsState>,
     id: AtomicU64,
-    /// Initial body captured at construction. Mirrors `MarkdownSection.content`.
+    /// Initial body captured at construction (always empty in v1).
     content: String,
     /// Encoded [`crate::runtime::ReasoningState`]. `false` ⇒ Streaming,
     /// `true` ⇒ Done. Flipped by `.close()`.
     done: AtomicBool,
-    /// Same close lifecycle as `MarkdownSection`.
+    /// Flipped by `.close()`. Subsequent writes throw; subsequent closes are no-ops.
     closed: AtomicBool,
 }
 
@@ -872,26 +754,6 @@ fn finish_thought<'js>(
 // Constructors
 // ---------------------------------------------------------------------
 
-fn build_markdown_ctor<'js>(ctx: &Ctx<'js>, state: Arc<SectionsState>) -> JsResult<Ctor<'js>> {
-    Constructor::new_class::<MarkdownSection, _, _>(
-        ctx.clone(),
-        move |ctx: Ctx<'js>, arg: Opt<Value<'js>>| {
-            let arg = arg.0.unwrap_or_else(|| Value::new_undefined(ctx.clone()));
-            let (content, source, closed) = parse_markdown_arg(&ctx, &arg)?;
-            Class::instance(
-                ctx.clone(),
-                MarkdownSection {
-                    state: state.clone(),
-                    id: AtomicU64::new(0),
-                    content,
-                    source,
-                    closed: AtomicBool::new(closed),
-                },
-            )
-        },
-    )
-}
-
 fn build_error_ctor<'js>(ctx: &Ctx<'js>) -> JsResult<Ctor<'js>> {
     Constructor::new_class::<ErrorSection, _, _>(
         ctx.clone(),
@@ -975,87 +837,4 @@ fn parse_content_arg<'js>(ctx: &Ctx<'js>, arg: &Value<'js>, name: &str) -> JsRes
     };
     obj.get::<_, String>("content")
         .map_err(|_| throw_err(ctx, &format!("new {name}: `content` must be a string")))
-}
-
-/// Parse `new MarkdownSection({ content?, source?, closed? })`. `content`
-/// is optional; absent / `undefined` / `null` map to `None`. `source`
-/// is one of `"user"`, `"assistant"`, `"internal"`; absent → `Internal`.
-/// `closed` is an optional bool defaulting to `false`; when `true` the
-/// frame's `closed` flag is pre-set so `transcript.push` emits a `Close`
-/// immediately after the `Push`. Anything else throws.
-fn parse_markdown_arg<'js>(
-    ctx: &Ctx<'js>,
-    arg: &Value<'js>,
-) -> JsResult<(Option<String>, Source, bool)> {
-    if arg.is_undefined() || arg.is_null() {
-        return Ok((None, Source::Internal, false));
-    }
-    let Some(obj) = arg.as_object() else {
-        return Err(throw_err(
-            ctx,
-            "new MarkdownSection: expected { content?: string, source?: \"user\"|\"assistant\"|\"internal\" } or no argument",
-        ));
-    };
-    let content_val: Value<'js> = get_or_undefined(ctx, obj, "content");
-    let content = if content_val.is_undefined() || content_val.is_null() {
-        None
-    } else if let Some(s) = content_val.as_string() {
-        Some(
-            s.to_string()
-                .map_err(|_| throw_err(ctx, "new MarkdownSection: `content` must be UTF-8"))?,
-        )
-    } else {
-        return Err(throw_err(
-            ctx,
-            "new MarkdownSection: `content` must be a string when present",
-        ));
-    };
-    let source_val: Value<'js> = get_or_undefined(ctx, obj, "source");
-    let source = if source_val.is_undefined() || source_val.is_null() {
-        Source::Internal
-    } else if let Some(s) = source_val.as_string() {
-        let s = s
-            .to_string()
-            .map_err(|_| throw_err(ctx, "new MarkdownSection: `source` must be UTF-8"))?;
-        match s.as_str() {
-            "user" => Source::User,
-            "assistant" => Source::Assistant,
-            "internal" => Source::Internal,
-            other => {
-                return Err(throw_err(
-                    ctx,
-                    &format!(
-                        "new MarkdownSection: `source` must be \"user\", \"assistant\", or \"internal\" (got {other:?})"
-                    ),
-                ));
-            }
-        }
-    } else {
-        return Err(throw_err(
-            ctx,
-            "new MarkdownSection: `source` must be a string when present",
-        ));
-    };
-    let closed = parse_optional_bool(ctx, obj, "closed", "new MarkdownSection: `closed`")?;
-    Ok((content, source, closed))
-}
-
-/// Parse an optional bool field. Absent / `undefined` / `null` →
-/// `false`; anything that isn't a bool throws with `field_label`.
-fn parse_optional_bool<'js>(
-    ctx: &Ctx<'js>,
-    obj: &rquickjs::Object<'js>,
-    key: &str,
-    field_label: &str,
-) -> JsResult<bool> {
-    let val: Value<'js> = get_or_undefined(ctx, obj, key);
-    if val.is_undefined() || val.is_null() {
-        return Ok(false);
-    }
-    val.as_bool().ok_or_else(|| {
-        throw_err(
-            ctx,
-            &format!("{field_label} must be a boolean when present"),
-        )
-    })
 }

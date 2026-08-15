@@ -23,11 +23,11 @@ import { inbox, INTERRUPT } from "frances:v1/inbox";
 import { AbortController } from "whatwg:abortcontroller";
 import {
   transcript,
-  MarkdownSection,
   ErrorSection,
   ReasoningSection,
   ToolUseSection,
 } from "frances:v1/sections";
+import { postMessage, openMessage } from "frances:v1/messages";
 import { ChatSession, complete, loadChatSession } from "frances:v1/chat";
 import { db } from "frances:v1/storage";
 import {
@@ -451,7 +451,7 @@ function resetStepTranscript(): void {
 
 async function pipeAssistantTextToFrame(
   text: ReadableStream<string>,
-  out: MarkdownSection,
+  out: ReturnType<typeof openMessage>,
 ): Promise<string> {
   const reader = text.getReader();
   const writer = out.writable.getWriter();
@@ -774,9 +774,7 @@ class PlanUpdate {
       };
       validatePlan();
       const confirmation = `Plan updated:\n${planTitles() || "(no steps)"}`;
-      transcript.push(
-        new MarkdownSection({ content: confirmation, source: "assistant", closed: true }),
-      );
+      postMessage({ source: "assistant", content: confirmation });
       await saveState();
       return _okResult(call.id, confirmation);
     } catch (err) {
@@ -1190,9 +1188,7 @@ async function handleEffortCommand(msg: string): Promise<boolean> {
     response = "Usage: /effort [default|0-100]";
   }
 
-  transcript.push(
-    new MarkdownSection({ content: response, source: "assistant", closed: true }),
-  );
+  postMessage({ source: "assistant", content: response });
   await saveState();
   return true;
 }
@@ -1202,13 +1198,10 @@ async function handlePendingCompletion(): Promise<boolean> {
   const signal = pendingCompletion;
   if (signal.action === "skip") {
     const skipped = markFinished(signal);
-    transcript.push(
-      new MarkdownSection({
-        content: `Step ${stepNumber(skipped)} skipped: **${skipped.title}**\n\nReason: ${skipped.reason}`,
-        source: "assistant",
-        closed: true,
-      }),
-    );
+    postMessage({
+      source: "assistant",
+      content: `Step ${stepNumber(skipped)} skipped: **${skipped.title}**\n\nReason: ${skipped.reason}`,
+    });
     resetStepTranscript();
     pendingCompletion = null;
     await newExecutionChat(contextAfterProgress(skipped));
@@ -1217,7 +1210,7 @@ async function handlePendingCompletion(): Promise<boolean> {
   const judgement = await referee(signal);
   if (judgement.type === "decline") {
     const msg = `Referee declined step completion: ${judgement.message}`;
-    transcript.push(new MarkdownSection({ content: msg, closed: true }));
+    postMessage({ content: msg });
     pendingCompletion = null;
     await newExecutionChat(declineSeed(judgement.message));
     return true;
@@ -1235,16 +1228,13 @@ async function handlePendingCompletion(): Promise<boolean> {
     await saveState();
     return false;
   }
-  transcript.push(
-    new MarkdownSection({
-      content:
-        `Step ${stepNumber(completed)} completed: **${completed.title}**\n\n` +
-        `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\`\n\n` +
-        `Transcript summary:\n\n${completed.transcript_summary || "(none)"}`,
-      source: "assistant",
-      closed: true,
-    }),
-  );
+  postMessage({
+    source: "assistant",
+    content:
+      `Step ${stepNumber(completed)} completed: **${completed.title}**\n\n` +
+      `Proof:\n\n\`\`\`\n${proofToString(completed.proof)}\n\`\`\`\n\n` +
+      `Transcript summary:\n\n${completed.transcript_summary || "(none)"}`,
+  });
   resetStepTranscript();
   pendingCompletion = null;
   await newExecutionChat(contextAfterProgress(completed));
@@ -1299,13 +1289,10 @@ async function turn(): Promise<TurnEnd> {
       pendingPlanExit = false;
       mode = "executing";
       resetStepTranscript();
-      transcript.push(
-        new MarkdownSection({
-          content: "Planning complete — beginning execution.",
-          source: "assistant",
-          closed: true,
-        }),
-      );
+      postMessage({
+        source: "assistant",
+        content: "Planning complete — beginning execution.",
+      });
       await saveState();
       await newExecutionChat(executionSeed());
       return true;
@@ -1315,13 +1302,10 @@ async function turn(): Promise<TurnEnd> {
       pendingPlanBegin = null;
       if (overBudget()) return false;
       mode = "planning";
-      transcript.push(
-        new MarkdownSection({
-          content: "Returning to planning to resolve a question with the user.",
-          source: "assistant",
-          closed: true,
-        }),
-      );
+      postMessage({
+        source: "assistant",
+        content: "Returning to planning to resolve a question with the user.",
+      });
       await saveState();
       await newPlanningChat(planBeginSeed(req));
       return true;
@@ -1340,15 +1324,13 @@ async function turn(): Promise<TurnEnd> {
     setStatus(mode === "planning" ? "planning…" : "working…");
     const ac = new AbortController();
     const r = await chat.stream({ maxToolCalls: 8, signal: ac.signal });
-    // Push the `frances:` frame eagerly with no content — the UI tracks
-    // the id but defers measure / render, and the daemon skips
-    // persistence, until the first text delta materialises the block.
-    // The `thought` frame sits alongside it for the reasoning channel;
-    // for non-thinking models it stays empty and closes immediately.
-    const out = new MarkdownSection({ source: "assistant" });
+    // Open the assistant message eagerly with empty text; each delta
+    // refreshes its snapshot. The `thought` frame sits alongside it for
+    // the reasoning channel; for non-thinking models it stays empty and
+    // closes immediately.
+    const out = openMessage("assistant");
     const thought = new ReasoningSection();
     transcript.push(thought);
-    transcript.push(out);
 
     const round = (async () => {
       await Promise.all([
@@ -1442,14 +1424,11 @@ async function turn(): Promise<TurnEnd> {
 
 const restored = await initializeWorkflow();
 if (!restored) {
-  transcript.push(
-    new MarkdownSection({
-      content:
-        "frances ready. Describe what you'd like to do and we'll plan it " +
-        "together first. Type `quit` to exit.",
-      closed: true,
-    }),
-  );
+  postMessage({
+    content:
+      "frances ready. Describe what you'd like to do and we'll plan it " +
+      "together first. Type `quit` to exit.",
+  });
   await saveState();
 }
 
@@ -1471,13 +1450,9 @@ async function ourLoop(): Promise<void> {
     }
 
     const msg = value.content.trim();
-    transcript.push(
-      new MarkdownSection({ content: msg, source: "user", closed: true }),
-    );
+    postMessage({ source: "user", content: msg });
     if (msg === "quit") {
-      transcript.push(
-        new MarkdownSection({ content: "bye", source: "assistant", closed: true }),
-      );
+      postMessage({ source: "assistant", content: "bye" });
       exit();
       break;
     }

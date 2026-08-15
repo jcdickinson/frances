@@ -11,7 +11,7 @@
 //!
 //! - `import { exit } from "frances:v1/workflow"`
 //! - `import { inbox } from "frances:v1/inbox"`
-//! - `import { transcript, MarkdownSection, ErrorSection, JsonSection } from "frances:v1/sections"`
+//! - `import { transcript, ErrorSection, JsonSection } from "frances:v1/sections"`
 //! - `import { ChatSession } from "frances:v1/chat"`
 //! - `import.meta.args` — per-invocation slash-command args.
 
@@ -57,14 +57,12 @@ pub enum SectionTranscript {
     /// initial body, if any); a later `Set` replaces its kind + bounded
     /// metadata — e.g. ShellOutput's state going `Running → Success` —
     /// carrying no body (`seed: None`). Does NOT seal anything: each
-    /// frame type chooses when it's done (markdown emits `Close` for its
-    /// predecessor before its own `Set`; shell output `Close`s when its
-    /// state goes terminal).
+    /// frame type chooses when it's done (e.g. reasoning `Close`s when
+    /// the model's thinking channel ends).
     Set { id: SectionId, section: SectionSpec },
     /// Append text to the frame with the given id. Valid for as long
-    /// as the frame remains open; the JS side enforces per-frame-type
-    /// rules (active-markdown slot, ShellOutput's open flag). The body
-    /// grows by delta — a full-value `Set` per chunk would be O(n²).
+    /// as the frame remains open. The body grows by delta — a
+    /// full-value `Set` per chunk would be O(n²).
     Append { id: SectionId, delta: String },
     /// Close the frame with the given id. The host emits a `BlockStop`
     /// and persists the row. Idempotent on unknown ids (the JS side
@@ -144,11 +142,11 @@ pub(crate) struct OutputSenders {
     pub usage: UnboundedSender<frances_models_llm::Usage>,
 }
 
-pub use frances_models_ui::{ReasoningState, SectionId, SectionKind, Source};
+pub use frances_models_ui::{ReasoningState, SectionId, SectionKind};
 
 /// What a [`SectionTranscript::Set`] carries: the section's kind +
 /// bounded metadata, plus an optional `seed` — the initial body chunk
-/// for text-bodied kinds (Markdown / ShellOutput / Error). One-shot
+/// for text-bodied kinds (Reasoning / Error). One-shot
 /// data kinds (ToolUse / Json / Diff) and metadata-only re-`Set`s leave
 /// it `None`. The streaming body never lives here; it grows via
 /// [`SectionTranscript::Append`].

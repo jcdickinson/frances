@@ -9,12 +9,10 @@
 
   const TAIL_LINES = 10;
 
-  function sourceSigil(): string {
-    if (section.kind.type !== 'markdown') return '';
-    if (section.kind.source === 'user') return '>';
-    if (section.kind.source === 'assistant') return '◆';
-    return '';
-  }
+  const referenced = $derived(
+    section.kind.type === 'entity_ref' ? entity(section.kind.entity_id) : undefined,
+  );
+  const Sigil = $derived(referenced ? viewsFor(referenced.kind).Sigil : undefined);
 
   function tailedText(): { hidden: number; text: string } {
     const lines = section.text.replace(/\n$/, '').split('\n');
@@ -38,17 +36,12 @@
   }
 </script>
 
-<article
-  class:streaming={!section.closed}
-  class:truncated={section.truncated}
-  class:user={section.kind.type === 'markdown' && section.kind.source === 'user'}
-  class="section"
->
-  <div class="sigil" aria-hidden="true">{sourceSigil()}</div>
+<article class:streaming={!section.closed} class:truncated={section.truncated} class="section">
+  <div class="sigil" aria-hidden="true">
+    {#if Sigil && referenced}<Sigil entity={referenced} />{/if}
+  </div>
   <div class="content">
-    {#if section.kind.type === 'markdown'}
-      <div class="prose">{section.text}</div>
-    {:else if section.kind.type === 'error'}
+    {#if section.kind.type === 'error'}
       <div class="error">frances: error: {section.text}</div>
     {:else if section.kind.type === 'tool_use'}
       <div class="tool">
@@ -67,7 +60,6 @@
       {#if tail.hidden > 0}<div class="collapsed">… [{tail.hidden} earlier lines]</div>{/if}
       {#if tail.text}<pre class="reasoning">{tail.text}</pre>{/if}
     {:else if section.kind.type === 'entity_ref'}
-      {@const referenced = entity(section.kind.entity_id)}
       {#if referenced}
         {@const Inline = viewsFor(referenced.kind).Inline}
         <Inline entity={referenced} />

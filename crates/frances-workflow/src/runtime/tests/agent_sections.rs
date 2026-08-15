@@ -17,10 +17,10 @@ async fn agent_sections_local_agents_emits_formatted_content() {
         "js",
         r#"
         import { localAgents } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await localAgents.prompt({});
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -77,10 +77,10 @@ async fn agent_sections_local_agents_returns_null_when_empty() {
         "js",
         r#"
         import { localAgents } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await localAgents.prompt({});
-        transcript.push(new MarkdownSection({ content: String(result) }));
+        transcript.push(new ErrorSection({ content: String(result) }));
         "#,
     );
     let mut handle = rt
@@ -107,7 +107,7 @@ async fn agent_sections_global_agents_section_shape() {
         "js",
         r#"
         import { globalAgents } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await globalAgents.prompt({});
         const isNullOrString = result === null || typeof result === "string";
@@ -121,7 +121,7 @@ async fn agent_sections_global_agents_section_shape() {
             hasPrecedence = result.includes("Project and local instructions take precedence");
         }
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             isNullOrString,
             hasCorrectName,
             hasHeader,
@@ -178,10 +178,10 @@ async fn agent_sections_nested_agents_inventory_emits_paths() {
         "js",
         r#"
         import { nestedAgentsInventory } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await nestedAgentsInventory.prompt({});
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt
@@ -227,10 +227,10 @@ async fn agent_sections_nested_agents_returns_null_when_empty() {
         "js",
         r#"
         import { nestedAgentsInventory } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await nestedAgentsInventory.prompt({});
-        transcript.push(new MarkdownSection({ content: String(result) }));
+        transcript.push(new ErrorSection({ content: String(result) }));
         "#,
     );
     let mut handle = rt
@@ -253,9 +253,9 @@ async fn agent_sections_are_stable_objects() {
         "js",
         r#"
         import { globalAgents, localAgents, nestedAgentsInventory } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
-        transcript.push(new MarkdownSection({ content: JSON.stringify({
+        transcript.push(new ErrorSection({ content: JSON.stringify({
             globalStable: globalAgents === globalAgents,
             localStable: localAgents === localAgents,
             nestedStable: nestedAgentsInventory === nestedAgentsInventory,
@@ -305,10 +305,10 @@ async fn agent_sections_local_agents_priority_order_in_output() {
         "js",
         r#"
         import { localAgents } from "frances:v1/agent-sections";
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection } from "frances:v1/sections";
 
         const result = await localAgents.prompt({});
-        transcript.push(new MarkdownSection({ content: result }));
+        transcript.push(new ErrorSection({ content: result }));
         "#,
     );
     let mut handle = rt

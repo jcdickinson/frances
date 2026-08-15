@@ -214,10 +214,6 @@ header {
     color: var(--accent);
     animation: pulse 900ms steps(2, end) infinite;
   }
-
-  &.user .content {
-    color: var(--accent);
-  }
 }
 
 .sigil {
@@ -230,6 +226,14 @@ header {
 pre {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+.prose.user {
+  color: var(--accent);
+}
+.prose.streaming::after {
+  content: ' ⠋';
+  color: var(--accent);
+  animation: pulse 900ms steps(2, end) infinite;
 }
 pre {
   margin: 6px 0 0;

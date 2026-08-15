@@ -1,56 +1,15 @@
 use super::*;
 
-/// `new MarkdownSection({ source })`, `{ content: undefined }`, and
-/// `{ content: null }` all produce `SectionKind::Markdown` with no seed.
+/// Pushing an empty frame and never writing to it produces no `Append`
+/// — just the `Set`, the close-time metadata `Set`, and the `Close`.
 #[tokio::test]
-async fn markdown_frame_content_can_be_omitted() {
+async fn empty_frame_pushes_and_closes_without_appends() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ source: "assistant" }));
-        transcript.push(new MarkdownSection({ content: undefined }));
-        transcript.push(new MarkdownSection({ content: null }));
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let (frames, done) = drive_one_cycle(&mut handle).await;
-    assert!(matches!(done, Some(Ok(()))));
-    for (i, expect_source) in [Source::Assistant, Source::Internal, Source::Internal]
-        .iter()
-        .enumerate()
-    {
-        match &frames[i] {
-            SectionTranscript::Set { section: spec, .. } => match &spec.kind {
-                SectionKind::Markdown { source } => {
-                    assert!(spec.seed.is_none(), "frame {i} should have no seed");
-                    assert_eq!(source, expect_source, "frame {i} source");
-                }
-                other => panic!("frame {i} unexpected kind {other:?}"),
-            },
-            other => panic!("frame {i} unexpected {other:?}"),
-        }
-    }
-}
-
-/// Pushing an empty-content frame and never writing to it produces
-/// `Set` + `Close` only — no `Append` in between.
-#[tokio::test]
-async fn empty_markdown_frame_pushes_and_closes_without_appends() {
-    let rt = Runtime::new(StubDeps::default()).unwrap();
-    let file = write_source(
-        "js",
-        r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        const f = new MarkdownSection({ source: "assistant" });
+        import { transcript, ReasoningSection } from "frances:v1/sections";
+        const f = new ReasoningSection();
         transcript.push(f);
         await f.writable.close();
         "#,
@@ -68,9 +27,14 @@ async fn empty_markdown_frame_pushes_and_closes_without_appends() {
     assert!(matches!(
         &frames[0],
         SectionTranscript::Set { section: spec, .. }
-            if matches!(&spec.kind, SectionKind::Markdown { .. }) && spec.seed.is_none()
+            if matches!(&spec.kind, SectionKind::Reasoning { .. })
     ));
-    assert!(matches!(&frames[1], SectionTranscript::Close { .. }));
+    assert!(
+        frames
+            .iter()
+            .any(|f| matches!(f, SectionTranscript::Close { .. })),
+        "closing the writable should seal the frame"
+    );
     assert!(
         !frames
             .iter()
@@ -85,39 +49,12 @@ async fn write_on_active_frame_emits_delta() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        const f = new MarkdownSection({ content: "hello" });
+        import { transcript, ReasoningSection } from "frances:v1/sections";
+        const f = new ReasoningSection();
         transcript.push(f);
         const w = f.writable.getWriter();
-        await w.write(" world");
+        await w.write("pondering");
         await w.close();
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let (frames, done) = drive_one_cycle(&mut handle).await;
-    assert!(matches!(done, Some(Ok(()))));
-    assert!(
-        matches!(&frames[0], SectionTranscript::Set { section: spec, .. } if matches!(&spec.kind, SectionKind::Markdown { .. }) && spec.seed.as_deref() == Some("hello"))
-    );
-    assert!(matches!(&frames[1], SectionTranscript::Append { delta, .. } if delta == " world"));
-}
-
-#[tokio::test]
-async fn markdown_frame_carries_source() {
-    let rt = Runtime::new(StubDeps::default()).unwrap();
-    let file = write_source(
-        "js",
-        r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "hi", source: "user" }));
-        transcript.push(new MarkdownSection({ content: "ok" }));
         "#,
     );
     let mut handle = rt
@@ -133,67 +70,9 @@ async fn markdown_frame_carries_source() {
     assert!(matches!(
         &frames[0],
         SectionTranscript::Set { section: spec, .. }
-            if matches!(&spec.kind, SectionKind::Markdown { source: Source::User })
-                && spec.seed.as_deref() == Some("hi")
+            if matches!(&spec.kind, SectionKind::Reasoning { .. })
     ));
-    assert!(matches!(
-        &frames[1],
-        SectionTranscript::Set { section: spec, .. }
-            if matches!(&spec.kind, SectionKind::Markdown { source: Source::Internal })
-                && spec.seed.as_deref() == Some("ok")
-    ));
-}
-
-#[tokio::test]
-async fn markdown_frame_rejects_non_string_source() {
-    let rt = Runtime::new(StubDeps::default()).unwrap();
-    let file = write_source(
-        "js",
-        r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        new MarkdownSection({ content: "hi", source: 42 });
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let (_frames, done) = drive_one_cycle(&mut handle).await;
-    let err = done.expect("workflow done").expect_err("expected throw");
-    assert!(
-        format!("{err}").contains("source"),
-        "error should mention source: {err}"
-    );
-}
-
-#[tokio::test]
-async fn markdown_frame_rejects_unknown_source_string() {
-    let rt = Runtime::new(StubDeps::default()).unwrap();
-    let file = write_source(
-        "js",
-        r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        new MarkdownSection({ content: "hi", source: "frances" });
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let (_frames, done) = drive_one_cycle(&mut handle).await;
-    let err = done.expect("workflow done").expect_err("expected throw");
-    assert!(
-        format!("{err}").contains("source"),
-        "error should mention source: {err}"
-    );
+    assert!(matches!(&frames[1], SectionTranscript::Append { delta, .. } if delta == "pondering"));
 }
 
 #[tokio::test]
@@ -202,10 +81,10 @@ async fn write_to_earlier_frame_after_newer_push_still_works() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        const a = new MarkdownSection({ content: "a" });
+        import { transcript, ReasoningSection } from "frances:v1/sections";
+        const a = new ReasoningSection();
         transcript.push(a);
-        transcript.push(new MarkdownSection({ content: "b" }));
+        transcript.push(new ReasoningSection());
         const w = a.writable.getWriter();
         await w.write(" extra");
         "#,
@@ -238,8 +117,8 @@ async fn frame_autoclose_can_be_disabled() {
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        const f = new MarkdownSection({ content: "" });
+        import { transcript, ReasoningSection } from "frances:v1/sections";
+        const f = new ReasoningSection();
         f.autoclose = false;
         transcript.push(f);
         const w = f.writable.getWriter();
@@ -263,48 +142,16 @@ async fn frame_autoclose_can_be_disabled() {
     assert_eq!(close_count, 0, "autoclose=false should suppress Close");
 }
 
-/// `new MarkdownSection({ ..., closed: true })` pre-seals the frame:
-/// `transcript.push` emits `Close` immediately after `Set`.
-#[tokio::test]
-async fn markdown_frame_closed_ctor_option_pushes_and_closes_in_one_shot() {
-    let rt = Runtime::new(StubDeps::default()).unwrap();
-    let file = write_source(
-        "js",
-        r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "hi", closed: true }));
-        "#,
-    );
-    let mut handle = rt
-        .start(Invocation {
-            source_path: file.path().to_path_buf(),
-            args: Vec::new(),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-    let (frames, done) = drive_one_cycle(&mut handle).await;
-    assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
-    let push_id = match frames.first() {
-        Some(SectionTranscript::Set { id, .. }) => *id,
-        other => panic!("expected push first, got {other:?}"),
-    };
-    assert!(
-        matches!(frames.get(1), Some(SectionTranscript::Close { id }) if *id == push_id),
-        "second frame must be the matching Close: {frames:?}"
-    );
-}
-
 /// `.close()` returns `this`; `transcript.push(frame.close())` emits
-/// `Set` then `Close`, the same as `{ closed: true }`.
+/// `Set` then `Close` in one shot.
 #[tokio::test]
-async fn markdown_frame_close_returns_this_for_chaining() {
+async fn frame_close_returns_this_for_chaining() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
-        transcript.push(new MarkdownSection({ content: "hi" }).close());
+        import { transcript, ReasoningSection } from "frances:v1/sections";
+        transcript.push(new ReasoningSection().close());
         "#,
     );
     let mut handle = rt
@@ -328,19 +175,19 @@ async fn markdown_frame_close_returns_this_for_chaining() {
 }
 
 #[tokio::test]
-async fn markdown_frame_writable_is_stable_writable_stream() {
+async fn frame_writable_is_stable_writable_stream() {
     let rt = Runtime::new(StubDeps::default()).unwrap();
     let file = write_source(
         "js",
         r#"
-        import { transcript, MarkdownSection } from "frances:v1/sections";
+        import { transcript, ErrorSection, ReasoningSection } from "frances:v1/sections";
         import { WritableStream } from "whatwg:web-streams";
-        const f = new MarkdownSection({ content: "hi" });
+        const f = new ReasoningSection();
         transcript.push(f);
         const w1 = f.writable;
         const w2 = f.writable;
-        const shape = `ws=${w1 instanceof WritableStream} stable=${w1 === w2} hasWrite=${typeof MarkdownSection.prototype.write}`;
-        transcript.push(new MarkdownSection({ content: shape }));
+        const shape = `ws=${w1 instanceof WritableStream} stable=${w1 === w2} hasWrite=${typeof ReasoningSection.prototype.write}`;
+        transcript.push(new ErrorSection({ content: shape }));
         "#,
     );
     let mut handle = rt
