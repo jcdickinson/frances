@@ -170,6 +170,10 @@ main {
   }
 }
 
+.hidden-tab {
+  display: none;
+}
+
 .scrollback {
   overflow: auto;
   padding: 30px clamp(20px, 5vw, 72px) 22px;

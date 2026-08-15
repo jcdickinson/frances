@@ -7,7 +7,7 @@
   import { viewsFor } from './entities/registry';
   import { entity, session, upsertEntity } from './stores/entities.svelte';
   import { applyStreamItem } from './stores/entityStreams.svelte';
-  import { activeTab } from './stores/tabs.svelte';
+  import { activeTab, openTabs } from './stores/tabs.svelte';
   import type { Command } from './commands';
   import { type Section, unwrap } from './types';
 
@@ -183,31 +183,38 @@
 <Sidebar />
 
 <main>
-  {#if activeTab() === null}
-    <section class="scrollback" bind:this={scrollback} aria-live="polite">
-      <header>
-        <div>frances session {sessionId}</div>
-        <div>
-          Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for
-          history. Ctrl-P for commands.
-        </div>
-      </header>
+  <!-- Every tab stays in the DOM (scroll position, subscriptions, and
+       transcript state survive switches); the inactive ones are just
+       display:none, which also keeps them out of main's grid. -->
+  <section
+    class="scrollback"
+    class:hidden-tab={activeTab() !== null}
+    bind:this={scrollback}
+    aria-live="polite"
+  >
+    <header>
+      <div>frances session {sessionId}</div>
+      <div>
+        Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for
+        history. Ctrl-P for commands.
+      </div>
+    </header>
 
-      {#each sections as section (section.id)}
-        <SectionView {section} />
-      {/each}
-    </section>
-  {:else}
-    {@const opened = entity(activeTab() ?? '')}
-    <section class="scrollback">
+    {#each sections as section (section.id)}
+      <SectionView {section} />
+    {/each}
+  </section>
+  {#each openTabs() as id (id)}
+    {@const opened = entity(id)}
+    <section class="scrollback" class:hidden-tab={activeTab() !== id}>
       {#if opened}
         {@const Opened = viewsFor(opened.kind).Opened}
         <Opened entity={opened} />
       {:else}
-        <div class="label">[entity {activeTab()}]</div>
+        <div class="label">[entity {id}]</div>
       {/if}
     </section>
-  {/if}
+  {/each}
 
   {#if paletteOpen}
     <CommandPalette {commands} onrun={runCommand} onclose={() => void closePalette()} />
