@@ -4,8 +4,10 @@
   import CommandPalette from './components/CommandPalette.svelte';
   import SectionView from './components/SectionView.svelte';
   import Sidebar from './components/Sidebar.svelte';
-  import { session, upsertEntity } from './stores/entities.svelte';
+  import { viewsFor } from './entities/registry';
+  import { entity, session, upsertEntity } from './stores/entities.svelte';
   import { applyStreamItem } from './stores/entityStreams.svelte';
+  import { activeTab } from './stores/tabs.svelte';
   import type { Command } from './commands';
   import { type Section, unwrap } from './types';
 
@@ -16,7 +18,7 @@
   let historyMode = $state(false);
   let paletteOpen = $state(false);
   let errorId = -1;
-  let scrollback: HTMLElement;
+  let scrollback = $state<HTMLElement | undefined>();
   let textarea: HTMLTextAreaElement;
 
   // Grow the textarea with its content; CSS max-height caps it at 5 lines.
@@ -181,19 +183,31 @@
 <Sidebar />
 
 <main>
-  <section class="scrollback" bind:this={scrollback} aria-live="polite">
-    <header>
-      <div>frances session {sessionId}</div>
-      <div>
-        Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for history.
-        Ctrl-P for commands.
-      </div>
-    </header>
+  {#if activeTab() === null}
+    <section class="scrollback" bind:this={scrollback} aria-live="polite">
+      <header>
+        <div>frances session {sessionId}</div>
+        <div>
+          Enter to send. Shift+Enter or Alt+Enter for newline. Esc to interrupt. Ctrl-O for
+          history. Ctrl-P for commands.
+        </div>
+      </header>
 
-    {#each sections as section (section.id)}
-      <SectionView {section} />
-    {/each}
-  </section>
+      {#each sections as section (section.id)}
+        <SectionView {section} />
+      {/each}
+    </section>
+  {:else}
+    {@const opened = entity(activeTab() ?? '')}
+    <section class="scrollback">
+      {#if opened}
+        {@const Opened = viewsFor(opened.kind).Opened}
+        <Opened entity={opened} />
+      {:else}
+        <div class="label">[entity {activeTab()}]</div>
+      {/if}
+    </section>
+  {/if}
 
   {#if paletteOpen}
     <CommandPalette {commands} onrun={runCommand} onclose={() => void closePalette()} />

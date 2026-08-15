@@ -1,6 +1,4 @@
 <script lang="ts">
-  import { Tabs } from 'bits-ui';
-  import { viewsFor } from '../entities/registry';
   import { entity, workspace } from '../stores/entities.svelte';
   import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
   import { asShellSnapshot } from '../entities/shell/types';
@@ -38,49 +36,39 @@
 </script>
 
 <aside class="sidebar" style:width="{width}px">
+  <h2>Tabs</h2>
+  <ul class="entity-tab-list">
+    <li class="entity-tab-row">
+      <button
+        class="entity-tab"
+        class:active={activeTab() === null}
+        onclick={() => focusTab(null)}
+      >transcript</button>
+    </li>
+    {#each openTabs() as id (id)}
+      <li class="entity-tab-row">
+        <button
+          class="entity-tab"
+          class:active={activeTab() === id}
+          onclick={() => focusTab(id)}
+          title={tabTitle(id)}
+        >{tabTitle(id)}</button>
+        <button
+          class="entity-tab-close"
+          onclick={() => closeTab(id)}
+          aria-label="Close tab"
+          title="Close tab"
+        >×</button>
+      </li>
+    {/each}
+  </ul>
+
   <h2>Directories</h2>
   <ul>
     {#each directories as directory (directory)}
       <li title={directory}>{basename(directory)}</li>
     {/each}
   </ul>
-
-  {#if openTabs().length > 0}
-    <h2>Open</h2>
-    <Tabs.Root
-      value={activeTab() ?? undefined}
-      onValueChange={(value) => focusTab(value)}
-      orientation="vertical"
-      class="entity-tabs"
-    >
-      <Tabs.List class="entity-tab-list">
-        {#each openTabs() as id (id)}
-          <div class="entity-tab-row">
-            <Tabs.Trigger value={id} class="entity-tab" title={tabTitle(id)}>
-              {tabTitle(id)}
-            </Tabs.Trigger>
-            <button
-              class="entity-tab-close"
-              onclick={() => closeTab(id)}
-              aria-label="Close tab"
-              title="Close tab"
-            >×</button>
-          </div>
-        {/each}
-      </Tabs.List>
-      {#each openTabs() as id (id)}
-        {@const state = entity(id)}
-        <Tabs.Content value={id} class="entity-tab-content">
-          {#if state}
-            {@const Opened = viewsFor(state.kind).Opened}
-            <Opened entity={state} />
-          {:else}
-            <div class="label">[entity {id}]</div>
-          {/if}
-        </Tabs.Content>
-      {/each}
-    </Tabs.Root>
-  {/if}
 </aside>
 
 <div

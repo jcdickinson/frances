@@ -85,24 +85,11 @@ main {
   }
 }
 
-// Sidebar as a vertical tabbed area: the aside stacks its headers,
-// the trigger list, and the active tab's pane; the pane takes the rest
-// of the column and scrolls on its own.
-.sidebar {
-  display: flex;
-  flex-direction: column;
-}
-
-.entity-tabs {
-  display: flex;
-  flex-direction: column;
-  flex: 1;
-  min-height: 0;
-}
-
-.entity-tab-list {
-  flex-shrink: 0;
-  margin-bottom: 10px;
+// Sidebar tab list: vertical triggers only — the active tab's content
+// renders in the main area (the transcript is the first, uncloseable
+// tab).
+.sidebar .entity-tab-list {
+  margin-bottom: 18px;
 }
 
 .entity-tab-row {
@@ -127,7 +114,7 @@ main {
   white-space: nowrap;
   cursor: pointer;
 
-  &[data-state='active'] {
+  &.active {
     color: var(--text-primary);
     background: var(--surface-well);
   }
@@ -144,13 +131,6 @@ main {
   &:hover {
     color: var(--danger-text);
   }
-}
-
-.entity-tab-content {
-  flex: 1;
-  min-height: 0;
-  overflow: auto;
-  scrollbar-color: var(--border-strong) transparent;
 }
 
 .entity-pane {
