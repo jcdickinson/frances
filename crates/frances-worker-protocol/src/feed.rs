@@ -99,6 +99,12 @@ impl<T> FeedSender<T> {
             .await
             .map_err(|error| FeedSendError(error.0))
     }
+
+    pub fn blocking_send(&self, item: T) -> Result<(), FeedSendError<T>> {
+        self.sender
+            .blocking_send(item)
+            .map_err(|error| FeedSendError(error.0))
+    }
 }
 
 pub struct FeedSendError<T>(pub T);

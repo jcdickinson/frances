@@ -57,8 +57,7 @@
 //!   `ReplaceAll`/`InsertAfter`/`InsertBefore`/`New`/`Overwrite` tool classes.
 //! - `frances:v1/tools/file_find_or_grep` — `FileSearch` primitive + `Search`
 //!   tool class. Combined name-pattern lookup, content search, and
-//!   directory listing via the ripgrep crates (`ignore::WalkParallel`
-//!   plus `grep-searcher`).
+//!   worker-backed directory listing and content search.
 //! - `frances:v1/tools/variable` — pure-JS `Variables` JSON store +
 //!   `Get`/`Set` tool classes.
 //! - `frances:v1/tool-family`   — pure-JS `defineToolFamily` + `defineTool`

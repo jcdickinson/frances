@@ -22,9 +22,13 @@ use parking_lot::Mutex;
 use tokio::sync::Notify;
 
 use frances_shell::{Shell, ShellError, ShellOptions};
+use frances_worker_protocol::FileSearchOptions;
 
 use super::real::{RealFs, RealTimer};
-use super::{FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer};
+use super::{
+    FileSearchResults, FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell,
+    WorkflowTimer,
+};
 use crate::closed::WorkflowClosed;
 
 /// Test IO bundle. Generic over the three sub-pieces so any one of
@@ -377,6 +381,13 @@ impl WorkflowFs for MockFs {
     async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         // No symlinks in the mock filesystem; return path as-is.
         Ok(path.to_path_buf())
+    }
+
+    async fn find_or_grep(&self, _options: FileSearchOptions) -> io::Result<FileSearchResults> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "find/grep is unavailable for the in-memory filesystem",
+        ))
     }
 }
 

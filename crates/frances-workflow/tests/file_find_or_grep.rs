@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use frances_workflow::{
-    Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
+    Invocation, Runtime, SectionKind, SectionTranscript, WorkerIo, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 
@@ -172,6 +172,82 @@ async fn search_finds_match_with_line_number_and_skips_binary() {
 }
 
 #[tokio::test]
+async fn find_and_grep_run_through_worker_io() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(root.path().join("a.txt"), "needle one\nneedle again\n").unwrap();
+    std::fs::write(root.path().join("z.txt"), "needle two\n").unwrap();
+    std::fs::write(root.path().join("ignored.txt"), "needle ignored\n").unwrap();
+    std::fs::write(root.path().join("skip.txt"), "needle excluded\n").unwrap();
+    std::fs::write(root.path().join(".hidden.txt"), "needle hidden\n").unwrap();
+    std::fs::write(root.path().join("blob.bin"), b"needle\0binary").unwrap();
+    let cwd = tempfile::tempdir().unwrap();
+
+    let (client_stream, worker_stream) = tokio::io::duplex(256 * 1024);
+    let worker = tokio::spawn(frances_worker::serve(worker_stream));
+    {
+        let client = frances_worker::Client::connect(client_stream)
+            .await
+            .unwrap();
+        let deps = StubDeps::with_io(WorkerIo::new(client.clone()));
+        deps.set_cwd(cwd.path().to_path_buf());
+        let root_arg = serde_json::to_string(&root.path().display().to_string()).unwrap();
+        let script = format!(
+            r#"
+            import {{ FileSearch }} from "frances:v1/tools/file_find_or_grep";
+            import {{ Editor }} from "frances:v1/tools/file";
+            import {{ transcript, ErrorSection }} from "frances:v1/sections";
+            const search = new FileSearch(new Editor());
+            const common = {{ root: {root_arg}, exclude: ["skip.txt"] }};
+            const listing = await search.search(common);
+            const matches = await search.search({{ ...common, search: "needle" }});
+            transcript.push(new ErrorSection({{ content: listing }}));
+            transcript.push(new ErrorSection({{ content: matches }}));
+            "#
+        );
+        let runtime = Runtime::new(deps).unwrap();
+        let source = write_source(&script);
+        let mut handle = runtime
+            .start(Invocation {
+                source_path: source.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (frames, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+
+        let listing: serde_json::Value = serde_json::from_str(&text_of(&frames[0])).unwrap();
+        let listed = listing["entries"].as_array().unwrap();
+        let listed_paths: Vec<&str> = listed
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(listed_paths, ["a.txt", "blob.bin", "z.txt"]);
+        assert_eq!(listed[1]["binary"], true);
+
+        let matches: serde_json::Value = serde_json::from_str(&text_of(&frames[1])).unwrap();
+        let matched = matches["entries"].as_array().unwrap();
+        let matched_paths: Vec<&str> = matched
+            .iter()
+            .map(|entry| entry["path"].as_str().unwrap())
+            .collect();
+        assert_eq!(matched_paths, ["a.txt", "z.txt"]);
+        assert_eq!(matched[0]["match_count"], 2);
+        assert_eq!(matched[1]["match_count"], 1);
+        assert!(matched.iter().all(|entry| {
+            entry["mtime"]
+                .as_str()
+                .is_some_and(|mtime| mtime.ends_with('Z'))
+        }));
+
+        client.shutdown().await.unwrap();
+    }
+    worker.await.unwrap().unwrap();
+}
+
+#[tokio::test]
 async fn huge_matching_line_returns_bounded_match_centered_excerpt() {
     let dir = tempfile::tempdir().unwrap();
     let mut body = vec![b'a'; 10 * 1024 * 1024];
@@ -188,7 +264,6 @@ async fn huge_matching_line_returns_bounded_match_centered_excerpt() {
 
     assert!(text.contains("UNIQUE_NEEDLE"), "excerpt lost match: {text}");
     assert!(text.len() <= 512, "excerpt was {} bytes", text.len());
-    assert_eq!(first["text_truncated"], true);
     assert_eq!(first["line_bytes"], body.len());
     assert!(
         text.starts_with('…') && text.ends_with('…'),

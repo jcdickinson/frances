@@ -7,9 +7,10 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use frances_shell::{QuietReason, ReadEvent, RunOpts, RunOutcome, WaitOpts};
 use frances_worker_protocol::{
-    Capability, Content, ErrorCode, Feed, FsMetadata, FsWriteMode, PROTOCOL_VERSION, ProtocolError,
-    ProtocolFeedError, ProtocolReader, ProtocolWriter, Request, RequestKind, Response,
-    ResponseKind, ShellId, ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
+    Capability, Content, ErrorCode, Feed, FileSearchEvent, FileSearchOptions, FsMetadata,
+    FsWriteMode, PROTOCOL_VERSION, ProtocolError, ProtocolFeedError, ProtocolReader,
+    ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellId, ShellOptions,
+    ShellOutput, ShellWaitQuiet, multiplex,
 };
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -200,6 +201,18 @@ impl Client {
             ResponseKind::Path(path) => Ok(path),
             _ => Err(ClientError::WrongResponseKind),
         }
+    }
+
+    pub async fn find_or_grep(
+        &self,
+        options: FileSearchOptions,
+    ) -> Result<Feed<FileSearchEvent>, ClientError> {
+        let ResponseKind::FileSearch { results } =
+            self.call(RequestKind::FsFindOrGrep { options }).await?
+        else {
+            return Err(ClientError::WrongResponseKind);
+        };
+        Ok(results)
     }
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {

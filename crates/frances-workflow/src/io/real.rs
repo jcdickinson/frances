@@ -13,11 +13,13 @@ use tokio::sync::Notify;
 
 use frances_shell::{ReadEvent, RunOpts, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
 use frances_worker::{Client as WorkerClient, WorkerShell};
-use frances_worker_protocol::{Content, ErrorCode, ShellOptions as WorkerShellOptions};
+use frances_worker_protocol::{
+    Content, ErrorCode, FileSearchEvent, FileSearchOptions, ShellOptions as WorkerShellOptions,
+};
 
 use super::{
-    FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowShellHandle,
-    WorkflowTimer,
+    FileSearchCollector, FileSearchResults, FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo,
+    WorkflowShell, WorkflowShellHandle, WorkflowTimer,
 };
 use crate::closed::WorkflowClosed;
 
@@ -321,6 +323,36 @@ impl WorkflowFs for WorkerFs {
             .await
             .map_err(worker_io_error)
     }
+
+    async fn find_or_grep(&self, options: FileSearchOptions) -> io::Result<FileSearchResults> {
+        let mut feed = self
+            .client
+            .find_or_grep(options)
+            .await
+            .map_err(worker_io_error)?;
+        let mut collector = FileSearchCollector::default();
+        loop {
+            match feed
+                .next()
+                .await
+                .map_err(|error| io::Error::new(io::ErrorKind::UnexpectedEof, error))?
+            {
+                Some(FileSearchEvent::Done { truncated_at }) => {
+                    return Ok(collector.finish(truncated_at));
+                }
+                Some(FileSearchEvent::Error { error }) => {
+                    return Err(io::Error::other(error.error.message));
+                }
+                Some(event) => collector.push(event)?,
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "worker search feed ended without completion",
+                    ));
+                }
+            }
+        }
+    }
 }
 
 fn worker_io_error(error: frances_worker::ClientError) -> io::Error {
@@ -373,5 +405,33 @@ impl WorkflowFs for RealFs {
 
     async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         tokio::fs::canonicalize(path).await
+    }
+
+    async fn find_or_grep(&self, options: FileSearchOptions) -> io::Result<FileSearchResults> {
+        tokio::task::spawn_blocking(move || {
+            let collector = Arc::new(parking_lot::Mutex::new(FileSearchCollector::default()));
+            let emitted = collector.clone();
+            let outcome = frances_worker::find_or_grep(
+                options,
+                || false,
+                move |event| {
+                    emitted
+                        .lock()
+                        .push(event)
+                        .expect("local search emits consistent events");
+                    true
+                },
+            )
+            .map_err(io::Error::other)?;
+            let frances_worker::SearchOutcome::Done { truncated_at } = outcome else {
+                return Err(io::Error::other("local search cancelled"));
+            };
+            let collector = Arc::try_unwrap(collector)
+                .map_err(|_| io::Error::other("local search collector is still shared"))?
+                .into_inner();
+            Ok(collector.finish(truncated_at))
+        })
+        .await
+        .map_err(|error| io::Error::other(format!("search task: {error}")))?
     }
 }

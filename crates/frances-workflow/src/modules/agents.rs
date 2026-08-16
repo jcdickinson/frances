@@ -22,6 +22,8 @@ use rquickjs::promise::Promised;
 use rquickjs::{Array, Ctx, Function, IntoJs, Object, Result as JsResult, Value};
 use twox_hash::XxHash64;
 
+use frances_worker_protocol::{FileSearchOptions, FileSearchPatterns, FileSearchQuery};
+
 use crate::WorkflowError;
 use crate::deps::WorkflowDeps;
 use crate::io::WorkflowFs;
@@ -234,54 +236,64 @@ async fn discover_nested<D: WorkflowDeps>(deps: &D) -> Vec<String> {
             "CLAUDE.local.md",
         ] {
             let p = root.join(name);
-            if let Ok(canonical) = deps.fs().canonicalize(&p).await {
-                root_level.insert(canonical);
+            match deps.fs().canonicalize(&p).await {
+                Ok(canonical) => {
+                    root_level.insert(canonical);
+                }
+                Err(error) => {
+                    tracing::debug!(?p, ?error, "root agent candidate not found");
+                }
             }
         }
         let frances = root.join(".agents").join("frances");
         for name in &["AGENTS.md", "AGENTS.local.md"] {
             let p = frances.join(name);
-            if let Ok(canonical) = deps.fs().canonicalize(&p).await {
-                root_level.insert(canonical);
+            match deps.fs().canonicalize(&p).await {
+                Ok(canonical) => {
+                    root_level.insert(canonical);
+                }
+                Err(error) => {
+                    tracing::debug!(?p, ?error, "root agent candidate not found");
+                }
             }
         }
     }
 
     for root in roots {
-        let walker = ignore::WalkBuilder::new(root)
-            .hidden(false) // include dotfiles like .agents/AGENTS.md
-            .git_ignore(true)
-            .git_global(true)
-            .git_exclude(true)
-            .build();
-
-        for entry in walker.flatten() {
-            // Skip if not a file or if at root depth.
-            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+        let patterns = FileSearchPatterns::new(vec!["**/AGENTS.md".to_owned()])
+            .expect("one nested agent pattern");
+        let found = match deps
+            .fs()
+            .find_or_grep(FileSearchOptions {
+                cwd: None,
+                root: Some(root.clone()),
+                query: FileSearchQuery::Paths { patterns },
+                exclude: Vec::new(),
+                ignore: true,
+                hidden: true,
+                depth: None,
+            })
+            .await
+        {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(?root, ?error, "nested agent discovery failed");
                 continue;
             }
-            if entry.depth() < 1 {
+        };
+
+        for entry in found.entries {
+            let path = root.join(entry.file.path);
+            let canonical = deps.fs().canonicalize(&path).await.unwrap_or_else(|error| {
+                tracing::debug!(?path, ?error, "nested agent canonicalization failed");
+                path.clone()
+            });
+
+            if root_level.contains(&canonical) {
                 continue;
             }
-
-            let path = entry.path();
-
-            // Only match AGENTS.md files (case-sensitive).
-            if path.file_name().is_some_and(|n| n == "AGENTS.md") {
-                let canonical = deps
-                    .fs()
-                    .canonicalize(path)
-                    .await
-                    .unwrap_or_else(|_| path.to_path_buf());
-
-                // Exclude root-level files already covered by localAgents.
-                if root_level.contains(&canonical) {
-                    continue;
-                }
-
-                if seen_canonical.insert(canonical) {
-                    results.push(path.to_string_lossy().into_owned());
-                }
+            if seen_canonical.insert(canonical) {
+                results.push(path.to_string_lossy().into_owned());
             }
         }
     }

@@ -10,9 +10,10 @@ use frances_shell::{
     ReadEvent, RunOpts, RunOutcome, Shell, ShellOptions as LocalShellOptions, WaitOpts,
 };
 use frances_worker_protocol::{
-    Capability, Content, ErrorCode, Feed, FeedSender, FsMetadata, FsWriteMode, Hello,
-    PROTOCOL_VERSION, ProtocolError, Request, RequestKind, Response, ResponseError, ResponseKind,
-    ShellId, ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
+    Capability, Content, ErrorCode, Feed, FeedSender, FileSearchEvent, FileSearchOptions,
+    FsMetadata, FsWriteMode, Hello, PROTOCOL_VERSION, ProtocolError, Request, RequestKind,
+    Response, ResponseError, ResponseKind, ShellId, ShellOptions, ShellOutput, ShellWaitQuiet,
+    multiplex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -276,6 +277,7 @@ async fn handle(
             .await
             .map(ResponseKind::Path)
             .map_err(|error| io_error(&path, error)),
+        RequestKind::FsFindOrGrep { options } => Ok(open_file_search(options)),
         RequestKind::ShellOpen { options } => open_shell(state, options).await,
         RequestKind::ShellRun {
             shell,
@@ -343,6 +345,68 @@ async fn handle(
             Ok(ResponseKind::Unit)
         }
         RequestKind::Cancel { .. } | RequestKind::Shutdown => unreachable!(),
+    }
+}
+
+fn open_file_search(options: FileSearchOptions) -> ResponseKind {
+    let (sender, results) = Feed::channel();
+    tokio::spawn(run_file_search(sender, options));
+    ResponseKind::FileSearch { results }
+}
+
+async fn run_file_search(sender: FeedSender<FileSearchEvent>, options: FileSearchOptions) {
+    let blocking_sender = sender.clone();
+    let searched = tokio::task::spawn_blocking(move || {
+        let cancellation = blocking_sender.clone();
+        crate::search::find_or_grep(
+            options,
+            move || cancellation.is_closed(),
+            move |event| match blocking_sender.blocking_send(event) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::debug!(?error, "search result receiver closed");
+                    false
+                }
+            },
+        )
+    })
+    .await;
+
+    let truncated_at = match searched {
+        Ok(Ok(crate::search::SearchOutcome::Done { truncated_at })) => truncated_at,
+        Ok(Ok(crate::search::SearchOutcome::Cancelled)) => return,
+        Ok(Err(error)) => {
+            if sender
+                .send(FileSearchEvent::Error {
+                    error: ResponseError::new(error.code(), error.to_string()),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!("search error receiver closed");
+            }
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(?error, "file search task failed");
+            if sender
+                .send(FileSearchEvent::Error {
+                    error: ResponseError::new(ErrorCode::Internal, format!("search task: {error}")),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!("search error receiver closed");
+            }
+            return;
+        }
+    };
+    if sender
+        .send(FileSearchEvent::Done { truncated_at })
+        .await
+        .is_err()
+    {
+        tracing::debug!("search result receiver closed before completion");
     }
 }
 

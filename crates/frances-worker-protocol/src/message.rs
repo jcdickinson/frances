@@ -1,10 +1,11 @@
+use std::num::{NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{Content, Feed};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -49,6 +50,9 @@ pub enum RequestKind {
     },
     FsCanonicalize {
         path: PathBuf,
+    },
+    FsFindOrGrep {
+        options: FileSearchOptions,
     },
     ShellOpen {
         options: ShellOptions,
@@ -99,6 +103,9 @@ pub enum ResponseKind {
     Content(Content),
     Metadata(FsMetadata),
     Path(PathBuf),
+    FileSearch {
+        results: Feed<FileSearchEvent>,
+    },
     ShellOpened {
         shell: ShellId,
         output: Feed<ShellOutput>,
@@ -133,6 +140,104 @@ pub struct FsMetadata {
     pub mtime_ns: i64,
     pub size: u64,
     pub is_dir: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileSearchOptions {
+    pub cwd: Option<PathBuf>,
+    pub root: Option<PathBuf>,
+    pub query: FileSearchQuery,
+    pub exclude: Vec<String>,
+    pub ignore: bool,
+    pub hidden: bool,
+    pub depth: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "query", rename_all = "snake_case")]
+pub enum FileSearchQuery {
+    All,
+    Paths {
+        patterns: FileSearchPatterns,
+    },
+    Search {
+        regex: String,
+        paths: Vec<String>,
+        matches: FileSearchMatchMode,
+    },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FileSearchMatchMode {
+    Count,
+    Content,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(transparent)]
+pub struct FileSearchPatterns(Vec<String>);
+
+impl FileSearchPatterns {
+    pub fn new(patterns: Vec<String>) -> Option<Self> {
+        if patterns.is_empty() {
+            None
+        } else {
+            Some(Self(patterns))
+        }
+    }
+
+    pub fn into_vec(self) -> Vec<String> {
+        self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for FileSearchPatterns {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let patterns = Vec::<String>::deserialize(deserializer)?;
+        Self::new(patterns)
+            .ok_or_else(|| serde::de::Error::custom("file search patterns cannot be empty"))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum FileSearchEvent {
+    Listed {
+        file: FileSearchFile,
+        binary: bool,
+    },
+    Counted {
+        file: FileSearchFile,
+    },
+    Matched {
+        file: FileSearchFile,
+        matched: FileSearchMatch,
+    },
+    Done {
+        truncated_at: Option<NonZeroUsize>,
+    },
+    Error {
+        error: ResponseError,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSearchFile {
+    pub path: PathBuf,
+    pub size: u64,
+    pub mtime_ns: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FileSearchMatch {
+    pub line: NonZeroU64,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_bytes: Option<NonZeroUsize>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

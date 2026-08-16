@@ -1,36 +1,22 @@
 //! `frances:v1/tools/file_find_or_grep` — combined name-pattern lookup,
 //! content search, and directory listing primitive.
 //!
-//! `new FileSearch(editor)` exposes a single async method, `search(args)`,
-//! that drives `ignore::WalkParallel` (the same multi-threaded walker ripgrep
-//! uses) and — when `args.search` is set — runs `grep-searcher` per-file
-//! through a per-thread `Searcher`/`RegexMatcher` clone. The result is a
-//! JSON string the JS wrapper parses; building a JS value tree directly
-//! would be slower than `JSON.parse` of a single string for this much
-//! data.
-//!
-//! Argument parsing goes through `frances_core::JsonRepair` so the
-//! qwen3-coder family's double-encoded array args (`paths: "[\"a\"]"`
-//! instead of `paths: ["a"]`) parse the same as the strict shape — at
-//! zero cost on the happy path.
-//!
-//! Paths are resolved against the latest invocation's cwd
-//! (`WorkflowDeps::current_cwd`), matching the file editor.
+//! `new FileSearch(editor)` exposes one async `search(args)` method. The
+//! complete filesystem operation is delegated through [`WorkflowFs`], so
+//! production performs the walk and grep in the worker. Results cross the
+//! worker protocol as typed entries and become one JSON string at the JS
+//! boundary.
 
 use std::hash::Hasher;
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::num::{NonZeroU64, NonZeroUsize};
+use std::path::PathBuf;
 
-use frances_core::{JsonRepair, expand_tilde, resolve_relative};
+use chrono::{DateTime, SecondsFormat, Utc};
+use frances_core::JsonRepair;
 use frances_edit::{LoopKey, LoopKind};
-use globset::{Glob, GlobSet, GlobSetBuilder};
-use grep_matcher::Matcher;
-use grep_regex::RegexMatcher;
-use grep_searcher::{BinaryDetection, Sink, SinkMatch};
-use ignore::WalkState;
-use ignore::overrides::OverrideBuilder;
+use frances_worker_protocol::{
+    FileSearchMatchMode, FileSearchOptions, FileSearchPatterns, FileSearchQuery,
+};
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
 use rquickjs::promise::Promised;
@@ -41,25 +27,10 @@ use twox_hash::XxHash3_64;
 use super::file::EditorJs;
 use super::throw_js as throw;
 use crate::deps::{EditorSession, WorkflowDeps};
-
-/// Hard cap on result entries. Workers atomically reserve a slot before
-/// pushing; the (cap+1)-th reservation flips a sticky `truncated` flag
-/// and the visitor returns `WalkState::Quit`. Per-thread already-found
-/// entries may still trickle in before the quit propagates, so the
-/// final list is trimmed to exactly `RESULT_CAP`.
-const RESULT_CAP: usize = 1000;
-
-/// Maximum UTF-8 size of the text retained for one matching line.
-/// A result-count cap cannot protect the context window from minified or
-/// generated files where a single line may be several megabytes long.
-const MATCH_TEXT_CAP: usize = 512;
+use crate::io::{FileSearchResult, FileSearchResultKind, FileSearchResults, WorkflowFs};
 
 fn default_true() -> bool {
     true
-}
-
-fn is_false(value: &bool) -> bool {
-    !value
 }
 
 #[derive(Deserialize, Debug)]
@@ -78,10 +49,6 @@ struct FileSearchArgs {
     paths_only: bool,
 }
 
-// Hand-written so `Default::default()` matches the serde defaults
-// (`ignore: true`). `#[derive(Default)]` would give `ignore: false`
-// because `#[serde(default = ...)]` only fires during deserialization,
-// not for `Default::default()` — easy to footgun.
 impl Default for FileSearchArgs {
     fn default() -> Self {
         Self {
@@ -97,6 +64,40 @@ impl Default for FileSearchArgs {
     }
 }
 
+impl FileSearchArgs {
+    fn into_options(self, cwd: Option<PathBuf>) -> Result<FileSearchOptions, &'static str> {
+        let query = match (self.paths, self.search) {
+            (None, None) => FileSearchQuery::All,
+            (Some(paths), None) => {
+                let Some(patterns) = FileSearchPatterns::new(paths) else {
+                    return Err(
+                        "provide at least one of \"paths\" or \"search\", or call with no arguments",
+                    );
+                };
+                FileSearchQuery::Paths { patterns }
+            }
+            (paths, Some(regex)) => FileSearchQuery::Search {
+                regex,
+                paths: paths.unwrap_or_default(),
+                matches: if self.paths_only {
+                    FileSearchMatchMode::Count
+                } else {
+                    FileSearchMatchMode::Content
+                },
+            },
+        };
+        Ok(FileSearchOptions {
+            cwd,
+            root: self.root.filter(|root| !root.is_empty()).map(PathBuf::from),
+            query,
+            exclude: self.exclude.unwrap_or_default(),
+            ignore: self.ignore,
+            hidden: self.hidden,
+            depth: self.depth,
+        })
+    }
+}
+
 pub(crate) fn build_file_search_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
     deps: D,
@@ -106,9 +107,6 @@ pub(crate) fn build_file_search_ctor<'js, D: WorkflowDeps>(
         move |ctx: Ctx<'js>,
               editor: Class<'js, EditorJs<D>>|
               -> JsResult<Class<'js, FileSearchJs<D>>> {
-            // `new FileSearch(editor)` binds to the editor's per-context read
-            // session, so search and edit share one loop guard (an edit clears
-            // it) and both reset together when the context clears.
             let session = editor.borrow().session.clone();
             Class::instance(
                 ctx.clone(),
@@ -139,30 +137,28 @@ impl<'js, D: WorkflowDeps> JsClass<'js> for FileSearchJs<D> {
     type Mutable = Readable;
 
     fn prototype(ctx: &Ctx<'js>) -> JsResult<Option<Object<'js>>> {
-        let proto = Object::new(ctx.clone())?;
-
-        proto.set(
+        let prototype = Object::new(ctx.clone())?;
+        prototype.set(
             "search",
             Function::new(
                 ctx.clone(),
                 |this: This<Class<'js, FileSearchJs<D>>>, value: Value<'js>| {
                     let raw = super::rquickjs_to_json(&value);
-                    let b = this.0.borrow();
-                    let deps = b.deps.clone();
-                    let session = b.session.clone();
-                    drop(b);
+                    let search = this.0.borrow();
+                    let deps = search.deps.clone();
+                    let session = search.session.clone();
+                    drop(search);
                     Ok::<_, rquickjs::Error>(Promised::from(async move {
                         let result = match raw {
-                            Ok(v) => search_inner(&deps, &session, v).await,
-                            Err(msg) => Err(msg),
+                            Ok(value) => search_inner(&deps, &session, value).await,
+                            Err(message) => Err(message),
                         };
                         SearchStringResult(result)
                     }))
                 },
             )?,
         )?;
-
-        Ok(Some(proto))
+        Ok(Some(prototype))
     }
 
     fn constructor(_ctx: &Ctx<'js>) -> JsResult<Option<Constructor<'js>>> {
@@ -176,47 +172,47 @@ async fn search_inner<D: WorkflowDeps>(
     raw: serde_json::Value,
 ) -> Result<String, String> {
     let args = JsonRepair::<FileSearchArgs>::from_value(raw)
-        .map_err(|e| format!("parse args: {e}"))?
+        .map_err(|error| format!("parse args: {error}"))?
         .into_inner();
     let key = LoopKey::Search {
         args_hash: hash_search_args(&args),
     };
-
     if session.lock().await.is_loop(&key) {
-        return Err(loop_error_search().to_string());
+        return Err(loop_error_search().to_owned());
     }
 
-    let cwd = deps.current_cwd();
-    let result = tokio::task::spawn_blocking(move || do_search(args, cwd.as_deref()))
+    let options = args
+        .into_options(deps.current_cwd())
+        .map_err(str::to_owned)?;
+    let result = deps
+        .fs()
+        .find_or_grep(options)
         .await
-        .map_err(|e| format!("join: {e}"))??;
+        .map_err(|error| error.to_string())?;
+    let payload = Payload::from(result);
+    let json = serde_json::to_string(&payload).map_err(|error| format!("serialize: {error}"))?;
     session.lock().await.record_loop(key);
-    Ok(result)
+    Ok(json)
 }
 
 fn hash_search_args(args: &FileSearchArgs) -> u64 {
-    // Hash a canonical byte sequence straight into the hasher (rather than
-    // serde_json, or a throwaway Vec) so the layout is fixed regardless of
-    // field-order drift in `FileSearchArgs`. Order matches the struct fields.
     let mut hasher = XxHash3_64::new();
-    // Discriminator — keeps file_find_or_grep keys from colliding with
-    // anything else that might one day land in this hasher.
     hasher.write(&[LoopKind::Search as u8]);
-    if let Some(r) = &args.root {
-        hasher.write(r.as_bytes());
+    if let Some(root) = &args.root {
+        hasher.write(root.as_bytes());
     }
     hasher.write(&[0xFE]);
     hash_str_list_sorted(&mut hasher, args.paths.as_deref());
     hasher.write(&[0xFE]);
-    if let Some(s) = &args.search {
-        hasher.write(s.as_bytes());
+    if let Some(search) = &args.search {
+        hasher.write(search.as_bytes());
     }
     hasher.write(&[0xFE]);
     hash_str_list_sorted(&mut hasher, args.exclude.as_deref());
     hasher.write(&[0xFE]);
     hasher.write(&[u8::from(args.ignore), u8::from(args.hidden)]);
-    if let Some(d) = args.depth {
-        hasher.write(&d.to_le_bytes());
+    if let Some(depth) = args.depth {
+        hasher.write(&depth.to_le_bytes());
     }
     hasher.write(&[0xFE]);
     hasher.write(&[u8::from(args.paths_only)]);
@@ -241,400 +237,77 @@ fn loop_error_search() -> &'static str {
      — change the query, the paths, or the tool, or move on."
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize)]
 struct Entry {
     path: String,
     size: u64,
     mtime: String,
     binary: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    match_count: Option<u64>,
+    match_count: Option<NonZeroU64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     first_match: Option<FirstMatch>,
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize)]
 struct FirstMatch {
-    line: u64,
+    line: NonZeroU64,
     text: String,
-    #[serde(skip_serializing_if = "is_false")]
-    text_truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    line_bytes: Option<usize>,
+    line_bytes: Option<NonZeroUsize>,
 }
 
-#[derive(Serialize, Debug)]
-struct Truncated {
-    count: String,
-    message: String,
+impl From<frances_worker_protocol::FileSearchMatch> for FirstMatch {
+    fn from(first_match: frances_worker_protocol::FileSearchMatch) -> Self {
+        Self {
+            line: first_match.line,
+            text: first_match.text,
+            line_bytes: first_match.line_bytes,
+        }
+    }
 }
 
-#[derive(Serialize, Debug)]
+impl From<FileSearchResult> for Entry {
+    fn from(result: FileSearchResult) -> Self {
+        let (binary, match_count, first_match) = match result.kind {
+            FileSearchResultKind::Listed { binary } => (binary, None, None),
+            FileSearchResultKind::Counted { match_count } => (false, Some(match_count), None),
+            FileSearchResultKind::Matched { match_count, first } => {
+                (false, Some(match_count), Some(FirstMatch::from(first)))
+            }
+        };
+        Self {
+            path: result.file.path.to_string_lossy().into_owned(),
+            size: result.file.size,
+            mtime: format_mtime(result.file.mtime_ns),
+            binary,
+            match_count,
+            first_match,
+        }
+    }
+}
+
+#[derive(Serialize)]
 struct Payload {
     entries: Vec<Entry>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    truncated: Option<Truncated>,
+    truncated_at: Option<NonZeroUsize>,
 }
 
-/// Resolve the walk root. When `root_arg` is provided, expand `~`,
-/// resolve against `cwd`, canonicalize, and verify it's an existing
-/// directory. When absent, fall back to `cwd` (or `.`).
-fn resolve_root(root_arg: Option<&str>, cwd: Option<&Path>) -> Result<PathBuf, String> {
-    let root = match root_arg {
-        Some(r) if !r.is_empty() => {
-            let expanded = expand_tilde(Path::new(r));
-            let resolved = resolve_relative(&expanded, cwd);
-            let canonicalized = resolved
-                .canonicalize()
-                .map_err(|e| format!("root {:?}: {e}", resolved.display()))?;
-            if !canonicalized.is_dir() {
-                return Err(format!(
-                    "root {:?} is not a directory",
-                    canonicalized.display()
-                ));
-            }
-            canonicalized
-        }
-        _ => cwd.map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
-    };
-    Ok(root)
-}
-
-fn do_search(args: FileSearchArgs, cwd: Option<&Path>) -> Result<String, String> {
-    let (paths, search) = match (args.paths, args.search) {
-        // No-args → recursive listing of pwd. Empty `paths` ↦ no
-        // include-set, i.e. accept every gitignore-permitted file.
-        (None, None) => (Vec::new(), None),
-        // Empty paths with no search → loud error, not silent wildcard.
-        (Some(p), None) if p.is_empty() => {
-            return Err(
-                "provide at least one of \"paths\" or \"search\", or call with no arguments"
-                    .to_string(),
-            );
-        }
-        (p, s) => (p.unwrap_or_default(), s),
-    };
-
-    let root = resolve_root(args.root.as_deref(), cwd)?;
-
-    // Excludes go through `OverrideBuilder` as negations — overrides
-    // intentionally win over `.gitignore`, which is what you want for
-    // an explicit "don't show me this" filter.
-    //
-    // Includes (`paths`) use a separate `GlobSet` that we test per
-    // entry, NOT an Override whitelist. Overrides with positive
-    // patterns bypass `.gitignore` (rg's `-g` semantics): a whitelist
-    // of `**/*` would silently include every gitignored file. Keeping
-    // includes out of the override pipeline preserves gitignore
-    // precedence — `paths: ["**/*.rs"]` still excludes vendored Rust
-    // under `target/`.
-    let exclude_override = match args.exclude.as_ref() {
-        Some(excludes) if !excludes.is_empty() => {
-            let mut b = OverrideBuilder::new(&root);
-            for p in excludes {
-                b.add(&format!("!{p}"))
-                    .map_err(|e| format!("invalid exclude {p:?}: {e}"))?;
-            }
-            Some(b.build().map_err(|e| format!("build overrides: {e}"))?)
-        }
-        _ => None,
-    };
-
-    let include_set: Option<GlobSet> = if paths.is_empty() {
-        None
-    } else {
-        let mut b = GlobSetBuilder::new();
-        for p in &paths {
-            let glob = Glob::new(p).map_err(|e| format!("invalid glob {p:?}: {e}"))?;
-            b.add(glob);
-        }
-        Some(b.build().map_err(|e| format!("build glob set: {e}"))?)
-    };
-
-    let mut builder = ignore::WalkBuilder::new(&root);
-    builder
-        .hidden(!args.hidden)
-        .git_ignore(args.ignore)
-        .git_global(args.ignore)
-        .git_exclude(args.ignore)
-        .parents(args.ignore)
-        .ignore(args.ignore)
-        // `.gitignore` is normally only consulted inside a real git tree
-        // (`require_git` defaults to `true`). For an agent that may run
-        // in scaffolded/non-git dirs the expected behavior is "the file
-        // is still honored" — matches what ripgrep itself does.
-        .require_git(false);
-    if let Some(o) = exclude_override {
-        builder.overrides(o);
-    }
-    if let Some(d) = args.depth {
-        builder.max_depth(Some(d));
-    }
-    let walker = builder.build_parallel();
-
-    let matcher = if let Some(ref pat) = search {
-        Some(RegexMatcher::new(pat).map_err(|e| format!("invalid regex {pat:?}: {e}"))?)
-    } else {
-        None
-    };
-
-    let results: Arc<Mutex<Vec<Entry>>> = Arc::new(Mutex::new(Vec::new()));
-    let reserved = Arc::new(AtomicUsize::new(0));
-    let truncated = Arc::new(AtomicUsize::new(0));
-    let paths_only = args.paths_only;
-    let want_search = search.is_some();
-    let root_for_visitors = root.clone();
-    let include_set = Arc::new(include_set);
-
-    walker.run(|| {
-        let results = results.clone();
-        let reserved = reserved.clone();
-        let truncated = truncated.clone();
-        let matcher = matcher.clone();
-        let include_set = include_set.clone();
-        let root = root_for_visitors.clone();
-        let mut searcher = grep_searcher::SearcherBuilder::new()
-            .binary_detection(BinaryDetection::quit(0))
-            .build();
-        Box::new(move |entry| {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(_) => return WalkState::Continue,
-            };
-            if !entry.file_type().is_some_and(|t| t.is_file()) {
-                return WalkState::Continue;
-            }
-            let path = entry.path();
-            // Include-glob test against the path relative to root so
-            // patterns like `src/**/*.rs` work the way the agent wrote
-            // them. Falls back to the absolute path if strip fails
-            // (shouldn't happen — walker yields under root).
-            if let Some(set) = include_set.as_ref().as_ref() {
-                let rel = path.strip_prefix(&root).unwrap_or(path);
-                if !set.is_match(rel) {
-                    return WalkState::Continue;
-                }
-            }
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => return WalkState::Continue,
-            };
-            let size = meta.len();
-            let mtime = meta
-                .modified()
-                .ok()
-                .and_then(systemtime_to_iso8601)
-                .unwrap_or_default();
-            let binary = is_binary_quick(path);
-
-            if want_search && binary {
-                return WalkState::Continue;
-            }
-
-            let (match_count, first_match) = if let Some(m) = matcher.as_ref() {
-                let mut sink = MatchSink::new(m, !paths_only);
-                if searcher.search_path(m, path, &mut sink).is_err() {
-                    return WalkState::Continue;
-                }
-                if sink.count == 0 {
-                    return WalkState::Continue;
-                }
-                let mc = Some(sink.count);
-                let fm = if paths_only { None } else { sink.first };
-                (mc, fm)
-            } else {
-                (None, None)
-            };
-
-            let slot = reserved.fetch_add(1, Ordering::Relaxed);
-            if slot >= RESULT_CAP {
-                truncated.fetch_add(1, Ordering::Relaxed);
-                return WalkState::Quit;
-            }
-
-            let display_path = path
-                .strip_prefix(&root)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .into_owned();
-
-            let entry = Entry {
-                path: display_path,
-                size,
-                mtime,
-                binary,
-                match_count,
-                first_match,
-            };
-            if let Ok(mut g) = results.lock() {
-                g.push(entry);
-            }
-            WalkState::Continue
-        })
-    });
-
-    let mut entries = Arc::try_unwrap(results)
-        .map_err(|_| "results arc still shared after walk".to_string())?
-        .into_inner()
-        .map_err(|e| format!("results mutex: {e}"))?;
-    entries.sort_by(|a, b| a.path.cmp(&b.path));
-    // In-flight workers may have pushed past the cap before the Quit
-    // propagated; trim deterministically.
-    if entries.len() > RESULT_CAP {
-        entries.truncate(RESULT_CAP);
-    }
-    let was_truncated = truncated.load(Ordering::Relaxed) > 0;
-    let truncated_info = was_truncated.then(|| Truncated {
-        count: format!("{RESULT_CAP}+"),
-        message: format!(
-            "{RESULT_CAP}+ matches, capped at {RESULT_CAP} — narrow paths or search to see all"
-        ),
-    });
-
-    let payload = Payload {
-        entries,
-        truncated: truncated_info,
-    };
-    serde_json::to_string(&payload).map_err(|e| format!("serialize: {e}"))
-}
-
-struct MatchSink<'a> {
-    matcher: &'a RegexMatcher,
-    capture_first: bool,
-    count: u64,
-    first: Option<FirstMatch>,
-}
-
-impl<'a> MatchSink<'a> {
-    fn new(matcher: &'a RegexMatcher, capture_first: bool) -> Self {
+impl From<FileSearchResults> for Payload {
+    fn from(results: FileSearchResults) -> Self {
         Self {
-            matcher,
-            capture_first,
-            count: 0,
-            first: None,
+            entries: results.entries.into_iter().map(Entry::from).collect(),
+            truncated_at: results.truncated_at,
         }
     }
 }
 
-impl Sink for MatchSink<'_> {
-    type Error = std::io::Error;
-
-    fn matched(
-        &mut self,
-        _searcher: &grep_searcher::Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> Result<bool, std::io::Error> {
-        self.count += 1;
-        if self.capture_first && self.first.is_none() {
-            let (text, line_bytes) = match_excerpt(self.matcher, mat.bytes());
-            let line = mat.line_number().unwrap_or(0);
-            self.first = Some(FirstMatch {
-                line,
-                text,
-                text_truncated: line_bytes.is_some(),
-                line_bytes,
-            });
-        }
-        Ok(true)
-    }
-}
-
-/// Keep a bounded excerpt with the actual regex match about one third of the
-/// way into the preview. Prefix-only truncation is nearly useless for a match
-/// near the end of a minified file.
-fn match_excerpt(matcher: &RegexMatcher, bytes: &[u8]) -> (String, Option<usize>) {
-    let bytes = trim_line_terminator(bytes);
-    if bytes.len() <= MATCH_TEXT_CAP {
-        let mut text = String::from_utf8_lossy(bytes).into_owned();
-        let expanded_past_cap = text.len() > MATCH_TEXT_CAP;
-        truncate_utf8(&mut text, MATCH_TEXT_CAP);
-        return (text, expanded_past_cap.then_some(bytes.len()));
-    }
-
-    const ELLIPSIS: &str = "…";
-    let source_cap = MATCH_TEXT_CAP - (ELLIPSIS.len() * 2);
-    let match_start = matcher.find(bytes).ok().flatten().map_or(0, |m| m.start());
-    let start = match_start
-        .saturating_sub(source_cap / 3)
-        .min(bytes.len() - source_cap);
-    let end = start + source_cap;
-
-    let mut text = String::with_capacity(MATCH_TEXT_CAP);
-    if start > 0 {
-        text.push_str(ELLIPSIS);
-    }
-    text.push_str(&String::from_utf8_lossy(&bytes[start..end]));
-    if end < bytes.len() {
-        text.push_str(ELLIPSIS);
-    }
-    truncate_utf8(&mut text, MATCH_TEXT_CAP);
-    (text, Some(bytes.len()))
-}
-
-fn trim_line_terminator(mut bytes: &[u8]) -> &[u8] {
-    while bytes.last().is_some_and(|b| matches!(b, b'\n' | b'\r')) {
-        bytes = &bytes[..bytes.len() - 1];
-    }
-    bytes
-}
-
-fn truncate_utf8(text: &mut String, byte_cap: usize) {
-    if text.len() <= byte_cap {
-        return;
-    }
-    let mut end = byte_cap;
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    text.truncate(end);
-}
-
-/// Cheap binary detection: peek the first 8 KiB and look for NUL.
-/// Matches what `grep_searcher::BinaryDetection::quit` does internally
-/// once it starts reading, but lets us tag files we never feed to the
-/// searcher (i.e. when `search` is unset).
-fn is_binary_quick(path: &Path) -> bool {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
+fn format_mtime(nanoseconds: Option<i64>) -> String {
+    let Some(nanoseconds) = nanoseconds else {
+        return String::new();
     };
-    let mut buf = [0u8; 8192];
-    let n = match f.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    buf[..n].contains(&0)
-}
-
-/// ISO 8601 / RFC 3339 formatter (UTC, second precision) without a
-/// chrono/time dep. Uses Howard Hinnant's civil-from-days algorithm,
-/// good for the full proleptic Gregorian range we care about.
-fn systemtime_to_iso8601(t: SystemTime) -> Option<String> {
-    let secs = t.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs() as i64;
-    let (year, mo, day, h, m, s) = civil_from_unix(secs);
-    Some(format!("{year:04}-{mo:02}-{day:02}T{h:02}:{m:02}:{s:02}Z"))
-}
-
-fn civil_from_unix(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400) as u32;
-    let h = tod / 3600;
-    let m = (tod / 60) % 60;
-    let s = tod % 60;
-
-    // Hinnant 2013: `civil_from_days`.
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if mo <= 2 { y + 1 } else { y };
-    (year as i32, mo as u32, d as u32, h, m, s)
+    DateTime::<Utc>::from_timestamp_nanos(nanoseconds).to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
 struct SearchStringResult(Result<String, String>);
@@ -642,23 +315,8 @@ struct SearchStringResult(Result<String, String>);
 impl<'js> IntoJs<'js> for SearchStringResult {
     fn into_js(self, ctx: &Ctx<'js>) -> JsResult<Value<'js>> {
         match self.0 {
-            Ok(s) => s.into_js(ctx),
-            Err(msg) => Err(throw(ctx, &msg)),
+            Ok(string) => string.into_js(ctx),
+            Err(message) => Err(throw(ctx, &message)),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn civil_from_unix_known_dates() {
-        // 1970-01-01 00:00:00 UTC
-        assert_eq!(civil_from_unix(0), (1970, 1, 1, 0, 0, 0));
-        // 2000-01-01 00:00:00 UTC = 946684800
-        assert_eq!(civil_from_unix(946_684_800), (2000, 1, 1, 0, 0, 0));
-        // 2024-02-29 12:34:56 UTC = 1709210096
-        assert_eq!(civil_from_unix(1_709_210_096), (2024, 2, 29, 12, 34, 56));
     }
 }

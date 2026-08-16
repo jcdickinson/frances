@@ -88,7 +88,7 @@ function _errResult(call_id, err) {
 
 function _formatEntry(e, hasSearch) {
   if (hasSearch && e.first_match) {
-    const truncation = e.first_match.text_truncated
+    const truncation = e.first_match.line_bytes !== undefined
       ? `  [line truncated from ${e.first_match.line_bytes}B]`
       : "";
     const location = `${e.path}:${e.first_match.line}:${e.first_match.text}`;
@@ -96,6 +96,10 @@ function _formatEntry(e, hasSearch) {
   }
   if (hasSearch) return `${e.path}  (${e.match_count} matches)`;
   return `${e.path}  (${e.size}B)`;
+}
+
+function _truncationMessage(limit) {
+  return `${limit}+ entries, capped at ${limit} — narrow paths or search to see all`;
 }
 
 function _utf8Length(text) {
@@ -149,9 +153,9 @@ function _formatInline(result, hasSearch, byteCap = INLINE_RESULT_BYTE_CAP) {
       `… ${omitted} entries omitted from this response (${INLINE_RESULT_BYTE_CAP / 1024} KiB output limit); narrow paths/search or use into`,
     );
   }
-  if (result.truncated) {
+  if (result.truncated_at !== undefined) {
     lines.push("");
-    lines.push(result.truncated.message);
+    lines.push(_truncationMessage(result.truncated_at));
   }
   return lines.join("\n");
 }
@@ -162,12 +166,15 @@ function _formatInline(result, hasSearch, byteCap = INLINE_RESULT_BYTE_CAP) {
 function _formatSummary(varName, result, hasSearch) {
   const n = result.entries.length;
   const head = result.entries.slice(0, 5);
-  const headLine = `${varName} = ${n}${result.truncated ? "+" : ""} entries`;
-  const truncLine = result.truncated ? `\n${result.truncated.message}` : "";
+  const truncated = result.truncated_at !== undefined;
+  const headLine = `${varName} = ${n}${truncated ? "+" : ""} entries`;
+  const truncLine = truncated
+    ? `\n${_truncationMessage(result.truncated_at)}`
+    : "";
   const previewCap =
     INLINE_RESULT_BYTE_CAP - _utf8Length(headLine) - _utf8Length(truncLine) - 2;
   const preview = _formatInline(
-    { entries: head, truncated: null },
+    { entries: head },
     hasSearch,
     previewCap,
   );

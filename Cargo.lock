@@ -1953,8 +1953,14 @@ dependencies = [
 name = "frances-worker"
 version = "0.1.0"
 dependencies = [
+ "frances-core",
  "frances-shell",
  "frances-worker-protocol",
+ "globset",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1989,11 +1995,6 @@ dependencies = [
  "frances-worker",
  "frances-worker-protocol",
  "frances-workflow",
- "globset",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
  "jaq-core",
  "jaq-json",
  "jaq-std",
