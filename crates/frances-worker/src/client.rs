@@ -7,9 +7,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use frances_shell::{QuietReason, ReadEvent, RunOpts, RunOutcome, WaitOpts};
 use frances_worker_protocol::{
-    Capability, Content, Feed, FsMetadata, PROTOCOL_VERSION, ProtocolError, ProtocolReader,
-    ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellId, ShellOptions,
-    ShellOutput, ShellWaitQuiet, multiplex,
+    Capability, Content, Feed, FsMetadata, PROTOCOL_VERSION, ProtocolError, ProtocolFeedError,
+    ProtocolReader, ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellId,
+    ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
 };
 use thiserror::Error;
 use tokio::process::{Child, Command};
@@ -37,6 +37,8 @@ pub enum ClientError {
     Spawn { path: PathBuf, source: io::Error },
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
+    #[error(transparent)]
+    Feed(#[from] ProtocolFeedError),
     #[error("content IO: {0}")]
     ContentIo(#[from] io::Error),
     #[error("worker closed the connection")]

@@ -1,4 +1,4 @@
-use frances_worker_protocol::{Connection, Content};
+use frances_worker_protocol::{Content, multiplex};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 
@@ -16,10 +16,15 @@ async fn content_round_trips_outside_json() {
         content: Content::from_bytes(b"hello\0world".to_vec()),
     };
 
+    let (left_read, left_write) = tokio::io::split(left);
+    let (right_read, right_write) = tokio::io::split(right);
+    let (_left_reader, left_writer) = multiplex(left_read, left_write);
+    let (mut right_reader, _right_writer) = multiplex(right_read, right_write);
+
     let sender = tokio::spawn(async move {
-        Connection::new(left).send(&send).await.unwrap();
+        left_writer.send(send).await.unwrap();
     });
-    let received: Message = Connection::new(right).receive().await.unwrap().unwrap();
+    let received: Message = right_reader.receive().await.unwrap().unwrap();
     sender.await.unwrap();
 
     assert_eq!(received.name, "example");

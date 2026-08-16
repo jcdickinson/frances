@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::io;
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
@@ -14,27 +15,102 @@ use frances_worker_protocol::{
     ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
-use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 
 struct ShellResource {
-    shell: AsyncMutex<Shell>,
-    events: AsyncMutex<mpsc::UnboundedReceiver<ReadEvent>>,
-    output: FeedSender<ShellOutput>,
-    output_sink: mpsc::UnboundedSender<ReadEvent>,
+    commands: mpsc::Sender<ShellCommand>,
+}
+
+struct ReapableShell {
+    shell: Option<Shell>,
+    reaper: mpsc::UnboundedSender<Shell>,
+}
+
+impl Deref for ReapableShell {
+    type Target = Shell;
+    fn deref(&self) -> &Shell {
+        self.shell.as_ref().expect("shell already reaped")
+    }
+}
+
+impl DerefMut for ReapableShell {
+    fn deref_mut(&mut self) -> &mut Shell {
+        self.shell.as_mut().expect("shell already reaped")
+    }
+}
+
+impl Drop for ReapableShell {
+    fn drop(&mut self) {
+        if let Some(shell) = self.shell.take() {
+            let _ = self.reaper.send(shell);
+        }
+    }
+}
+
+enum ShellCommand {
+    Run {
+        script: String,
+        opts: RunOpts,
+        reply: oneshot::Sender<Result<(), ResponseError>>,
+    },
+    Wait {
+        quiet: Duration,
+        reply: oneshot::Sender<Result<RunOutcome, ResponseError>>,
+    },
+    Kill {
+        reply: oneshot::Sender<Result<(), ResponseError>>,
+    },
+    SetVar {
+        name: String,
+        value: Content,
+        reply: oneshot::Sender<Result<(), ResponseError>>,
+    },
+    GetVar {
+        name: String,
+        reply: oneshot::Sender<Result<String, ResponseError>>,
+    },
+}
+
+impl ShellResource {
+    async fn call<T>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<Result<T, ResponseError>>) -> ShellCommand,
+    ) -> Result<T, ResponseError> {
+        let (reply, response) = oneshot::channel();
+        self.commands
+            .send(make(reply))
+            .await
+            .map_err(|_| ResponseError::new(ErrorCode::Io, "shell closed"))?;
+        response
+            .await
+            .map_err(|_| ResponseError::new(ErrorCode::Io, "shell closed"))?
+    }
 }
 
 struct ServerState {
     next_shell: AtomicU64,
     shells: Mutex<HashMap<ShellId, Arc<ShellResource>>>,
     requests: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    shell_reaper: mpsc::UnboundedSender<Shell>,
 }
 
 impl ServerState {
     fn new() -> Arc<Self> {
+        let (shell_reaper, mut shells) = mpsc::unbounded_channel::<Shell>();
+        tokio::spawn(async move {
+            while let Some(mut shell) = shells.recv().await {
+                shell
+                    .shutdown_running(Duration::from_secs(5))
+                    .await
+                    .inspect_err(|error| tracing::warn!(?error, "failed to kill shell"))
+                    .ok();
+            }
+        });
         Arc::new(Self {
             next_shell: AtomicU64::new(1),
             shells: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
+            shell_reaper,
         })
     }
 
@@ -194,17 +270,23 @@ async fn handle(
         } => {
             let stdin = read_optional_content(stdin).await.map_err(content_error)?;
             let resource = state.shell(shell)?;
-            let mut local = resource.shell.lock().await;
-            local.set_output_sink(Some(resource.output_sink.clone()));
-            local
-                .start(&script, RunOpts { stdin, persist })
-                .await
-                .map_err(shell_error)?;
+            resource
+                .call(|reply| ShellCommand::Run {
+                    script,
+                    opts: RunOpts { stdin, persist },
+                    reply,
+                })
+                .await?;
             Ok(ResponseKind::Unit)
         }
         RequestKind::ShellWaitQuiet { shell, quiet_ms } => {
             let resource = state.shell(shell)?;
-            let outcome = wait_quiet(&resource, Duration::from_millis(quiet_ms)).await?;
+            let outcome = resource
+                .call(|reply| ShellCommand::Wait {
+                    quiet: Duration::from_millis(quiet_ms),
+                    reply,
+                })
+                .await?;
             match outcome {
                 RunOutcome::Quiet { .. } => Ok(ResponseKind::ShellWaitQuiet(ShellWaitQuiet::Quiet)),
                 RunOutcome::Done { .. } => Ok(ResponseKind::ShellWaitQuiet(ShellWaitQuiet::Exit)),
@@ -217,24 +299,22 @@ async fn handle(
         RequestKind::ShellKill { shell } => {
             state
                 .shell(shell)?
-                .shell
-                .lock()
-                .await
-                .kill_running()
-                .await
-                .map_err(shell_error)?;
+                .call(|reply| ShellCommand::Kill { reply })
+                .await?;
             Ok(ResponseKind::Unit)
         }
         RequestKind::ShellSetVar { shell, name, value } => {
-            let resource = state.shell(shell)?;
-            let mut local = resource.shell.lock().await;
-            set_var(&mut local, name, value).await?;
+            state
+                .shell(shell)?
+                .call(|reply| ShellCommand::SetVar { name, value, reply })
+                .await?;
             Ok(ResponseKind::Unit)
         }
         RequestKind::ShellGetVar { shell, name } => {
-            let resource = state.shell(shell)?;
-            let mut local = resource.shell.lock().await;
-            let value = get_var(&mut local, name).await?;
+            let value = state
+                .shell(shell)?
+                .call(|reply| ShellCommand::GetVar { name, reply })
+                .await?;
             Ok(ResponseKind::Content(Content::from_bytes(
                 value.into_bytes(),
             )))
@@ -255,7 +335,7 @@ async fn open_shell(
     state: &Arc<ServerState>,
     options: ShellOptions,
 ) -> Result<ResponseKind, ResponseError> {
-    let mut shell = Shell::spawn(LocalShellOptions {
+    let shell = Shell::spawn(LocalShellOptions {
         cwd: options.cwd,
         env: options
             .env
@@ -269,32 +349,72 @@ async fn open_shell(
     let shell_id = state.next_shell.fetch_add(1, Ordering::Relaxed);
     let (output, output_feed) = Feed::channel();
     let (events, receiver) = mpsc::unbounded_channel();
-    shell.set_output_sink(Some(events.clone()));
+    let (commands, command_receiver) = mpsc::channel(16);
+    tokio::spawn(run_shell(
+        ReapableShell {
+            shell: Some(shell),
+            reaper: state.shell_reaper.clone(),
+        },
+        output,
+        events,
+        receiver,
+        command_receiver,
+    ));
     state
         .shells
         .lock()
         .expect("shell registry poisoned")
-        .insert(
-            shell_id,
-            Arc::new(ShellResource {
-                shell: AsyncMutex::new(shell),
-                events: AsyncMutex::new(receiver),
-                output,
-                output_sink: events,
-            }),
-        );
+        .insert(shell_id, Arc::new(ShellResource { commands }));
     Ok(ResponseKind::ShellOpened {
         shell: shell_id,
         output: output_feed,
     })
 }
 
-async fn wait_quiet(
-    resource: &ShellResource,
+async fn run_shell(
+    mut shell: ReapableShell,
+    output: FeedSender<ShellOutput>,
+    events: mpsc::UnboundedSender<ReadEvent>,
+    mut event_receiver: mpsc::UnboundedReceiver<ReadEvent>,
+    mut commands: mpsc::Receiver<ShellCommand>,
+) {
+    shell.set_output_sink(Some(events));
+    loop {
+        tokio::select! {
+            () = output.closed() => break,
+            command = commands.recv() => match command {
+                Some(ShellCommand::Run { script, opts, reply }) => {
+                    let _ = reply.send(shell.start(&script, opts).await.map_err(shell_error));
+                }
+                Some(ShellCommand::Wait { quiet, reply }) => {
+                    actor_wait(&mut shell, &mut event_receiver, &output, quiet, reply).await;
+                    if output.is_closed() { break; }
+                }
+                Some(ShellCommand::Kill { reply }) => {
+                    let result = shell.kill_running().await
+                        .inspect_err(|error| tracing::warn!(?error, "failed to kill shell"))
+                        .map_err(shell_error);
+                    let _ = reply.send(result);
+                }
+                Some(ShellCommand::SetVar { name, value, reply }) => {
+                    let _ = reply.send(set_var(&mut shell, name, value).await);
+                }
+                Some(ShellCommand::GetVar { name, reply }) => {
+                    let _ = reply.send(get_var(&mut shell, name).await);
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+async fn actor_wait(
+    shell: &mut Shell,
+    events: &mut mpsc::UnboundedReceiver<ReadEvent>,
+    output: &FeedSender<ShellOutput>,
     quiet: Duration,
-) -> Result<RunOutcome, ResponseError> {
-    let mut shell = resource.shell.lock().await;
-    let mut events = resource.events.lock().await;
+    mut reply: oneshot::Sender<Result<RunOutcome, ResponseError>>,
+) {
     let waiting = shell.keep_waiting(WaitOpts {
         quiet: Some(quiet),
         max: None,
@@ -302,21 +422,25 @@ async fn wait_quiet(
     tokio::pin!(waiting);
     let outcome = loop {
         tokio::select! {
-            outcome = &mut waiting => break outcome.map_err(shell_error)?,
+            outcome = &mut waiting => break outcome.map_err(shell_error),
+            () = output.closed() => return,
+            () = reply.closed() => return,
             event = events.recv() => {
                 if let Some(event) = event {
-                    send_output(resource, event).await;
+                    if !send_output(output, event).await { return; }
                 }
             }
         }
     };
     while let Ok(event) = events.try_recv() {
-        send_output(resource, event).await;
+        if !send_output(output, event).await {
+            return;
+        }
     }
-    Ok(outcome)
+    let _ = reply.send(outcome);
 }
 
-async fn send_output(resource: &ShellResource, event: ReadEvent) {
+async fn send_output(output: &FeedSender<ShellOutput>, event: ReadEvent) -> bool {
     let item = match event {
         ReadEvent::Output(bytes) => Some(ShellOutput::Output {
             content: Content::from_bytes(bytes),
@@ -325,7 +449,9 @@ async fn send_output(resource: &ShellResource, event: ReadEvent) {
         ReadEvent::Quiet { .. } | ReadEvent::Dead => None,
     };
     if let Some(item) = item {
-        let _ = resource.output.send(item).await;
+        output.send(item).await.is_ok()
+    } else {
+        true
     }
 }
 

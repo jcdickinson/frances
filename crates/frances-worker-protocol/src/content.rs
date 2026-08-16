@@ -17,7 +17,13 @@ pub(crate) enum PendingContent {
     File(TempPath),
 }
 
-pub(crate) type Encoded = (Vec<u8>, Vec<(u64, PendingContent)>);
+/// A complete encoded message and the content attachments it references.
+/// Keeping these together makes cancellation drop the JSON and its
+/// attachments as one unit.
+pub(crate) struct Encoded {
+    pub(crate) json: Vec<u8>,
+    pub(crate) pending: Vec<(u64, PendingContent)>,
+}
 
 enum ContentState {
     Pending(PendingContent),
@@ -178,7 +184,7 @@ pub(crate) fn encode<T: Serialize>(value: &T) -> Result<Encoded, serde_json::Err
             .expect("protocol encoding context disappeared")
             .pending
     });
-    encoded.map(|json| (json, pending))
+    encoded.map(|json| Encoded { json, pending })
 }
 
 pub(crate) fn decode<'de, T: Deserialize<'de>>(

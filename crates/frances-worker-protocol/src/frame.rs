@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::io;
 
-use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tempfile::NamedTempFile;
 use thiserror::Error;
@@ -27,32 +26,23 @@ pub enum ProtocolError {
     InvalidFrame(String),
 }
 
-pub struct Connection<S> {
+pub(crate) struct Connection<S> {
     stream: S,
     received: HashMap<u64, Content>,
 }
 
 impl<S> Connection<S> {
-    pub fn new(stream: S) -> Self {
+    pub(crate) fn new(stream: S) -> Self {
         Self {
             stream,
             received: HashMap::new(),
         }
     }
-
-    pub fn into_inner(self) -> S {
-        self.stream
-    }
 }
 
 impl<S: AsyncWrite + Unpin> Connection<S> {
-    pub async fn send<T: Serialize>(&mut self, value: &T) -> Result<(), ProtocolError> {
-        let encoded = content::encode(value).map_err(ProtocolError::Encode)?;
-        self.send_encoded(encoded).await
-    }
-
     pub(crate) async fn send_encoded(&mut self, encoded: Encoded) -> Result<(), ProtocolError> {
-        let (json, pending) = encoded;
+        let Encoded { json, pending } = encoded;
 
         for (id, source) in pending {
             self.send_content(id, source).await?;
@@ -101,13 +91,6 @@ impl<S: AsyncWrite + Unpin> Connection<S> {
 }
 
 impl<S: AsyncRead + Unpin> Connection<S> {
-    pub async fn receive<T: DeserializeOwned>(&mut self) -> Result<Option<T>, ProtocolError> {
-        let Some(raw) = self.receive_raw().await? else {
-            return Ok(None);
-        };
-        raw.decode().map(Some)
-    }
-
     pub(crate) async fn receive_raw(&mut self) -> Result<Option<RawMessage>, ProtocolError> {
         loop {
             let Some(header) = self.read_header().await? else {

@@ -2,9 +2,10 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncRead, AsyncWrite};
 
+use crate::ProtocolError;
 use crate::feed::{self, DecodeContext, InboundFeeds, OutboundFeeds, Writer};
+use crate::frame::Connection;
 use crate::frame::RawMessage;
-use crate::{Connection, ProtocolError};
 
 /// Serialized writing half of a multiplexed protocol connection.
 #[derive(Clone)]

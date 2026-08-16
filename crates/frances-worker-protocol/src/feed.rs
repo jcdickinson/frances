@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use thiserror::Error;
 use tokio::io::AsyncWrite;
 use tokio::sync::{mpsc, oneshot};
 
@@ -15,6 +16,14 @@ use crate::frame::{Connection, ProtocolError, RawMessage};
 const FEED_CAPACITY: usize = 16;
 
 pub type FeedId = u64;
+
+#[derive(Debug, Error)]
+pub enum ProtocolFeedError {
+    #[error("feed is closed")]
+    Closed,
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
+}
 pub(crate) type InboundFeeds = Arc<Mutex<HashMap<FeedId, mpsc::Sender<RawMessage>>>>;
 pub(crate) type OutboundFeeds = Arc<Mutex<HashMap<FeedId, tokio::task::AbortHandle>>>;
 
@@ -76,6 +85,14 @@ impl<T> Clone for FeedSender<T> {
 }
 
 impl<T> FeedSender<T> {
+    pub async fn closed(&self) {
+        self.sender.closed().await;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.sender.is_closed()
+    }
+
     pub async fn send(&self, item: T) -> Result<(), FeedSendError<T>> {
         self.sender
             .send(item)
@@ -115,7 +132,7 @@ impl<T> Feed<T> {
         )
     }
 
-    pub async fn next(&mut self) -> Result<Option<T>, ProtocolError>
+    pub async fn next(&mut self) -> Result<Option<T>, ProtocolFeedError>
     where
         T: DeserializeOwned,
     {
@@ -125,32 +142,37 @@ impl<T> Feed<T> {
                 .get_mut()
                 .expect("feed state mutex poisoned")
                 .as_mut()
-                .ok_or_else(|| ProtocolError::InvalidFrame("feed has been transferred".into()))?;
+                .ok_or_else(|| {
+                    ProtocolFeedError::Protocol(ProtocolError::InvalidFrame(
+                        "feed has been transferred".into(),
+                    ))
+                })?;
             let FeedState::Remote {
                 receiver, context, ..
             } = state
             else {
-                return Err(ProtocolError::InvalidFrame(
+                return Err(ProtocolFeedError::Protocol(ProtocolError::InvalidFrame(
                     "cannot receive from a feed before it is transferred".into(),
-                ));
+                )));
             };
             (receiver.recv().await, context.clone())
         };
         let Some(raw) = raw else {
-            return Ok(None);
+            return Err(ProtocolFeedError::Closed);
         };
-        let header: FeedHeader =
-            serde_json::from_slice(&raw.json).map_err(ProtocolError::Decode)?;
+        let header: FeedHeader = serde_json::from_slice(&raw.json)
+            .map_err(ProtocolError::Decode)
+            .map_err(ProtocolFeedError::Protocol)?;
         if header.end.is_some() {
-            return Ok(None);
+            return Err(ProtocolFeedError::Closed);
         }
-        with_decode_context(context, || {
+        Ok(with_decode_context(context, || {
             raw.decode::<FeedItem<T>>().map(|frame| Some(frame.item))
-        })
+        })?)
     }
 
     /// Return the next already-buffered item without waiting for the wire.
-    pub fn try_next(&mut self) -> Result<Option<T>, ProtocolError>
+    pub fn try_next(&mut self) -> Result<Option<T>, ProtocolFeedError>
     where
         T: DeserializeOwned,
     {
@@ -160,31 +182,37 @@ impl<T> Feed<T> {
                 .get_mut()
                 .expect("feed state mutex poisoned")
                 .as_mut()
-                .ok_or_else(|| ProtocolError::InvalidFrame("feed has been transferred".into()))?;
+                .ok_or_else(|| {
+                    ProtocolFeedError::Protocol(ProtocolError::InvalidFrame(
+                        "feed has been transferred".into(),
+                    ))
+                })?;
             let FeedState::Remote {
                 receiver, context, ..
             } = state
             else {
-                return Err(ProtocolError::InvalidFrame(
+                return Err(ProtocolFeedError::Protocol(ProtocolError::InvalidFrame(
                     "cannot receive from a feed before it is transferred".into(),
-                ));
+                )));
             };
             let raw = match receiver.try_recv() {
                 Ok(raw) => raw,
-                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
-                    return Ok(None);
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(None),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(ProtocolFeedError::Closed);
                 }
             };
             (raw, context.clone())
         };
-        let header: FeedHeader =
-            serde_json::from_slice(&raw.json).map_err(ProtocolError::Decode)?;
+        let header: FeedHeader = serde_json::from_slice(&raw.json)
+            .map_err(ProtocolError::Decode)
+            .map_err(ProtocolFeedError::Protocol)?;
         if header.end.is_some() {
-            return Ok(None);
+            return Err(ProtocolFeedError::Closed);
         }
-        with_decode_context(context, || {
+        Ok(with_decode_context(context, || {
             raw.decode::<FeedItem<T>>().map(|frame| Some(frame.item))
-        })
+        })?)
     }
 }
 

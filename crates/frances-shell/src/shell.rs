@@ -250,6 +250,31 @@ impl Shell {
         signal_pgid(in_flight.pgid, libc::SIGKILL).map_err(ShellError::Signal)
     }
 
+    /// Gracefully terminate the in-flight process group, escalating to
+    /// `SIGKILL` when it does not exit within `grace`.
+    pub async fn shutdown_running(&mut self, grace: Duration) -> ShellResult<()> {
+        let Some(in_flight) = self.in_flight.as_mut() else {
+            return Ok(());
+        };
+        signal_pgid(in_flight.pgid, libc::SIGTERM)
+            .inspect_err(|error| {
+                tracing::warn!(?error, "failed to send SIGTERM to shell process group")
+            })
+            .map_err(ShellError::Signal)?;
+        if tokio::time::timeout(grace, in_flight.child.wait())
+            .await
+            .is_err()
+        {
+            signal_pgid(in_flight.pgid, libc::SIGKILL)
+                .inspect_err(|error| {
+                    tracing::warn!(?error, "failed to send SIGKILL to shell process group")
+                })
+                .map_err(ShellError::Signal)?;
+            let _ = in_flight.child.wait().await;
+        }
+        Ok(())
+    }
+
     async fn start_run(&mut self, cmd: &str, opts: RunOpts) -> ShellResult<()> {
         let run_id = self.next_run_id;
         self.next_run_id = self.next_run_id.wrapping_add(1);
