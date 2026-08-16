@@ -26,12 +26,10 @@
 //! parent — idempotent; in practice it only matters for `New` since the
 //! other ops require a prior successful `readFile`.
 
-use std::fs;
 use std::hash::Hasher;
 use std::io;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::SystemTime;
 
 use rquickjs::class::{JsClass, Readable, Trace, Tracer};
 use rquickjs::function::{Constructor, This};
@@ -43,7 +41,9 @@ use twox_hash::XxHash3_64;
 use std::fmt::Write;
 
 use frances_core::{is_within, resolve_relative};
-use frances_edit::{DiffOp, DiffRender, EditError, LlmEdit, LoopKey, LoopKind, WriteMode};
+use frances_edit::{
+    DiffOp, DiffRender, DraftWriter, EditError, LlmEdit, LoopKey, LoopKind, WriteMode,
+};
 
 use super::throw_js as throw;
 use crate::deps::{EditorFactory, EditorSession, WorkflowDeps};
@@ -426,7 +426,10 @@ async fn edit_inner<D: WorkflowDeps>(
     }
 
     let mut sess = session.lock().await;
-    Ok(sess.edit(edit, write_draft).await?)
+    let writer = WorkflowDraftWriter {
+        fs: deps.fs().clone(),
+    };
+    Ok(sess.edit(edit, writer).await?)
 }
 
 /// Extract the resolved path from an `LlmEdit`.
@@ -490,7 +493,23 @@ fn hash_read_raw_args(path: &str) -> u64 {
     hasher.finish()
 }
 
-fn write_draft(
+struct WorkflowDraftWriter<F> {
+    fs: F,
+}
+
+impl<F: WorkflowFs> DraftWriter for WorkflowDraftWriter<F> {
+    async fn write(
+        &mut self,
+        path: &Path,
+        draft: &[String],
+        mode: WriteMode,
+    ) -> io::Result<(Vec<String>, i64, u64)> {
+        write_draft(&self.fs, path, draft, mode).await
+    }
+}
+
+async fn write_draft<F: WorkflowFs>(
+    fs: &F,
     path: &Path,
     draft: &[String],
     mode: WriteMode,
@@ -501,7 +520,7 @@ fn write_draft(
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        fs::create_dir_all(parent)?;
+        fs.create_dir_all(parent).await?;
     }
     let mut content = draft.join("\n");
     content.push('\n');
@@ -509,21 +528,12 @@ fn write_draft(
         // create_new is the atomic check-and-create: if the file appeared
         // since file_new's caller decided to create it, this fails with
         // AlreadyExists rather than clobbering it.
-        WriteMode::CreateNew => {
-            use io::Write;
-            let mut f = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(path)?;
-            f.write_all(content.as_bytes())?;
-        }
-        WriteMode::Overwrite => fs::write(path, &content)?,
+        WriteMode::CreateNew => fs.write_create_new(path, content.as_bytes()).await?,
+        WriteMode::Overwrite => fs.write(path, content.as_bytes()).await?,
     }
-    let meta = fs::metadata(path)?;
-    let mtime_ns = mtime_ns_from(&meta)?;
-    let size = meta.len();
-    let post = fs::read_to_string(path)?;
-    Ok((split_lines(&post), mtime_ns, size))
+    let meta = fs.metadata(path).await?;
+    let post = fs.read_to_string(path).await?;
+    Ok((split_lines(&post), meta.mtime_ns, meta.size))
 }
 
 fn split_lines(s: &str) -> Vec<String> {
@@ -532,14 +542,6 @@ fn split_lines(s: &str) -> Vec<String> {
         lines.pop();
     }
     lines
-}
-
-fn mtime_ns_from(meta: &fs::Metadata) -> io::Result<i64> {
-    let modified = meta.modified()?;
-    let dur = modified
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| io::Error::other(format!("mtime before epoch: {e}")))?;
-    i64::try_from(dur.as_nanos()).map_err(|e| io::Error::other(format!("mtime overflow: {e}")))
 }
 
 /// Run the edit commit (clears anchor tombstones on the shared engine).
@@ -646,16 +648,5 @@ mod tests {
         assert_eq!(split_lines("a\nb\n"), vec!["a", "b"]);
         assert_eq!(split_lines("a\nb\n\n"), vec!["a", "b", ""]);
         assert_eq!(split_lines(""), Vec::<String>::new());
-    }
-
-    #[test]
-    fn write_draft_creates_missing_parent_dirs() {
-        let tmp = tempfile::tempdir().unwrap();
-        let nested = tmp.path().join("a").join("b").join("c.txt");
-        let result = write_draft(&nested, &["hello".to_string()], WriteMode::Overwrite).unwrap();
-        let (post, _mtime, size) = result;
-        assert_eq!(post, vec!["hello"]);
-        assert!(size > 0);
-        assert!(nested.exists());
     }
 }

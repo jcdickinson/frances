@@ -1,13 +1,12 @@
 # Complete remote tool I/O
 
 Production uses `WorkerIo`, but not every tool operation is worker-backed yet.
-The shell protocol and basic `WorkflowFs` operations execute in the worker;
-file editing and file search still contain direct frontend-side filesystem I/O.
+The shell protocol, basic `WorkflowFs` operations, and file editing execute in
+the worker. File search still contains direct frontend-side filesystem I/O.
 
-## File editing
+## File editing — complete
 
-`frances-workflow/src/modules/file.rs::write_draft` currently uses `std::fs`
-for:
+`frances-workflow/src/modules/file.rs::write_draft` now uses `WorkflowFs` for:
 
 - parent directory creation;
 - atomic create-new writes;
@@ -15,12 +14,17 @@ for:
 - post-write metadata;
 - rereading the written file.
 
-Move this work behind `WorkflowFs`. The worker protocol needs an atomic
-create-new operation so `WriteMode::CreateNew` cannot race or accidentally
-overwrite a file. The edit engine may continue to run in the frontend process;
-only filesystem access needs to move to the worker.
+The worker protocol carries an explicit write mode, and `CreateNew` uses the
+worker's atomic create-new open. `AlreadyExists` is preserved across the
+protocol so `WriteMode::CreateNew` cannot race or accidentally overwrite a
+file. The edit engine continues to run in the frontend process; its draft
+writer is async so only filesystem access moves to the worker.
 
-## Find and grep
+Production-path coverage drives the JS `Editor` through `WorkerIo` over
+`multiplex`, including parent creation, overwrite, atomic create-new rejection,
+post-write metadata, and rereading.
+
+## Find and grep — remaining
 
 `frances-workflow/src/modules/file_find_or_grep.rs` currently performs local:
 

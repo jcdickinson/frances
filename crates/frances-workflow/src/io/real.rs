@@ -13,7 +13,7 @@ use tokio::sync::Notify;
 
 use frances_shell::{ReadEvent, RunOpts, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
 use frances_worker::{Client as WorkerClient, WorkerShell};
-use frances_worker_protocol::{Content, ShellOptions as WorkerShellOptions};
+use frances_worker_protocol::{Content, ErrorCode, ShellOptions as WorkerShellOptions};
 
 use super::{
     FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowShellHandle,
@@ -292,6 +292,13 @@ impl WorkflowFs for WorkerFs {
             .map_err(worker_io_error)
     }
 
+    async fn write_create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+        self.client
+            .write_create_new(path, Content::from_bytes(content.to_vec()))
+            .await
+            .map_err(worker_io_error)
+    }
+
     async fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
         let metadata = self.client.metadata(path).await.map_err(worker_io_error)?;
         Ok(FsMetadata {
@@ -317,7 +324,14 @@ impl WorkflowFs for WorkerFs {
 }
 
 fn worker_io_error(error: frances_worker::ClientError) -> io::Error {
-    io::Error::other(error)
+    let kind = match &error {
+        frances_worker::ClientError::Worker {
+            code: ErrorCode::AlreadyExists,
+            ..
+        } => io::ErrorKind::AlreadyExists,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, error)
 }
 
 impl WorkflowFs for RealFs {
@@ -327,6 +341,15 @@ impl WorkflowFs for RealFs {
 
     async fn write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
         tokio::fs::write(path, content).await
+    }
+
+    async fn write_create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .await?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, content).await
     }
 
     async fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {

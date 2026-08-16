@@ -10,9 +10,9 @@ use frances_shell::{
     ReadEvent, RunOpts, RunOutcome, Shell, ShellOptions as LocalShellOptions, WaitOpts,
 };
 use frances_worker_protocol::{
-    Capability, Content, ErrorCode, Feed, FeedSender, FsMetadata, Hello, PROTOCOL_VERSION,
-    ProtocolError, Request, RequestKind, Response, ResponseError, ResponseKind, ShellId,
-    ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
+    Capability, Content, ErrorCode, Feed, FeedSender, FsMetadata, FsWriteMode, Hello,
+    PROTOCOL_VERSION, ProtocolError, Request, RequestKind, Response, ResponseError, ResponseKind,
+    ShellId, ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
@@ -240,8 +240,23 @@ async fn handle(
                 .map_err(|error| io_error(&path, error))?;
             Ok(ResponseKind::Content(Content::from_async_read(file)))
         }
-        RequestKind::FsWrite { path, content } => {
-            let mut file = tokio::fs::File::create(&path)
+        RequestKind::FsWrite {
+            path,
+            content,
+            mode,
+        } => {
+            let mut options = tokio::fs::OpenOptions::new();
+            options.write(true);
+            match mode {
+                FsWriteMode::Overwrite => {
+                    options.create(true).truncate(true);
+                }
+                FsWriteMode::CreateNew => {
+                    options.create_new(true);
+                }
+            }
+            let mut file = options
+                .open(&path)
                 .await
                 .map_err(|error| io_error(&path, error))?;
             content
@@ -426,8 +441,10 @@ async fn actor_wait(
             () = output.closed() => return,
             () = reply.closed() => return,
             event = events.recv() => {
-                if let Some(event) = event {
-                    if !send_output(output, event).await { return; }
+                if let Some(event) = event
+                    && !send_output(output, event).await
+                {
+                    return;
                 }
             }
         }
@@ -576,5 +593,9 @@ fn content_error(error: io::Error) -> ResponseError {
 }
 
 fn io_error(path: &std::path::Path, error: io::Error) -> ResponseError {
-    ResponseError::new(ErrorCode::Io, format!("{}: {error}", path.display()))
+    let code = match error.kind() {
+        io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+        _ => ErrorCode::Io,
+    };
+    ResponseError::new(code, format!("{}: {error}", path.display()))
 }

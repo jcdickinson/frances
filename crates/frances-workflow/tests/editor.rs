@@ -8,7 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use frances_workflow::{
-    EntityCmd, Invocation, Runtime, SectionKind, SectionTranscript, test_deps::StubDeps,
+    EntityCmd, Invocation, Runtime, SectionKind, SectionTranscript, WorkerIo, test_deps::StubDeps,
     test_drive::drive_one_cycle,
 };
 
@@ -128,6 +128,75 @@ async fn editor_edit_replace_writes_disk() {
 
     let on_disk = std::fs::read_to_string(&path).unwrap();
     assert_eq!(on_disk, "a\nB2\nc\n");
+}
+
+#[tokio::test]
+async fn editor_edits_through_worker_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("file.txt");
+    let nested = dir.path().join("nested/new.txt");
+    std::fs::write(&path, "a\nb\nc\n").unwrap();
+
+    let (client_stream, worker_stream) = tokio::io::duplex(256 * 1024);
+    let worker = tokio::spawn(frances_worker::serve(worker_stream));
+    {
+        let client = frances_worker::Client::connect(client_stream)
+            .await
+            .unwrap();
+        let deps = StubDeps::with_io(WorkerIo::new(client.clone()));
+        deps.set_cwd(dir.path().to_path_buf());
+        let rt = Runtime::new(deps).unwrap();
+        let file = write_source(
+            r#"
+            import { Editor } from "frances:v1/tools/file";
+            const editor = new Editor();
+            const read = await editor.readFile("file.txt");
+            const line_b = read.split("\n")[1];
+            await editor.edit({
+                kind: "ReplaceLines",
+                path: "file.txt",
+                anchor: line_b,
+                end_anchor: line_b,
+                text: "worker",
+            });
+            await editor.edit({
+                kind: "New",
+                path: "nested/new.txt",
+                text: "created remotely",
+            });
+            let duplicateRejected = false;
+            try {
+                await editor.edit({
+                    kind: "New",
+                    path: "nested/new.txt",
+                    text: "must not clobber",
+                });
+            } catch (error) {
+                duplicateRejected = String(error).includes("already exists");
+            }
+            if (!duplicateRejected) {
+                throw new Error("duplicate file_new was not rejected");
+            }
+            "#,
+        );
+        let mut handle = rt
+            .start(Invocation {
+                source_path: file.path().to_path_buf(),
+                args: Vec::new(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (_, done) = drive_one_cycle(&mut handle).await;
+        assert!(matches!(done, Some(Ok(()))), "done was {done:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a\nworker\nc\n");
+        assert_eq!(
+            std::fs::read_to_string(&nested).unwrap(),
+            "created remotely\n"
+        );
+        client.shutdown().await.unwrap();
+    }
+    worker.await.unwrap().unwrap();
 }
 
 #[tokio::test]

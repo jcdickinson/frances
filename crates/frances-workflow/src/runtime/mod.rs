@@ -715,32 +715,34 @@ pub mod test_deps {
     /// elapsed time and seed tempdirs through `set_cwd`, so swapping
     /// timer or fs to mocks would break them. Tests that want
     /// determinism construct a different `StubIo` variant themselves.
-    type DefaultIo = StubIo;
-
     #[derive(Clone)]
-    pub struct StubDeps {
+    pub struct StubDeps<I = StubIo> {
         manager: StubManager,
-        io: DefaultIo,
+        io: I,
         editor_factory: StubEditorFactory,
         cwd: Arc<Mutex<Option<PathBuf>>>,
         storage: StubStorage,
         editable_roots: Vec<PathBuf>,
     }
 
-    impl Default for StubDeps {
+    impl Default for StubDeps<StubIo> {
         fn default() -> Self {
+            Self::with_io(StubIo::default())
+        }
+    }
+
+    impl<I> StubDeps<I> {
+        pub fn with_io(io: I) -> Self {
             Self {
                 manager: StubManager::default(),
-                io: DefaultIo::default(),
+                io,
                 editor_factory: StubEditorFactory::default(),
                 cwd: Arc::new(Mutex::new(None)),
                 storage: StubStorage::default(),
                 editable_roots: vec![PathBuf::from("/")],
             }
         }
-    }
 
-    impl StubDeps {
         /// Sets the cwd reported by `current_cwd`. Lets editor tests
         /// point relative paths at a tempdir without spinning up a full
         /// `InvocationContext`.
@@ -761,7 +763,7 @@ pub mod test_deps {
 
         /// Hand back the IO bundle. Lets tests reach into the mock
         /// shell or any other swappable sub-piece directly.
-        pub fn io(&self) -> &DefaultIo {
+        pub fn io(&self) -> &I {
             &self.io
         }
 
@@ -772,10 +774,10 @@ pub mod test_deps {
         }
     }
 
-    impl WorkflowIo for StubDeps {
-        type Timer = <DefaultIo as WorkflowIo>::Timer;
-        type Shell = <DefaultIo as WorkflowIo>::Shell;
-        type Fs = <DefaultIo as WorkflowIo>::Fs;
+    impl<I: WorkflowIo> WorkflowIo for StubDeps<I> {
+        type Timer = I::Timer;
+        type Shell = I::Shell;
+        type Fs = I::Fs;
         fn timer(&self) -> &Self::Timer {
             self.io.timer()
         }
@@ -787,7 +789,7 @@ pub mod test_deps {
         }
     }
 
-    impl WorkflowDeps for StubDeps {
+    impl<I: WorkflowIo> WorkflowDeps for StubDeps<I> {
         type ChatSessionManager = StubManager;
         type EditorFactory = StubEditorFactory;
 
@@ -888,7 +890,7 @@ pub mod test_deps {
     #[derive(Clone)]
     pub struct StubDepsRealShell {
         manager: StubManager,
-        io: DefaultIo,
+        io: StubIo,
         editor_factory: StubEditorFactory,
         storage: StubStorage,
         editable_roots: Vec<PathBuf>,
@@ -898,7 +900,7 @@ pub mod test_deps {
         fn default() -> Self {
             Self {
                 manager: StubManager::default(),
-                io: DefaultIo::with_real_shell(),
+                io: StubIo::with_real_shell(),
                 editor_factory: StubEditorFactory::default(),
                 storage: StubStorage::default(),
                 editable_roots: vec![PathBuf::from("/")],
@@ -907,9 +909,9 @@ pub mod test_deps {
     }
 
     impl WorkflowIo for StubDepsRealShell {
-        type Timer = <DefaultIo as WorkflowIo>::Timer;
-        type Shell = <DefaultIo as WorkflowIo>::Shell;
-        type Fs = <DefaultIo as WorkflowIo>::Fs;
+        type Timer = <StubIo as WorkflowIo>::Timer;
+        type Shell = <StubIo as WorkflowIo>::Shell;
+        type Fs = <StubIo as WorkflowIo>::Fs;
         fn timer(&self) -> &Self::Timer {
             self.io.timer()
         }

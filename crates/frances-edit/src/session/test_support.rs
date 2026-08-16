@@ -19,7 +19,7 @@ pub fn no_format(
     draft: &[String],
     mode: WriteMode,
 ) -> io::Result<(Vec<String>, i64, u64)> {
-    // Mirror the real drafter's `create_new` atomicity so the apply_new
+    // Mirror the real writer's `create_new` atomicity so the apply_new
     // "already exists" path stays exercised under the fake writer.
     if mode == WriteMode::CreateNew && path.exists() {
         return Err(io::Error::new(io::ErrorKind::AlreadyExists, "file exists"));

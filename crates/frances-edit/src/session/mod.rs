@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::{Future, ready};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -21,6 +22,31 @@ pub mod test_support;
 pub use types::{EditError, EditResult, LlmEdit, WriteMode};
 
 const DIFF_CONTEXT: usize = 2;
+
+/// Persists an edit draft and returns the content and metadata observed after
+/// the write. The post-write content may differ when a formatter runs.
+pub trait DraftWriter {
+    fn write<'a>(
+        &'a mut self,
+        path: &'a Path,
+        draft: &'a [String],
+        mode: WriteMode,
+    ) -> impl Future<Output = io::Result<(Vec<String>, i64, u64)>> + Send + 'a;
+}
+
+impl<F> DraftWriter for F
+where
+    F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
+{
+    fn write<'a>(
+        &'a mut self,
+        path: &'a Path,
+        draft: &'a [String],
+        mode: WriteMode,
+    ) -> impl Future<Output = io::Result<(Vec<String>, i64, u64)>> + Send + 'a {
+        ready(self(path, draft, mode))
+    }
+}
 
 pub struct EditSession<S: AnchorStore> {
     /// Shared anchor engine. Every method on it takes `&self`, so contexts
@@ -83,15 +109,16 @@ impl<S: AnchorStore> EditSession<S> {
     /// - `Overwrite` replaces a previously-read file's content (requires
     ///   prior `read_file` for the up-to-date-read safety net).
     /// - `Replace`/`InsertAfter`/`InsertBefore` resolve anchors against the
-    ///   cached anchored state, replay one `EditOp` into a draft, write via
-    ///   `on_draft`, then reconcile. Path must be cached via `read_file`.
+    ///   cached anchored state, replay one `EditOp` into a draft, persist it
+    ///   through the writer, then reconcile. Path must be cached via
+    ///   `read_file`.
     ///
     /// Returns the rendered diff block (or full anchored file in the `New`
     /// case) — `DiffRender` carries both the LLM-facing string and the
     /// structured ops shipped to the UI.
-    pub async fn edit<F>(&mut self, edit: LlmEdit, mut on_draft: F) -> EditResult<DiffRender>
+    pub async fn edit<W>(&mut self, edit: LlmEdit, mut writer: W) -> EditResult<DiffRender>
     where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
+        W: DraftWriter,
     {
         // Any edit mutates the workspace; previously-cached read/search
         // results are no longer the source of truth, so the loop-guard
@@ -99,13 +126,13 @@ impl<S: AnchorStore> EditSession<S> {
         // unblocks subsequent reads — failure is itself new information.
         self.loop_set.clear();
         match edit {
-            LlmEdit::New { path, text } => self.apply_new(&path, &text, &mut on_draft).await,
+            LlmEdit::New { path, text } => self.apply_new(&path, &text, &mut writer).await,
             LlmEdit::Overwrite {
                 path,
                 text,
                 bypass_anchor_guard,
             } => {
-                self.apply_overwrite(&path, &text, bypass_anchor_guard, &mut on_draft)
+                self.apply_overwrite(&path, &text, bypass_anchor_guard, &mut writer)
                     .await
             }
             LlmEdit::ReplaceLines {
@@ -121,7 +148,7 @@ impl<S: AnchorStore> EditSession<S> {
                     &end_anchor,
                     &text,
                     bypass_anchor_guard,
-                    &mut on_draft,
+                    &mut writer,
                 )
                 .await
             }
@@ -131,7 +158,7 @@ impl<S: AnchorStore> EditSession<S> {
                 replacement,
                 count,
             } => {
-                self.apply_replace_all(&path, &find, &replacement, count, &mut on_draft)
+                self.apply_replace_all(&path, &find, &replacement, count, &mut writer)
                     .await
             }
             LlmEdit::InsertAfter {
@@ -146,7 +173,7 @@ impl<S: AnchorStore> EditSession<S> {
                     &text,
                     PinPosition::After,
                     bypass_anchor_guard,
-                    &mut on_draft,
+                    &mut writer,
                 )
                 .await
             }
@@ -162,7 +189,7 @@ impl<S: AnchorStore> EditSession<S> {
                     &text,
                     PinPosition::Before,
                     bypass_anchor_guard,
-                    &mut on_draft,
+                    &mut writer,
                 )
                 .await
             }

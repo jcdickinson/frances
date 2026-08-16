@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::io;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -14,7 +13,7 @@ use crate::{
 };
 
 use super::types::{EditError, EditResult, WriteMode};
-use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
+use super::{DIFF_CONTEXT, DraftWriter, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 const ANCHOR_SEP: char = '§';
 
@@ -28,18 +27,15 @@ pub(super) enum PinPosition {
 }
 
 impl<S: AnchorStore> EditSession<S> {
-    pub(super) async fn apply_replace<F>(
+    pub(super) async fn apply_replace<W: DraftWriter>(
         &mut self,
         path: &Path,
         anchor: &str,
         end_anchor: &str,
         text: &str,
         bypass_anchor_guard: bool,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
         }
@@ -62,21 +58,18 @@ impl<S: AnchorStore> EditSession<S> {
             to: to_anchor,
             lines: new_lines,
         };
-        self.apply_line_edit(path, working, op, tombstones, on_draft)
+        self.apply_line_edit(path, working, op, tombstones, writer)
             .await
     }
 
-    pub(super) async fn apply_replace_all<F>(
+    pub(super) async fn apply_replace_all<W: DraftWriter>(
         &mut self,
         path: &Path,
         find: &str,
         replacement: &str,
         count: Option<usize>,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         let working = self.cached_working(path)?;
         let re = Regex::new(find)?;
         let content = working.lines.join("\n");
@@ -102,22 +95,19 @@ impl<S: AnchorStore> EditSession<S> {
         }
 
         let draft = split_text_to_lines(&replaced);
-        self.apply_draft_edit(path, working, draft, None, on_draft)
+        self.apply_draft_edit(path, working, draft, None, writer)
             .await
     }
 
-    pub(super) async fn apply_pin_insert<F>(
+    pub(super) async fn apply_pin_insert<W: DraftWriter>(
         &mut self,
         path: &Path,
         anchor: &str,
         text: &str,
         position: PinPosition,
         bypass_anchor_guard: bool,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
         }
@@ -128,7 +118,7 @@ impl<S: AnchorStore> EditSession<S> {
             PinPosition::After => EditOp::InsertAfter { pin, lines },
             PinPosition::Before => EditOp::InsertBefore { pin, lines },
         };
-        self.apply_line_edit(path, working, op, Vec::new(), on_draft)
+        self.apply_line_edit(path, working, op, Vec::new(), writer)
             .await
     }
 
@@ -154,20 +144,19 @@ impl<S: AnchorStore> EditSession<S> {
     /// `deleted` is the pre-edit anchor list for lines the op removes (only
     /// `Replace` produces them); they're gone from the draft, so the formatter
     /// reconcile can't see them and we tombstone them explicitly.
-    async fn apply_line_edit<F>(
+    async fn apply_line_edit<W: DraftWriter>(
         &mut self,
         path: &Path,
         working: WorkingFile,
         op: EditOp,
         deleted: Vec<Anchor>,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         let ops = [op];
         let (draft_lines, origins) = apply_ops(&working.state, &working.lines, &ops);
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft_lines, WriteMode::Overwrite)?;
+        let (post_lines, mtime_ns, size) = writer
+            .write(path, &draft_lines, WriteMode::Overwrite)
+            .await?;
 
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
@@ -223,18 +212,15 @@ impl<S: AnchorStore> EditSession<S> {
 
         Ok(block)
     }
-    async fn apply_draft_edit<F>(
+    async fn apply_draft_edit<W: DraftWriter>(
         &mut self,
         path: &Path,
         working: WorkingFile,
         draft: Vec<String>,
         hints: Option<&EditHints>,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft, WriteMode::Overwrite)?;
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
+        let (post_lines, mtime_ns, size) = writer.write(path, &draft, WriteMode::Overwrite).await?;
 
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
@@ -864,7 +850,7 @@ mod tests {
                     replacement: "delta".into(),
                     count: None,
                 },
-                |path, draft, mode| {
+                |path: &Path, draft: &[String], mode| {
                     wrote = true;
                     no_format(path, draft, mode)
                 },
@@ -897,7 +883,7 @@ mod tests {
                     replacement: "b".into(),
                     count: Some(2),
                 },
-                |path, draft, mode| {
+                |path: &Path, draft: &[String], mode| {
                     wrote = true;
                     no_format(path, draft, mode)
                 },

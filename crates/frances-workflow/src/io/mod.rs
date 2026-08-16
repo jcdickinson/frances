@@ -132,6 +132,12 @@ pub trait WorkflowFs: Clone + Send + Sync + 'static {
         content: &[u8],
     ) -> impl Future<Output = std::io::Result<()>> + Send;
 
+    fn write_create_new(
+        &self,
+        path: &Path,
+        content: &[u8],
+    ) -> impl Future<Output = std::io::Result<()>> + Send;
+
     fn metadata(&self, path: &Path) -> impl Future<Output = std::io::Result<FsMetadata>> + Send;
 
     fn create_dir_all(&self, path: &Path) -> impl Future<Output = std::io::Result<()>> + Send;

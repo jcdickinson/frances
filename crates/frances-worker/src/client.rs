@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use frances_shell::{QuietReason, ReadEvent, RunOpts, RunOutcome, WaitOpts};
 use frances_worker_protocol::{
-    Capability, Content, Feed, FsMetadata, PROTOCOL_VERSION, ProtocolError, ProtocolFeedError,
-    ProtocolReader, ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellId,
-    ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
+    Capability, Content, ErrorCode, Feed, FsMetadata, FsWriteMode, PROTOCOL_VERSION, ProtocolError,
+    ProtocolFeedError, ProtocolReader, ProtocolWriter, Request, RequestKind, Response,
+    ResponseKind, ShellId, ShellOptions, ShellOutput, ShellWaitQuiet, multiplex,
 };
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 
@@ -23,7 +24,7 @@ pub struct Client {
 struct Inner {
     writer: ProtocolWriter,
     pending: Arc<StdMutex<HashMap<u64, oneshot::Sender<Response>>>>,
-    _child: Mutex<Child>,
+    _child: Option<Mutex<Child>>,
     next_id: AtomicU64,
 }
 
@@ -51,8 +52,8 @@ pub enum ClientError {
     MissingFilesystemCapability,
     #[error("worker does not advertise the shell capability")]
     MissingShellCapability,
-    #[error("worker error: {0}")]
-    Worker(String),
+    #[error("worker error: {message}")]
+    Worker { code: ErrorCode, message: String },
     #[error("worker returned the wrong response kind")]
     WrongResponseKind,
 }
@@ -87,14 +88,35 @@ impl Client {
             })?;
         let stdin = child.stdin.take().expect("piped worker stdin");
         let stdout = child.stdout.take().expect("piped worker stdout");
-        let (reader, writer) = multiplex(stdout, stdin);
+        Self::connect_io(stdout, stdin, Some(child)).await
+    }
+
+    /// Connect to a worker over an existing bidirectional transport.
+    pub async fn connect<S>(stream: S) -> Result<Self, ClientError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let (reader, writer) = tokio::io::split(stream);
+        Self::connect_io(reader, writer, None).await
+    }
+
+    async fn connect_io<R, W>(
+        reader: R,
+        writer: W,
+        child: Option<Child>,
+    ) -> Result<Self, ClientError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (reader, writer) = multiplex(reader, writer);
         let pending = Arc::new(StdMutex::new(HashMap::new()));
         tokio::spawn(route_responses(reader, pending.clone()));
         let client = Self {
             inner: Arc::new(Inner {
                 writer,
                 pending,
-                _child: Mutex::new(child),
+                _child: child.map(Mutex::new),
                 next_id: AtomicU64::new(1),
             }),
         };
@@ -135,6 +157,16 @@ impl Client {
         self.expect_unit(RequestKind::FsWrite {
             path: path.to_path_buf(),
             content,
+            mode: FsWriteMode::Overwrite,
+        })
+        .await
+    }
+
+    pub async fn write_create_new(&self, path: &Path, content: Content) -> Result<(), ClientError> {
+        self.expect_unit(RequestKind::FsWrite {
+            path: path.to_path_buf(),
+            content,
+            mode: FsWriteMode::CreateNew,
         })
         .await
     }
@@ -168,6 +200,10 @@ impl Client {
             ResponseKind::Path(path) => Ok(path),
             _ => Err(ClientError::WrongResponseKind),
         }
+    }
+
+    pub async fn shutdown(&self) -> Result<(), ClientError> {
+        self.expect_unit(RequestKind::Shutdown).await
     }
 
     pub async fn open_shell(&self, options: ShellOptions) -> Result<WorkerShell, ClientError> {
@@ -229,9 +265,10 @@ impl Client {
                 actual: response.version,
             });
         }
-        response
-            .result
-            .map_err(|error| ClientError::Worker(error.error.message))
+        response.result.map_err(|error| ClientError::Worker {
+            code: error.error.code,
+            message: error.error.message,
+        })
     }
 }
 

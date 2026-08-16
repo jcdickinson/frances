@@ -5,32 +5,31 @@ use crate::render::{DiffRender, render_diff_block};
 use crate::{AnchorStore, EditHints, FileAnchorState, Pool, WorkingFile, reconcile};
 
 use super::types::{EditError, EditResult, WriteMode};
-use super::{DIFF_CONTEXT, EditSession, detect_anchor_pasteback, split_text_to_lines};
+use super::{DIFF_CONTEXT, DraftWriter, EditSession, detect_anchor_pasteback, split_text_to_lines};
 
 impl<S: AnchorStore> EditSession<S> {
     /// Create a brand-new file. Fails if the file already exists on disk.
     /// Mints fresh anchors for every line and renders a diff against an
     /// empty pre-state (all `+` lines).
-    pub(super) async fn apply_new<F>(
+    pub(super) async fn apply_new<W: DraftWriter>(
         &mut self,
         path: &Path,
         text: &str,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         let draft = split_text_to_lines(text);
-        // No `path.exists()` precheck — not race-free. The drafter opens with
+        // No `path.exists()` precheck — not race-free. The writer opens with
         // `create_new` so a race surfaces as `AlreadyExists` and maps to the
         // typed error below.
-        let (post_lines, mtime_ns, size) =
-            on_draft(path, &draft, WriteMode::CreateNew).map_err(|e| match e.kind() {
-                io::ErrorKind::AlreadyExists => EditError::NewFileExists {
-                    path: path.to_path_buf(),
-                },
-                _ => EditError::Draft(e),
-            })?;
+        let (post_lines, mtime_ns, size) = writer
+            .write(path, &draft, WriteMode::CreateNew)
+            .await
+            .map_err(|e| match e.kind() {
+            io::ErrorKind::AlreadyExists => EditError::NewFileExists {
+                path: path.to_path_buf(),
+            },
+            _ => EditError::Draft(e),
+        })?;
         let working = self
             .engine
             .open(path.to_path_buf(), post_lines, mtime_ns, size)
@@ -50,16 +49,13 @@ impl<S: AnchorStore> EditSession<S> {
     /// Overwrite an existing, already-read file. Up-to-date read enforced via
     /// the cache. Tombstones every prior anchor and mints fresh ones via the
     /// normal reconcile path.
-    pub(super) async fn apply_overwrite<F>(
+    pub(super) async fn apply_overwrite<W: DraftWriter>(
         &mut self,
         path: &Path,
         text: &str,
         bypass_anchor_guard: bool,
-        on_draft: &mut F,
-    ) -> EditResult<DiffRender>
-    where
-        F: FnMut(&Path, &[String], WriteMode) -> io::Result<(Vec<String>, i64, u64)>,
-    {
+        writer: &mut W,
+    ) -> EditResult<DiffRender> {
         if !bypass_anchor_guard && let Some(anchors) = detect_anchor_pasteback(text) {
             return Err(EditError::AnchorPastebackDetected { anchors });
         }
@@ -71,7 +67,7 @@ impl<S: AnchorStore> EditSession<S> {
             })?
             .clone();
         let draft = split_text_to_lines(text);
-        let (post_lines, mtime_ns, size) = on_draft(path, &draft, WriteMode::Overwrite)?;
+        let (post_lines, mtime_ns, size) = writer.write(path, &draft, WriteMode::Overwrite).await?;
         let used = self.engine.store().used_anchors(path).await?;
         let mut pool = Pool::from_used(used);
         let hints = EditHints {

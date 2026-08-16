@@ -67,7 +67,7 @@ pub enum LlmEdit {
 
 /// How the draft writer must open the target file. The check-and-create for
 /// a brand-new file has to be atomic, and frances-edit is filesystem-agnostic
-/// (the caller's `on_draft` owns the actual write), so the engine threads this
+/// (the caller's draft writer owns the actual write), so the engine threads this
 /// signal through instead of doing a racy `path.exists()` itself.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WriteMode {

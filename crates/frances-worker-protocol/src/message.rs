@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Content, Feed};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -39,6 +39,7 @@ pub enum RequestKind {
     FsWrite {
         path: PathBuf,
         content: Content,
+        mode: FsWriteMode,
     },
     FsMetadata {
         path: PathBuf,
@@ -136,9 +137,17 @@ pub struct FsMetadata {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum FsWriteMode {
+    Overwrite,
+    CreateNew,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
     InvalidRequest,
     Io,
+    AlreadyExists,
     UnsupportedVersion,
     Internal,
 }

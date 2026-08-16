@@ -340,6 +340,21 @@ impl WorkflowFs for MockFs {
         Ok(())
     }
 
+    async fn write_create_new(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.files.contains_key(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                path.display().to_string(),
+            ));
+        }
+        let next = inner.mtime_counter.wrapping_add(1);
+        inner.mtime_counter = next;
+        inner.files.insert(path.to_path_buf(), content.to_vec());
+        inner.mtime.insert(path.to_path_buf(), next);
+        Ok(())
+    }
+
     async fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
         let inner = self.inner.lock();
         let bytes = inner
