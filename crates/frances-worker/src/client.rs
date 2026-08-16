@@ -7,10 +7,9 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use frances_shell::{QuietReason, ReadEvent, RunOpts, RunOutcome, WaitOpts};
 use frances_worker_protocol::{
-    Capability, Content, Feed, FeedSender, FsMetadata, PROTOCOL_VERSION, ProtocolError,
-    ProtocolReader, ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellCommand,
-    ShellEvent, ShellEventKind, ShellId, ShellOperationId, ShellOptions, ShellQuietReason,
-    ShellWait, multiplex,
+    Capability, Content, Feed, FsMetadata, PROTOCOL_VERSION, ProtocolError, ProtocolReader,
+    ProtocolWriter, Request, RequestKind, Response, ResponseKind, ShellId, ShellOptions,
+    ShellOutput, ShellWaitQuiet, multiplex,
 };
 use thiserror::Error;
 use tokio::process::{Child, Command};
@@ -170,19 +169,11 @@ impl Client {
     }
 
     pub async fn open_shell(&self, options: ShellOptions) -> Result<WorkerShell, ClientError> {
-        let (commands, command_feed) = Feed::channel();
-        match self
-            .call(RequestKind::ShellOpen {
-                options,
-                commands: command_feed,
-            })
-            .await?
-        {
-            ResponseKind::ShellOpened { shell, events } => Ok(WorkerShell {
+        match self.call(RequestKind::ShellOpen { options }).await? {
+            ResponseKind::ShellOpened { shell, output } => Ok(WorkerShell {
                 id: shell,
-                commands,
-                events,
-                next_operation: 1,
+                client: self.clone(),
+                output,
                 output_sink: None,
             }),
             _ => Err(ClientError::WrongResponseKind),
@@ -217,7 +208,13 @@ impl Client {
                 .remove(&id);
             return Err(error.into());
         }
+        let mut cancel = CancelOnDrop {
+            client: self.clone(),
+            request: id,
+            armed: true,
+        };
         let response = response.await.map_err(|_| ClientError::Closed)?;
+        cancel.armed = false;
         if response.id != id {
             return Err(ClientError::WrongResponseId {
                 expected: id,
@@ -236,11 +233,42 @@ impl Client {
     }
 }
 
+struct CancelOnDrop {
+    client: Client,
+    request: u64,
+    armed: bool,
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.client
+            .inner
+            .pending
+            .lock()
+            .expect("worker response map poisoned")
+            .remove(&self.request);
+        let id = self.client.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let writer = self.client.inner.writer.clone();
+        let request = self.request;
+        tokio::spawn(async move {
+            let _ = writer
+                .send(Request {
+                    version: PROTOCOL_VERSION,
+                    id,
+                    kind: RequestKind::Cancel { request },
+                })
+                .await;
+        });
+    }
+}
+
 pub struct WorkerShell {
     id: ShellId,
-    commands: FeedSender<ShellCommand>,
-    events: Feed<ShellEvent>,
-    next_operation: ShellOperationId,
+    client: Client,
+    output: Feed<ShellOutput>,
     output_sink: Option<tokio::sync::mpsc::UnboundedSender<ReadEvent>>,
 }
 
@@ -259,130 +287,128 @@ impl WorkerShell {
         options: RunOpts,
         wait: WaitOpts,
     ) -> Result<RunOutcome, ClientError> {
-        let operation = self.operation();
-        self.commands
-            .send(ShellCommand::Run {
-                operation,
+        self.client
+            .expect_unit(RequestKind::ShellRun {
+                shell: self.id,
                 script: script.to_owned(),
                 stdin: options.stdin.map(Content::from_bytes),
                 persist: options.persist,
-                wait: wire_wait(wait),
             })
-            .await
-            .map_err(|_| ClientError::Closed)?;
-        self.observe(operation).await
+            .await?;
+        self.wait(wait).await
     }
 
     pub async fn keep_waiting(&mut self, wait: WaitOpts) -> Result<RunOutcome, ClientError> {
-        let operation = self.operation();
-        self.commands
-            .send(ShellCommand::KeepWaiting {
-                operation,
-                wait: wire_wait(wait),
-            })
-            .await
-            .map_err(|_| ClientError::Closed)?;
-        self.observe(operation).await
+        self.wait(wait).await
     }
 
     pub async fn kill_running(&mut self) -> Result<(), ClientError> {
-        let operation = self.operation();
-        self.commands
-            .send(ShellCommand::Kill { operation })
+        self.client
+            .expect_unit(RequestKind::ShellKill { shell: self.id })
             .await
-            .map_err(|_| ClientError::Closed)?;
-        self.expect_ack(operation).await
     }
 
     pub async fn set_var(&mut self, name: String, value: Content) -> Result<(), ClientError> {
-        let operation = self.operation();
-        self.commands
-            .send(ShellCommand::SetVar {
-                operation,
+        self.client
+            .expect_unit(RequestKind::ShellSetVar {
+                shell: self.id,
                 name,
                 value,
             })
             .await
-            .map_err(|_| ClientError::Closed)?;
-        self.expect_ack(operation).await
     }
 
     pub async fn get_var(&mut self, name: String) -> Result<Content, ClientError> {
-        let operation = self.operation();
-        self.commands
-            .send(ShellCommand::GetVar { operation, name })
-            .await
-            .map_err(|_| ClientError::Closed)?;
-        let event = self.next_for(operation).await?;
-        match event.kind {
-            ShellEventKind::Value { content } => Ok(content),
-            ShellEventKind::Error { message } => Err(ClientError::Worker(message)),
+        match self
+            .client
+            .call(RequestKind::ShellGetVar {
+                shell: self.id,
+                name,
+            })
+            .await?
+        {
+            ResponseKind::Content(content) => Ok(content),
             _ => Err(ClientError::WrongResponseKind),
         }
     }
 
-    fn operation(&mut self) -> ShellOperationId {
-        let operation = self.next_operation;
-        self.next_operation += 1;
-        operation
+    async fn wait(&mut self, wait: WaitOpts) -> Result<RunOutcome, ClientError> {
+        let quiet = wait.quiet.unwrap_or(frances_shell::DEFAULT_QUIET);
+        let waiting = self.wait_quiet(quiet);
+        if let Some(max) = wait.max {
+            match tokio::time::timeout(max, waiting).await {
+                Ok(result) => self.read_until(result?).await,
+                Err(_) => Ok(RunOutcome::Quiet {
+                    output: String::new(),
+                    reason: QuietReason::MaxElapsed,
+                }),
+            }
+        } else {
+            self.read_until(waiting.await?).await
+        }
     }
 
-    async fn observe(&mut self, operation: ShellOperationId) -> Result<RunOutcome, ClientError> {
+    /// Wait for the shell to become quiet or exit.
+    ///
+    /// This is a protocol operation of its own so callers can wrap it in a
+    /// timeout. Dropping the future sends a cancellation request to the
+    /// worker, which aborts the corresponding server task.
+    pub async fn wait_quiet(
+        &self,
+        quiet: std::time::Duration,
+    ) -> Result<ShellWaitQuiet, ClientError> {
+        let result = self
+            .client
+            .call(RequestKind::ShellWaitQuiet {
+                shell: self.id,
+                quiet_ms: duration_millis(quiet),
+            })
+            .await?;
+        let wait = match result {
+            ResponseKind::ShellWaitQuiet(wait) => wait,
+            _ => return Err(ClientError::WrongResponseKind),
+        };
+        Ok(wait)
+    }
+
+    async fn read_until(&mut self, wait: ShellWaitQuiet) -> Result<RunOutcome, ClientError> {
         let mut output = Vec::new();
+        if matches!(wait, ShellWaitQuiet::Quiet) {
+            while let Some(item) = self.output.try_next()? {
+                let ShellOutput::Output { content } = item else {
+                    return Err(ClientError::WrongResponseKind);
+                };
+                let bytes = read_content(content).await?;
+                output.extend_from_slice(&bytes);
+                if let Some(sink) = &self.output_sink {
+                    let _ = sink.send(ReadEvent::Output(bytes));
+                }
+            }
+            let reason = QuietReason::NoOutput;
+            self.send_read_event(ReadEvent::Quiet { reason });
+            return Ok(RunOutcome::Quiet {
+                output: String::from_utf8_lossy(&output).into_owned(),
+                reason,
+            });
+        }
         loop {
-            let event = self.next_for(operation).await?;
-            match event.kind {
-                ShellEventKind::Output { content } => {
+            match self.output.next().await?.ok_or(ClientError::Closed)? {
+                ShellOutput::Output { content } => {
                     let bytes = read_content(content).await?;
                     output.extend_from_slice(&bytes);
                     if let Some(sink) = &self.output_sink {
                         let _ = sink.send(ReadEvent::Output(bytes));
                     }
                 }
-                ShellEventKind::Done { exit_code } => {
+                ShellOutput::Exit { exit_code } => {
                     self.send_read_event(ReadEvent::Done { exit_code });
                     return Ok(RunOutcome::Done {
                         exit_code,
                         output: String::from_utf8_lossy(&output).into_owned(),
                     });
                 }
-                ShellEventKind::Quiet { reason } => {
-                    let reason = local_quiet_reason(reason);
-                    self.send_read_event(ReadEvent::Quiet { reason });
-                    return Ok(RunOutcome::Quiet {
-                        output: String::from_utf8_lossy(&output).into_owned(),
-                        reason,
-                    });
-                }
-                ShellEventKind::Dead => {
-                    self.send_read_event(ReadEvent::Dead);
-                    return Ok(RunOutcome::Dead {
-                        output: String::from_utf8_lossy(&output).into_owned(),
-                    });
-                }
-                ShellEventKind::Error { message } => return Err(ClientError::Worker(message)),
-                _ => return Err(ClientError::WrongResponseKind),
             }
         }
-    }
-
-    async fn expect_ack(&mut self, operation: ShellOperationId) -> Result<(), ClientError> {
-        match self.next_for(operation).await?.kind {
-            ShellEventKind::Ack => Ok(()),
-            ShellEventKind::Error { message } => Err(ClientError::Worker(message)),
-            _ => Err(ClientError::WrongResponseKind),
-        }
-    }
-
-    async fn next_for(&mut self, operation: ShellOperationId) -> Result<ShellEvent, ClientError> {
-        let event = self.events.next().await?.ok_or(ClientError::Closed)?;
-        if event.operation != operation {
-            return Err(ClientError::Worker(format!(
-                "shell {} received operation {}, expected {operation}",
-                self.id, event.operation
-            )));
-        }
-        Ok(event)
     }
 
     fn send_read_event(&self, event: ReadEvent) {
@@ -392,22 +418,8 @@ impl WorkerShell {
     }
 }
 
-fn wire_wait(wait: WaitOpts) -> ShellWait {
-    ShellWait {
-        quiet_ms: wait.quiet.map(duration_millis),
-        max_ms: wait.max.map(duration_millis),
-    }
-}
-
 fn duration_millis(duration: std::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
-}
-
-fn local_quiet_reason(reason: ShellQuietReason) -> QuietReason {
-    match reason {
-        ShellQuietReason::NoOutput => QuietReason::NoOutput,
-        ShellQuietReason::MaxElapsed => QuietReason::MaxElapsed,
-    }
 }
 
 async fn read_content(content: Content) -> Result<Vec<u8>, ClientError> {

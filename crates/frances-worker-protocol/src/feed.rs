@@ -148,6 +148,44 @@ impl<T> Feed<T> {
             raw.decode::<FeedItem<T>>().map(|frame| Some(frame.item))
         })
     }
+
+    /// Return the next already-buffered item without waiting for the wire.
+    pub fn try_next(&mut self) -> Result<Option<T>, ProtocolError>
+    where
+        T: DeserializeOwned,
+    {
+        let (raw, context) = {
+            let state = self
+                .state
+                .get_mut()
+                .expect("feed state mutex poisoned")
+                .as_mut()
+                .ok_or_else(|| ProtocolError::InvalidFrame("feed has been transferred".into()))?;
+            let FeedState::Remote {
+                receiver, context, ..
+            } = state
+            else {
+                return Err(ProtocolError::InvalidFrame(
+                    "cannot receive from a feed before it is transferred".into(),
+                ));
+            };
+            let raw = match receiver.try_recv() {
+                Ok(raw) => raw,
+                Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => {
+                    return Ok(None);
+                }
+            };
+            (raw, context.clone())
+        };
+        let header: FeedHeader =
+            serde_json::from_slice(&raw.json).map_err(ProtocolError::Decode)?;
+        if header.end.is_some() {
+            return Ok(None);
+        }
+        with_decode_context(context, || {
+            raw.decode::<FeedItem<T>>().map(|frame| Some(frame.item))
+        })
+    }
 }
 
 impl<T> Serialize for Feed<T>

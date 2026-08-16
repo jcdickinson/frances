@@ -14,7 +14,6 @@ pub enum Capability {
 }
 
 pub type ShellId = u64;
-pub type ShellOperationId = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Hello {
@@ -52,7 +51,34 @@ pub enum RequestKind {
     },
     ShellOpen {
         options: ShellOptions,
-        commands: Feed<ShellCommand>,
+    },
+    ShellRun {
+        shell: ShellId,
+        script: String,
+        stdin: Option<Content>,
+        persist: Vec<String>,
+    },
+    ShellWaitQuiet {
+        shell: ShellId,
+        quiet_ms: u64,
+    },
+    ShellKill {
+        shell: ShellId,
+    },
+    ShellSetVar {
+        shell: ShellId,
+        name: String,
+        value: Content,
+    },
+    ShellGetVar {
+        shell: ShellId,
+        name: String,
+    },
+    ShellClose {
+        shell: ShellId,
+    },
+    Cancel {
+        request: u64,
     },
     Shutdown,
 }
@@ -74,8 +100,9 @@ pub enum ResponseKind {
     Path(PathBuf),
     ShellOpened {
         shell: ShellId,
-        events: Feed<ShellEvent>,
+        output: Feed<ShellOutput>,
     },
+    ShellWaitQuiet(ShellWaitQuiet),
     Unit,
 }
 
@@ -87,64 +114,17 @@ pub struct ShellOptions {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "command", rename_all = "snake_case")]
-pub enum ShellCommand {
-    Run {
-        operation: ShellOperationId,
-        script: String,
-        stdin: Option<Content>,
-        persist: Vec<String>,
-        wait: ShellWait,
-    },
-    KeepWaiting {
-        operation: ShellOperationId,
-        wait: ShellWait,
-    },
-    Kill {
-        operation: ShellOperationId,
-    },
-    SetVar {
-        operation: ShellOperationId,
-        name: String,
-        value: Content,
-    },
-    GetVar {
-        operation: ShellOperationId,
-        name: String,
-    },
-    Close,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct ShellWait {
-    pub quiet_ms: Option<u64>,
-    pub max_ms: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ShellEvent {
-    pub operation: ShellOperationId,
-    #[serde(flatten)]
-    pub kind: ShellEventKind,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(tag = "event", rename_all = "snake_case")]
-pub enum ShellEventKind {
+#[serde(tag = "output", rename_all = "snake_case")]
+pub enum ShellOutput {
     Output { content: Content },
-    Done { exit_code: i32 },
-    Quiet { reason: ShellQuietReason },
-    Dead,
-    Ack,
-    Value { content: Content },
-    Error { message: String },
+    Exit { exit_code: i32 },
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ShellQuietReason {
-    NoOutput,
-    MaxElapsed,
+pub enum ShellWaitQuiet {
+    Quiet,
+    Exit,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

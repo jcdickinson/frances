@@ -218,12 +218,16 @@ impl Shell {
         opts: RunOpts,
         wait: WaitOpts,
     ) -> ShellResult<RunOutcome> {
+        self.start(cmd, opts).await?;
+        self.read_outcome(wait).await
+    }
+
+    /// Start a command without waiting for output or completion.
+    pub async fn start(&mut self, cmd: &str, opts: RunOpts) -> ShellResult<()> {
         if self.in_flight.is_some() {
             return Err(ShellError::CommandRunning);
         }
-
-        self.start_run(cmd, opts).await?;
-        self.read_outcome(wait).await
+        self.start_run(cmd, opts).await
     }
 
     /// Continue waiting on the in-flight command. Returns the same shape as
