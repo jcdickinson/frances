@@ -44,8 +44,6 @@
 //! silence, no max ceiling). Workflows that need different pacing can
 //! layer a Timer + Promise.race on top.
 
-use std::fs;
-use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -57,15 +55,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use frances_shell::{
-    QuietReason, ReadEvent, RunOpts as ShellRunOpts, RunOutcome, Shell, ShellError, ShellOptions,
-    WaitOpts,
+    QuietReason, ReadEvent, RunOpts as ShellRunOpts, RunOutcome, ShellError, ShellOptions, WaitOpts,
 };
 
 use super::throw_js as throw;
 use crate::deps::WorkflowDeps;
-use crate::io::{WorkflowIo, WorkflowShell};
+use crate::io::{WorkflowIo, WorkflowShell, WorkflowShellHandle};
 
 type ShellOf<D> = <D as WorkflowIo>::Shell;
+type ShellHandleOf<F> = <F as WorkflowShell>::Handle;
 
 pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
     ctx: &Ctx<'js>,
@@ -103,7 +101,7 @@ pub(crate) fn build_shell_ctor<'js, D: WorkflowDeps>(
 
 pub struct ShellJs<F: WorkflowShell> {
     factory: F,
-    state: Arc<AsyncMutex<ShellState>>,
+    state: Arc<AsyncMutex<ShellState<ShellHandleOf<F>>>>,
     /// Receiver end of the per-shell event stream. JS pulls events
     /// one at a time via `nextEvent`. Held behind its own mutex so
     /// pull calls don't contend with the `state` mutex `runOnce` /
@@ -136,8 +134,8 @@ fn decode_stream_chunk(carry: &mut Vec<u8>, bytes: &[u8]) -> String {
     }
 }
 
-struct ShellState {
-    shell: Option<Shell>,
+struct ShellState<H> {
+    shell: Option<H>,
     /// True after a runOnce/keepWaiting returned Quiet. Cleared when
     /// Done/Dead lands.
     running: bool,
@@ -319,30 +317,18 @@ enum ShellToolError {
     KeepWaiting(#[source] ShellError),
     #[error("kill: {0}")]
     Kill(#[source] ShellError),
-    #[error("tempfile: {0}")]
-    Tempfile(#[source] io::Error),
-    #[error("write tempfile: {0}")]
-    WriteTempfile(#[source] io::Error),
-    #[error("flush tempfile: {0}")]
-    FlushTempfile(#[source] io::Error),
-    #[error("read value tempfile: {0}")]
-    ReadValue(#[source] io::Error),
-    #[error("export {name}: exit {exit}\n{output}")]
-    SetVarFailed {
+    #[error("export {name}: {source}")]
+    SetVar {
         name: String,
-        exit: i32,
-        output: String,
+        #[source]
+        source: ShellError,
     },
-    #[error("get {name}: unset or expansion failed (exit {exit})\n{output}")]
-    GetVarFailed {
+    #[error("get {name}: unset or expansion failed: {source}")]
+    GetVar {
         name: String,
-        exit: i32,
-        output: String,
+        #[source]
+        source: ShellError,
     },
-    #[error("command went quiet (export/get expect immediate Done):\n{output}")]
-    WentQuiet { output: String },
-    #[error("bash died mid-command:\n{output}")]
-    Died { output: String },
     #[error("empty bash name")]
     EmptyBashName,
     #[error("invalid bash name: {0:?}")]
@@ -424,7 +410,7 @@ fn parse_wait_opts_from_obj(obj: Option<&Object<'_>>) -> WaitOpts {
 
 async fn run_once_inner<F: WorkflowShell>(
     factory: &F,
-    state: &Arc<AsyncMutex<ShellState>>,
+    state: &Arc<AsyncMutex<ShellState<ShellHandleOf<F>>>>,
     cmd: String,
     opts: RunOpts,
 ) -> Result<Outcome, ShellToolError> {
@@ -462,7 +448,7 @@ async fn run_once_inner<F: WorkflowShell>(
 /// `Shell`, attach the per-`ShellJs` output sink so streaming pipes
 /// through, and stash it on `guard`. No-op when a shell already exists.
 async fn ensure_shell<F: WorkflowShell>(
-    guard: &mut tokio::sync::MutexGuard<'_, ShellState>,
+    guard: &mut tokio::sync::MutexGuard<'_, ShellState<ShellHandleOf<F>>>,
     factory: &F,
 ) -> Result<(), ShellToolError> {
     if guard.shell.is_some() {
@@ -488,8 +474,8 @@ async fn ensure_shell<F: WorkflowShell>(
     Ok(())
 }
 
-async fn keep_waiting_inner(
-    state: &Arc<AsyncMutex<ShellState>>,
+async fn keep_waiting_inner<H: WorkflowShellHandle>(
+    state: &Arc<AsyncMutex<ShellState<H>>>,
     wait: WaitOpts,
 ) -> Result<Outcome, ShellToolError> {
     let mut guard = state.lock().await;
@@ -509,7 +495,9 @@ async fn keep_waiting_inner(
     Ok(absorb_outcome(&mut guard, outcome))
 }
 
-async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), ShellToolError> {
+async fn kill_inner<H: WorkflowShellHandle>(
+    state: &Arc<AsyncMutex<ShellState<H>>>,
+) -> Result<(), ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
         return Err(ShellToolError::Closed);
@@ -529,7 +517,7 @@ async fn kill_inner(state: &Arc<AsyncMutex<ShellState>>) -> Result<(), ShellTool
 /// string values, JSON for everything else).
 async fn set_var_inner<F: WorkflowShell>(
     factory: &F,
-    state: &Arc<AsyncMutex<ShellState>>,
+    state: &Arc<AsyncMutex<ShellState<ShellHandleOf<F>>>>,
     name: String,
     value: String,
 ) -> Result<(), ShellToolError> {
@@ -537,21 +525,21 @@ async fn set_var_inner<F: WorkflowShell>(
     if name == "FRANCES_ROOT" {
         return Err(ShellToolError::ReservedBashName);
     }
-    let mut tmp = tempfile::NamedTempFile::new().map_err(ShellToolError::Tempfile)?;
-    tmp.write_all(value.as_bytes())
-        .map_err(ShellToolError::WriteTempfile)?;
-    tmp.flush().map_err(ShellToolError::FlushTempfile)?;
-    let cmd = format!(
-        "export {name}=$(cat {})",
-        shell_quote(tmp.path().to_string_lossy().as_ref()),
-    );
-    let (exit, output) = run_to_done(factory, state, &cmd, vec![name.clone()]).await?;
-    if exit != 0 {
-        return Err(ShellToolError::SetVarFailed { name, exit, output });
+    let mut guard = state.lock().await;
+    if guard.closed {
+        return Err(ShellToolError::Closed);
     }
-    // `tmp` drops here — file is removed.
-    drop(tmp);
-    Ok(())
+    if guard.running {
+        return Err(ShellToolError::Busy);
+    }
+    ensure_shell(&mut guard, factory).await?;
+    guard
+        .shell
+        .as_mut()
+        .expect("shell is Some")
+        .set_var(name.clone(), value.into_bytes())
+        .await
+        .map_err(|source| ShellToolError::SetVar { name, source })
 }
 
 /// Bridge a bash variable into Frances by having bash `printf` the
@@ -563,33 +551,10 @@ async fn set_var_inner<F: WorkflowShell>(
 /// shell's settings aren't disturbed.
 async fn get_var_inner<F: WorkflowShell>(
     factory: &F,
-    state: &Arc<AsyncMutex<ShellState>>,
+    state: &Arc<AsyncMutex<ShellState<ShellHandleOf<F>>>>,
     name: String,
 ) -> Result<String, ShellToolError> {
     validate_bash_name(&name)?;
-    let tmp = tempfile::NamedTempFile::new().map_err(ShellToolError::Tempfile)?;
-    let cmd = format!(
-        "( set -u; printf '%s' \"${name}\" > {} )",
-        shell_quote(tmp.path().to_string_lossy().as_ref()),
-    );
-    let (exit, output) = run_to_done(factory, state, &cmd, Vec::new()).await?;
-    if exit != 0 {
-        return Err(ShellToolError::GetVarFailed { name, exit, output });
-    }
-    let value = fs::read_to_string(tmp.path()).map_err(ShellToolError::ReadValue)?;
-    drop(tmp);
-    Ok(value)
-}
-
-/// Issue a one-shot bash command and require a `Done` outcome. Used
-/// by export/get, both of which run short deterministic commands
-/// where Quiet would be a tool-side bug (an infinite-output trap or equivalent).
-async fn run_to_done<F: WorkflowShell>(
-    factory: &F,
-    state: &Arc<AsyncMutex<ShellState>>,
-    cmd: &str,
-    persist: Vec<String>,
-) -> Result<(i32, String), ShellToolError> {
     let mut guard = state.lock().await;
     if guard.closed {
         return Err(ShellToolError::Closed);
@@ -598,26 +563,13 @@ async fn run_to_done<F: WorkflowShell>(
         return Err(ShellToolError::Busy);
     }
     ensure_shell(&mut guard, factory).await?;
-    let outcome = {
-        let shell = guard.shell.as_mut().expect("shell is Some");
-        shell
-            .run_with_opts(
-                cmd,
-                ShellRunOpts {
-                    stdin: None,
-                    persist,
-                },
-                WaitOpts::default(),
-            )
-            .await
-            .map_err(ShellToolError::Run)?
-    };
-    let absorbed = absorb_outcome(&mut guard, outcome);
-    match absorbed {
-        Outcome::Done { exit_code, output } => Ok((exit_code, output)),
-        Outcome::Quiet { output, .. } => Err(ShellToolError::WentQuiet { output }),
-        Outcome::Dead { output } => Err(ShellToolError::Died { output }),
-    }
+    guard
+        .shell
+        .as_mut()
+        .expect("shell is Some")
+        .get_var(name.clone())
+        .await
+        .map_err(|source| ShellToolError::GetVar { name, source })
 }
 
 /// Reject anything that isn't a plain bash identifier. The name lands
@@ -637,24 +589,7 @@ fn validate_bash_name(name: &str) -> Result<(), ShellToolError> {
     Ok(())
 }
 
-/// Wrap a path in single quotes for bash, doubling any embedded
-/// single-quote via `'\''`. TMPDIR is user-controlled so the input
-/// cannot be trusted to be quote-free.
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for c in s.chars() {
-        if c == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(c);
-        }
-    }
-    out.push('\'');
-    out
-}
-
-fn absorb_outcome(state: &mut ShellState, outcome: RunOutcome) -> Outcome {
+fn absorb_outcome<H>(state: &mut ShellState<H>, outcome: RunOutcome) -> Outcome {
     match outcome {
         RunOutcome::Done { exit_code, output } => {
             state.running = false;

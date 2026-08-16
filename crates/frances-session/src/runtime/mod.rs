@@ -35,8 +35,8 @@ use frances_llm::{ChatManagerDeps, ChatSessionManager, ProviderCache};
 use frances_models_llm::config::ModelConfig;
 use frances_storage::{Database, Migration};
 use frances_workflow::{
-    EditorFactory, PermissionResponse, RealIo, Runtime as WorkflowRuntime, WorkflowDb,
-    WorkflowDbError, WorkflowDeps,
+    EditorFactory, PermissionResponse, RealFs, RealIo, Runtime as WorkflowRuntime, WorkflowDb,
+    WorkflowDbError, WorkflowDeps, WorkflowFs,
 };
 
 pub(crate) mod auto_judge;
@@ -356,7 +356,7 @@ impl<Io: frances_workflow::WorkflowIo> SessionRuntime<Io> {
             .map(|r| (*r).clone())
             .unwrap_or_else(default_root_markers);
         let editable_root = match invocation.process.cwd.as_ref() {
-            Some(cwd) => discover_root(cwd, &root_markers).await,
+            Some(cwd) => discover_root_with(io.fs(), cwd, &root_markers).await,
             None => std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         };
         let editable_roots = vec![editable_root];
@@ -572,12 +572,21 @@ fn build_config_providers(
 /// first ancestor (or `cwd` itself) that contains one; falls back to `cwd` when
 /// no marker is found.
 pub async fn discover_root(cwd: &std::path::Path, markers: &[PathBuf]) -> PathBuf {
+    discover_root_with(&RealFs, cwd, markers).await
+}
+
+async fn discover_root_with(
+    fs: &impl WorkflowFs,
+    cwd: &std::path::Path,
+    markers: &[PathBuf],
+) -> PathBuf {
     let mut dir = cwd;
     loop {
         for marker in markers {
-            if tokio::fs::metadata(dir.join(marker))
+            if fs
+                .metadata(&dir.join(marker))
                 .await
-                .is_ok_and(|m| m.is_dir())
+                .is_ok_and(|metadata| metadata.is_dir)
             {
                 return dir.to_path_buf();
             }

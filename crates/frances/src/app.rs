@@ -11,6 +11,8 @@ use frances_session::runtime::{SessionRuntime, StartOverrides, install_logging};
 use frances_session::session::{Paths, Session};
 use frances_session::store;
 use frances_session::workspace::Workspace;
+use frances_worker::Client as WorkerClient;
+use frances_workflow::WorkerIo;
 #[cfg(target_os = "linux")]
 use gdk::prelude::*;
 use parking_lot::Mutex;
@@ -22,7 +24,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 
 struct Backend {
-    runtime: Arc<SessionRuntime>,
+    runtime: Arc<SessionRuntime<WorkerIo>>,
     events: Mutex<Option<mpsc::UnboundedReceiver<StreamFrame>>>,
     permission: Mutex<Option<oneshot::Sender<PermissionResponse>>>,
 }
@@ -183,13 +185,20 @@ async fn start_runtime(
     session: Session,
     invocation: InvocationContext,
     workflow: Option<String>,
-) -> Result<(Arc<SessionRuntime>, mpsc::UnboundedReceiver<StreamFrame>)> {
+) -> Result<(
+    Arc<SessionRuntime<WorkerIo>>,
+    mpsc::UnboundedReceiver<StreamFrame>,
+)> {
     let db = store::open(&session).await?;
+    let worker = WorkerClient::spawn_local().await?;
     let overrides = StartOverrides {
         default_workflow: workflow,
         ..StartOverrides::default()
     };
-    Ok(SessionRuntime::start_with(session, db, invocation, overrides).await?)
+    Ok(
+        SessionRuntime::start_with_io(session, db, invocation, overrides, WorkerIo::new(worker))
+            .await?,
+    )
 }
 
 #[tauri::command]

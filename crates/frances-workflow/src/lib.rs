@@ -30,8 +30,9 @@ pub use closed::WorkflowClosed;
 pub use config::WorkflowConfig;
 pub use deps::{EditorFactory, WorkflowDeps};
 pub use io::{
-    FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer,
-    real::{RealFs, RealIo, RealShell, RealTimer},
+    FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowShellHandle,
+    WorkflowTimer,
+    real::{RealFs, RealIo, RealShell, RealTimer, WorkerFs, WorkerIo},
 };
 
 pub use error::WorkflowError;

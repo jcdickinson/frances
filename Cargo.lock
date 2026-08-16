@@ -1762,6 +1762,8 @@ dependencies = [
  "clap",
  "frances-models-ui",
  "frances-session",
+ "frances-worker",
+ "frances-workflow",
  "gdk",
  "gtk",
  "libc",
@@ -1947,6 +1949,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "frances-worker"
+version = "0.1.0"
+dependencies = [
+ "frances-shell",
+ "frances-worker-protocol",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "frances-worker-protocol"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "frances-workflow"
 version = "0.1.0"
 dependencies = [
@@ -1960,6 +1984,8 @@ dependencies = [
  "frances-models-ui",
  "frances-shell",
  "frances-storage",
+ "frances-worker",
+ "frances-worker-protocol",
  "frances-workflow",
  "globset",
  "grep-matcher",

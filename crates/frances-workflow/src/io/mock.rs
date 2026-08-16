@@ -266,6 +266,8 @@ impl MockShell {
 }
 
 impl WorkflowShell for MockShell {
+    type Handle = Shell;
+
     fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send {
         let real = self.real;
         async move {
@@ -348,6 +350,7 @@ impl WorkflowFs for MockFs {
         Ok(FsMetadata {
             mtime_ns,
             size: bytes.len() as u64,
+            is_dir: false,
         })
     }
 

@@ -35,11 +35,10 @@ the file — so sessions spawned before the save are already linked to it.
 switching it to the workspace's dirs verbatim is a known follow-up once
 multi-dir workspaces are exercised.
 
-## In-process runtime
+## Local runtime and worker
 
-There is no daemon. `frances` is a single process: the binary resolves the
-workspace, creates the session, opens the
-per-session turso database, and constructs a
+There is no daemon. The desktop process resolves the workspace, creates the
+session, opens the per-session turso database, and constructs a
 [`SessionRuntime`](../../crates/frances-session/src/runtime/mod.rs). The desktop UI
 runs in the same process and talks to the runtime through:
 
@@ -51,12 +50,38 @@ runs in the same process and talks to the runtime through:
   UI drains scrollback replay, prompt frames, and any workflow-switch
   replay through this channel.
 
+The desktop always starts the sibling `frances-worker serve --stdio` binary.
+Milestone one hardcodes this local startup sequence, but the protocol only
+assumes an async byte stream; SSH and WSL launchers can provide the same stdio
+shape later. There is deliberately no in-process production filesystem
+fallback. Workflow file reads, writes, metadata, directory creation,
+canonicalization, and editable-root marker discovery all cross the worker.
+
+Worker messages use `Content-Length` framed JSON. Byte content is carried in
+preceding `application/octet-stream` frames and represented in Rust as a
+single-use `Content`; serde registers and claims attachment IDs internally.
+Received content is staged and deleted when `Content` or its reader is dropped,
+so filesystem handlers do not know about framing or transport tempfiles.
+
+The worker advertises `filesystem` and `shell` capabilities. The protocol has a
+permanent reader dispatcher, a serialized bounded writer, concurrent request
+matching, and transferable bounded `Feed<T>` endpoints. A shell is a
+connection-scoped resource with a command feed in one direction and an event
+feed in the other; multiple shells have independent worker tasks, process
+state, and output. Each run/wait observation ends with `Done`, `Quiet`, or
+`Dead`, which the local proxy consumes behind its ordinary async methods.
+
+`Feed<T>` is intentionally one-way. Passing one feed in a request and another
+in its response composes a bidirectional session without a separate channel
+abstraction. A future one-result `Observation<T>` can reuse the same routing
+machinery without changing shell resource or framing semantics.
+
 `OPENROUTER_API_KEY` and any other secrets come from the process environment
 at startup; the runtime carries an `InvocationContext` snapshot of env + cwd
 that workflows read via `current_env` / `current_cwd`.
 
-There is no IPC, no socket-pairing race, no protocol versioning, no
-re-attach. The single-process model intentionally drops the "session
+There is no listening socket, socket-pairing race, or re-attach. The UI/runtime
+model intentionally drops the "session
 outlives the UI" property — quitting the app cancels any in-flight turn.
 Persisted state (scrollback rows, history rows, workflow metadata) is
 written eagerly during the turn so a partial turn survives the restart.

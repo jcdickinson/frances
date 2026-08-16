@@ -76,6 +76,10 @@ Frances is named for two early UNIVAC programmers:
 The interesting crates live under `crates/`:
 
 - **`frances`** — the Tauri binary, launcher, and Rust-to-webview event bridge.
+- **`frances-worker`** / **`frances-worker-protocol`** — the mandatory local
+  workspace worker and its framed stdio protocol. The transport is remote-ready;
+  milestone one exposes only local sibling-process startup; filesystem IO and
+  independent multi-shell execution already cross the worker boundary.
 - **`frontend`** — the Svelte, TypeScript, and SCSS interface, built with Deno.
 - **`frances-session`** — session runtime: per-session DB handle, workflow
   selection, history, scrollback persistence, anchor store, the LLM session

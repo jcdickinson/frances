@@ -8,11 +8,17 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use tokio::io::AsyncReadExt;
 use tokio::sync::Notify;
 
-use frances_shell::{Shell, ShellError, ShellOptions};
+use frances_shell::{ReadEvent, RunOpts, RunOutcome, Shell, ShellError, ShellOptions, WaitOpts};
+use frances_worker::{Client as WorkerClient, WorkerShell};
+use frances_worker_protocol::{Content, ShellOptions as WorkerShellOptions};
 
-use super::{FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowTimer};
+use super::{
+    FsMetadata, SleepOutcome, WorkflowFs, WorkflowIo, WorkflowShell, WorkflowShellHandle,
+    WorkflowTimer,
+};
 use crate::closed::WorkflowClosed;
 
 /// Production IO bundle.
@@ -34,6 +40,44 @@ impl WorkflowIo for RealIo {
     fn shell(&self) -> &Self::Shell {
         &self.shell
     }
+    fn fs(&self) -> &Self::Fs {
+        &self.fs
+    }
+}
+
+/// Production IO with project filesystem operations delegated to the worker.
+#[derive(Clone)]
+pub struct WorkerIo {
+    timer: RealTimer,
+    shell: WorkerShellFactory,
+    fs: WorkerFs,
+}
+
+impl WorkerIo {
+    pub fn new(client: WorkerClient) -> Self {
+        Self {
+            timer: RealTimer,
+            shell: WorkerShellFactory {
+                client: client.clone(),
+            },
+            fs: WorkerFs { client },
+        }
+    }
+}
+
+impl WorkflowIo for WorkerIo {
+    type Timer = RealTimer;
+    type Shell = WorkerShellFactory;
+    type Fs = WorkerFs;
+
+    fn timer(&self) -> &Self::Timer {
+        &self.timer
+    }
+
+    fn shell(&self) -> &Self::Shell {
+        &self.shell
+    }
+
     fn fs(&self) -> &Self::Fs {
         &self.fs
     }
@@ -76,14 +120,205 @@ impl WorkflowTimer for RealTimer {
 pub struct RealShell;
 
 impl WorkflowShell for RealShell {
+    type Handle = Shell;
+
     fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send {
         Shell::spawn(opts)
+    }
+}
+
+#[derive(Clone)]
+pub struct WorkerShellFactory {
+    client: WorkerClient,
+}
+
+impl WorkflowShell for WorkerShellFactory {
+    type Handle = WorkerShell;
+
+    async fn spawn(&self, opts: ShellOptions) -> Result<WorkerShell, ShellError> {
+        self.client
+            .open_shell(WorkerShellOptions {
+                cwd: opts.cwd,
+                env: opts
+                    .env
+                    .into_iter()
+                    .map(|(name, value)| {
+                        (
+                            name.to_string_lossy().into_owned(),
+                            value.to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect(),
+                init_script: opts.init_script,
+            })
+            .await
+            .map_err(worker_shell_error)
+    }
+}
+
+impl WorkflowShellHandle for WorkerShell {
+    fn set_output_sink(&mut self, sink: Option<tokio::sync::mpsc::UnboundedSender<ReadEvent>>) {
+        WorkerShell::set_output_sink(self, sink);
+    }
+
+    async fn run_with_opts(
+        &mut self,
+        command: &str,
+        options: RunOpts,
+        wait: WaitOpts,
+    ) -> Result<RunOutcome, ShellError> {
+        WorkerShell::run_with_opts(self, command, options, wait)
+            .await
+            .map_err(worker_shell_error)
+    }
+
+    async fn keep_waiting(&mut self, wait: WaitOpts) -> Result<RunOutcome, ShellError> {
+        WorkerShell::keep_waiting(self, wait)
+            .await
+            .map_err(worker_shell_error)
+    }
+
+    async fn kill_running(&mut self) -> Result<(), ShellError> {
+        WorkerShell::kill_running(self)
+            .await
+            .map_err(worker_shell_error)
+    }
+
+    async fn set_var(&mut self, name: String, value: Vec<u8>) -> Result<(), ShellError> {
+        WorkerShell::set_var(self, name, Content::from_bytes(value))
+            .await
+            .map_err(worker_shell_error)
+    }
+
+    async fn get_var(&mut self, name: String) -> Result<String, ShellError> {
+        let content = WorkerShell::get_var(self, name)
+            .await
+            .map_err(worker_shell_error)?;
+        let mut reader = content.into_async_read().await.map_err(ShellError::Io)?;
+        let mut value = String::new();
+        reader
+            .read_to_string(&mut value)
+            .await
+            .map_err(ShellError::Io)?;
+        Ok(value)
+    }
+}
+
+fn worker_shell_error(error: frances_worker::ClientError) -> ShellError {
+    ShellError::Io(io::Error::other(error))
+}
+
+impl WorkflowShellHandle for Shell {
+    fn set_output_sink(&mut self, sink: Option<tokio::sync::mpsc::UnboundedSender<ReadEvent>>) {
+        Shell::set_output_sink(self, sink);
+    }
+
+    async fn run_with_opts(
+        &mut self,
+        command: &str,
+        options: RunOpts,
+        wait: WaitOpts,
+    ) -> Result<RunOutcome, ShellError> {
+        Shell::run_with_opts(self, command, options, wait).await
+    }
+
+    async fn keep_waiting(&mut self, wait: WaitOpts) -> Result<RunOutcome, ShellError> {
+        Shell::keep_waiting(self, wait).await
+    }
+
+    async fn kill_running(&mut self) -> Result<(), ShellError> {
+        Shell::kill_running(self).await
+    }
+
+    async fn set_var(&mut self, name: String, value: Vec<u8>) -> Result<(), ShellError> {
+        let outcome = self
+            .run_with_opts(
+                &format!("export {name}=$(cat)"),
+                RunOpts {
+                    stdin: Some(value),
+                    persist: vec![name],
+                },
+                WaitOpts::default(),
+            )
+            .await?;
+        require_done(outcome, "set variable").map(|_| ())
+    }
+
+    async fn get_var(&mut self, name: String) -> Result<String, ShellError> {
+        let outcome = self
+            .run(
+                &format!("( set -u; printf '%s' \"${name}\" )"),
+                WaitOpts::default(),
+            )
+            .await?;
+        require_done(outcome, "get variable")
+    }
+}
+
+fn require_done(outcome: RunOutcome, operation: &str) -> Result<String, ShellError> {
+    match outcome {
+        RunOutcome::Done {
+            exit_code: 0,
+            output,
+        } => Ok(output),
+        other => Err(ShellError::Io(io::Error::other(format!(
+            "{operation}: {other:?}"
+        )))),
     }
 }
 
 /// `tokio::fs` passthrough.
 #[derive(Clone, Copy, Default)]
 pub struct RealFs;
+
+#[derive(Clone)]
+pub struct WorkerFs {
+    client: WorkerClient,
+}
+
+impl WorkflowFs for WorkerFs {
+    async fn read_to_string(&self, path: &Path) -> io::Result<String> {
+        let content = self.client.read(path).await.map_err(worker_io_error)?;
+        let mut reader = content.into_async_read().await?;
+        let mut text = String::new();
+        reader.read_to_string(&mut text).await?;
+        Ok(text)
+    }
+
+    async fn write(&self, path: &Path, content: &[u8]) -> io::Result<()> {
+        self.client
+            .write(path, Content::from_bytes(content.to_vec()))
+            .await
+            .map_err(worker_io_error)
+    }
+
+    async fn metadata(&self, path: &Path) -> io::Result<FsMetadata> {
+        let metadata = self.client.metadata(path).await.map_err(worker_io_error)?;
+        Ok(FsMetadata {
+            mtime_ns: metadata.mtime_ns,
+            size: metadata.size,
+            is_dir: metadata.is_dir,
+        })
+    }
+
+    async fn create_dir_all(&self, path: &Path) -> io::Result<()> {
+        self.client
+            .create_dir_all(path)
+            .await
+            .map_err(worker_io_error)
+    }
+
+    async fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
+        self.client
+            .canonicalize(path)
+            .await
+            .map_err(worker_io_error)
+    }
+}
+
+fn worker_io_error(error: frances_worker::ClientError) -> io::Error {
+    io::Error::other(error)
+}
 
 impl WorkflowFs for RealFs {
     async fn read_to_string(&self, path: &Path) -> io::Result<String> {
@@ -105,6 +340,7 @@ impl WorkflowFs for RealFs {
         Ok(FsMetadata {
             mtime_ns,
             size: meta.len(),
+            is_dir: meta.is_dir(),
         })
     }
 

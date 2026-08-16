@@ -12,9 +12,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, mpsc::UnboundedSender};
 
-use frances_shell::{Shell, ShellError, ShellOptions};
+use frances_shell::{ReadEvent, RunOpts, RunOutcome, ShellError, ShellOptions, WaitOpts};
 
 use crate::closed::WorkflowClosed;
 
@@ -54,6 +54,8 @@ pub struct FsMetadata {
     pub mtime_ns: i64,
     /// File size in bytes.
     pub size: u64,
+    /// Whether the path names a directory.
+    pub is_dir: bool,
 }
 
 /// The umbrella IO surface — held by `WorkflowDeps::Io`.
@@ -83,11 +85,40 @@ pub trait WorkflowTimer: Clone + Send + Sync + 'static {
     ) -> Pin<Box<dyn Future<Output = SleepOutcome> + Send>>;
 }
 
-/// Spawns bash subprocesses for the `frances:v1/tools/shell` primitive.
-/// Stubs the spawn boundary only; `Shell` itself is the concrete
-/// `frances_shell::Shell`.
+/// Spawns shell handles for the `frances:v1/tools/shell` primitive.
 pub trait WorkflowShell: Clone + Send + Sync + 'static {
-    fn spawn(&self, opts: ShellOptions) -> impl Future<Output = Result<Shell, ShellError>> + Send;
+    type Handle: WorkflowShellHandle;
+
+    fn spawn(
+        &self,
+        opts: ShellOptions,
+    ) -> impl Future<Output = Result<Self::Handle, ShellError>> + Send;
+}
+
+pub trait WorkflowShellHandle: Send + 'static {
+    fn set_output_sink(&mut self, sink: Option<UnboundedSender<ReadEvent>>);
+
+    fn run_with_opts(
+        &mut self,
+        command: &str,
+        options: RunOpts,
+        wait: WaitOpts,
+    ) -> impl Future<Output = Result<RunOutcome, ShellError>> + Send;
+
+    fn keep_waiting(
+        &mut self,
+        wait: WaitOpts,
+    ) -> impl Future<Output = Result<RunOutcome, ShellError>> + Send;
+
+    fn kill_running(&mut self) -> impl Future<Output = Result<(), ShellError>> + Send;
+
+    fn set_var(
+        &mut self,
+        name: String,
+        value: Vec<u8>,
+    ) -> impl Future<Output = Result<(), ShellError>> + Send;
+
+    fn get_var(&mut self, name: String) -> impl Future<Output = Result<String, ShellError>> + Send;
 }
 
 /// Filesystem accessor backing `frances:v1/tools/file` reads/writes and
