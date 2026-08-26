@@ -15,8 +15,8 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: ${{ matrix.target }}
+  workers:
+    name: worker ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
@@ -34,42 +34,109 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      # musl needs a C toolchain for the bundled QuickJS (rquickjs). On the
-      # native arm64 runner, musl-gcc from musl-tools targets aarch64.
-      - name: Install musl toolchain
-        if: contains(matrix.target, '-linux-musl')
+      - name: Install Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build worker image
+        shell: bash
+        run: |
+          cargo build --release --locked -p frances-worker --target '${{ matrix.target }}'
+          # Keep the uploaded worker in the same gzip format consumed by the
+          # AppImage builder, avoiding an extra raw-binary artifact round trip.
+          gzip -9 -c 'target/${{ matrix.target }}/release/frances-worker' \
+            > 'target/${{ matrix.target }}/release/frances-worker.gz'
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: frances-worker-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/frances-worker.gz
+          retention-days: 1
+
+  build:
+    name: ${{ matrix.target }}
+    needs: workers
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+            package: appimage
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            package: appimage
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+            package: archive
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            package: archive
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: frances-worker-*
+          path: worker-images
+
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Install AppImage dependencies
+        if: matrix.package == 'appimage'
         run: |
           sudo apt-get update
-          sudo apt-get install -y musl-tools
-          key=$(echo '${{ matrix.target }}' | tr '-' '_')
-          echo "CC_${key}=musl-gcc" >> "$GITHUB_ENV"
-          echo "CARGO_TARGET_${key^^}_LINKER=musl-gcc" >> "$GITHUB_ENV"
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
 
       - name: Install Rust target
         run: rustup target add ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --release --locked -p frances --target ${{ matrix.target }}
-
-      - name: Package
-        id: package
+      - name: Build AppImage
+        if: matrix.package == 'appimage'
+        id: appimage
+        shell: bash
         run: |
+          worker_args=()
+          for image in worker-images/frances-worker-*/frances-worker.gz; do
+            target=${image#worker-images/frances-worker-}
+            target=${target%/frances-worker.gz}
+            worker_args+=(--worker-image "$target=$image")
+          done
+          asset="frances-${{ matrix.target }}.AppImage"
+          ./opt/bin/build-appimage \
+            --target '${{ matrix.target }}' \
+            --output "$asset" \
+            "${worker_args[@]}"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS archive
+        if: matrix.package == 'archive'
+        id: archive
+        shell: bash
+        run: |
+          deno task --config frontend/deno.json build
+          cargo build --release --locked -p frances --target '${{ matrix.target }}'
           name="frances-${{ matrix.target }}"
-          staging="$name"
-          mkdir "$staging"
-          cp "target/${{ matrix.target }}/release/frances" "$staging/"
-          tar czf "$name.tar.gz" "$staging"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/frances" "$name/"
+          gzip -d -c "worker-images/frances-worker-${{ matrix.target }}/frances-worker.gz" \
+            > "$name/frances-worker"
+          chmod +x "$name/frances-worker"
+          tar czf "$name.tar.gz" "$name"
           echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v5
         with:
           name: frances-${{ matrix.target }}
-          path: ${{ steps.package.outputs.asset }}
+          path: ${{ steps.appimage.outputs.asset || steps.archive.outputs.asset }}
 
       - name: Attach to release
         if: inputs.release != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.asset }}
+          files: ${{ steps.appimage.outputs.asset || steps.archive.outputs.asset }}
           tag_name: ${{ inputs.release }}
           draft: true

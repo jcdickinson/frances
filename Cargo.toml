@@ -32,6 +32,7 @@ bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
 deno_ast = { version = "0.53", features = ["transpiling"] }
+flate2 = "1"
 futures = "0.3"
 futures-util = "0.3"
 getrandom = "0.2"

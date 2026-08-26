@@ -75,6 +75,12 @@ impl Client {
         };
         let worker_path = parent.join(worker_name);
 
+        Self::spawn(worker_path).await
+    }
+
+    /// Spawn a worker binary at an explicitly resolved path.
+    pub async fn spawn(worker_path: impl AsRef<Path>) -> Result<Self, ClientError> {
+        let worker_path = worker_path.as_ref().to_path_buf();
         let mut child = Command::new(&worker_path)
             .arg("serve")
             .arg("--stdio")

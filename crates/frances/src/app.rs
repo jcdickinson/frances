@@ -84,11 +84,20 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
         .setup(move |app| {
             specta.mount_events(app);
 
-            let (runtime, events) = tauri::async_runtime::block_on(start_runtime(
-                session_for_setup.clone(),
-                invocation,
-                workflow,
-            ))?;
+            let (runtime, events) = tauri::async_runtime::block_on(async {
+                #[cfg(target_os = "linux")]
+                let worker_image = crate::appimage::local_worker_image(app.handle()).await?;
+                #[cfg(not(target_os = "linux"))]
+                let worker_image = None;
+
+                start_runtime(
+                    session_for_setup.clone(),
+                    invocation,
+                    workflow,
+                    worker_image,
+                )
+                .await
+            })?;
 
             if let Some(title) = &session_for_setup.meta.title
                 && let Some(window) = app.get_webview_window("main")
@@ -169,6 +178,7 @@ fn specta_builder() -> tauri_specta::Builder {
 }
 
 /// Write the generated TypeScript bindings into the frontend source tree.
+#[cfg(any(debug_assertions, test))]
 fn export_bindings(specta: &tauri_specta::Builder) -> Result<()> {
     specta.export(
         specta_typescript::Typescript::default()
@@ -185,12 +195,16 @@ async fn start_runtime(
     session: Session,
     invocation: InvocationContext,
     workflow: Option<String>,
+    worker_image: Option<std::path::PathBuf>,
 ) -> Result<(
     Arc<SessionRuntime<WorkerIo>>,
     mpsc::UnboundedReceiver<StreamFrame>,
 )> {
     let db = store::open(&session).await?;
-    let worker = WorkerClient::spawn_local().await?;
+    let worker = match worker_image {
+        Some(path) => WorkerClient::spawn(path).await?,
+        None => WorkerClient::spawn_local().await?,
+    };
     let overrides = StartOverrides {
         default_workflow: workflow,
         ..StartOverrides::default()

@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+    echo "usage: $0 [--target TARGET] [--output PATH] --worker-image TARGET=PATH [...]" >&2
+    exit 2
+}
+
+repo_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+source "$repo_dir/opt/lib/linux-targets.sh"
+frances_detect_linux_targets
+
+target=$FRANCES_GNU_TARGET
+output=
+worker_images=()
+
+while (($#)); do
+    case "$1" in
+        --target)
+            (($# >= 2)) || usage
+            target=$2
+            shift 2
+            ;;
+        --output)
+            (($# >= 2)) || usage
+            output=$2
+            shift 2
+            ;;
+        --worker-image)
+            (($# >= 2)) || usage
+            worker_images+=("$2")
+            shift 2
+            ;;
+        -h | --help) usage ;;
+        *) usage ;;
+    esac
+done
+
+if [[ $target != x86_64-unknown-linux-gnu && $target != aarch64-unknown-linux-gnu ]]; then
+    echo "AppImage target must be x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu: $target" >&2
+    exit 1
+fi
+
+if ((${#worker_images[@]} == 0)); then
+    echo "at least one --worker-image TARGET=PATH is required" >&2
+    exit 1
+fi
+
+staging=$(mktemp -d "${TMPDIR:-/tmp}/frances-appimage.XXXXXX")
+trap 'rm -rf "$staging"' EXIT
+
+declare -A seen_targets=()
+for worker_image in "${worker_images[@]}"; do
+    worker_target=${worker_image%%=*}
+    worker_path=${worker_image#*=}
+    if [[ -z $worker_target || $worker_path == "$worker_image" ]]; then
+        echo "worker image must be TARGET=PATH: $worker_image" >&2
+        exit 1
+    fi
+    if [[ -n ${seen_targets[$worker_target]:-} ]]; then
+        echo "worker image target was passed more than once: $worker_target" >&2
+        exit 1
+    fi
+    if [[ ! -f $worker_path ]]; then
+        echo "worker image does not exist: $worker_path" >&2
+        exit 1
+    fi
+    if ! gzip -t "$worker_path"; then
+        echo "worker image is not a valid gzip file: $worker_path" >&2
+        exit 1
+    fi
+
+    seen_targets[$worker_target]=1
+    worker_dir="$staging/worker-images/$worker_target"
+    mkdir -p "$worker_dir"
+    # Keep workers compressed in the AppImage. linuxdeploy rewrites embedded
+    # ELF files, which corrupts Rust's static musl PIE binaries.
+    cp "$worker_path" "$worker_dir/frances-worker.gz"
+done
+
+jq -n --arg workers "$staging/worker-images/" '{
+    bundle: {
+        active: true,
+        targets: ["appimage"],
+        resources: {($workers): "worker-images/"}
+    }
+}' > "$staging/tauri.appimage.json"
+
+cd "$repo_dir"
+bundle_dir="$repo_dir/target/$target/release/bundle/appimage"
+mkdir -p "$bundle_dir"
+find "$bundle_dir" -maxdepth 1 -type f -name '*.AppImage' -delete
+
+deno task --config frontend/deno.json tauri build \
+    --target "$target" \
+    --bundles appimage \
+    --config "$staging/tauri.appimage.json" \
+    -- --locked
+
+mapfile -t appimages < <(find "$bundle_dir" -maxdepth 1 -type f -name '*.AppImage' -print)
+if ((${#appimages[@]} != 1)); then
+    echo "expected one AppImage in $bundle_dir, found ${#appimages[@]}" >&2
+    exit 1
+fi
+
+appimage=${appimages[0]}
+
+# Tauri's linuxdeploy bundle includes libwayland-client, which is incompatible
+# with newer host Mesa versions and makes WebKitGTK abort during EGL startup.
+# Repack without it so the AppImage uses the host's matching Wayland library.
+cache_home=${XDG_CACHE_HOME:-${HOME:?HOME is not set}/.cache}
+appimage_plugin="$cache_home/tauri/linuxdeploy-plugin-appimage.AppImage"
+if [[ ! -x $appimage_plugin ]]; then
+    echo "Tauri AppImage plugin does not exist: $appimage_plugin" >&2
+    exit 1
+fi
+
+repair_dir="$staging/repair"
+mkdir "$repair_dir"
+(
+    cd "$repair_dir"
+    "$appimage" --appimage-extract >/dev/null
+)
+bundled_wayland="$repair_dir/squashfs-root/usr/lib/libwayland-client.so.0"
+if [[ ! -f $bundled_wayland ]]; then
+    echo "expected bundled Wayland client does not exist: $bundled_wayland" >&2
+    exit 1
+fi
+rm "$bundled_wayland"
+
+frances_detect_linux_targets "$target"
+(
+    cd "$repair_dir"
+    ARCH=$FRANCES_APPIMAGE_ARCH APPIMAGE_EXTRACT_AND_RUN=1 \
+        "$appimage_plugin" --appdir=squashfs-root
+)
+mapfile -t repaired_appimages < <(find "$repair_dir" -maxdepth 1 -type f -name '*.AppImage' -print)
+if ((${#repaired_appimages[@]} != 1)); then
+    echo "expected one repaired AppImage, found ${#repaired_appimages[@]}" >&2
+    exit 1
+fi
+install -m 755 "${repaired_appimages[0]}" "$appimage"
+
+if [[ -n $output ]]; then
+    if [[ $output != /* ]]; then
+        output="$repo_dir/$output"
+    fi
+    mkdir -p "$(dirname "$output")"
+    cp "$appimage" "$output"
+    appimage=$output
+fi
+
+echo "$appimage"

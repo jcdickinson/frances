@@ -1,4 +1,6 @@
 mod app;
+#[cfg(target_os = "linux")]
+mod appimage;
 mod install;
 
 use std::path::PathBuf;
@@ -64,7 +66,11 @@ fn real_main() -> Result<()> {
 }
 
 fn launch_detached(workspace: &Workspace, workflow: Option<&str>) -> Result<()> {
-    let executable = std::env::current_exe().context("resolve frances executable")?;
+    let current_executable = std::env::current_exe().context("resolve frances executable")?;
+    #[cfg(target_os = "linux")]
+    let executable = appimage::launcher_executable(&current_executable);
+    #[cfg(not(target_os = "linux"))]
+    let executable = current_executable;
 
     let mut command = ProcessCommand::new(executable);
     command.arg("--foreground");
