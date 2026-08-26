@@ -7,7 +7,7 @@ edition = "2024"
 version = "0.1.0"
 authors = ["Frances Contributors"]
 license = "MIT"
-repository = "https://github.com/jono/frances"
+repository = "https://github.com/jcdickinson/frances"
 
 [workspace.dependencies]
 frances-anchors = { path = "crates/frances-anchors" }

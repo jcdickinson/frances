@@ -25,6 +25,13 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png"],
+    "linux": {
+      "appimage": {
+        "files": {
+          "/usr/share/metainfo/Frances.appdata.xml": "Frances.appdata.xml"
+        }
+      }
+    }
   }
 }

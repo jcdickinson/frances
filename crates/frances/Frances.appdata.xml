@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>Frances.desktop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Frances</name>
+  <summary>An agentic coding tool</summary>
+  <description>
+    <p>
+      Frances is a desktop agentic coding tool that opens a workspace, runs a
+      configurable coding workflow, and displays the session as it progresses.
+    </p>
+  </description>
+  <launchable type="desktop-id">Frances.desktop</launchable>
+  <url type="homepage">https://github.com/jcdickinson/frances</url>
+  <developer id="io.github.jcdickinson">
+    <name>Frances Contributors</name>
+  </developer>
+  <provides>
+    <binary>frances</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+</component>
