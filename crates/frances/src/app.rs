@@ -21,7 +21,7 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use tauri_specta::Event as _;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 struct Backend {
     runtime: Arc<SessionRuntime<WorkerIo>>,
@@ -144,9 +144,10 @@ fn ensure_valid_font_dpi() -> Result<()> {
         .map(|dpi| f64::from(dpi) / 1024.0)
         .unwrap_or(96.0);
 
-    info!(
+    tracing::info!(
         current_dpi,
-        configured_dpi, "repairing invalid GDK font DPI"
+        configured_dpi,
+        "repairing invalid GDK font DPI"
     );
     screen.set_resolution(configured_dpi);
     Ok(())

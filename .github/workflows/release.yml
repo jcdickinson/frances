@@ -46,7 +46,7 @@ jobs:
           gzip -9 -c 'target/${{ matrix.target }}/release/frances-worker' \
             > 'target/${{ matrix.target }}/release/frances-worker.gz'
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: frances-worker-${{ matrix.target }}
           path: target/${{ matrix.target }}/release/frances-worker.gz
@@ -76,7 +76,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: frances-worker-*
           path: worker-images
@@ -128,14 +128,14 @@ jobs:
           tar czf "$name.tar.gz" "$name"
           echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v7
         with:
           name: frances-${{ matrix.target }}
           path: ${{ steps.appimage.outputs.asset || steps.archive.outputs.asset }}
 
       - name: Attach to release
         if: inputs.release != ''
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: ${{ steps.appimage.outputs.asset || steps.archive.outputs.asset }}
           tag_name: ${{ inputs.release }}
