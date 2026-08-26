@@ -6,10 +6,19 @@ app:
 build:
     cargo build
 
-# Build the frontend, then the binary (standalone run, no dev server)
+# Build the standalone debug application and its sibling worker.
 build-app:
-    cd frontend && deno task build
-    cargo build -p frances
+    cargo build -p frances-worker
+    deno task --config frontend/deno.json tauri build --debug --no-bundle
+
+# Build the standalone release application and its sibling worker.
+bundle:
+    cargo build --release -p frances-worker
+    deno task --config frontend/deno.json tauri build --no-bundle
+
+# Run the already-built standalone release binary.
+bundle-run *args:
+    exec ./target/release/frances {{ args }}
 
 # Build an AppImage containing the musl worker for this Linux host.
 appimage:
