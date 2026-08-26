@@ -47,6 +47,9 @@ fn main() {
 }
 
 fn real_main() -> Result<()> {
+    #[cfg(target_os = "linux")]
+    restore_appimage_working_dir()?;
+
     let cli = Cli::parse();
 
     if let Some(Command::Install { local }) = cli.command {
@@ -63,6 +66,23 @@ fn real_main() -> Result<()> {
     }
 
     app::run(workspace, cli.workflow)
+}
+
+#[cfg(target_os = "linux")]
+fn restore_appimage_working_dir() -> Result<()> {
+    if std::env::var_os("APPIMAGE").is_none() {
+        return Ok(());
+    }
+    let Some(original_working_dir) = std::env::var_os("OWD") else {
+        return Ok(());
+    };
+
+    std::env::set_current_dir(&original_working_dir).with_context(|| {
+        format!(
+            "restore AppImage working directory {}",
+            PathBuf::from(original_working_dir).display()
+        )
+    })
 }
 
 fn launch_detached(workspace: &Workspace, workflow: Option<&str>) -> Result<()> {

@@ -130,6 +130,14 @@ pub async fn local_worker_image(app: &tauri::AppHandle) -> Result<Option<PathBuf
 }
 
 pub fn launcher_executable(fallback: &Path) -> PathBuf {
+    // NixOS appimage-run has already extracted the image and provided its FHS
+    // environment. Re-executing the AppImage from inside that environment
+    // bypasses the wrapper and fails, while the extracted binary remains at a
+    // stable cache path.
+    if std::env::var_os("APPIMAGE_SILENT_INSTALL").is_some() {
+        return fallback.to_path_buf();
+    }
+
     std::env::var_os("APPIMAGE")
         .map(PathBuf::from)
         .unwrap_or_else(|| fallback.to_path_buf())
