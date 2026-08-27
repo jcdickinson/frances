@@ -17,6 +17,7 @@ parking_lot.workspace = true
 clap.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+frances-core.workspace = true
 frances-models-ui.workspace = true
 frances-session.workspace = true
 frances-worker.workspace = true

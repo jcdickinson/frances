@@ -1,5 +1,6 @@
 //! Shared utilities used across the Frances workspace.
 
+pub mod env;
 pub mod json_repair;
 pub mod log_fmt;
 pub mod path_util;

@@ -1761,6 +1761,7 @@ dependencies = [
  "anyhow",
  "clap",
  "flate2",
+ "frances-core",
  "frances-models-ui",
  "frances-session",
  "frances-worker",
