@@ -25,6 +25,7 @@
   },
   "bundle": {
     "active": false,
+    "category": "DeveloperTool",
     "icon": ["icons/icon.png"],
     "linux": {
       "appimage": {
