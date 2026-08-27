@@ -30,7 +30,8 @@
     "linux": {
       "appimage": {
         "files": {
-          "/usr/share/metainfo/Frances.appdata.xml": "Frances.appdata.xml"
+          "/usr/share/applications/dev.frances.Frances.desktop": "dev.frances.Frances.desktop",
+          "/usr/share/metainfo/dev.frances.Frances.metainfo.xml": "dev.frances.Frances.metainfo.xml"
         }
       }
     }

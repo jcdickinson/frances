@@ -1,0 +1,8 @@
+[Desktop Entry]
+Categories=Development;
+Exec=frances
+StartupWMClass=frances
+Icon=frances
+Name=Frances
+Terminal=false
+Type=Application

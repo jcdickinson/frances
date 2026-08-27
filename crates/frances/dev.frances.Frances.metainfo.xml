@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>Frances.desktop</id>
+  <id>dev.frances.Frances</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <name>Frances</name>
@@ -11,7 +11,7 @@
       configurable coding workflow, and displays the session as it progresses.
     </p>
   </description>
-  <launchable type="desktop-id">Frances.desktop</launchable>
+  <launchable type="desktop-id">dev.frances.Frances.desktop</launchable>
   <url type="homepage">https://github.com/jcdickinson/frances</url>
   <developer id="io.github.jcdickinson">
     <name>Frances Contributors</name>
