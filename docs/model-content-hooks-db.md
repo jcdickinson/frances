@@ -13,7 +13,10 @@ databases containing object stores, primary keys, secondary indexes, and atomic
 transactions. This is an RPC design inspired by that data model, not an
 implementation of the browser API.
 
-All methods below are server-to-host requests over the existing MCP connection.
+All methods below are host operations inside the core draft's
+`frances/hostInputRequired` continuation, not standalone server-to-host RPCs.
+This extension requires MCP 2026-07-28 and `frances/session`. Older MCP revisions
+can provide classic MCP features only.
 Fields use camelCase and methods use `frances/db/`. MUST, SHOULD, and MAY have the
 same meaning as in the core draft. Shapes are illustrative; complete JSON Schemas
 and numeric error codes remain to be specified.
@@ -42,7 +45,8 @@ Use the core protocol's version-intersection rule. Both sides advertise
 ```json
 {
   "capabilities": {
-    "experimental": {
+    "extensions": {
+      "frances/session": { "versions": [1] },
       "frances/db": {
         "versions": [1],
         "scopes": ["session", "workspace"],
@@ -84,17 +88,25 @@ the server's self-reported name, an RPC parameter, or a tool argument. Distinct
 configured identities cannot read one another's databases. Reconnection must
 restore the same binding before storage requests are accepted.
 
-An MCP session ID and a model context ID are not database names. A fresh context
+An application session ID and a model context ID are not database names. A fresh context
 does not clear storage. A fresh connection does not grant access to arbitrary
-previous sessions. The host MUST support servicing database requests while
+previous sessions. Each operation inherits the application session and trusted
+server identity of its originating client RPC; an embedded operation cannot
+choose another binding. The host MUST support servicing database requests while
 awaiting a server's tool, hook, or UI response; otherwise a controller persisting
 its state would deadlock.
 
-This follows the core draft's MCP 2025-11-25 baseline and its
-[transport rules](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports).
-On HTTP, requests use an available server-to-client stream; storage does not
-create a new transport. Durable stdio attachment remains a shared open question
-with the core draft. No filesystem location or stdio session header is invented.
+The core draft's continuation contract works identically over HTTP and stdio.
+The server yields a host-operation request, and the host returns its result in
+`_meta["frances/session"].continuation.hostResponses` on the next client RPC round.
+The server commits no dependent workflow result until it receives the storage
+outcome. The operation's durable `requestId` stays the same across lost responses,
+new JSON-RPC IDs, and continuation rounds. Transport errors never imply rollback.
+
+The application session binding must exist before database operations are
+accepted. Session creation itself cannot depend on these host operations;
+a server using host storage must retain its session registry and creation/deletion
+receipts independently, and may store the workflow contents through `frances/db`.
 
 ## Data model
 
@@ -238,12 +250,11 @@ an oversized result aborts instead of committing an unreportable mutation.
 ### Example: finish a step atomically
 
 The server has read revision `r17`, performed its review, and computed the new
-state. One request updates the step and workflow together:
+state. One host operation updates the step and workflow together. The following object
+is the value of a `hostRequests` entry named `finish-step`:
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 42,
   "method": "frances/db/transaction",
   "params": {
     "databaseId": "db-7",
@@ -273,10 +284,10 @@ state. One request updates the step and workflow together:
 }
 ```
 
+The matching `hostResponses["finish-step"]` entry is:
+
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 42,
   "result": {
     "revision": "r18",
     "results": [{ "written": 1 }, { "written": 1 }]
@@ -351,7 +362,7 @@ Receipts survive disconnect and restart and are retained for the namespace's
 lifetime, including receipts for deleted databases. The host MUST NOT silently
 expire them. This costs storage; quota accounting includes receipts. Explicit
 namespace deletion removes both databases and receipts and revokes its binding,
-so a stale request cannot recreate deleted state through the old connection.
+so a stale request cannot recreate deleted state through the old application session binding.
 A bounded receipt-retirement protocol is an open question, not a hidden TTL.
 
 Success means the mutation and receipt are durably committed under the host's
@@ -374,7 +385,7 @@ required to avoid deleting state changed since the caller last observed it.
 Old database IDs never refer to a recreation. Explicitly deleting a host session
 also removes its session storage; it does not delete workspace storage.
 
-Protocol failures are JSON-RPC errors with a machine-readable
+Operation failures use JSON-RPC-shaped errors in `hostResponses`, with a machine-readable
 `data.kind`. Proposed kinds are `notFound`, `permissionDenied`,
 `unsupportedScope`, `schemaMismatch`, `revisionConflict`, `constraintViolation`,
 `requestIdConflict`, `scanInvalidated`, `cursorExpired`, `quotaExceeded`,
@@ -384,7 +395,7 @@ and may identify the offending store, index, or input record. No failed
 transaction returns a successful prefix. Diagnostics must not leak another
 namespace's existence or data.
 
-Storage RPCs are infrastructure operations, not model-facing tools, and MUST NOT
+Storage host operations are infrastructure operations, not model-facing tools, and MUST NOT
 recursively trigger tool hooks. Negotiation does not bypass host policy. A server
 may expose application tools that use this storage; their user-visible effects
 still require appropriate authorization descriptions. Reading a database does
@@ -395,9 +406,9 @@ It MUST NOT silently evict durable workflow state to meet a quota. The physical
 engine is an implementation choice; Frances can use turso without exposing its
 SQL dialect or internal schema through the extension.
 
-## Round-trip budget
+## Host-operation budget
 
-| Work | Requests after opening |
+| Work | Host operations after opening |
 | --- | --- |
 | Fetch known keys from several stores | One readonly transaction |
 | Insert or replace a bounded batch across stores | One readwrite transaction |
@@ -405,6 +416,11 @@ SQL dialect or internal schema through the extension.
 | Read an indexed range | One request per bounded page |
 | Retry a mutation with a lost response | One replay of the same request |
 | Update several records and persist a context-transition proposal | One readwrite transaction in the same database |
+
+Each host-operation round requires a server response followed by a client retry
+of the originating RPC. The counts above describe storage operations, not extra
+standalone network RPCs. Independent operations can share a continuation round;
+read-dependent writes need a later round.
 
 Operations are batched inside one method call, independently of JSON-RPC batch
 support. SDKs SHOULD make this boundary explicit: a local builder accumulates
@@ -426,8 +442,8 @@ counts instead of echoing values. Keys can be allocated before building the batc
 5. Is lifetime receipt retention acceptable, or do we need explicit retirement
    with durable rejection of retired request IDs?
 6. Specify complete schemas, numeric errors, stable server/workspace identity
-   assignment, and the shared durable stdio attachment mechanism before claiming
-   interoperability.
+   assignment, and continuation schemas before claiming interoperability. Session
+   identity and resumption are defined by the core `frances/session` extension.
 
 ## Review scenarios
 
@@ -450,3 +466,7 @@ An implementation should demonstrate:
 11. Retrying deletion succeeds through its receipt without affecting a recreated
     database with the same name.
 12. A hook can persist state while the host awaits its response without deadlock.
+13. A storage operation inherits the originating request's application session;
+    interleaved requests on one stdio process cannot change its namespace.
+14. A lost continuation round reuses the durable storage request ID and returns
+    the recorded outcome without committing the transaction twice.

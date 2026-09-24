@@ -4,6 +4,7 @@ pub mod env;
 pub mod json_repair;
 pub mod log_fmt;
 pub mod path_util;
+pub mod process;
 pub mod sink;
 pub mod time;
 
@@ -12,3 +13,5 @@ pub use log_fmt::Truncated;
 pub use path_util::{expand_tilde, is_within, resolve_relative};
 pub use sink::CountingSink;
 pub use time::{now_ns, now_unix_secs};
+
+pub mod which;

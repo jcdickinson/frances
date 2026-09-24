@@ -1,3 +1,4 @@
+use super::mcp::{McpError, McpTools};
 use super::{ChatDepsImpl, HarnessDepsImpl, SessionRuntime};
 use crate::{
     Result,
@@ -10,13 +11,27 @@ use frances_models_llm::chat::{
 use frances_models_llm::{CompletionOutcome, OwnedHistoryInput, StreamEvent};
 use serde_json::json;
 use std::{collections::VecDeque, sync::Arc};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub(super) enum Input {
     Prompt(String),
     Interrupt,
+    SelectMcp {
+        selection: frances_mcp::Selection,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    ListMcpPrompts {
+        server: String,
+        reply: oneshot::Sender<Result<serde_json::Value>>,
+    },
+    UseMcpPrompt {
+        server: String,
+        name: String,
+        arguments: std::collections::BTreeMap<String, String>,
+        reply: oneshot::Sender<Result<()>>,
+    },
 }
 
 /// A context owns the model conversation and its fixed tool inventory. Session
@@ -26,11 +41,14 @@ struct Context<Io: HarnessIo> {
     chat: frances_llm::ChatSession<ChatDepsImpl>,
     tools: Tools<HarnessDepsImpl<Io>>,
     instructions: String,
+    mcp: McpTools,
+    outputs: Outputs,
 }
 
 pub(super) async fn run<Io: HarnessIo>(
     runtime: Arc<SessionRuntime<Io>>,
     mut input: mpsc::UnboundedReceiver<Input>,
+    mcp: McpTools,
 ) {
     let (tx, mut output) = mpsc::unbounded_channel();
     let outputs = Outputs(tx);
@@ -38,19 +56,27 @@ pub(super) async fn run<Io: HarnessIo>(
         chat: runtime.chat.create(ChatSessionBuilder::new()),
         tools: Tools::new(runtime.deps.clone(), outputs.clone()),
         instructions: frances_harness::instructions::load(&runtime.deps).await,
+        mcp,
+        outputs: outputs.clone(),
     };
-    let mut queued = VecDeque::new();
+    let mut queued: VecDeque<Input> = VecDeque::new();
     let mut paused = false;
     loop {
-        let text = if !paused && !queued.is_empty() {
-            queued.pop_front().expect("queue is nonempty")
+        let next = queued
+            .iter()
+            .position(|item| !paused || !matches!(item, Input::Prompt(_)));
+        let work = if let Some(index) = next {
+            queued.remove(index).expect("queued input exists")
         } else {
             tokio::select! {
                 biased;
                 () = runtime.cancel.cancelled() => break,
                 message = input.recv() => match message {
-                    Some(Input::Prompt(text)) => { paused = false; queued.push_back(text); continue; },
                     Some(Input::Interrupt) => { paused = true; continue; },
+                    Some(message) => {
+                        if matches!(message, Input::Prompt(_)) { paused = false; }
+                        queued.push_back(message); continue;
+                    },
                     None => break,
                 }
             }
@@ -58,9 +84,20 @@ pub(super) async fn run<Io: HarnessIo>(
         let cancel = runtime.cancel.child_token();
         runtime
             .entities
-            .update_session(|s| s.busy = Some("Working".into()))
+            .update_session(|s| {
+                s.busy = Some(
+                    match &work {
+                        Input::SelectMcp { .. } => "Connecting MCP servers",
+                        Input::ListMcpPrompts { .. } | Input::UseMcpPrompt { .. } => {
+                            "Loading MCP prompt"
+                        }
+                        _ => "Working",
+                    }
+                    .into(),
+                )
+            })
             .await;
-        let turn = turn(&runtime, &mut context, text, &cancel, &outputs);
+        let turn = handle_input(&runtime, &mut context, work, &cancel, &outputs);
         {
             tokio::pin!(turn);
             loop {
@@ -68,8 +105,9 @@ pub(super) async fn run<Io: HarnessIo>(
                     biased;
                     () = runtime.cancel.cancelled(), if !cancel.is_cancelled() => cancel.cancel(),
                     message = input.recv(), if !input.is_closed() => match message {
-                        Some(Input::Prompt(text)) => { queued.push_back(text); paused = false; },
+                        Some(Input::Prompt(text)) => { queued.push_back(Input::Prompt(text)); paused = false; },
                         Some(Input::Interrupt) => { cancel.cancel(); paused = true; },
+                        Some(message) => { if matches!(message, Input::SelectMcp { .. }) { cancel.cancel(); } queued.push_back(message); },
                         None => cancel.cancel(),
                     },
                     Some(event) = output.recv() => publish(&runtime, event, &cancel).await,
@@ -96,9 +134,145 @@ pub(super) async fn run<Io: HarnessIo>(
         }
     }
     context.tools.stop_shell().await;
+    context.mcp.close().await;
     while let Ok(event) = output.try_recv() {
         publish(&runtime, event, &runtime.cancel).await;
     }
+}
+
+async fn handle_input<Io: HarnessIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    context: &mut Context<Io>,
+    input: Input,
+    cancel: &CancellationToken,
+    outputs: &Outputs,
+) -> Result<()> {
+    match input {
+        Input::Prompt(text) => turn(runtime, context, text, cancel, outputs).await,
+        Input::Interrupt => Ok(()),
+        Input::SelectMcp { selection, reply } => {
+            let result = replace_mcp(runtime, context, selection, cancel, outputs).await;
+            if let Err(error) = reply.send(result) {
+                tracing::debug!(?error, "MCP selection caller closed");
+            }
+            Ok(())
+        }
+        Input::ListMcpPrompts { server, reply } => {
+            let result = async {
+                let connection = context.mcp.connections.get(&server).ok_or_else(|| {
+                    McpError::Config(frances_mcp::Error::UnknownServer(server.clone()))
+                })?;
+                let prompts = if connection.has_prompts() {
+                    connection.prompts(cancel).await.map_err(McpError::from)?
+                } else {
+                    vec![]
+                };
+                Ok(serde_json::to_value(prompts).map_err(McpError::from)?)
+            }
+            .await;
+            if let Err(error) = reply.send(result) {
+                tracing::debug!(?error, "MCP prompt caller closed");
+            }
+            Ok(())
+        }
+        Input::UseMcpPrompt {
+            server,
+            name,
+            arguments,
+            reply,
+        } => {
+            let result = async {
+                let connection = context.mcp.connections.get(&server).ok_or_else(|| {
+                    McpError::Config(frances_mcp::Error::UnknownServer(server.clone()))
+                })?;
+                let prompt = connection
+                    .prompt(name.clone(), arguments, cancel)
+                    .await
+                    .map_err(McpError::from)?;
+                let content = super::mcp_content::prompt(&prompt);
+                turn(
+                    runtime,
+                    context,
+                    format!("Use MCP prompt {server}/{name}:\n{content}"),
+                    cancel,
+                    outputs,
+                )
+                .await
+            }
+            .await;
+            if let Err(error) = reply.send(result) {
+                tracing::debug!(?error, "MCP prompt caller closed");
+            }
+            Ok(())
+        }
+    }
+}
+
+async fn replace_mcp<Io: HarnessIo>(
+    runtime: &Arc<SessionRuntime<Io>>,
+    context: &mut Context<Io>,
+    selection: frances_mcp::Selection,
+    cancel: &CancellationToken,
+    outputs: &Outputs,
+) -> Result<()> {
+    let env = {
+        let invocation = runtime.invocation.lock();
+        frances_mcp::Environment {
+            worker: runtime.deps.io.worker().cloned(),
+            cwd: invocation.workspace.primary_dir().to_path_buf(),
+            env: invocation.process.env.clone(),
+        }
+    };
+    // Prepare first. A failed connection leaves the current selection usable.
+    let next = context
+        .mcp
+        .select(&runtime.mcp_config, &selection, &env, cancel)
+        .await?;
+    context.chat.persist_pending().await?;
+    let history = match context.chat.id() {
+        Some(id) => runtime.history.load_primitives(id).await?,
+        None => vec![],
+    };
+    let chat = runtime.chat.create(ChatSessionBuilder::new());
+    if !history.is_empty() {
+        // Carry text history without nesting serialized transcripts on every switch.
+        // Old tool exchanges are reference text, not calls under the new inventory.
+        for input in history {
+            let input = match input {
+                OwnedHistoryInput::System { .. } => continue,
+                OwnedHistoryInput::ToolCall {
+                    name, arguments, ..
+                } => OwnedHistoryInput::Assistant {
+                    text: format!("Previous tool call: {name} {arguments}"),
+                },
+                OwnedHistoryInput::ToolResult {
+                    content, is_error, ..
+                } => OwnedHistoryInput::User {
+                    text: format!("Previous tool result (error: {is_error}):\n{content}"),
+                },
+                input => input,
+            };
+            chat.push(input);
+        }
+        chat.push(OwnedHistoryInput::User { text: "The user changed the MCP selection. Continue using the current tool definitions. Historical tool calls are reference text; read files again before editing in this new context.".into() });
+        chat.persist_pending().await?;
+    }
+    if cancel.is_cancelled() {
+        return Err(McpError::Interrupted.into());
+    }
+    context.tools.stop_shell().await;
+    context.tools.commit_edits().await?;
+    let status = next.status(&runtime.mcp_config, selection);
+    let previous = std::mem::replace(&mut context.mcp, next);
+    context.chat = chat;
+    context.tools = Tools::new(runtime.deps.clone(), outputs.clone());
+    context.instructions = frances_harness::instructions::load(&runtime.deps).await;
+    runtime
+        .entities
+        .update_session(|session| session.mcp = status)
+        .await;
+    previous.close().await;
+    Ok(())
 }
 
 async fn turn<Io: HarnessIo>(
@@ -149,7 +323,7 @@ async fn drive<Io: HarnessIo>(
             return Ok(());
         }
         context.chat.push_system(OwnedHistoryInput::System {
-            text: context.instructions.clone(),
+            text: format!("{}{}", context.instructions, context.mcp.instructions()),
         });
         let outcome = model_call(runtime, context, cancel).await?;
         if outcome.tool_calls.is_empty() {
@@ -174,10 +348,16 @@ async fn drive<Io: HarnessIo>(
         // Every call receives a result, even if a prior call was interrupted.
         // No new model request is issued while a batch is unsettled.
         for call in outcome.tool_calls {
-            let result = context.tools.execute(&call, cancel).await;
-            let (content, is_error) = match result {
-                Ok(content) => (content, false),
-                Err(error) => (error.to_string(), true),
+            let (content, is_error) = if context.mcp.contains(&call.name) {
+                match context.mcp.execute(&call, cancel, &context.outputs).await {
+                    Ok(result) => result,
+                    Err(error) => (error.to_string(), true),
+                }
+            } else {
+                match context.tools.execute(&call, cancel).await {
+                    Ok(content) => (content, false),
+                    Err(error) => (error.to_string(), true),
+                }
             };
             context.chat.push(OwnedHistoryInput::ToolResult {
                 call_id: call.id,
@@ -199,7 +379,13 @@ async fn model_call<Io: HarnessIo>(
     let env = runtime.invocation.lock().process.env.clone();
     let request = context.chat.run(
         env,
-        context.tools.definitions().to_vec(),
+        context
+            .tools
+            .definitions()
+            .iter()
+            .cloned()
+            .chain(context.mcp.definitions())
+            .collect(),
         None,
         cancel.clone(),
         None,

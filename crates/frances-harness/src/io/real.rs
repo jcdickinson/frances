@@ -55,6 +55,9 @@ impl WorkerIo {
 }
 
 impl HarnessIo for WorkerIo {
+    fn worker(&self) -> Option<&WorkerClient> {
+        Some(&self.fs.client)
+    }
     type Shell = WorkerShellFactory;
     type Fs = WorkerFs;
 

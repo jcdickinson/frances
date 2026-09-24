@@ -78,6 +78,30 @@ async readEntityArtifact(entityId: string, tag: string) : Promise<Result<JsonVal
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+async selectMcp(selection: Selection) : Promise<Result<null, McpCommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("select_mcp", { selection }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async mcpPrompts(server: string) : Promise<Result<JsonValue, McpCommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("mcp_prompts", { server }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+async useMcpPrompt(server: string, name: string, values: Partial<{ [key in string]: string }>) : Promise<Result<null, McpCommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("use_mcp_prompt", { server, name, values }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -110,6 +134,10 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
  */
 export type Lifecycle = "live" | "settled"
 /**
+ * Terminal exception text for the frontend; never inspected as Rust control flow.
+ */
+export type McpCommandError = string
+/**
  * What kind of section, and the data that rides with it. Every
  * section is one-shot: the host pushes it fully formed and the
  * frontend matches on this to pick a rendering.
@@ -138,15 +166,17 @@ export type SectionKind =
  * optional decoration.
  */
 { type: "entity_ref"; entity_id: string }
+export type Selection = { presets?: string[]; servers?: string[] }
 /**
  * Snapshot payload of the singleton session entity.
  */
-export type SessionSnapshot = { title: string | null; usage: Usage | null; 
+export type SessionSnapshot = { mcp: Status; title: string | null; usage: Usage | null; 
 /**
  * Footer busy-indicator text (the agent's `setStatus`). Not
  * meaningful after settle; a fresh session starts with `None`.
  */
 busy: string | null }
+export type Status = { selection: Selection; presets: Partial<{ [key in string]: string[] }>; available_servers: string[]; active_servers: string[] }
 export type UiEvent = { type: "reset" } | { type: "replay_end" } | { type: "section"; kind: SectionKind } | 
 /**
  * Latest-wins entity state. `snapshot` is opaque at this boundary;

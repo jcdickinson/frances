@@ -5,12 +5,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Content, Feed};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
     Filesystem,
+    Process,
     Shell,
 }
 
@@ -34,6 +35,10 @@ pub struct Request {
 #[serde(tag = "method", content = "params", rename_all = "snake_case")]
 pub enum RequestKind {
     Hello,
+    ProcessOpen {
+        options: ProcessOptions,
+        input: Feed<Content>,
+    },
     FsRead {
         path: PathBuf,
     },
@@ -100,6 +105,9 @@ pub struct Response {
 #[serde(tag = "result", content = "value", rename_all = "snake_case")]
 pub enum ResponseKind {
     Hello(Hello),
+    ProcessOpened {
+        output: Feed<Content>,
+    },
     Content(Content),
     Metadata(FsMetadata),
     Path(PathBuf),
@@ -278,4 +286,14 @@ impl ResponseError {
             },
         }
     }
+}
+
+/// Environment values are templates expanded on the worker before executable lookup.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ProcessOptions {
+    pub shutdown_timeout_seconds: u64,
+    pub command: String,
+    pub args: Vec<String>,
+    pub env: std::collections::BTreeMap<String, String>,
+    pub cwd: PathBuf,
 }

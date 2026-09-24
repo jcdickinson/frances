@@ -53,6 +53,8 @@ pub enum ClientError {
     MissingFilesystemCapability,
     #[error("worker does not advertise the shell capability")]
     MissingShellCapability,
+    #[error("worker does not advertise the process capability")]
+    MissingProcessCapability,
     #[error("worker error: {message}")]
     Worker { code: ErrorCode, message: String },
     #[error("worker returned the wrong response kind")]
@@ -135,6 +137,9 @@ impl Client {
                         expected: PROTOCOL_VERSION,
                         actual: hello.version,
                     });
+                }
+                if !hello.capabilities.contains(&Capability::Process) {
+                    return Err(ClientError::MissingProcessCapability);
                 }
                 if !hello.capabilities.contains(&Capability::Filesystem) {
                     return Err(ClientError::MissingFilesystemCapability);
@@ -223,6 +228,53 @@ impl Client {
 
     pub async fn shutdown(&self) -> Result<(), ClientError> {
         self.expect_unit(RequestKind::Shutdown).await
+    }
+
+    pub async fn open_process(
+        &self,
+        options: frances_worker_protocol::ProcessOptions,
+    ) -> Result<tokio::io::DuplexStream, ClientError> {
+        let (input, receiver) = Feed::channel();
+        let ResponseKind::ProcessOpened { mut output } = self
+            .call(RequestKind::ProcessOpen {
+                options,
+                input: receiver,
+            })
+            .await?
+        else {
+            return Err(ClientError::WrongResponseKind);
+        };
+        let (stream, bridge) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let (mut reader, mut writer) = tokio::io::split(bridge);
+            let send = async {
+                let mut bytes = vec![0; 16 * 1024];
+                loop {
+                    let count = reader.read(&mut bytes).await?;
+                    if count == 0 {
+                        return Ok::<_, io::Error>(());
+                    }
+                    input
+                        .send(Content::from_bytes(bytes[..count].to_vec()))
+                        .await
+                        .map_err(|_| {
+                            io::Error::new(io::ErrorKind::BrokenPipe, "worker process input closed")
+                        })?;
+                }
+            };
+            let receive = async {
+                while let Some(content) = output.next().await.map_err(io::Error::other)? {
+                    content.copy_to(&mut writer).await?;
+                }
+                Ok::<_, io::Error>(())
+            };
+            let result = tokio::select! { result = send => result, result = receive => result };
+            if let Err(error) = result {
+                tracing::debug!(%error, "worker process stream closed");
+            }
+        });
+        Ok(stream)
     }
 
     pub async fn open_shell(&self, options: ShellOptions) -> Result<WorkerShell, ClientError> {

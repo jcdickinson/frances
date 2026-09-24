@@ -74,6 +74,7 @@ pub struct WorkspaceSnapshot {
 #[derive(Debug, Clone, Default, Serialize, Deserialize, specta::Type)]
 #[serde(rename_all = "camelCase")]
 pub struct SessionSnapshot {
+    pub mcp: crate::runtime::mcp::Status,
     pub title: Option<String>,
     pub usage: Option<frances_models_llm::Usage>,
     /// Footer busy-indicator text (the agent's `setStatus`). Not

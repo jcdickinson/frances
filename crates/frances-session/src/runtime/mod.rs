@@ -28,6 +28,8 @@ mod driver;
 mod error;
 mod events;
 mod logging;
+pub mod mcp;
+mod mcp_content;
 pub use error::RuntimeError;
 pub use events::EventsChannel;
 pub use logging::install_logging;
@@ -106,6 +108,7 @@ pub struct SessionRuntime<Io: HarnessIo = RealIo> {
     pub(crate) db: Database,
     pub(crate) instance_id: Uuid,
     deps: HarnessDepsImpl<Io>,
+    pub mcp_config: frances_mcp::Config,
     input: mpsc::UnboundedSender<driver::Input>,
 }
 
@@ -114,6 +117,7 @@ pub type ProviderCacheHook = Box<dyn FnOnce(&ProviderCache) + Send>;
 pub struct StartOverrides {
     pub extra_config_providers: Vec<Arc<dyn ConfigProvider>>,
     pub on_cache: Option<ProviderCacheHook>,
+    pub mcp_selection: frances_mcp::Selection,
 }
 
 impl SessionRuntime<RealIo> {
@@ -144,6 +148,7 @@ impl<Io: HarnessIo> SessionRuntime<Io> {
         let StartOverrides {
             extra_config_providers,
             on_cache,
+            mcp_selection,
         } = overrides;
         std::fs::create_dir_all(&session.runtime_dir).map_err(|source| {
             RuntimeError::CreateRuntimeDir {
@@ -165,6 +170,25 @@ impl<Io: HarnessIo> SessionRuntime<Io> {
             .bind::<ModelConfig>(["models", "default"])?
             .required()
             .map_err(|_| RuntimeError::DefaultModelMissing)?;
+        let mcp_config = config
+            .bind::<frances_mcp::Config>("mcp")?
+            .get()
+            .map(|value| (*value).clone())
+            .unwrap_or_default();
+        let mcp_environment = frances_mcp::Environment {
+            worker: io.worker().cloned(),
+            cwd: invocation.workspace.primary_dir().to_path_buf(),
+            env: invocation.process.env.clone(),
+        };
+        let mcp = mcp::McpTools::default()
+            .select(
+                &mcp_config,
+                &mcp_selection,
+                &mcp_environment,
+                &CancellationToken::new(),
+            )
+            .await?;
+        let mcp_status = mcp.status(&mcp_config, mcp_selection);
         let cache = ProviderCache::new(config.clone())?;
         if let Some(hook) = on_cache {
             hook(&cache);
@@ -208,6 +232,7 @@ impl<Io: HarnessIo> SessionRuntime<Io> {
             .update_session(|session_snapshot| {
                 *session_snapshot = SessionSnapshot {
                     title: session.meta.title.clone(),
+                    mcp: mcp_status,
                     ..SessionSnapshot::default()
                 };
             })
@@ -236,10 +261,11 @@ impl<Io: HarnessIo> SessionRuntime<Io> {
             db,
             instance_id,
             deps,
+            mcp_config,
             input,
         });
         runtime.entities.attach_publish_all();
-        tokio::spawn(driver::run(runtime.clone(), input_rx));
+        tokio::spawn(driver::run(runtime.clone(), input_rx, mcp));
         Ok((runtime, events_rx))
     }
     pub async fn update_invocation(&self, ctx: InvocationContext) {
@@ -266,6 +292,61 @@ impl<Io: HarnessIo> SessionRuntime<Io> {
             warn!(%error, "agent input closed");
         }
     }
+    pub async fn select_mcp(&self, selection: frances_mcp::Selection) -> crate::Result<()> {
+        self.mcp_config
+            .resolve(&selection)
+            .map_err(mcp::McpError::from)?;
+        let (reply, response) = oneshot::channel();
+        self.input
+            .send(driver::Input::SelectMcp { selection, reply })
+            .map_err(|error| {
+                tracing::debug!(%error, "MCP selection input closed");
+                mcp::McpError::Closed
+            })?;
+        response.await.map_err(|error| {
+            tracing::debug!(%error, "MCP selection response closed");
+            mcp::McpError::Closed
+        })?
+    }
+
+    pub async fn mcp_prompts(&self, server: String) -> crate::Result<serde_json::Value> {
+        let (reply, response) = oneshot::channel();
+        self.input
+            .send(driver::Input::ListMcpPrompts { server, reply })
+            .map_err(|error| {
+                tracing::debug!(%error, "MCP prompt input closed");
+                mcp::McpError::Closed
+            })?;
+        response.await.map_err(|error| {
+            tracing::debug!(%error, "MCP prompt response closed");
+            mcp::McpError::Closed
+        })?
+    }
+
+    pub async fn use_mcp_prompt(
+        &self,
+        server: String,
+        name: String,
+        arguments: std::collections::BTreeMap<String, String>,
+    ) -> crate::Result<()> {
+        let (reply, response) = oneshot::channel();
+        self.input
+            .send(driver::Input::UseMcpPrompt {
+                server,
+                name,
+                arguments,
+                reply,
+            })
+            .map_err(|error| {
+                tracing::debug!(%error, "MCP prompt input closed");
+                mcp::McpError::Closed
+            })?;
+        response.await.map_err(|error| {
+            tracing::debug!(%error, "MCP prompt response closed");
+            mcp::McpError::Closed
+        })?
+    }
+
     pub fn interrupt(self: &Arc<Self>) {
         if let Err(error) = self.input.send(driver::Input::Interrupt) {
             warn!(%error, "agent input closed");

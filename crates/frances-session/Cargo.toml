@@ -32,6 +32,7 @@ frances-models-llm.workspace = true
 frances-models-ui.workspace = true
 frances-storage.workspace = true
 frances-harness.workspace = true
+frances-mcp.workspace = true
 
 [dev-dependencies]
 frances-edit = { workspace = true, features = ["test-utils"] }

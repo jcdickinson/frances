@@ -1,11 +1,22 @@
 import ResumeSessionForm from './ResumeSessionForm.svelte';
 import SaveWorkspaceForm from './SaveWorkspaceForm.svelte';
+import McpPromptForm from './McpPromptForm.svelte';
+import { commands as backend } from '../bindings';
+import { unwrap } from '../types';
 import { saveWorkspace } from './workspace';
 import type { Command } from './types';
 
 export type { Command, CommandValues, FormCommand, PlainCommand } from './types';
 
 export const commands: Command[] = [
+  {
+    id: 'mcp::prompt',
+    title: 'Use MCP Prompt',
+    form: McpPromptForm,
+    run: async (values) => {
+      unwrap(await backend.useMcpPrompt(values.server, values.name, JSON.parse(values.arguments)));
+    },
+  },
   {
     id: 'workspace::save',
     title: 'Save Workspace',

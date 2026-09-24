@@ -146,6 +146,9 @@ pub trait HarnessIo: Clone + Send + Sync + 'static {
 
     fn shell(&self) -> &Self::Shell;
     fn fs(&self) -> &Self::Fs;
+    fn worker(&self) -> Option<&frances_worker::Client> {
+        None
+    }
 }
 
 /// Spawns shell handles for native shell tools.

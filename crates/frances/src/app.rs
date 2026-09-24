@@ -66,7 +66,7 @@ enum UiEvent {
     },
 }
 
-pub fn run(workspace: Workspace) -> Result<()> {
+pub fn run(workspace: Workspace, mcp_selection: frances_mcp::Selection) -> Result<()> {
     let paths = Paths::discover()?;
     let session = paths.create_session(&workspace)?;
     let invocation = InvocationContext::capture(workspace);
@@ -90,7 +90,13 @@ pub fn run(workspace: Workspace) -> Result<()> {
                 #[cfg(not(target_os = "linux"))]
                 let worker_image = None;
 
-                start_runtime(session_for_setup.clone(), invocation, worker_image).await
+                start_runtime(
+                    session_for_setup.clone(),
+                    invocation,
+                    worker_image,
+                    mcp_selection,
+                )
+                .await
             })?;
 
             if let Some(title) = &session_for_setup.meta.title
@@ -163,7 +169,10 @@ fn specta_builder() -> tauri_specta::Builder {
             save_workspace,
             subscribe_entity,
             unsubscribe_entity,
-            read_entity_artifact
+            read_entity_artifact,
+            select_mcp,
+            mcp_prompts,
+            use_mcp_prompt
         ])
         .events(tauri_specta::collect_events![UiEvent])
         // Snapshot payloads are opaque JSON on the wire; export the
@@ -190,6 +199,7 @@ async fn start_runtime(
     session: Session,
     invocation: InvocationContext,
     worker_image: Option<std::path::PathBuf>,
+    mcp_selection: frances_mcp::Selection,
 ) -> Result<(
     Arc<SessionRuntime<WorkerIo>>,
     mpsc::UnboundedReceiver<StreamFrame>,
@@ -199,7 +209,10 @@ async fn start_runtime(
         Some(path) => WorkerClient::spawn(path).await?,
         None => WorkerClient::spawn_local().await?,
     };
-    let overrides = StartOverrides::default();
+    let overrides = StartOverrides {
+        mcp_selection,
+        ..StartOverrides::default()
+    };
     Ok(
         SessionRuntime::start_with_io(session, db, invocation, overrides, WorkerIo::new(worker))
             .await?,
@@ -415,6 +428,9 @@ fn store_permission(app: &tauri::AppHandle, request: PermissionRequest) -> Optio
     let state = app.state::<Backend>();
     let mut pending = state.permission.lock();
 
+    if pending.as_ref().is_some_and(|reply| reply.is_closed()) {
+        pending.take();
+    }
     if pending.is_some() {
         warn!("received a second permission request while one is pending");
         return Some(UiEvent::Error {
@@ -438,4 +454,52 @@ mod tests {
     fn export_typescript_bindings() {
         export_bindings(&specta_builder()).expect("export bindings");
     }
+}
+
+/// Terminal exception text for the frontend; never inspected as Rust control flow.
+#[derive(Debug, Serialize, specta::Type)]
+#[serde(transparent)]
+struct McpCommandError(String);
+
+impl From<frances_session::Error> for McpCommandError {
+    fn from(error: frances_session::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn select_mcp(
+    state: tauri::State<'_, Backend>,
+    selection: frances_mcp::Selection,
+) -> Result<(), McpCommandError> {
+    state
+        .runtime
+        .select_mcp(selection)
+        .await
+        .map_err(Into::into)
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn mcp_prompts(
+    state: tauri::State<'_, Backend>,
+    server: String,
+) -> Result<serde_json::Value, McpCommandError> {
+    state.runtime.mcp_prompts(server).await.map_err(Into::into)
+}
+
+#[tauri::command]
+#[specta::specta]
+async fn use_mcp_prompt(
+    state: tauri::State<'_, Backend>,
+    server: String,
+    name: String,
+    values: std::collections::BTreeMap<String, String>,
+) -> Result<(), McpCommandError> {
+    state
+        .runtime
+        .use_mcp_prompt(server, name, values)
+        .await
+        .map_err(Into::into)
 }

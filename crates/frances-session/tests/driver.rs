@@ -27,6 +27,9 @@ impl Drop for Harness {
 }
 impl Harness {
     async fn new(scripts: Vec<StubScript>) -> Self {
+        Self::with_mcp(scripts, false).await
+    }
+    async fn with_mcp(scripts: Vec<StubScript>, enable_config: bool) -> Self {
         let temp = tempfile::tempdir().unwrap();
         let paths = Paths {
             state_root: temp.path().join("state"),
@@ -51,6 +54,21 @@ impl Harness {
                 value,
             );
         }
+        let mut extra_config_providers: Vec<Arc<dyn frances_config::ConfigProvider>> =
+            vec![Arc::new(config)];
+        if enable_config {
+            let script = format!(
+                "{}/../frances-mcp/tests/support/server.py",
+                env!("CARGO_MANIFEST_DIR")
+            );
+            let settings = json!({"mcp":{"servers":{
+                "fixture":{"transport":{"type":"local-stdio","command":"python3","args":[script,"modern",temp.path().join("mcp.jsonl")] }},
+                "broken":{"transport":{"type":"local-stdio","command":"/does/not/exist/frances-mcp-fixture"}}
+            },"presets":{"rust":{"servers":["fixture"]},"frances":{"servers":["fixture"]}}}});
+            let path = temp.path().join("mcp.toml");
+            std::fs::write(&path, toml::to_string(&settings).unwrap()).unwrap();
+            extra_config_providers.push(Arc::new(frances_config::TomlProvider::new(path)));
+        }
         let stub = Arc::new(StubProvider::new());
         for script in scripts {
             stub.push_script(script);
@@ -61,8 +79,9 @@ impl Harness {
             db,
             InvocationContext::capture(workspace),
             StartOverrides {
-                extra_config_providers: vec![Arc::new(config)],
+                extra_config_providers,
                 on_cache: Some(Box::new(move |cache| cache.insert_stub("test", inserted))),
+                ..StartOverrides::default()
             },
         )
         .await
@@ -328,4 +347,153 @@ async fn approved_shell_publishes_output_and_interrupt_kills_it() {
     h.idle_after_started().await;
     assert!(!h.temp.path().join("late").exists());
     assert_eq!(h.stub.captured().len(), 2);
+}
+
+#[tokio::test]
+async fn mcp_presets_compose_and_calls_preserve_errors_without_private_metadata() {
+    use frances_session::runtime::mcp::tool_name;
+    let mut h = Harness::with_mcp(
+        vec![
+            calls(vec![
+                call(
+                    &tool_name("fixture", "tool", "echo"),
+                    json!({"text":"hello"}),
+                ),
+                call(
+                    &tool_name("fixture", "tool", "fail"),
+                    json!({"text":"failed"}),
+                ),
+                call(&tool_name("fixture", "host", "resources"), json!({})),
+                call(
+                    &tool_name("fixture", "host", "read_resource"),
+                    json!({"uri":"fixture://readme"}),
+                ),
+            ]),
+            text("Done"),
+        ],
+        true,
+    )
+    .await;
+    h.runtime
+        .select_mcp(frances_mcp::Selection {
+            presets: vec!["rust".into(), "frances".into()],
+            servers: vec![],
+        })
+        .await
+        .unwrap();
+    h.idle().await;
+    h.runtime.prompt("Use the MCP tools".into());
+    for _ in 0..3 {
+        let request = h.permission().await;
+        assert!(!request.allow_auto);
+        h.runtime
+            .respond_permission(request.reply, PermissionResponseWire::Yes { details: None })
+            .unwrap();
+    }
+    h.idle_after_started().await;
+    let requests = h.stub.captured();
+    assert_eq!(requests.len(), 2);
+    let results: Vec<_> = requests[1]
+        .new_inputs
+        .iter()
+        .filter_map(|input| {
+            if let OwnedHistoryInput::ToolResult {
+                content, is_error, ..
+            } = input
+            {
+                Some((content, *is_error))
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(results.len(), 4);
+    assert!(
+        results[2]
+            .0
+            .starts_with("Resources:\n- Readme — fixture://readme")
+    );
+    assert_eq!(
+        results[3].0,
+        "Resource: fixture://readme\n\nfixture resource"
+    );
+    assert!(!results[0].1);
+    assert!(results[1].1);
+    assert!(results[0].0.contains("hello"));
+    assert!(!results[0].0.contains("host-only"));
+    let log = std::fs::read_to_string(h.temp.path().join("mcp.jsonl")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("server/discover"))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn mcp_selection_replaces_context_and_failed_preparation_preserves_it() {
+    let mut h = Harness::with_mcp(vec![text("First"), text("Second"), text("Third")], true).await;
+    h.runtime.prompt("Remember the task".into());
+    h.idle().await;
+    h.runtime
+        .select_mcp(frances_mcp::Selection {
+            presets: vec!["rust".into()],
+            servers: vec![],
+        })
+        .await
+        .unwrap();
+    h.idle().await;
+    h.runtime.prompt("Continue".into());
+    h.idle().await;
+    assert!(
+        h.runtime
+            .select_mcp(frances_mcp::Selection {
+                servers: vec!["fixture".into(), "broken".into()],
+                presets: vec![]
+            })
+            .await
+            .is_err()
+    );
+    h.idle().await;
+    h.runtime.prompt("Continue after the failure".into());
+    h.idle().await;
+    let requests = h.stub.captured();
+    assert_ne!(requests[0].session_id, requests[1].session_id);
+    assert_eq!(requests[1].session_id, requests[2].session_id);
+    assert_eq!(requests[1].tools, requests[2].tools);
+    assert!(requests[1].new_inputs.iter().any(
+        |input| matches!(input,OwnedHistoryInput::User{text} if text.contains("Remember the task"))
+    ));
+}
+
+#[tokio::test]
+async fn denied_mcp_call_never_reaches_server() {
+    let name = frances_session::runtime::mcp::tool_name("fixture", "tool", "echo");
+    let mut h = Harness::with_mcp(
+        vec![
+            calls(vec![call(&name, json!({"text":"denied"}))]),
+            text("Denied"),
+        ],
+        true,
+    )
+    .await;
+    h.runtime
+        .select_mcp(frances_mcp::Selection {
+            presets: vec!["rust".into()],
+            servers: vec![],
+        })
+        .await
+        .unwrap();
+    h.idle().await;
+    h.runtime.prompt("Try calling the server".into());
+    let request = h.permission().await;
+    h.runtime
+        .respond_permission(request.reply, PermissionResponseWire::No { details: None })
+        .unwrap();
+    h.idle_after_started().await;
+    assert!(
+        !std::fs::read_to_string(h.temp.path().join("mcp.jsonl"))
+            .unwrap()
+            .contains("tools/call")
+    );
 }

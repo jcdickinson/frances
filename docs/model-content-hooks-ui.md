@@ -15,7 +15,11 @@ semantics without displaying identical interfaces.
 All wire shapes below are proposed by this document. Fields use camelCase; RPC
 methods use the `frances/ui/` namespace. Requirements use the core draft's MUST,
 SHOULD, and MAY conventions. This is a design contract, not yet a complete set of
-JSON Schemas.
+JSON Schemas. This extension requires MCP 2026-07-28 and `frances/session`;
+older MCP revisions can provide classic MCP features only. Examples of host
+operations below are entries in a continuation's `hostRequests`, not independent
+server-initiated JSON-RPC requests. Request examples abbreviate the standard and
+session metadata required by the core draft.
 
 ## Scope
 
@@ -43,7 +47,8 @@ Use the core protocol's version intersection rules. A host advertisement might b
 ```json
 {
   "capabilities": {
-    "experimental": {
+    "extensions": {
+      "frances/session": { "versions": [1] },
       "frances/ui": {
         "versions": [1],
         "interactions": ["choice", "form", "review"],
@@ -61,11 +66,11 @@ use. Features are usable only when supported by both sides. `frances/ui` does no
 grant permission to replace model context, execute tools, or answer host approval
 prompts. Those authorities remain separate.
 
-Each server can publish UI over its existing MCP connection. Objects and actions
-are scoped by server identity and MCP session ID, so two servers can use the same
-object ID without collision. Servers that need resumable UI MUST retain the
-session ID and authoritative UI state until explicit deletion, as described for
-durable sessions in the core protocol.
+Each server can publish UI through the core draft's host-operation continuations.
+Objects and actions are scoped by server identity and application session ID, so two
+servers can use the same object ID without collision. Servers MUST retain the
+application session ID and authoritative UI state until explicit deletion, as described
+for durable sessions in the core protocol.
 
 ## Presentation and content
 
@@ -97,7 +102,7 @@ impersonate that UI through labels or presentation.
 
 ## Publishing objects
 
-### `frances/ui/publish` — server to host
+### `frances/ui/publish` — host operation
 
 Publish a complete object snapshot with `id`, `revision`, `presentation`, and
 `body`. IDs are opaque strings; revisions are positive integers that increase
@@ -107,8 +112,6 @@ revision, or a stale revision, is an error. Updates replace snapshots, not patch
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 10,
   "method": "frances/ui/publish",
   "params": {
     "id": "approach",
@@ -133,14 +136,14 @@ revision, or a stale revision, is an error. Updates replace snapshots, not patch
 }
 ```
 
-The host responds promptly with `{ "status": "accepted" }` or
-`{ "status": "unsupported", "reason": "..." }`. Acceptance means the host has
-accepted the snapshot for presentation, not that the user has answered. Invalid
-objects return an RPC error. A backgrounded app may queue presentation, but cannot
-claim that queued content has been reviewed.
+The host returns an operation result promptly with `{ "status": "accepted" }` or `{
+"status": "unsupported", "reason": "..." }`. Acceptance means the host has accepted the
+snapshot for presentation, not that the user has answered. Invalid objects return an
+operation error in `hostResponses`. A backgrounded app may queue presentation, but
+cannot claim that queued content has been reviewed.
 
 Publication MUST NOT hold a tool call or hook open waiting for a human. It is a
-short request; user responses arrive through a separate RPC. This permits normal
+short host operation; user responses arrive through a separate client RPC. This permits normal
 chat and interruption while an interaction exists.
 
 ## Interaction types
@@ -175,8 +178,6 @@ A review binds a decision to an immutable artifact revision. Example publication
 
 ```json
 {
-  "jsonrpc": "2.0",
-  "id": 11,
   "method": "frances/ui/publish",
   "params": {
     "id": "approve-plan",
@@ -243,7 +244,8 @@ Only actions supported by the interaction are valid. The host sends actual user
 input, not an answer inferred by the model. The server checks IDs, revisions,
 constraints, and its current workflow state before accepting an action.
 
-The response is `{ "status": "accepted" }` or
+The completed RPC response contains `resultType: "complete"` and either
+`{ "status": "accepted" }` or
 `{ "status": "rejected", "reason": "...", "currentRevision": 2 }`.
 The server commits acceptance before acknowledging it and deduplicates retries by
 `actionId`. Reusing an action ID for different content is an error. A lost response
@@ -257,8 +259,8 @@ resolve the interaction. The host refreshes the current snapshot before retrying
 **Discussion is not an answer or cancellation.** An accepted `discuss` action
 keeps the question unresolved and opens a conversation associated with that
 interaction. The host includes `{ id, revision }` under
-`_meta["frances/ui"]` on the associated `prompt/submit` event. The controller can
-seed a fresh discussion context using `frances/context`, or continue the current
+`_meta["frances/ui"]` on the associated `platform:///prompt/submit` event. The controller can
+seed a fresh discussion context using `frances/session`, or continue the current
 conversation if its existing tools and instructions are appropriate.
 
 Messages in that discussion inform the server's revisions; they are not implicit
@@ -282,15 +284,15 @@ infer workflow permissions from the text of a question. `blocking: false` allows
 unrelated work to continue without treating the question as answered.
 
 Accepting `requestChanges` or `cancel` resolves that request, but does not approve
-dependent work. Approval itself also does not auto-run the model. The controller
-must explicitly request continuation or context replacement. A response to
-`frances/ui/respond` may carry a transition in `_meta["frances/context"]` using
-the core transition contract, only when sent by the selected controller with the
-negotiated capability. Other UI providers cannot obtain controller authority by
-returning such metadata.
+dependent work. Approval itself also does not auto-run the model. The controller must
+explicitly request continuation or context replacement. A completed response to
+`frances/ui/respond` may carry a transition in `_meta["frances/session"].transition`
+using the core transition contract, only when sent by the selected controller with the
+negotiated `contextControl: true` capability. Other UI providers cannot obtain
+controller authority by returning such metadata.
 
-The host includes its current `contextId` and `revision` under
-`_meta["frances/context"]` in a response request to the controller. An interrupt
+The host includes the application session `id`, current `contextId`, and `revision` under
+`_meta["frances/session"]` in a response request to the controller. An interrupt
 or new user input can invalidate automatic continuation even if the server has
 already durably recorded the answer. The core reconciliation rules still apply.
 
@@ -322,24 +324,45 @@ after a disconnect. Pending user responses may be queued durably for retry and
 remain visibly unconfirmed until accepted.
 
 `frances/ui/list` is a host-to-server request with empty parameters returning
-`{ "objects": [...] }`, the current published snapshots. On reconnect, the host
+`{ "resultType": "complete", "objects": [...], "removed": [...], "resourceUri": ... }`,
+the current published snapshots and removal tombstones. On reconnect, the host
 loads this snapshot, reconciles pending action IDs, and then enables interaction.
-This uses the saved MCP session ID, not a separate UI attachment protocol.
+These RPCs carry the saved application session ID in `_meta["frances/session"]`;
+no connection-scoped UI attachment is needed.
 
 `frances/ui/read` accepts `{ id, revision }` and returns that immutable snapshot,
 including older artifact revisions referenced by reviews. Missing revisions are
 errors; the host must not replace them with the latest version.
 
-`frances/ui/remove` is a server-to-host request with `{ id, revision }` naming a
-new revision that retires the object; its result is empty. Removal is idempotent
+`frances/ui/remove` is a host operation with `{ id, revision }` naming a
+new revision that retires the object; its operation result is empty. Removal is idempotent
 and is retained as a tombstone against delayed publications. A pending interaction
 must first be explicitly cancelled or superseded; removing UI is never approval.
 Removal hides the live surface but does not erase the user's decision history.
 
-If the connection cannot deliver server-to-host publication, the provider cannot
-use live UI on that connection. It must report the limitation, not claim the user
-has seen or answered an interaction. During a disconnect, blocking interactions
-remain blocking.
+### Updates outside an active call
+
+For background changes, the server exposes a session-specific UI catalog resource
+through ordinary MCP resources. `frances/ui/list` additionally returns its
+`resourceUri`; reading that resource returns the current snapshot and tombstones
+as JSON in an MCP text resource content block with MIME type `application/json`.
+The URI is a resource identifier, not authorization. The server checks that it
+belongs to the application session carried on the request.
+
+The host subscribes to that URI with `subscriptions/listen` and
+`notifications.resourceSubscriptions`. Resource-update notifications prompt a
+fresh `frances/ui/list`; they do not themselves carry an approval or transition.
+The host opens the subscription before its final snapshot read, then processes
+queued updates, so changes between discovery and subscription are not lost.
+The list result also contains `removed`, an array of `{ id, revision }` tombstones,
+and applying a snapshot enforces the same revision rules as publication/removal.
+
+Subscriptions are re-established after reconnect and correlated by MCP's
+`io.modelcontextprotocol/subscriptionId`. If resource notifications are not
+supported, the host can refresh by polling the list RPC and MUST disclose delayed
+updates. During a disconnect, blocking interactions remain blocking. Required
+presentation failures are explicit; neither delivery mechanism implies that a
+user has seen or answered an interaction.
 
 ## Plan approval flow
 
@@ -350,8 +373,9 @@ ordinary harness without MCP; the server and this UI integration follow later.
 
 1. The planning server maintains the plan through its ordinary MCP tools and
    publishes an inspectable plan artifact.
-2. When the agent requests planning exit, the server publishes a blocking review
-   of that exact plan revision. Publishing returns promptly; execution waits.
+2. When the agent requests planning exit, a host-operation continuation publishes
+   a blocking review of that exact plan revision. The tool then completes without
+   waiting for the user; dependent workflow execution remains blocked.
 3. The user approves, requests changes, discusses, or cancels through native UI.
 4. Discussion keeps the decision unresolved and allows a planning conversation.
    Revisions produce a new artifact and review; stale actions are rejected.
@@ -368,7 +392,7 @@ they do not substitute for user approval of a plan.
 ## Frances implementation fit
 
 Frances can render snapshots through its existing
-[entity system](arch/session-runtime.md#entities): transcript references for inline
+[entity system](arch/session-runtime.md#worker-and-persistence): transcript references for inline
 objects, persistent panels for artifacts/progress, and native interaction views
 for choices and reviews. The Rust runtime routes protocol actions; Svelte renders
 known semantic types. Neither layer needs to load server-supplied executable UI.
@@ -406,3 +430,6 @@ required interactions or treat dismissal as approval.
     controller authority; host permission prompts remain distinct.
 11. Plan approval starts execution through an explicit context transition whose
     tools remain fixed for the new context.
+12. Publications and removals travel as host operations or refreshed resource
+    snapshots, never standalone server RPCs. Subscription reconnect and snapshot
+    refresh recover updates without treating them as user decisions.

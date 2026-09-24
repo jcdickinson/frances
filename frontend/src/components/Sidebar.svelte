@@ -1,5 +1,6 @@
 <script lang="ts">
   import X from '@lucide/svelte/icons/x';
+  import McpPanel from './McpPanel.svelte';
   import { viewsFor } from '../entities/registry';
   import { entity, workspace } from '../stores/entities.svelte';
   import { activeTab, closeTab, focusTab, openTabs } from '../stores/tabs.svelte';
@@ -148,6 +149,8 @@
       </ul>
     {/if}
   {/each}
+
+  <McpPanel />
 
   <div class="mode-toggle">
     {#each MODES as m (m)}

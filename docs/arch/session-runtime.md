@@ -1,7 +1,8 @@
 # Session runtime
 
-Status: ordinary Rust harness implemented. MCP and the planning server described
-in the [protocol](../model-content-hooks-protocol.md) remain future work.
+Status: ordinary Rust harness and [basic MCP support](mcp.md) implemented. The
+planning server and Frances extensions described in the
+[protocol](../model-content-hooks-protocol.md) remain future work.
 
 ## Agent loop
 
@@ -52,9 +53,10 @@ Editable roots currently come from a marker walk on the primary directory.
 
 ## Worker and persistence
 
-Production filesystem and shell operations cross the worker's framed stdio
+Production filesystem, shell, and `stdio` MCP process operations cross the worker's framed stdio
 protocol. Content attachments carry file bytes, while feeds carry search and
-shell output. Shell observations drain output concurrently with waiting so the
+shell output. Process feeds carry raw stdin/stdout; executable lookup and environment
+expansion happen on the worker. `local-stdio` MCP stays on the host. Shell observations drain output concurrently with waiting so the
 bounded feed cannot block progress. Dropping a shell feed closes its worker
 resource. `RealIo` is available for local tests; the desktop uses `WorkerIo`.
 
@@ -70,13 +72,16 @@ bounded output and a model digest. Transcript sections refer to entities or hold
 structured diffs. Startup force-settles entities whose producer died, and queues
 entity snapshots before transcript replay.
 
-## Later MCP integration
+## MCP integration
 
-The tool executor and context lifetime are separate from the agent loop so an
-MCP inventory can join native tools later. Context replacement belongs between
-settled batches: preserve session transcript and the shared anchor engine, create
-a fresh model conversation and editor read cache, and freeze the selected tool
-set. No placeholder MCP transport or hook framework is implemented.
+The driver combines native tools with a fixed inventory from selected MCP servers.
+Presets compose by union; configuration alone never activates a server. Selection
+changes settle the current turn, prepare the new inventory, then create a fresh
+model conversation and editor read cache. Text history, session transcript, and
+the shared anchor engine survive. Retained servers keep their connections.
+Failed preparation preserves the previous selection. MCP permissions use the
+existing user gate without extending the auto-judge. See [MCP support](mcp.md)
+for configuration, transports, resource tools, and user-selected prompts.
 
 The [main workflow record](main-workflow.md) preserves the removed planning
 workflow for its later server port. That server will own planning state; the

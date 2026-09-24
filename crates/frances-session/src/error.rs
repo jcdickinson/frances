@@ -14,6 +14,8 @@ use frances_models_llm::chat::{ChatError, HistoryError};
 #[derive(Debug, Error)]
 pub enum Error {
     #[error(transparent)]
+    Mcp(#[from] crate::runtime::mcp::McpError),
+    #[error(transparent)]
     Migration(#[from] frances_storage::MigrationError),
 
     #[error(transparent)]

@@ -22,8 +22,16 @@ struct Cli {
     foreground: bool,
 
     /// Print all built-in tool definitions and their strict mode flags as JSON.
-    #[arg(long, conflicts_with_all = ["path", "foreground"])]
+    #[arg(long, conflicts_with_all = ["path", "foreground", "presets", "mcp_servers"])]
     export_tool_schemas: bool,
+
+    /// Compose MCP presets for this session (repeat, or separate with +).
+    #[arg(long = "preset", value_delimiter = '+')]
+    presets: Vec<String>,
+
+    /// Enable an additional configured MCP server.
+    #[arg(long = "mcp-server")]
+    mcp_servers: Vec<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -63,14 +71,18 @@ fn real_main() -> Result<()> {
     let path = frances_core::env::invocation_dir().join(path);
     let workspace = Workspace::open(&path)?;
 
+    let selection = frances_mcp::Selection {
+        presets: cli.presets,
+        servers: cli.mcp_servers,
+    };
     if !cli.foreground {
-        return launch_detached(&workspace);
+        return launch_detached(&workspace, &selection);
     }
 
-    app::run(workspace)
+    app::run(workspace, selection)
 }
 
-fn launch_detached(workspace: &Workspace) -> Result<()> {
+fn launch_detached(workspace: &Workspace, selection: &frances_mcp::Selection) -> Result<()> {
     let current_executable = std::env::current_exe().context("resolve frances executable")?;
     #[cfg(target_os = "linux")]
     let executable = appimage::launcher_executable(&current_executable);
@@ -79,6 +91,12 @@ fn launch_detached(workspace: &Workspace) -> Result<()> {
 
     let mut command = ProcessCommand::new(executable);
     command.arg("--foreground");
+    for preset in &selection.presets {
+        command.arg("--preset").arg(preset);
+    }
+    for server in &selection.servers {
+        command.arg("--mcp-server").arg(server);
+    }
     command
         .arg(workspace.source.identity_path())
         .stdin(Stdio::null())
@@ -133,6 +151,24 @@ mod tests {
 
         assert!(!cli.foreground);
         assert!(cli.path.is_none());
+        assert!(cli.presets.is_empty());
+        assert!(cli.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn mcp_presets_compose_at_launch() {
+        let cli = Cli::try_parse_from([
+            "frances",
+            "--preset",
+            "frances+rust",
+            "--preset",
+            "project",
+            "--mcp-server",
+            "docs",
+        ])
+        .unwrap();
+        assert_eq!(cli.presets, ["frances", "rust", "project"]);
+        assert_eq!(cli.mcp_servers, ["docs"]);
     }
 
     #[test]

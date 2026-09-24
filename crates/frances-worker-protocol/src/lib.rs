@@ -10,7 +10,7 @@ pub use frame::ProtocolError;
 pub use message::{
     Capability, ErrorCode, FileSearchEvent, FileSearchFile, FileSearchMatch, FileSearchMatchMode,
     FileSearchOptions, FileSearchPatterns, FileSearchQuery, FsMetadata, FsWriteMode, Hello,
-    PROTOCOL_VERSION, Request, RequestKind, Response, ResponseError, ResponseKind, ShellId,
-    ShellOptions, ShellOutput, ShellWaitQuiet,
+    PROTOCOL_VERSION, ProcessOptions, Request, RequestKind, Response, ResponseError, ResponseKind,
+    ShellId, ShellOptions, ShellOutput, ShellWaitQuiet,
 };
 pub use transport::{ProtocolReader, ProtocolWriter, multiplex};

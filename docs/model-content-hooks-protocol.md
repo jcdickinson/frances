@@ -9,18 +9,25 @@ capabilities and RPC methods use the `frances/` namespace, but their contracts
 must not depend on Frances, Rust, a particular model provider, or a particular
 plan format.
 
-The reference MCP baseline is [2025-11-25](https://modelcontextprotocol.io/specification/2025-11-25).
-Existing MCP methods retain their meanings. Everything under `frances/` below
-is proposed here, not part of the MCP standard. MUST, SHOULD, and MAY describe
-requirements of this draft. Wire examples are illustrative instances of those
-requirements, not a complete machine-readable schema.
+The reference MCP baseline is
+[2026-07-28](https://modelcontextprotocol.io/specification/2026-07-28). Existing MCP
+methods retain their meanings. Everything under `frances/` below is proposed here, not
+part of the MCP standard. MUST, SHOULD, and MAY describe requirements of this draft.
+Wire examples are illustrative instances of those requirements, not a complete
+machine-readable schema.
+
+These extensions require MCP 2026-07-28. Hosts may support earlier MCP revisions
+for ordinary tools, resources, and prompts, but MUST NOT advertise or activate
+these Frances extensions on those revisions. A selected workflow requiring them
+fails explicitly if its server only supports classic MCP. No compatibility
+handshake, session-header fallback, or legacy Frances wire format is specified.
 
 ## Naming conventions
 
 Extension fields use camelCase, following MCP's naming conventions, for example
-`canonicalUri` and `contextId`. Hook event names use slash-separated paths, such
-as `tool/use/before` and `tool/use/batch/after`; `stop` and `interrupt` are single
-segments. RPC methods also use slash-separated namespaces, such as
+`canonicalUri` and `contextId`. Hook types are URIs, such as
+`platform:///tool/use/before`, `platform:///session/start`, and
+`frances:///plan/update`. RPC methods use slash-separated namespaces, such as
 `frances/authorization/describe`. Existing MCP names, URI schemes such as
 `workspace-file`, and tool-provider-defined names are preserved. Hook event names
 are this protocol's convention, inspired by MCP method naming; references to other
@@ -58,7 +65,7 @@ is unrelated to removing the workflow runtime.
 | --- | --- |
 | Host | Runs the agent, enforces permissions, persists conversation history and accepted context transitions |
 | Tool provider | Implements MCP tools and describes their authorization requirements |
-| Hook provider | Receives host events and returns decisions or context |
+| Hook provider | Advertises and publishes its own events, subscribes to events, and handles deliveries |
 | Controller | Hook provider selected by the host to control context transitions |
 
 One MCP server can fill all three server roles over the same connection. A host
@@ -76,91 +83,288 @@ the plan. Servers may expose the plan through ordinary MCP resources.
 The companion [UI specification](model-content-hooks-ui.md) defines `frances/ui`
 for native choices, forms, plan approval, progress, and artifact views.
 
-Capabilities are exchanged during MCP initialization. The
-[MCP lifecycle](https://modelcontextprotocol.io/specification/2025-11-25/basic/lifecycle)
-provides `experimental` fields on both sides for non-standard features.
+Capabilities use `capabilities.extensions`, following MCP's
+[versioning rules](https://modelcontextprotocol.io/specification/2026-07-28/basic/versioning).
+The host obtains server capabilities through `server/discover` and advertises its
+own capabilities in each request's `_meta["io.modelcontextprotocol/clientCapabilities"]`.
+There is no `initialize` handshake or connection-scoped capability negotiation.
 
-Each side advertises supported positive integer versions independently:
+Each side advertises supported positive integer versions independently. The
+capability fragment below can appear in discovery or client request metadata:
 
 ```json
 {
   "capabilities": {
-    "experimental": {
+    "extensions": {
       "frances/authorization": { "versions": [1] },
       "frances/hooks": { "versions": [1] },
-      "frances/context": { "versions": [1] }
+      "frances/session": { "versions": [1], "contextControl": true }
     }
   }
 }
 ```
 
 For each extension, use the highest version present in both advertisements.
-No intersection means that extension is unavailable. A server MUST NOT infer
-support from the client's product name. A host MUST NOT silently substitute
-ordinary chat for a configured controller whose required extensions are absent.
+No intersection means that extension is unavailable. Each request MUST advertise
+the capabilities it relies on; neither endpoint may rely on earlier requests to
+establish them. A server MUST NOT infer support from the client's product name.
+A host MUST NOT silently substitute ordinary chat for a configured controller
+whose required extensions are absent.
 
 | Extension | Contract |
 | --- | --- |
 | `frances/authorization` | Describe a tool invocation without executing it |
-| `frances/hooks` | Discover subscriptions and deliver lifecycle events with responses |
-| `frances/context` | Propose, acknowledge, and recover context transitions |
+| `frances/hooks` | Advertise URI hook types, manage subscriptions, and deliver platform and provider events |
+| `frances/session` | Durable application identity, host-operation continuations, and optional context control |
 | `frances/ui` | Publish semantic UI and receive user decisions; defined in the companion spec |
+| `frances/db` | Optional host-provided storage; defined in the database companion |
 
-`frances/context` requires `frances/hooks`. Authorization
-descriptions can be implemented independently. A hook can operate without
-authorization descriptions, but MUST then treat effects it cannot determine as
-unknown. Standard tools, resources, and sampling capabilities remain separate.
+`frances/session` combines session identity and context control in one extension.
+`contextControl` defaults to false; context control is usable only when both sides
+advertise true. Supporting sessions alone does not require hooks or context
+replacement. Context control additionally requires `frances/hooks`, and only the
+host-selected controller may propose transitions. `frances/hooks`, `frances/ui`,
+and `frances/db` require `frances/session` for their durable identities.
+Authorization descriptions can be implemented independently. A hook can operate
+without descriptions, but MUST treat effects it cannot determine as unknown.
+Ordinary MCP servers do not need any Frances extension.
 
 ## Sessions and persistence
 
-Two protocol identities have different meanings:
+These are application identities, independent of MCP transports:
 
 | Identity | Meaning |
 | --- | --- |
-| MCP session ID | Server-issued protocol session, durably retained when server state depends on it |
-| Context ID | Host-issued identifier for one model conversation within that session |
+| Application session ID | Host-generated UUID identifying durable work on one configured server |
+| Context ID | Host-issued identifier for one model conversation within that work |
+| Revision | Host execution-state revision used to reject stale context transitions |
 
-Ordinary MCP initialization establishes the server session; there is no separate
-attachment handshake. The host's internal session ID does not cross the wire.
-The host maps its user session to the server's MCP session locally.
+A session contains the server's plan, phase, step history, and other durable
+state. A context contains the model conversation, fixed tool selection, and
+transient execution state. Context replacement preserves the session and its
+plan, creates a new context ID, and recreates context-local state such as the
+editor read cache. These are separate identities within one extension.
 
-For Streamable HTTP, the host persists `MCP-Session-Id` with the server connection
-configuration and authentication identity and sends it on subsequent requests.
-Servers providing `frances/context` MUST persist the MCP session ID and any
-application state needed to resume it for the lifetime of that session, including
-across process restarts. There is no idle expiry: a server that needs the state
-retains it indefinitely until explicit session deletion. An application exit or
-transport disconnect is not a request to delete the session.
+The host maps `(host user session, configured server identity, authenticated
+principal)` to an application session ID. The host's internal user-session ID
+need not cross the wire. Different configured servers receive distinct IDs;
+composing presets does not share their state. A stateless server that does not
+support this extension receives no Frances session metadata.
 
-This is a stronger lifetime contract than base MCP's optional HTTP session
-management. See [HTTP session management](https://modelcontextprotocol.io/specification/2025-11-25/basic/transports#session-management).
-The host reconnects using the saved ID. An unexpected unknown session is an error,
-not permission to silently create an empty plan. Deliberately creating a new
-session remains possible, but is not recovery of the old one. The protocol does
-not require plan snapshots in the host or an expired-session recovery handshake.
+### Creation and deletion
 
-The server MUST scope access to the authenticated client; possession of a session
-ID alone is not authorization. The host MUST allocate a distinct controller MCP
-session for each independent user session. Concurrent writers to the same
-controller session are not supported and MUST NOT have their events mixed.
+After discovery and explicit host selection, the host generates a UUID and
+persists the mapping before sending `frances/session/create` with `{ "id": ... }`.
+This is a host-to-server RPC, not a model-facing tool. Its successful result is
+`{ "resultType": "complete", "id": ... }`. Creation MUST atomically persist the
+session and its creation receipt before returning. An identical retry by the same
+authenticated owner returns the original result; conflicting creation parameters
+fail. The ID is the creation idempotency key, not the JSON-RPC request ID.
 
-The host persists the session ID, context identity, revision, and transition
-receipts. The server chooses its database, subject to the lifetime contract above.
-Neither the header nor these extensions promise that an ordinary tool call
-executes exactly once after a network failure.
+`frances/session/read` has no method-specific parameters and returns
+`{ "resultType": "complete", "id": ... }` for the session identified by metadata.
+It checks that the saved session is available without creating or attaching one.
+`frances/session/delete` likewise selects the session through metadata and returns
+`{ "resultType": "complete", "deleted": true }`. Deletion requires explicit host
+authorization. Repeating it succeeds for the same owner. Servers retain a deletion
+tombstone so delayed creation retries cannot resurrect a deleted session. Deletion
+and ordinary operations serialize: once deletion succeeds, no pending operation
+may recreate or modify that session. New work always uses a new UUID.
 
-The durable session resumption mechanism for stdio remains an open design question;
-`MCP-Session-Id` is an HTTP mechanism and MUST NOT be presented as a stdio header.
+Missing, unknown, deleted, or unauthorized IDs MUST fail on ordinary requests;
+they MUST NOT create a session implicitly or fall back to an unscoped operation.
+Errors MUST NOT disclose another owner's state. Application errors use a
+machine-readable `data.kind`; session kinds include `sessionNotFound`,
+`sessionDeleted`, `sessionConflict`, and `permissionDenied`. Numeric extension
+codes must be outside the JSON-RPC reserved range, following the MCP baseline.
+
+### Metadata on every request
+
+Once the host opts into sessions for a server, its request layer MUST attach
+`_meta["frances/session"]` to **every RPC issued for that application session**,
+including ordinary MCP tool, resource, prompt, discovery, and subscription RPCs,
+as well as Frances methods. There is no per-tool opt-in. Initial discovery and
+creation precede the session and omit this metadata; creation carries the new ID
+in its method parameters. Server-wide discovery outside a user session can also
+remain unscoped. Method-independent metadata does not change standard MCP tool
+arguments or permit session-dependent tool catalogs contrary to the base spec.
+
+The metadata contains `id`. When context control is negotiated, it additionally
+contains the current `contextId` and `revision` together. Every session-bound tool
+call also carries a stable `invocationId` so it can support execution deduplication
+and host-operation continuations. These fields
+are generated by the host, never accepted from model-generated arguments. A
+session-only provider needs no context fields and gains no context-control authority.
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "method": "tools/call",
+  "params": {
+    "name": "plan_next_step",
+    "arguments": {},
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientInfo": { "name": "example-host", "version": "1" },
+      "io.modelcontextprotocol/clientCapabilities": {
+        "extensions": {
+          "frances/session": { "versions": [1], "contextControl": true },
+          "frances/hooks": { "versions": [1] }
+        }
+      },
+      "frances/session": {
+        "id": "7dc95b0b-2664-49ab-a3ab-246435485bf8",
+        "contextId": "context-7",
+        "revision": 12,
+        "invocationId": "call-9"
+      }
+    }
+  }
+}
+```
+
+Other examples abbreviate standard request metadata and session identity. Empty
+parameters mean no method-specific parameters, not absence of required `_meta`.
+All completed RPC results include `resultType: "complete"`; fragments may omit
+that envelope. HTTP requests also carry the standard routing/version headers.
+No `Mcp-Session-Id` header is used. This application metadata works identically
+over HTTP and stdio.
+
+Connections and stdio processes may serve multiple application sessions. The
+sender chooses the binding per request, and the receiver MUST NOT infer it from
+the connection, process, or most recently seen ID. Responses inherit their
+request's binding; subscription notifications are correlated by MCP's
+`io.modelcontextprotocol/subscriptionId`. A long-lived subscription retains its
+original session binding until cancelled; it does not change when another
+session sends a request over the same connection.
+
+### Durability and recovery
+
+Servers MUST retain the session and application state across disconnects and
+process restarts until explicit deletion, without idle expiry. Closing the app,
+deselecting a preset, or replacing context does not delete the session. The
+server chooses its database; the host need not store plan snapshots.
+
+On reconnect, the host rediscovers capabilities and uses its saved ID. It reads
+the session, reconciles pending controller transitions, restores subscriptions,
+and delivers `platform:///session/start` with reason `resume` before model execution.
+An unknown saved session is an error, never permission to create an empty plan.
+HTTP and stdio use the same recovery procedure.
+
+The server MUST authorize the authenticated principal on every request; knowing
+an ID is not authorization. Local stdio deployments use their host-established
+security boundary. Concurrent writers to a controller session are unsupported;
+hosts MUST NOT run two writers against the same ID. Controller takeover requires
+an explicit ownership mechanism, still a draft question.
+
+The host persists context identity, revision, and transition receipts alongside
+the session mapping. Ordinary tool calls are not promised exactly-once execution
+after a network failure. Creation, deletion, controller invocation, and transition
+acknowledgment have the explicit retry contracts specified here.
+
+## Host operations and continuations
+
+MCP 2026-07-28 forbids independent server-initiated JSON-RPC requests. Its
+[MRTR pattern](https://modelcontextprotocol.io/specification/2026-07-28/basic/patterns/mrtr)
+permits `input_required` only on `tools/call`, `prompts/get`, and `resources/read`,
+and defines a closed set of input-request methods. Arbitrary database/UI methods
+and hooks MUST NOT be presented as standard MRTR.
+
+Instead, negotiated `frances/session` version 1 defines the extension result type
+`frances/hostInputRequired`, using MCP's allowance for extension-defined result
+types. It is permitted on `tools/call`, `frances/hooks/invoke`,
+`frances/hooks/changed`, and `frances/ui/respond`. It contains an opaque
+`requestState` and a nonempty
+`hostRequests` map. Each value is `{ method, params }`, without a JSON-RPC ID or
+envelope. Methods are limited to negotiated `frances/db/*` and the UI
+`frances/ui/publish` and `frances/ui/remove` operations, plus negotiated
+`frances/hooks/subscribe`, `frances/hooks/unsubscribe`, and
+`frances/hooks/publish`. Negotiated sampling can
+also be requested as `sampling/createMessage` with its standard parameters.
+This envelope extends result handling, not the core MRTR input-request union.
+
+The host executes these operations under its policy, then repeats the originating
+RPC with a new JSON-RPC ID. Its params retain the original semantic arguments and
+add `_meta["frances/session"].continuation` containing the exact `requestState`
+and a `hostResponses` map. Each entry is either `{ "result": ... }` or
+`{ "error": { "code": ..., "message": ..., "data": ... } }`. Keys match
+`hostRequests`; the host does not invent successful responses for unsupported or
+denied operations. Host-request keys MUST remain stable for retries and MUST NOT be reused for
+different operations within an originating call. Entries are independent;
+dependent operations require another round. This is not a distributed transaction.
+
+```json
+{
+  "resultType": "frances/hostInputRequired",
+  "requestState": "opaque-server-state",
+  "hostRequests": {
+    "publish-review": {
+      "method": "frances/ui/publish",
+      "params": {
+        "id": "approve-plan",
+        "revision": 1,
+        "presentation": "modal",
+        "body": { "type": "review", "state": "pending", "title": "Approve plan",
+          "artifact": { "id": "plan", "revision": 7 }, "blocking": true }
+      }
+    }
+  }
+}
+```
+
+For that result, the host retries the originating method and arguments with this
+additional session-metadata field (alongside the unchanged session and operation
+identifiers):
+
+```json
+{
+  "continuation": {
+    "requestState": "opaque-server-state",
+    "hostResponses": {
+      "publish-review": { "result": { "status": "accepted" } }
+    }
+  }
+}
+```
+
+Host operations inherit the authenticated server and application session from the
+originating RPC. An embedded operation cannot select another session or principal.
+The host MUST service them while the outer operation is pending, without holding
+locks that prevent storage, UI, interruption, or sampling. Publication returns
+acceptance of presentation promptly; it never waits for a human answer. Human
+actions use a later `frances/ui/respond` RPC.
+
+The server binds continuation state to the authenticated owner, application session,
+originating method, semantic arguments, and stable operation ID. It MUST verify
+integrity and reject cross-request reuse. Continuations preserve the original
+`invocationId`, `eventId`, `updateId`, or `actionId` (required for any call using this continuation,
+including a session-only tool provider); continuation payloads are excluded from
+semantic-argument comparisons for deduplication. The server MUST track intermediate
+versus terminal outcomes and MUST NOT repeat committed effects when a round is retried.
+The host keys completed host-operation responses by application session, stable
+originating operation ID, and host-request key, and persists them before continuing;
+database mutations additionally use their durable `requestId`. Neither side may assume
+that the next round will arrive.
+
+Hosts bound rounds, time, and resource use and surface exhaustion as an error.
+Interruptions stop automatic continuation; uncertain committed effects are
+reconciled before resumption. Context identity and revision remain those of the
+originating operation during its continuation; the host compares proposed
+transitions with its current revision before applying them. A continuation token
+is temporary request state, not the durable session ID or a replacement for
+pending-transition recovery. All continuation metadata stays out of model input.
 
 ## Authorization descriptions
 
 ### Tool declarations: static or per-call
 
-MCP tool definitions provide `_meta` for extension metadata and `inputSchema`
-for their argument schema. This extension uses `_meta["frances/authorization"]`,
-not a new top-level `extensions` property. See the
-[MCP Tool schema](https://modelcontextprotocol.io/specification/2025-11-25/schema#tool)
-and [metadata key rules](https://modelcontextprotocol.io/specification/2025-11-25/basic#general-fields).
+MCP tool definitions provide `_meta` for extension metadata and `inputSchema` for their
+argument schema. This extension uses `_meta["frances/authorization"]`, not a new
+top-level `extensions` property. See the [MCP Tool
+schema](https://modelcontextprotocol.io/specification/2026-07-28/schema#tool) and
+[metadata key
+rules](https://modelcontextprotocol.io/specification/2026-07-28/basic#general-fields).
 
 The value is either a static authorization description or the literal string
 `"authorize"`. A static description applies to every valid invocation of that
@@ -213,13 +417,13 @@ A tool whose description depends on its arguments explicitly requests lookup:
 
 For `"authorize"`, the host calls `frances/authorization/describe` before executing
 each invocation. The marker selects that fixed RPC method; it is not the name of
-another tool. Session-level capability support alone MUST NOT trigger lookups for
+another tool. Advertised capability support alone MUST NOT trigger lookups for
 every tool. Missing metadata means unknown effects. Invalid metadata or a failed
 advertised lookup is an error, not a fallback to a more permissive description.
 Without negotiated extension support, this metadata grants no permission.
 
 The host invalidates cached declarations when the tool list changes or the server
-connection is reinitialized. This refreshes the inventory for future contexts;
+server capabilities or catalog freshness change. This refreshes the inventory for future contexts;
 it MUST NOT change the active context's tool definitions. If an active tool's
 definition or authorization contract has changed, the host pauses affected calls
 until an explicit context replacement selects the current definition. Static and
@@ -261,18 +465,18 @@ The corresponding execution request has the same parameters:
 }
 ```
 
-The requests have independent JSON-RPC IDs. Optional MCP request metadata is
-accepted under the same parameter schema. A description MUST NOT execute the
+The requests have independent JSON-RPC IDs. Required MCP and session metadata
+are supplied under the same parameter schema. A description MUST NOT execute the
 tool, mutate the requested resources, or advance workflow state. It may inspect
 metadata needed to resolve targets. Unknown tools and invalid parameters produce
 ordinary JSON-RPC errors.
 
-The baseline schema also admits task metadata. Negotiating task support for
-`tools/call` does not authorize task augmentation of this extension method. A
-version 1 receiver MUST reject task-augmented description requests explicitly;
-the eventual task-enabled execution is still subject to completed authorization.
-This is a method capability restriction, not a different parameter schema.
-See [MCP CallToolRequestParams](https://modelcontextprotocol.io/specification/2025-11-25/schema#calltoolrequestparams).
+The separate MCP Tasks extension can add task metadata. Negotiating task support for
+`tools/call` does not authorize task augmentation of this extension method. A version 1
+receiver MUST reject task-augmented description requests explicitly; the eventual
+task-enabled execution is still subject to completed authorization. This is a method
+capability restriction, not a different parameter schema. See [MCP
+CallToolRequestParams](https://modelcontextprotocol.io/specification/2026-07-28/schema#calltoolrequestparams).
 
 Example result:
 
@@ -458,33 +662,340 @@ Native tools use the same description contract, produced by a host adapter.
 An MCP tool without this capability remains usable under host policy, but is
 described as unknown rather than assumed safe.
 
-## Lifecycle hooks
+## Hooks
 
-### Discovery
+### Identities and scope
 
-`frances/hooks/list` is a host-to-server request with empty parameters. Its result
-contains `hooks`, an array of `{ id, events }` subscriptions. Version 1 subscriptions
-remain fixed for the MCP session. Hosts choose which subscriptions to activate and
-whether a subscription is required. A server cannot make itself mandatory.
+Hook types are absolute URIs: `platform:///session/start` is a platform event,
+and `frances:///plan/update` is an event published by a configured MCP provider.
+The scheme identifies the publisher namespace; the slash-separated path identifies
+the event type. Hook URIs use an empty authority, an absolute nonempty path, and
+no query or fragment. Schemes match `[a-z][a-z0-9+.-]*`. Path segments contain
+ASCII letters, digits, `_`, or `-`; empty, `.` and `..` segments and percent
+encoding are rejected. This makes exact URI equality sufficient for matching.
+These are identifiers, not URLs to fetch or filesystem operation URIs.
+
+The host reserves `platform` and assigns each configured publisher a unique URI
+scheme, such as `frances`. A server advertises hooks in its assigned namespace;
+it cannot claim another provider's namespace or publish platform events. Multiple
+configurations of the same server need distinct assigned namespaces. The host
+passes `namespace` in `frances/hooks/list` so a provider need not assume its alias.
+
+The subscription key is **(subscriber MCP identity, hook URI)** within one host
+user session. There is no handler ID or subscription ID. A subscriber that wants
+multiple local handlers dispatches to them itself. Repeated subscriptions are
+idempotent and never cause duplicate deliveries.
+
+The host routes events only within that host user session. Each recipient receives
+its own application session metadata; the publisher cannot choose a recipient's
+session ID. Host policy controls visibility and subscription permissions. A server
+cannot make itself a required subscriber or gain controller authority by subscribing.
+
+### Up-front advertisement and initial subscriptions
+
+After application session creation or recovery, the host calls
+`frances/hooks/list` with `{ "namespace": "frances" }`. The provider returns its
+complete published hook catalog and the hooks it wants to subscribe to:
+
+```json
+{
+  "resultType": "complete",
+  "hooks": [
+    {
+      "uri": "frances:///plan/update",
+      "description": "The saved plan changed.",
+      "payloadSchema": { "type": "object" }
+    }
+  ],
+  "subscriptions": [
+    "platform:///session/start",
+    "engineering:///review/complete"
+  ]
+}
+```
+
+`hooks` describes what this provider can publish, not its local handlers.
+Descriptors contain `uri`, `description`, and an object-valued JSON Schema
+`payloadSchema` for the event payload. Published types are advertised up-front
+and remain fixed for that provider's application session. Reloading or reconnecting
+a publisher reconciles its catalog before new publications are accepted.
+Subscriptions may change throughout the session.
+
+The host installs valid advertisements and processes each initial subscription
+independently on application session creation, using the same rules as
+`frances/hooks/subscribe`. On recovery, persisted subscription intent takes
+precedence over this bootstrap list, so reconnecting does not undo a later
+unsubscribe. The provider can request changes after its recovery snapshot. A
+provider may request every hook it could ever need before receiving any platform catalog.
+The host MUST NOT require publisher-first load order or a successful catalog
+notification before accepting subscription intent. Individual unavailable hooks
+do not fail startup or prevent other subscriptions from succeeding.
+
+### Subscription intent and availability
+
+`frances/hooks/subscribe` is a host operation with `{ "uris": [...] }`:
+
+```json
+{
+  "method": "frances/hooks/subscribe",
+  "params": {
+    "uris": [
+      "platform:///session/start",
+      "engineering:///review/complete"
+    ]
+  }
+}
+```
+
+Its result contains `subscriptions`, one outcome per requested entry in input
+order. Duplicate URIs return the same outcome without adding subscriptions; an
+empty list is a successful no-op:
+
+```json
+{
+  "subscriptions": [
+    { "uri": "platform:///session/start", "state": "active" },
+    {
+      "uri": "engineering:///review/complete",
+      "state": "pending",
+      "error": {
+        "kind": "hookNotAvailable",
+        "message": "The publisher has not advertised this hook."
+      }
+    }
+  ]
+}
+```
+
+An unavailable hook returns a non-fatal error **and retains subscription intent**.
+When an authorized publisher becomes available, the host establishes the pending
+subscription automatically. When the publisher becomes unavailable, the subscription
+returns to pending without losing intent. Retrying subscribe returns the current
+state; it neither creates another handler nor clears the pending request.
+
+Malformed or forbidden requests return a per-URI `state: "rejected"` with an
+`error` carrying `kind` and `message`; they do not create subscription intent.
+Permission failures must not disclose hidden publishers. Envelope validation
+errors remain ordinary operation errors. Errors for one URI do not roll back
+successful requests for other URIs.
+
+`frances/hooks/unsubscribe` takes `{ "uris": [...] }` and returns
+`{ "unsubscribed": [...] }`. It removes both active subscriptions and pending
+intent. Removing an absent subscription succeeds. The authenticated originating
+provider is always the subscriber; it cannot unsubscribe another provider.
+The list is validated before removal; invalid URI syntax fails without removing
+any subscriptions. The result echoes the requested URIs in input order, including
+duplicates; an empty list is a successful no-op.
+
+Subscription intent and operation receipts are durable. Changes serialize at the
+host, and a replayed continuation returns its recorded outcome without undoing
+a later unsubscribe. Transient delivery failure does not silently unsubscribe
+a provider. Host-required policy remains required even when its provider is
+unavailable; pending status is not permission to bypass it.
+
+### Full catalog updates
+
+`frances/hooks/changed` is a host-to-provider request carrying `updateId`, an
+increasing `revision`, `hooks`, and `pendingSubscriptions`. It is a complete
+snapshot for that recipient, not a diff:
+
+```json
+{
+  "updateId": "hook-update-8",
+  "revision": 8,
+  "hooks": [
+    {
+      "uri": "platform:///session/start",
+      "description": "The application session starts or resumes.",
+      "payloadSchema": { "type": "object" },
+      "subscribed": true
+    },
+    {
+      "uri": "frances:///plan/update",
+      "description": "The saved plan changed.",
+      "payloadSchema": { "type": "object" },
+      "subscribed": false
+    }
+  ],
+  "pendingSubscriptions": [
+    {
+      "uri": "engineering:///review/complete",
+      "error": { "kind": "hookNotAvailable", "message": "Hook unavailable." }
+    }
+  ],
+  "rejectedSubscriptions": []
+}
+```
+
+`hooks` includes every available hook visible to this recipient, each with one
+`subscribed` boolean indicating whether its subscription is established. There
+is no array of handler IDs. `pendingSubscriptions` lists all retained intents
+that are not established, with their current errors. Initial subscription
+rejections are additionally reported as `rejectedSubscriptions` on the initial
+update, using the rejected outcome shape above; otherwise that array is empty.
+
+The host MUST deliver at least one snapshot after processing the provider's
+up-front advertisement and subscriptions, before delivering its initial platform
+session-start event. It may send snapshots at any time and MUST send a fresh
+snapshot when the visible catalog or recipient's subscription state changes.
+This includes publisher arrival, removal, and reconnect. Updates may coalesce
+intermediate changes; every update is a complete current snapshot.
+
+The provider returns `{ "resultType": "complete" }` after recording the snapshot.
+It can also use `frances/hostInputRequired` to subscribe or unsubscribe in response.
+That continuation retains the original `updateId`. Repeating an already established
+subscription changes no state and MUST NOT itself generate another changed update.
+Actual changes queue a subsequent snapshot after the current update completes.
+
+Snapshots are serialized per recipient. Retries preserve ID, revision, and content;
+stale snapshots cannot overwrite newer state. The host retains the latest snapshot
+and pending receipt for recovery. It sends the relevant snapshot before delivering
+an event through a newly established subscription. This does not replay events
+published before the subscription became active.
+
+### Platform events
 
 | Event | Delivery point | Permitted response |
 | --- | --- | --- |
-| `session/start` | After MCP initialization or reconnection and pending-transition reconciliation, before model execution | Context, controller transition |
-| `context/start` | After replacement, before the next model request | Context only |
-| `prompt/submit` | Before adding new user input | Accept or deny with reason, context |
-| `tool/use/before` | After argument validation and description, before execution | Authorization decision, context |
-| `tool/permission` | When host policy requires approval | Authorization decision |
-| `tool/use/after` | After one call settles, including failures or denials | Context, controller transition |
-| `tool/use/batch/after` | After all calls in a model response settle | Context, controller transition |
-| `stop` | Model would finish without further tool calls | Wait, continue, or controller transition |
-| `interrupt` | User interrupts execution | Observation only |
-| `session/end` | Host detaches from the session | Observation only |
+| `platform:///session/start` | After application session creation or recovery and pending-transition reconciliation, before model execution | Context, controller transition |
+| `platform:///context/start` | After replacement, before the next model request | Context only |
+| `platform:///prompt/submit` | Before adding new user input | Accept or deny with reason, context |
+| `platform:///tool/use/before` | After argument validation and description, before execution | Authorization decision, context |
+| `platform:///tool/permission` | When host policy requires approval | Authorization decision |
+| `platform:///tool/use/after` | After one call settles, including failures or denials | Context, controller transition |
+| `platform:///tool/use/batch/after` | After all calls in a model response settle | Context, controller transition |
+| `platform:///stop` | Model would finish without further tool calls | Wait, continue, or controller transition |
+| `platform:///interrupt` | User interrupts execution | Observation only |
+| `platform:///session/end` | Host detaches from the session | Observation only |
 
 The names and tool decision points draw on
 [Claude Code hooks](https://code.claude.com/docs/en/hooks#pretooluse-decision-control)
 and [Codex hooks](https://learn.chatgpt.com/docs/hooks). This draft defines its own
 coverage and semantics rather than inheriting either host's implementation gaps.
-`session/end` does not delete server state.
+`platform:///session/end` does not delete server state.
+
+### Provider broadcasts
+
+`frances/hooks/publish` is a host operation with `publishId`, `uri`, and `payload`:
+
+```json
+{
+  "method": "frances/hooks/publish",
+  "params": {
+    "publishId": "plan-update-19",
+    "uri": "frances:///plan/update",
+    "payload": { "planId": "plan-1", "revision": 19 }
+  }
+}
+```
+
+The host validates publisher ownership, advertisement, payload schema, and policy.
+It persists acceptance and queues delivery to currently established subscribers,
+then returns `{ "status": "accepted", "eventId": ... }`. Acceptance does not
+mean subscribers have handled the event. No subscribers is a successful publication.
+An unadvertised event is a `hookNotAvailable` error; publication does not implicitly
+advertise a hook or create pending subscription intent.
+
+The deduplication key is `(publisher application session, publishId)`. Identical
+retries return the same event ID; conflicting reuse fails. The host records the
+recipient set at acceptance. Newly established subscriptions receive future events,
+not earlier publications. Unsubscribing removes undelivered work for that
+subscription; it cannot undo an invocation already dispatched. Unsubscribing and
+subscribing again must not resurrect cancelled deliveries.
+
+Delivery uses `frances/hooks/invoke` with a host-issued `eventId`, host-established
+`publisher` identity, and `event: { "type": <hook URI>, "payload": ... }`.
+The publisher's application session ID is not copied into recipient metadata.
+Custom broadcasts report occurrences; subscriber responses cannot veto or undo
+the publisher's completed operation. They may provide context and, for the selected
+controller only, propose a context transition under the existing revision rules.
+They cannot return platform authorization decisions or claim platform provenance.
+
+The host MUST queue broadcasts rather than synchronously wait for subscriber
+responses inside `publish`. It services the originating continuation first and
+delivers events at safe boundaries. Queued events retain their originating
+evaluation stack as specified below. Hosts also bound event chains and queue
+growth and surface exhaustion explicitly. Protocol bookkeeping calls do not
+themselves emit hook events.
+
+For publication while no client call is active, a provider MAY additionally return
+`eventResourceUri` from `frances/hooks/list`. It identifies a session-scoped MCP
+resource containing `{ "events": [...] }`, a durable outbox of the same
+`{ publishId, uri, payload }` envelopes in publication order. The host subscribes
+before its final resource read, as in the UI extension's background-update pattern,
+then reads on notifications or polls when subscriptions are unavailable. The host
+discloses polling delays. The resource must remain readable until acknowledged;
+the URI does not itself authorize access to another session's events.
+
+Each outbox event goes through the same publication validation and deduplication.
+After persisting its outcome, the host sends `frances/hooks/ack` with
+`{ "publications": [{ "publishId": ..., "outcome": ... }] }`. Each outcome is
+either `{ "status": "accepted", "eventId": ... }` or
+`{ "status": "rejected", "error": { "kind": ..., "message": ... } }`.
+The provider records receipts before returning `{ "resultType": "complete" }`
+and can then remove those outbox entries. Identical acknowledgments succeed;
+conflicting acknowledgments fail. Lost acknowledgments cause replay, not a new
+broadcast. A changed envelope with an existing publish ID is a protocol error,
+not a new outcome for an already acknowledged publication.
+
+Background publication does not by itself restart the model. Context is queued
+for the next permitted model request; automatic continuation still requires an
+authorized controller transition. Interruption, pending user decisions, and new
+user input retain their existing precedence.
+
+### Evaluation stack and recursive delivery
+
+The host maintains an evaluation stack for each causal chain of hook invocations.
+A frame is `(subscriber MCP identity, hook URI)`, scoped to the host user session.
+The publisher, event ID, local handler, and skill activation are not part of the
+key. A provider cannot evade the recursion check by publishing a new event ID.
+
+Before invoking a subscriber, the host checks the entire inherited stack:
+
+1. If that key is already present, skip this invocation and log a warning with
+   the subscriber, hook URI, event ID, and evaluation stack.
+2. Otherwise, push the key, invoke the subscriber, and pop the frame on completion,
+   error, or cancellation. Continuation rounds belong to the same invocation and
+   keep its frame; they are not recursive hook invocations.
+
+Skipping is non-fatal and affects only that recipient. Other subscribers still
+receive the event. The skipped invocation contributes no decision or context;
+it is never recorded as an allowance or successful execution of a required hook.
+If an operation needs an affirmative decision, a skipped callback cannot supply it.
+
+This is a stack, not a session-wide visited set. A hook may run again after its
+earlier invocation is no longer an ancestor. Sibling deliveries inherit separate
+copies of their parent's stack; an unrelated event starts with an empty stack.
+Different MCPs may handle the same hook, and one MCP may handle different hooks,
+until a branch would repeat an existing pair.
+
+Every event published during evaluation captures the current stack, including
+the publishing subscriber's frame. The host retains that stack with queued work
+and restores it for delivery, including after restart. Popping the live frame
+when the originating RPC returns does not erase queued events' ancestry. This
+prevents deferred cycles as well as direct recursion.
+
+For example, A is the engineering provider: it handles `frances:///plan/update`
+and publishes `engineering:///review/complete`. B is the Frances provider: it
+handles that event and publishes another `frances:///plan/update`. Delivery to A
+is skipped because
+`(A, frances:///plan/update)` already appears in that branch's stack. Delivery
+to another subscriber continues if its pair is absent.
+
+The host attaches an opaque `evaluationId` under `_meta["frances/hooks"]` on
+each invocation and maps it to the current stack and recipient session. It
+retains that mapping for resumable delivery. Host-operation publications inherit
+it automatically. Outbox events caused by that invocation MUST additionally carry
+its `evaluationId`; independent background events omit it and start a new chain.
+The host validates an echoed ID against the publishing provider and session and
+loads its saved stack. Unknown or cross-session IDs fail explicitly. Providers
+cannot supply stack frames themselves. This is cooperative causal tracking, not
+an execution sandbox for a provider that hides an event's origin.
+
+Retries use the saved inherited stack and invocation receipt, not a second push
+onto a still-running invocation. The host deduplicates or serializes concurrent
+retries. Stack checks run before dispatch and never recursively emit another
+hook event merely to report the skip.
 
 ### `frances/hooks/invoke` — host to hook provider
 
@@ -494,12 +1005,11 @@ coverage and semantics rather than inheriting either host's implementation gaps.
   "id": 30,
   "method": "frances/hooks/invoke",
   "params": {
-    "hookId": "planning-policy",
+    "_meta": { "frances/hooks": { "evaluationId": "evaluation-18" } },
     "eventId": "event-18",
-    "contextId": "context-7",
-    "revision": 12,
+    "publisher": { "kind": "platform" },
     "event": {
-      "type": "tool/use/before",
+      "type": "platform:///tool/use/before",
       "invocationId": "call-9",
       "provider": { "kind": "platform" },
       "call": {
@@ -523,22 +1033,26 @@ coverage and semantics rather than inheriting either host's implementation gaps.
 }
 ```
 
-An MCP provider is represented as `{ "kind": "mcp", "id": "ferrisfetch" }`.
-The host supplies this identity. `call` preserves MCP call parameters, including
-metadata; native tools are adapted to that shape. This hook envelope does not
-change the separate authorization request's parameter shape.
+An MCP provider is represented as `{ "kind": "mcp", "id": "ferrisfetch" }`. The host
+supplies this identity. `publisher` identifies the event producer; the `provider`
+inside a platform tool event identifies the tool executor. The outer request
+carries the subscriber's session binding;
+context identity and revision also come from that metadata. `call` preserves the target
+provider's MCP call parameters, including metadata; native tools are adapted to that
+shape. This hook envelope does not change the separate authorization request's parameter
+shape.
 
 Other event payloads carry the data needed at their delivery point:
 
-- `session/start`: reason `new` or `resume`.
-- `context/start`: applied transition ID and reason.
-- `prompt/submit`: submitted MCP content blocks.
-- `tool/permission`: invocation, authorization description, and host approval reason.
-- `tool/use/after`: invocation ID, final call, and tagged outcome: result, denied,
+- `platform:///session/start`: reason `new` or `resume`.
+- `platform:///context/start`: applied transition ID and reason.
+- `platform:///prompt/submit`: submitted MCP content blocks.
+- `platform:///tool/permission`: invocation, authorization description, and host approval reason.
+- `platform:///tool/use/after`: invocation ID, final call, and tagged outcome: result, denied,
   cancelled, or execution error. A result carries an MCP `CallToolResult`.
-- `tool/use/batch/after`: settled invocation IDs in model order and assistant content.
-- `stop`: final assistant content and the count of automatic continuations.
-- `interrupt` and `session/end`: reason.
+- `platform:///tool/use/batch/after`: settled invocation IDs in model order and assistant content.
+- `platform:///stop`: final assistant content and the count of automatic continuations.
+- `platform:///interrupt` and `platform:///session/end`: reason.
 
 The complete per-event JSON Schemas are a follow-up to review of these contracts.
 Hosts MUST reject response actions not permitted for the triggering event.
@@ -556,8 +1070,8 @@ to the model as a tool failure explaining what was blocked. `abstain` means the
 hook supplies no decision. For multiple hooks, `deny` wins over `ask`, which wins
 over `allow`; abstentions have no effect.
 
-`tool/use/before` allowance permits the call through workflow policy; it does not
-override host permissions or sandboxing. `tool/permission` allowance can answer
+`platform:///tool/use/before` allowance permits the call through workflow policy; it does not
+override host permissions or sandboxing. `platform:///tool/permission` allowance can answer
 an approval prompt only if the host explicitly delegated that authority to the
 provider. Otherwise the normal approval path remains. `ask` never implicitly
 approves an operation when an interactive user is unavailable.
@@ -580,9 +1094,10 @@ Within a controller session, the host delivers stateful events serially in a
 stable order. Tools may execute concurrently, but results and hooks are delivered
 in model call order. Requests generated by the protocol itself, such as hook
 invocations and authorization descriptions, MUST NOT recursively trigger tool
-hooks. Hosts must still service MCP sampling requests while awaiting a hook.
+hooks. Hosts must still service negotiated host-operation continuations while
+awaiting a hook; servers cannot initiate a separate sampling RPC.
 
-`stop` responses choose `wait` or `continue`; `continue` includes model-facing
+`platform:///stop` responses choose `wait` or `continue`; `continue` includes model-facing
 content explaining the remaining work. Hosts bound automatic continuations and
 expose exhaustion to the user. An interrupt always suppresses automatic restart.
 
@@ -600,29 +1115,42 @@ resources. Hosts MUST report unsupported required content rather than silently
 omit it from a replacement context. Host policy determines instruction priority;
 server text cannot replace mandatory host instructions.
 
-## Context control
+## Context control within `frances/session`
 
-A negotiated, selected controller can propose a transition in a permitted hook
-response. It can also include the same object in an ordinary tool result under
-`_meta["frances/context"]`. Keeping the transition with the tool result ensures
-that `plan_exit` does not race a separate clear notification.
-When `frances/ui` is negotiated, the selected controller may also return this
-metadata in a `frances/ui/respond` response, for example after explicit plan
+A controller with negotiated `contextControl: true`, selected by the host, can
+propose a transition in a completed hook, tool, or `frances/ui/respond` result
+under `_meta["frances/session"].transition`. Keeping the transition with the final
+result ensures that `plan_exit` does not race a separate clear notification.
+Intermediate host-operation results MUST NOT carry a transition.
+UI responses require negotiated `frances/ui`, for example after explicit plan
 approval. The same authority, revision, and acknowledgment rules apply.
 
 ```json
 {
-  "content": [{ "type": "text", "text": "Planning complete." }],
+  "resultType": "complete",
+  "content": [
+    {
+      "type": "text",
+      "text": "Planning complete."
+    }
+  ],
   "_meta": {
-    "frances/context": {
-      "transitionId": "transition-4",
-      "expectedRevision": 12,
-      "action": {
-        "type": "replace",
-        "reason": "Begin the first execution step",
-        "instructions": "Execute only the active step. Submit proof when finished.",
-        "content": [{ "type": "text", "text": "# Agreed plan\n\n..." }],
-        "next": "run"
+    "frances/session": {
+      "transition": {
+        "transitionId": "transition-4",
+        "expectedRevision": 12,
+        "action": {
+          "type": "replace",
+          "reason": "Begin the first execution step",
+          "instructions": "Execute only the active step. Submit proof when finished.",
+          "content": [
+            {
+              "type": "text",
+              "text": "# Agreed plan\n\n..."
+            }
+          ],
+          "next": "run"
+        }
       }
     }
   }
@@ -654,7 +1182,7 @@ subsequent changes to host defaults do not affect the active context.
 
 For the initial context, where no current selection exists, omission uses the
 host's configured defaults. The controller can replace that initial context
-during `session/start`, before the first model call.
+during `platform:///session/start`, before the first model call.
 
 The host resolves the selection against its inventory and permissions before
 accepting the context, then freezes the model-facing tool names, descriptions,
@@ -664,7 +1192,7 @@ The same selection applies to every model request within the context.
 
 Changing that selection requires an explicit context replacement with a new
 context ID. There is no per-model-call tool filtering hook and no in-place tool
-enable/disable operation. `context/start` can add context but cannot change the
+enable/disable operation. `platform:///context/start` can add context but cannot change the
 selected tools. MCP tool-list changes update the host's inventory for future
 contexts; they do not silently alter the active context. If a selected tool
 becomes unavailable, the host reports or pauses the affected operation rather
@@ -684,23 +1212,24 @@ inventory-discovery method remains to be specified.
 
 ### Safe boundaries and recovery
 
-The host attaches `contextId` and `revision` to calls to the
-controller through `_meta["frances/context"]`, without changing the MCP call
-schema. A stable `invocationId` in that metadata identifies execution retries.
-The authorization description receives the same call parameters.
+The host attaches `contextId` and `revision` to calls to the controller alongside the
+application session `id` in `_meta["frances/session"]`, without changing model-facing
+arguments. A stable `invocationId` in that metadata identifies execution retries. The
+authorization description receives the same call parameters.
 
 The server persists a proposed transition before returning it. It MUST retain
-unacknowledged proposals and expose them through `frances/context/pending`.
+unacknowledged proposals and expose them through `frances/session/context/pending`.
 Controller tool calls
 that mutate workflow state MUST deduplicate by invocation ID and return the
 recorded result for a retry; the same ID with different parameters is an error.
 This requirement does not imply idempotence of arbitrary external tools.
 
-`frances/context/pending` is a host-to-controller request with empty parameters.
-It returns `{ "transitions": [...] }`, containing unacknowledged proposals in
-creation order for the current MCP session. It is read-only and does not create,
-attach, or replace a session. After reconnection, the host retrieves and reconciles
-these proposals before delivering `session/start` or resuming model execution.
+`frances/session/context/pending` is a host-to-controller request with empty parameters.
+It returns `{ "resultType": "complete", "transitions": [...] }`, containing
+unacknowledged proposals in creation order for the current application session. It is
+read-only and does not create, attach, or replace a session. After reconnection, the
+host retrieves and reconciles these proposals before delivering `platform:///session/start` or
+resuming model execution.
 
 The host MUST:
 
@@ -710,13 +1239,13 @@ The host MUST:
    cannot be applied in sequence merely because they arrived in sequence.
 3. Persist acceptance, the new context identity, and continuation intent before
    issuing another model request.
-4. Apply the replacement and deliver `context/start`.
-5. Acknowledge the transition with `frances/context/ack`.
+4. Apply the replacement and deliver `platform:///context/start`.
+5. Acknowledge the transition with `frances/session/context/ack`.
 6. Run if requested, unless interrupted or awaiting user input.
 
-`frances/context/ack` has parameters `transitionId` and `outcome`. The outcome is
+`frances/session/context/ack` has parameters `transitionId` and `outcome`. The outcome is
 either `{ "type": "applied", "contextId": ..., "revision": ... }` or
-`{ "type": "rejected", "reason": ... }`; its result is empty. Duplicate
+`{ "type": "rejected", "reason": ... }`; its result is `{ "resultType": "complete" }`. Duplicate
 acknowledgments with the same outcome succeed. Conflicting acknowledgments fail.
 
 Host revisions increase when user input, interruption, or an accepted transition
@@ -740,10 +1269,13 @@ MUST NOT resume model execution until the user resumes it.
 
 ## Referee and summarizer calls
 
-Use MCP [sampling](https://modelcontextprotocol.io/specification/2025-11-25/client/sampling)
-where negotiated, rather than inventing another inference transport. A controller
-can request sampling while handling a completion tool or hook. The host remains
-responsible for model selection, sampling permissions, and execution budgets.
+Use the MCP [sampling](https://modelcontextprotocol.io/specification/2026-07-28/client/sampling)
+request and result shapes where negotiated. Standard tool calls can request it
+through core MRTR; hooks use the `frances/hostInputRequired` continuation above.
+No standalone server-to-host sampling RPC is sent. Sampling is deprecated in the
+2026-07-28 baseline but still supported there; this draft retains it for referee
+and summarizer behavior. Its eventual replacement remains a design question.
+The host owns model selection, sampling permissions, and execution budgets.
 
 For isolated review, supply explicit messages and `includeContext: "none"`.
 If the referee returns a structured decision through a tool, negotiate
@@ -883,7 +1415,7 @@ rendered plan resource. The host does not implement plan semantics.
 | Skip step | Record reason and advance under the configured skip policy |
 | Summarize completed work | Sampling over collected step evidence, stored in the plan |
 | `plan_begin` | Replace context with planning instructions, blocker, and carried context; run to ask the user |
-| Model stops with an active step | `stop` hook returns continuation content |
+| Model stops with an active step | `platform:///stop` hook returns continuation content |
 | Plan finishes | Permit final response and then wait |
 | Clear model context | Plan persists on the server; the user's host session stays open |
 
@@ -897,17 +1429,22 @@ not a guarantee that files cannot change.
 These questions must be settled before calling version 1 an interoperable spec:
 
 - Complete per-event and response JSON Schemas, extension error codes, and exact
-  hook capability subfields for coverage and approval delegation.
+  hook capability subfields for coverage and approval delegation, including
+  catalog snapshots, pending subscriptions, broadcast receipts, and evaluation
+  metadata.
 - Portable tool inventory discovery and operation URI authority assignment.
-- Durable stdio session resumption and how competing writers to the same
-  controller MCP session are identified and explicitly taken over.
+- How competing writers to the same controller application session are fenced
+  out and explicitly taken over. HTTP and stdio session resumption are specified
+  through application metadata above.
+- Complete continuation schemas and the long-term replacement for deprecated
+  MCP sampling; continuation operation failures must remain explicit.
 - Canonical target resolution for new files and operations whose targets depend
   on runtime results. Requested symlink paths and resolved destinations are
   already distinguished by `uri` and `canonicalUri`.
 - Whether argument rewriting earns its complexity in version 1; this draft keeps
   execution arguments unchanged.
 - Portable workspace binding for multi-root and remote execution environments.
-  Durable server-owned session IDs and state are already requirements, not an
+  Host-issued application session IDs and durable server-owned state are already requirements, not an
   optional retention policy.
 
 ## Review scenarios
@@ -924,10 +1461,10 @@ An implementation should demonstrate these cases before claiming conformance:
 6. Approval, rejection, skipping, and return to planning preserve server state.
 7. A lost transition response is recovered without advancing a step twice.
 8. A lost acknowledgment does not clear the host context a second time.
-9. HTTP reconnection and server restart retain the same MCP session ID and plan;
+9. HTTP or stdio reconnection and server restart retain the same application session ID and plan;
    an unexpected missing session does not silently start an empty workflow.
 10. The same server provides ordinary tools, resources, hooks, and sampling
-    requests over one MCP transport without deadlock.
+    continuations over one MCP transport without deadlock or independent server RPCs.
 11. Static authorization causes no description RPC; `"authorize"` causes one per
     invocation. Missing metadata is not treated as permission.
 12. `workspace-file:///**/AGENTS.md` matches root and nested instruction files,
@@ -944,3 +1481,33 @@ An implementation should demonstrate these cases before claiming conformance:
 17. A replacement with `tools: "default"` restores the configured default
     selection; omission preserves the previous selection, and `[]` selects none.
     Later changes to host defaults leave the new context's selection unchanged.
+18. Two application sessions share a connection without mixing plans, hooks, UI,
+    or database bindings; every session RPC carries the correct metadata.
+19. Creation retries return the same session. Deletion retries succeed, and stale
+    creation or mutation retries cannot resurrect deleted state.
+20. A session-only provider works without context control; advertising context
+    support does not grant controller authority.
+21. A lost continuation response recovers without repeating committed host
+    mutations. Interrupting between rounds never starts another model turn.
+22. A provider subscribes before seeing a catalog or before its publisher loads.
+    The request reports a non-fatal unavailable error, retains pending intent,
+    and becomes established automatically when the publisher advertises the URI.
+23. Every provider receives a full catalog snapshot at least once. Publisher
+    changes and subscription changes update that recipient's established and
+    pending state; repeated identical subscriptions create neither duplicate
+    deliveries nor an endless catalog-update loop.
+24. Two subscribers handle the same URI independently. Multiple handlers inside
+    one subscriber require only one protocol subscription. Unsubscribe removes
+    pending intent as well as established subscriptions.
+25. Provider broadcasts reach established subscribers without borrowing platform
+    authority or leaking another provider's application session ID. Publication
+    retries and outbox acknowledgment retries do not broadcast an event twice.
+26. A direct or indirect cycle skips only the repeated `(MCP, hook URI)` pair
+    and logs a warning. Other recipients continue. Siblings and later independent
+    events can invoke that pair again.
+27. Queued delivery and restart retain causal stacks. Continuation rounds and
+    execution retries neither bypass cycle detection nor falsely count as new
+    recursive invocations. Outbox events caused by a hook retain its evaluation ID.
+28. A batch subscription request reports active, pending, and rejected entries
+    independently in input order. Duplicate URIs add no handlers, empty lists
+    succeed, and batched unsubscribe removes both established and pending intent.

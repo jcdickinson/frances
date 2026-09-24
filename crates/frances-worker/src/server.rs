@@ -89,9 +89,11 @@ impl ShellResource {
 }
 
 struct ServerState {
+    processes: Mutex<tokio::task::JoinSet<()>>,
+    process_cancel: tokio_util::sync::CancellationToken,
     next_shell: AtomicU64,
     shells: Mutex<HashMap<ShellId, Arc<ShellResource>>>,
-    requests: Mutex<HashMap<u64, tokio::task::AbortHandle>>,
+    requests: Mutex<HashMap<u64, tokio::task::JoinHandle<()>>>,
     shell_reaper: mpsc::UnboundedSender<Shell>,
 }
 
@@ -108,6 +110,8 @@ impl ServerState {
             }
         });
         Arc::new(Self {
+            processes: Mutex::new(tokio::task::JoinSet::new()),
+            process_cancel: tokio_util::sync::CancellationToken::new(),
             next_shell: AtomicU64::new(1),
             shells: Mutex::new(HashMap::new()),
             requests: Mutex::new(HashMap::new()),
@@ -115,16 +119,32 @@ impl ServerState {
         })
     }
 
-    fn abort_all(&self) {
-        for (_, request) in self
+    async fn abort_all(&self) {
+        let requests: Vec<_> = self
             .requests
             .lock()
             .expect("request registry poisoned")
             .drain()
-        {
+            .map(|(_, task)| task)
+            .collect();
+        for request in &requests {
             request.abort();
         }
+        // Finish in-flight startup before collecting the process cleanup tasks.
+        for request in requests {
+            if let Err(error) = request.await {
+                tracing::debug!(%error, "worker request stopped during shutdown");
+            }
+        }
         self.shells.lock().expect("shell registry poisoned").clear();
+        self.process_cancel.cancel();
+        let mut processes =
+            std::mem::take(&mut *self.processes.lock().expect("process registry poisoned"));
+        while let Some(result) = processes.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "worker process task failed");
+            }
+        }
     }
 
     fn shell(&self, id: ShellId) -> Result<Arc<ShellResource>, ResponseError> {
@@ -148,9 +168,13 @@ where
     let state = ServerState::new();
 
     loop {
-        let request = match reader.receive::<Request>().await? {
-            Some(request) => request,
-            None => break,
+        let request = match reader.receive::<Request>().await {
+            Err(error) => {
+                state.abort_all().await;
+                return Err(error);
+            }
+            Ok(Some(request)) => request,
+            Ok(None) => break,
         };
         let id = request.id;
 
@@ -174,7 +198,7 @@ where
         }
 
         if matches!(request.kind, RequestKind::Shutdown) {
-            state.abort_all();
+            state.abort_all().await;
             writer
                 .send(Response {
                     version: PROTOCOL_VERSION,
@@ -218,11 +242,11 @@ where
             .requests
             .lock()
             .expect("request registry poisoned")
-            .insert(id, task.abort_handle());
+            .insert(id, task);
         let _ = start.send(());
     }
 
-    state.abort_all();
+    state.abort_all().await;
     Ok(())
 }
 
@@ -233,8 +257,24 @@ async fn handle(
     match kind {
         RequestKind::Hello => Ok(ResponseKind::Hello(Hello {
             version: PROTOCOL_VERSION,
-            capabilities: vec![Capability::Filesystem, Capability::Shell],
+            capabilities: vec![
+                Capability::Filesystem,
+                Capability::Shell,
+                Capability::Process,
+            ],
         })),
+        RequestKind::ProcessOpen { options, input } => {
+            let (output, task) =
+                crate::process::open(options, input, state.process_cancel.clone()).await?;
+            let mut processes = state.processes.lock().expect("process registry poisoned");
+            while let Some(result) = processes.try_join_next() {
+                if let Err(error) = result {
+                    tracing::warn!(%error, "worker process task failed");
+                }
+            }
+            processes.spawn(task);
+            Ok(ResponseKind::ProcessOpened { output })
+        }
         RequestKind::FsRead { path } => {
             let file = tokio::fs::File::open(&path)
                 .await

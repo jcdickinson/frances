@@ -166,7 +166,7 @@ impl HistoryStoreTrait for TursoHistoryStore {
 }
 
 impl TursoHistoryStore {
-    pub(super) async fn load_primitives(
+    pub(crate) async fn load_primitives(
         &self,
         session: ChatSessionId,
     ) -> Result<Vec<OwnedHistoryInput>, HistoryError> {

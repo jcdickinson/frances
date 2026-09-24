@@ -22,6 +22,7 @@ frances-models-ui.workspace = true
 frances-session.workspace = true
 frances-worker.workspace = true
 frances-harness.workspace = true
+frances-mcp.workspace = true
 flate2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
