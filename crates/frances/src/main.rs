@@ -11,19 +11,19 @@ use clap::{Parser, Subcommand};
 use frances_session::workspace::Workspace;
 
 #[derive(Debug, Parser)]
-#[command(name = "frances")]
+#[command(name = "frances", args_conflicts_with_subcommands = true)]
 struct Cli {
     /// Directory or workspace file to open. Defaults to the current
     /// directory. Every launch starts a fresh session.
     path: Option<PathBuf>,
 
-    /// Workflow to start the session with. Defaults to `default_workflow`.
-    #[arg(long)]
-    workflow: Option<String>,
-
     /// Keep the desktop app attached to this process.
     #[arg(long, global = true)]
     foreground: bool,
+
+    /// Print all built-in tool definitions and their strict mode flags as JSON.
+    #[arg(long, conflicts_with_all = ["path", "foreground"])]
+    export_tool_schemas: bool,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -31,12 +31,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Write a starter config and install the `main` workflow.
-    Install {
-        /// Point config at the in-repo workflow instead of copying it.
-        #[arg(long)]
-        local: bool,
-    },
+    /// Write a starter model/provider configuration.
+    Install,
 }
 
 fn main() {
@@ -49,8 +45,16 @@ fn main() {
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
 
-    if let Some(Command::Install { local }) = cli.command {
-        return install::run(local);
+    if cli.export_tool_schemas {
+        serde_json::to_writer_pretty(
+            std::io::stdout().lock(),
+            &frances_session::runtime::tool_schemas(),
+        )?;
+        return Ok(());
+    }
+
+    if let Some(Command::Install) = cli.command {
+        return install::run();
     }
 
     // Canonicalize and validate before detaching so errors land on the
@@ -60,13 +64,13 @@ fn real_main() -> Result<()> {
     let workspace = Workspace::open(&path)?;
 
     if !cli.foreground {
-        return launch_detached(&workspace, cli.workflow.as_deref());
+        return launch_detached(&workspace);
     }
 
-    app::run(workspace, cli.workflow)
+    app::run(workspace)
 }
 
-fn launch_detached(workspace: &Workspace, workflow: Option<&str>) -> Result<()> {
+fn launch_detached(workspace: &Workspace) -> Result<()> {
     let current_executable = std::env::current_exe().context("resolve frances executable")?;
     #[cfg(target_os = "linux")]
     let executable = appimage::launcher_executable(&current_executable);
@@ -75,9 +79,6 @@ fn launch_detached(workspace: &Workspace, workflow: Option<&str>) -> Result<()> 
 
     let mut command = ProcessCommand::new(executable);
     command.arg("--foreground");
-    if let Some(workflow) = workflow {
-        command.arg("--workflow").arg(workflow);
-    }
     command
         .arg(workspace.source.identity_path())
         .stdin(Stdio::null())
@@ -111,27 +112,34 @@ mod tests {
     use super::Cli;
 
     #[test]
+    fn schema_export_is_exclusive() {
+        assert!(
+            Cli::try_parse_from(["frances", "--export-tool-schemas"])
+                .unwrap()
+                .export_tool_schemas
+        );
+        for args in [
+            vec!["frances", "--export-tool-schemas", "some/dir"],
+            vec!["frances", "--export-tool-schemas", "--foreground"],
+            vec!["frances", "--export-tool-schemas", "install"],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+
+    #[test]
     fn bare_launch_defaults_to_detached_cwd() {
         let cli = Cli::try_parse_from(["frances"]).unwrap();
 
         assert!(!cli.foreground);
         assert!(cli.path.is_none());
-        assert!(cli.workflow.is_none());
     }
 
     #[test]
-    fn path_and_workflow_parse() {
-        let cli = Cli::try_parse_from([
-            "frances",
-            "some/dir",
-            "--workflow",
-            "review",
-            "--foreground",
-        ])
-        .unwrap();
+    fn path_and_foreground_parse() {
+        let cli = Cli::try_parse_from(["frances", "some/dir", "--foreground"]).unwrap();
 
         assert!(cli.foreground);
         assert_eq!(cli.path.unwrap(), std::path::Path::new("some/dir"));
-        assert_eq!(cli.workflow.as_deref(), Some("review"));
     }
 }

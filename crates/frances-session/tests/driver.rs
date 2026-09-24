@@ -1,289 +1,331 @@
-//! Integration tests for [`frances_session::SessionRuntime`]'s driver
-//! loop. Each test spins up a real `SessionRuntime` against a tempdir
-//! `Database` + an `InMemoryProvider`-seeded config + a scripted
-//! `StubProvider`, then asserts on the `StreamFrame` sequence on the
-//! runtime's events channel.
-//!
-//! Determinism: no real wall-clock waits inside the workflow JS
-//! (workflows resolve immediately or via `inbox.next()`). The driver's
-//! `DEHYDRATE_TIMEOUT` is controllable via `tokio::time::pause` for
-//! tests that need to exercise the timeout branch.
-
-use std::sync::Arc;
-use std::time::Duration;
-
-use tempfile::{NamedTempFile, TempDir};
+//! Native harness integration: real session storage and scripted model calls.
+use frances_config::{InMemoryProvider, Value as ConfigValue};
+use frances_llm::test_util::{StubProvider, StubScript};
+use frances_models_llm::{CompletionOutcome, OwnedHistoryInput, StreamEvent, ToolCall};
+use frances_session::{
+    context::InvocationContext,
+    events::{Lifecycle, PermissionResponseWire, StreamFrame},
+    runtime::{SessionRuntime, StartOverrides},
+    session::Paths,
+    store,
+    workspace::Workspace,
+};
+use serde_json::{Value, json};
+use std::{sync::Arc, time::Duration};
 use tokio::sync::mpsc::UnboundedReceiver;
 
-use frances_config::{ConfigProvider, InMemoryProvider, Value as ConfigValue};
-use frances_llm::test_util::StubProvider;
-use frances_session::context::{InvocationContext, ProcessContext};
-use frances_session::events::{SectionKind, StreamFrame};
-use frances_session::runtime::{SessionRuntime, StartOverrides};
-use frances_session::session::Paths;
-use frances_session::store;
-use frances_session::workspace::Workspace;
-
-/// Anything the harness keeps alive for the duration of one test.
 struct Harness {
-    _runtime: Arc<SessionRuntime>,
+    runtime: Arc<SessionRuntime>,
     events: UnboundedReceiver<StreamFrame>,
-    _src: NamedTempFile,
-    _tempdir: TempDir,
+    stub: Arc<StubProvider>,
+    temp: tempfile::TempDir,
 }
-
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.runtime.shutdown();
+    }
+}
 impl Harness {
-    /// Pull one frame off the channel, timing out after 5 seconds.
-    async fn recv_one(&mut self) -> StreamFrame {
-        match tokio::time::timeout(Duration::from_secs(5), self.events.recv()).await {
-            Ok(Some(frame)) => frame,
-            Ok(None) => panic!("events channel closed unexpectedly"),
-            Err(_) => panic!("recv_one timed out after 5s — runtime hung?"),
+    async fn new(scripts: Vec<StubScript>) -> Self {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            state_root: temp.path().join("state"),
+            runtime_root: temp.path().join("runtime"),
+        };
+        paths.ensure_layout().unwrap();
+        let workspace = Workspace::open(temp.path()).unwrap();
+        let session = paths.create_session(&workspace).unwrap();
+        let db = store::open(&session).await.unwrap();
+        let mut config = InMemoryProvider::new();
+        for (path, value) in [
+            ("models.default.model_provider", "test"),
+            ("models.default.id", "test-model"),
+            ("model_providers.test.kind", "openai-chat"),
+            ("model_providers.test.base_url", "http://stub.invalid"),
+            ("model_providers.test.auth.token", "stub-token"),
+        ] {
+            config = config.set(
+                path.split('.')
+                    .map(|s| ConfigValue::String(s.into()))
+                    .collect::<Vec<_>>(),
+                value,
+            );
+        }
+        let stub = Arc::new(StubProvider::new());
+        for script in scripts {
+            stub.push_script(script);
+        }
+        let inserted = stub.clone();
+        let (runtime, events) = SessionRuntime::start_with(
+            session,
+            db,
+            InvocationContext::capture(workspace),
+            StartOverrides {
+                extra_config_providers: vec![Arc::new(config)],
+                on_cache: Some(Box::new(move |cache| cache.insert_stub("test", inserted))),
+            },
+        )
+        .await
+        .unwrap();
+        Self {
+            runtime,
+            events,
+            stub,
+            temp,
         }
     }
-
-    /// Drain frames until `pred` matches. Returns everything collected
-    /// (including the matching frame).
-    async fn recv_until<F>(&mut self, mut pred: F) -> Vec<StreamFrame>
-    where
-        F: FnMut(&StreamFrame) -> bool,
-    {
-        let mut out = Vec::new();
+    async fn frame(&mut self) -> StreamFrame {
+        tokio::time::timeout(Duration::from_secs(10), self.events.recv())
+            .await
+            .expect("driver timed out")
+            .expect("driver closed")
+    }
+    async fn idle(&mut self) -> Vec<StreamFrame> {
+        let mut frames = vec![];
+        let mut started = false;
         loop {
-            let frame = self.recv_one().await;
-            let stop = pred(&frame);
-            out.push(frame);
-            if stop {
-                return out;
+            let frame = self.frame().await;
+            if let StreamFrame::EntityUpsert { envelope, snapshot } = &frame
+                && envelope.kind == "session"
+            {
+                if snapshot["busy"].is_string() {
+                    started = true;
+                } else if started {
+                    frames.push(frame);
+                    return frames;
+                }
+            }
+            if let StreamFrame::Error(error) = &frame {
+                panic!("driver error: {error}");
+            }
+            frames.push(frame);
+        }
+    }
+    async fn permission(&mut self) -> frances_harness::PermissionRequest {
+        loop {
+            if let StreamFrame::Permission(request) = self.frame().await {
+                return request;
+            }
+        }
+    }
+    async fn idle_after_started(&mut self) {
+        loop {
+            if let StreamFrame::EntityUpsert { envelope, snapshot } = self.frame().await
+                && envelope.kind == "session"
+                && snapshot["busy"].is_null()
+            {
+                return;
             }
         }
     }
 }
-
-/// Build a single-workflow harness. `workflow_src` is a TS body
-/// dropped into a tempfile; the seeded config points `workflows.test`
-/// at it and sets it as the default workflow.
-async fn harness(workflow_src: &str) -> Harness {
-    use std::io::Write;
-    let tempdir = tempfile::tempdir().expect("tempdir");
-
-    let mut src = NamedTempFile::with_suffix(".ts").expect("tempfile");
-    src.write_all(workflow_src.as_bytes()).expect("write src");
-    src.flush().expect("flush src");
-    let src_path = src.path().to_path_buf();
-
-    // Go through the real creation path so the session's metadata file
-    // exists on disk — the runtime reads-modifies-writes it (selected
-    // workflow, title).
-    let paths = Paths {
-        state_root: tempdir.path().to_path_buf(),
-        runtime_root: tempdir.path().to_path_buf(),
-    };
-    paths.ensure_layout().expect("ensure layout");
-    let workspace = Workspace::open(tempdir.path()).expect("open workspace");
-    let session = paths.create_session(&workspace).expect("create session");
-
-    let db = store::open(&session).await.expect("open db");
-
-    let invocation = InvocationContext {
-        workspace,
-        process: ProcessContext {
-            cwd: Some(tempdir.path().to_path_buf()),
-            env: std::sync::Arc::new(std::env::vars_os().collect()),
-        },
-    };
-
-    let in_memory = build_in_memory_config(&src_path, "test");
-
-    let stub = Arc::new(StubProvider::new());
-    let (runtime, events) = SessionRuntime::start_with(
-        session,
-        db,
-        invocation,
-        StartOverrides {
-            extra_config_providers: vec![Arc::new(in_memory) as Arc<dyn ConfigProvider>],
-            on_cache: Some(Box::new(move |cache| {
-                cache.insert_stub("test", stub);
-            })),
-            ..StartOverrides::default()
-        },
-    )
-    .await
-    .expect("start_with");
-
-    Harness {
-        _runtime: runtime,
-        events,
-        _src: src,
-        _tempdir: tempdir,
+fn call(name: &str, arguments: Value) -> ToolCall {
+    ToolCall {
+        id: format!("call-{name}"),
+        name: name.into(),
+        arguments,
+        error: None,
     }
 }
-
-/// Seed every config key the runtime touches during start_with.
-fn build_in_memory_config(workflow_file: &std::path::Path, workflow_id: &str) -> InMemoryProvider {
-    let workflow_path = workflow_file.display().to_string();
-    InMemoryProvider::new()
-        .set(
-            vec![
-                ConfigValue::String("models".into()),
-                ConfigValue::String("default".into()),
-                ConfigValue::String("model_provider".into()),
-            ],
-            "test",
-        )
-        .set(
-            vec![
-                ConfigValue::String("models".into()),
-                ConfigValue::String("default".into()),
-                ConfigValue::String("id".into()),
-            ],
-            "test-model",
-        )
-        .set(
-            vec![
-                ConfigValue::String("model_providers".into()),
-                ConfigValue::String("test".into()),
-                ConfigValue::String("kind".into()),
-            ],
-            "openai-chat",
-        )
-        .set(
-            vec![
-                ConfigValue::String("model_providers".into()),
-                ConfigValue::String("test".into()),
-                ConfigValue::String("base_url".into()),
-            ],
-            "http://stub.invalid",
-        )
-        .set(
-            vec![
-                ConfigValue::String("model_providers".into()),
-                ConfigValue::String("test".into()),
-                ConfigValue::String("auth".into()),
-                ConfigValue::String("token".into()),
-            ],
-            "stub-token",
-        )
-        .set(
-            vec![
-                ConfigValue::String("workflows".into()),
-                ConfigValue::String(workflow_id.into()),
-                ConfigValue::String("id".into()),
-            ],
-            "00000000-0000-0000-0000-000000000001",
-        )
-        .set(
-            vec![
-                ConfigValue::String("workflows".into()),
-                ConfigValue::String(workflow_id.into()),
-                ConfigValue::String("file".into()),
-            ],
-            workflow_path.as_str(),
-        )
-        .set(
-            vec![ConfigValue::String("default_workflow".into())],
-            workflow_id,
-        )
+fn calls(calls: Vec<ToolCall>) -> StubScript {
+    StubScript {
+        events: vec![],
+        outcome: CompletionOutcome {
+            text: String::new(),
+            tool_calls: calls,
+        },
+    }
+}
+fn text(text: &str) -> StubScript {
+    StubScript {
+        events: vec![StreamEvent::TextDelta(text.into())],
+        outcome: CompletionOutcome {
+            text: text.into(),
+            tool_calls: vec![],
+        },
+    }
+}
+fn reject() -> StubScript {
+    calls(vec![call(
+        "decide",
+        json!({"verdict":"reject","reason":"ask the user"}),
+    )])
 }
 
-// =========================================================================
-// Tests
-// =========================================================================
-
-/// Workflow starts, pushes a one-shot JsonSection, ends.
 #[tokio::test]
-async fn smoke_workflow_starts_and_pushes_frame() {
-    let mut h = harness(
-        r#"
-        import { transcript, JsonSection } from "frances:v1/sections";
-        transcript.push(new JsonSection({ tag: "harness", value: "hello" }));
-        "#,
-    )
-    .await;
-
-    let frames = h
-        .recv_until(|f| matches!(f, StreamFrame::Section { .. }))
-        .await;
+async fn ordinary_chat_streams_and_slashes_are_plain_input() {
+    let mut h = Harness::new(vec![text("Hello"), text("Again")]).await;
+    h.runtime.prompt("/this/is/a/path".into());
+    let frames = h.idle().await;
+    assert!(frames.iter().any(|frame| matches!(frame, StreamFrame::EntityUpsert { envelope, snapshot } if envelope.lifecycle == Lifecycle::Settled && snapshot["text"] == "Hello")));
+    h.runtime.prompt("Continue".into());
+    h.idle().await;
+    let requests = h.stub.captured();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].session_id, requests[1].session_id);
+    assert!(requests[0].new_inputs.iter().any(
+        |input| matches!(input, OwnedHistoryInput::User { text } if text == "/this/is/a/path")
+    ));
     assert!(
-        frames.iter().any(|f| matches!(
-            f,
-            StreamFrame::Section(SectionKind::Json { tag, value })
-                if tag == "harness" && value == "hello"
-        )),
-        "expected the harness json frame; got: {frames:?}"
-    );
-}
-
-/// The full entity producer path through the driver: creating upsert
-/// reaches the channel before the transcript ref, appends persist (and
-/// replay via subscribe), settle flips lifecycle and stores artifacts.
-#[tokio::test]
-async fn entity_producer_flows_through_driver_to_hub() {
-    let mut h = harness(
-        r#"
-        import { createEntity } from "frances:v1/entities";
-        import { transcript, EntityRefSection } from "frances:v1/sections";
-        const e = createEntity("shell", { cmd: "demo", state: "running" });
-        transcript.push(new EntityRefSection({ id: e.id }));
-        e.append({ text: "hello" });
-        e.settle({ cmd: "demo", state: "success" }, { artifacts: { llm_digest: "Exit 0" } });
-        "#,
-    )
-    .await;
-
-    use frances_session::events::Lifecycle;
-    let frames = h
-        .recv_until(|f| {
-            matches!(
-                f,
-                StreamFrame::EntityUpsert { envelope, .. }
-                    if envelope.kind == "shell" && envelope.lifecycle == Lifecycle::Settled
-            )
-        })
-        .await;
-
-    let live_pos = frames
-        .iter()
-        .position(|f| {
-            matches!(
-                f,
-                StreamFrame::EntityUpsert { envelope, .. }
-                    if envelope.kind == "shell" && envelope.lifecycle == Lifecycle::Live
-            )
-        })
-        .expect("creating Live upsert");
-    let (ref_pos, entity_id) = frames
-        .iter()
-        .enumerate()
-        .find_map(|(i, f)| match f {
-            StreamFrame::Section(SectionKind::EntityRef { entity_id }) => Some((i, *entity_id)),
-            _ => None,
-        })
-        .expect("EntityRef section");
-    assert!(live_pos < ref_pos, "upsert must precede its ref");
-
-    // No stream frames without a subscription.
-    assert!(
-        !frames
+        !requests[0]
+            .tools
             .iter()
-            .any(|f| matches!(f, StreamFrame::EntityStream { .. })),
-        "stream items must not broadcast unsubscribed"
+            .any(|name| name.starts_with("plan_") || name.starts_with("mcp"))
     );
+    assert!(requests[0].tools.iter().any(|name| name == "file_read"));
+    assert_eq!(requests[0].tools, requests[1].tools);
+}
 
-    // Catch-up subscribe replays the persisted append.
-    let hub = h._runtime.entities.clone();
-    hub.subscribe(entity_id, true).await.expect("subscribe");
-    match h.recv_one().await {
-        StreamFrame::EntityStream { seq, payload, .. } => {
-            assert_eq!(seq, 1);
-            assert_eq!(payload["text"], "hello");
-        }
-        other => panic!("expected replayed stream item, got {other:?}"),
+#[tokio::test]
+async fn file_tools_execute_batches_and_keep_history_and_diff() {
+    let mut h = Harness::new(vec![
+        calls(vec![call(
+            "file_new",
+            json!({"path":"nested/test.txt","text":"before"}),
+        )]),
+        calls(vec![call("file_read", json!({"path":"nested/test.txt"}))]),
+        calls(vec![call(
+            "file_overwrite",
+            json!({"path":"nested/test.txt","text":"after"}),
+        )]),
+        text("Done"),
+    ])
+    .await;
+    h.runtime.prompt("Create and edit a file".into());
+    let frames = h.idle().await;
+    assert_eq!(
+        std::fs::read_to_string(h.temp.path().join("nested/test.txt")).unwrap(),
+        "after\n"
+    );
+    assert!(frames.iter().any(|f| matches!(
+        f,
+        StreamFrame::Section(frances_session::events::SectionKind::Diff { .. })
+    )));
+    let requests = h.stub.captured();
+    assert_eq!(requests.len(), 4);
+    for request in &requests[1..] {
+        assert!(request.new_inputs.iter().any(|i| matches!(
+            i,
+            OwnedHistoryInput::ToolResult {
+                is_error: false,
+                ..
+            }
+        )));
     }
+    let db = store::open(&h.runtime.session).await.unwrap();
+    assert!(
+        !frances_session::scrollback::load(&db)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
 
-    let digest = hub
-        .read_artifact(entity_id, "llm_digest")
-        .await
-        .expect("read artifact");
-    assert_eq!(digest, Some(serde_json::json!("Exit 0")));
+#[tokio::test]
+async fn invalid_and_unknown_calls_never_execute() {
+    let mut h = Harness::new(vec![
+        calls(vec![
+            call("file_new", json!({"path":"oops"})),
+            call("plan_exit", json!({})),
+        ]),
+        text("Recovered"),
+    ])
+    .await;
+    h.runtime.prompt("Test malformed calls".into());
+    h.idle().await;
+    assert!(!h.temp.path().join("oops").exists());
+    let requests = h.stub.captured();
+    let results: Vec<_> = requests[1]
+        .new_inputs
+        .iter()
+        .filter(|i| matches!(i, OwnedHistoryInput::ToolResult { is_error: true, .. }))
+        .collect();
+    assert_eq!(results.len(), 2);
+}
+
+#[tokio::test]
+async fn denied_shell_has_no_effect_and_continues() {
+    let mut h = Harness::new(vec![
+        calls(vec![call("shell_run", json!({"cmd":"touch denied"}))]),
+        reject(),
+        text("Denied"),
+    ])
+    .await;
+    h.runtime.prompt("Run a command".into());
+    let request = h.permission().await;
+    h.runtime
+        .respond_permission(
+            request.reply,
+            PermissionResponseWire::No {
+                details: Some("No".into()),
+            },
+        )
+        .unwrap();
+    h.idle_after_started().await;
+    assert!(!h.temp.path().join("denied").exists());
+    assert!(h.stub.captured().last().unwrap().new_inputs.iter().any(|i| matches!(i, OwnedHistoryInput::ToolResult { is_error:true, content, .. } if content.contains("permission denied"))));
+}
+
+#[tokio::test]
+async fn interrupt_permission_settles_remaining_calls_and_waits_for_user() {
+    let mut h = Harness::new(vec![
+        calls(vec![
+            call("shell_run", json!({"cmd":"touch denied"})),
+            call("file_new", json!({"path":"skipped","text":"no"})),
+        ]),
+        reject(),
+        text("Resumed"),
+    ])
+    .await;
+    h.runtime.prompt("Run a batch".into());
+    let request = h.permission().await;
+    h.runtime.interrupt();
+    h.idle_after_started().await;
+    assert!(request.reply.is_closed());
+    assert!(!h.temp.path().join("denied").exists());
+    assert!(!h.temp.path().join("skipped").exists());
+    assert_eq!(h.stub.captured().len(), 2);
+    h.runtime.prompt("Resume".into());
+    h.idle().await;
+    let requests = h.stub.captured();
+    assert_eq!(requests.len(), 3);
+    assert_eq!(
+        requests[2]
+            .new_inputs
+            .iter()
+            .filter(|i| matches!(i, OwnedHistoryInput::ToolResult { is_error: true, .. }))
+            .count(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn approved_shell_publishes_output_and_interrupt_kills_it() {
+    let mut h = Harness::new(vec![
+        calls(vec![call(
+            "shell_run",
+            json!({"cmd":"printf 'ready%.0s' {1..1000}; sleep 30; touch late","quiet":60,"max":60}),
+        )]),
+        reject(),
+    ])
+    .await;
+    h.runtime.prompt("Run".into());
+    let request = h.permission().await;
+    h.runtime
+        .respond_permission(request.reply, PermissionResponseWire::Yes { details: None })
+        .unwrap();
+    loop {
+        if let StreamFrame::EntityUpsert { envelope, snapshot } = h.frame().await
+            && envelope.kind == "shell"
+            && snapshot["teaser"]
+                .as_str()
+                .is_some_and(|s| s.contains("ready"))
+        {
+            break;
+        }
+    }
+    h.runtime.interrupt();
+    h.idle_after_started().await;
+    assert!(!h.temp.path().join("late").exists());
+    assert_eq!(h.stub.captured().len(), 2);
 }

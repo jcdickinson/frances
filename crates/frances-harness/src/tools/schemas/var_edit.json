@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "filter": {
+      "type": "string"
+    },
+    "inputs": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Optional names of other variables to expose inside the filter as $name bindings."
+    }
+  },
+  "required": [
+    "name",
+    "filter"
+  ],
+  "additionalProperties": false
+}

@@ -73,17 +73,9 @@ pub struct SessionMeta {
     /// brand-new workspace persists the same id, linking the sessions
     /// it already spawned to the saved file.
     pub workspace_id: Uuid,
-    pub workflow: Option<SessionWorkflow>,
-    /// Human-readable session title. Set by the active workflow via
-    /// `setTitle`; `None` until one is set.
+    /// Human-readable session title; `None` until one is set.
     pub title: Option<String>,
     pub reserved: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct SessionWorkflow {
-    pub name: String,
-    pub args: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -154,7 +146,6 @@ impl Paths {
             cwd: workspace.primary_dir().to_path_buf(),
             workspace_source: workspace.source.identity_path().to_path_buf(),
             workspace_id: workspace.id,
-            workflow: None,
             title: None,
             reserved: None,
         };
@@ -207,16 +198,12 @@ impl Session {
     /// Read-modify-write the metadata file. Rereads from disk (rather
     /// than cloning the boot-time `self.meta` snapshot) so one field's
     /// update can't clobber another's earlier write. All post-boot
-    /// writes happen on the workflow driver task, so there is no
+    /// writes happen on the agent driver task, so there is no
     /// concurrent-writer race to guard.
     pub fn update_meta(&self, update: impl FnOnce(&mut SessionMeta)) -> Result<()> {
         let mut meta = read_metadata(&self.metadata_path())?;
         update(&mut meta);
         write_metadata(&self.metadata_path(), &meta)
-    }
-
-    pub fn write_workflow(&self, workflow: SessionWorkflow) -> Result<()> {
-        self.update_meta(|meta| meta.workflow = Some(workflow))
     }
 
     pub fn write_title(&self, title: Option<String>) -> Result<()> {

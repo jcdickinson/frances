@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Frances variable name to store the value into."
+    },
+    "from": {
+      "type": "string",
+      "description": "Bash variable name to read."
+    }
+  },
+  "required": [
+    "name",
+    "from"
+  ],
+  "additionalProperties": false
+}

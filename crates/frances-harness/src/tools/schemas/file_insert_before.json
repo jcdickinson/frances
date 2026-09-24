@@ -1,0 +1,23 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "anchor": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "from": {
+      "type": "string",
+      "description": "Frances variable name to pull insertion text from. Provide exactly one of `text` or `from`."
+    }
+  },
+  "required": [
+    "path",
+    "anchor"
+  ],
+  "additionalProperties": false
+}

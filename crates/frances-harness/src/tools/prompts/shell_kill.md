@@ -1,0 +1,1 @@
+Kill the running shell command.

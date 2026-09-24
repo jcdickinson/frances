@@ -1,0 +1,1 @@
+Run a bash command. Cwd persists; exported variables persist when named in persist. If still running, call shell_wait or shell_kill. Commands require approval.

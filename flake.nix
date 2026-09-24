@@ -72,6 +72,7 @@
             cargo-machete
             just
             deno
+            nodejs # Includes npm for tool-schema validation.
           ]) ++ tauriNativeBuildInputs ++ tauriBuildInputs;
         };
       });

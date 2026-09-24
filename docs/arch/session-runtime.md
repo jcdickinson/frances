@@ -1,177 +1,84 @@
 # Session runtime
 
-Status: current implementation, with the replacement target below. References to
-JS workflows describe code being removed, not an extension API to build upon.
+Status: ordinary Rust harness implemented. MCP and the planning server described
+in the [protocol](../model-content-hooks-protocol.md) remain future work.
 
-## Replacement target
+## Agent loop
 
-First implement an ordinary Rust harness without MCP or the structured planning
-workflow. The [main workflow record](main-workflow.md) preserves the behavior for
-a later server port; MCP is not a prerequisite for removing JS.
+`frances-session::runtime` owns the model connection, user input, interruptions,
+history, permissions, and UI publication. `frances-harness` provides native
+filesystem, anchor editing, search, shell, and variable tools. There is no embedded
+JavaScript runtime, script workflow configuration, or built-in planning loop.
 
-The [Model Content + Hooks Protocol](../model-content-hooks-protocol.md) and its
-[UI extension](../model-content-hooks-ui.md) define the later host/server boundary.
-The [agentic-loop overview](agentic-loop.md) maps that boundary to Frances.
+A model context holds a chat session, fixed tool definitions, an editor read
+cache, variables, and shell state. The loop calls the model, executes its tool
+batch in order, records every result, commits edit reconciliation, and repeats
+until the model stops calling tools. Unknown tools and invalid arguments return
+errors before execution. Tool definitions stay unchanged across model requests.
 
-- A Rust-owned agent loop replaces the JS workflow driver, QuickJS runtime,
-  TypeScript transpilation, and embedded `frances:v1/*` module surface. Move
-  required dispatch, streaming, tool, permission, and interruption behavior into
-  Rust before deleting those bindings. Do not preserve a parallel JS workflow API.
-- Existing provider, worker, editor, anchor, history, and UI infrastructure remains
-  available to the Rust host. Removing workflow JS does not remove Svelte or the
-  frontend's JavaScript runtime.
-- MCP servers own planning state and its persistence. The host does not add plan
-  tables to its session DB; it persists MCP session IDs, conversation history,
-  context identities, and protocol receipts. Durable controller session IDs survive
-  server restart and do not expire while their state is needed.
-- Later port the recorded main workflow behavior into a supplied planning MCP
-  server, with server configuration and behavioral coverage. The initial harness
-  can ship without this workflow or MCP support; see the
-  [port requirements](agentic-loop.md#remove-the-js-workflow-layer).
-- One host session can contain successive model contexts. Replacement preserves
-  workspace files and UI history while rebuilding model context and the editor's
-  per-context read state. Tool selection is fixed for each context.
-- The selected controller requests transitions through `frances/context`. Other
-  servers can supply tools, authorization descriptions, hooks, and UI without
-  owning the conversation. Generic MCP sampling supports server-owned referee and
-  summarizer logic; the host does not implement those planning roles itself.
-- Native semantic UI replaces workflow-specific rendering code: plan approval is
-  an explicit review of a revision, and discussion leaves it unresolved. This is
-  separate from host tool permissions.
+Input received during a turn is queued. Interrupt cancels the model or pending
+permission, kills a running shell, and gives remaining calls in the batch an
+interrupted result. File operations already underway finish at their safe
+boundary. The host records results before stopping; it waits for new user input
+to resume. Shutdown uses the same cancellation path.
 
-The existing fresh-launch behavior below does not implement durable MCP
-reconnection yet. Host session restoration and protocol receipts must be wired
-up when implementing the new design; deleting JS alone does not provide them.
+Shell commands go through the permission gate. The existing auto-judge may approve
+an eligible command; rejection or an indeterminate result falls through to the
+user. Filesystem writes are restricted to resolved editable roots and require a
+read in this context, except atomic new-file creation. This is the initial native
+policy, not implementation of the draft authorization extension.
 
-## Current session layout
+Instruction files and environment information are loaded for the context through
+the filesystem adapter. Native producers publish chat, file, shell, and diff UI
+content through the existing entity hub and transcript channel.
 
-The unit of state is a **session**, identified by a random ID. A session owns:
+## Session and workspace
 
-- `state_root/sessions/<id>/` — durable: `metadata.bin`, `frances.db` (turso), anchor state, `frances.log`.
-- `runtime_root/sessions/<id>/` — ephemeral runtime dir. Empty in the current
-  build; reserved for future per-process locks or scratch files.
+Every launch opens a workspace and creates a fresh session. A workspace is a
+directory or a TOML file containing `dirs = ["a", "b"]`; relative entries resolve
+against the file's parent. Its primary directory is the initial cwd. The launcher
+validates the workspace before detaching and starts the sibling
+`frances-worker serve --stdio` process.
 
-`state_root` resolves from `XDG_STATE_HOME` (else `~/.local/state/frances`);
-`runtime_root` from `XDG_RUNTIME_DIR` (else `/tmp/frances-<uid>`). Both
-directories are created `0700`.
+Session directories are:
 
-## Workspaces
+- `state_root/sessions/<id>/`: metadata, `frances.db` (turso), anchors, and log.
+- `runtime_root/sessions/<id>/`: ephemeral runtime files.
 
-A launch opens a **workspace**: `frances [path]` where path is a directory
-(an implicit single-dir workspace) or a workspace file — TOML
-`dirs = ["a", "b"]`, relative entries resolved against the file's parent,
-`.frances-workspace` extension by convention (not enforced). The path is
-canonicalized and validated before the launcher detaches, so errors land on
-the launching terminal.
+State roots follow XDG conventions, with `~/.local/state/frances` and
+`/tmp/frances-<uid>` fallbacks. Directories are created with mode `0700`.
+Metadata contains workspace identity and title; it has no workflow selection.
+Editable roots currently come from a marker walk on the primary directory.
 
-**Every launch creates a fresh session.** There is no resume;
-`SessionMeta.workspace_source` records the workspace's canonical identity
-path so a future MRU/picker can enumerate sessions by workspace and reopen
-them. The session's cwd is the workspace's primary dir (`dirs[0]`), not the
-launching process's cwd.
+## Worker and persistence
 
-Workspaces also carry a UUID identity: read from the workspace file's `id`
-field, or generated in memory when opening a bare dir (or a file without an
-`id`). `SessionMeta.workspace_id` snapshots it at session creation, and
-saving the workspace (the `workspace::save` command) writes the same id into
-the file — so sessions spawned before the save are already linked to it.
+Production filesystem and shell operations cross the worker's framed stdio
+protocol. Content attachments carry file bytes, while feeds carry search and
+shell output. Shell observations drain output concurrently with waiting so the
+bounded feed cannot block progress. Dropping a shell feed closes its worker
+resource. `RealIo` is available for local tests; the desktop uses `WorkerIo`.
 
-`editable_roots` currently derives from a marker walk on the primary dir;
-switching it to the workspace's dirs verbatim is a known follow-up once
-multi-dir workspaces are exercised.
+Each session owns its own turso database. Chat inputs and tool outcomes are
+persisted before continuation, including on interruption. A failed model request
+keeps its inputs queued for retry without duplicating primitive history rows.
+The transcript has one sequence of sections across the session, with no workflow
+instance column or planning tables.
 
-## Local runtime and worker
+The `EntityHub` persists snapshots, optional append-only streams, and final
+artifacts. Chat messages update snapshots while streaming; shell entities carry
+bounded output and a model digest. Transcript sections refer to entities or hold
+structured diffs. Startup force-settles entities whose producer died, and queues
+entity snapshots before transcript replay.
 
-There is no daemon. The desktop process resolves the workspace, creates the
-session, opens the per-session turso database, and constructs a
-[`SessionRuntime`](../../crates/frances-session/src/runtime/mod.rs). The desktop UI
-runs in the same process and talks to the runtime through:
+## Later MCP integration
 
-- `SessionRuntime::prompt(text)` — spawns the workflow cycle.
-- `SessionRuntime::respond_permission(id, response)` — settles a pending
-  permission.
-- An `mpsc::UnboundedReceiver<StreamFrame>` paired with the runtime's
-  [`EventsChannel`](../../crates/frances-session/src/runtime/events.rs) — the
-  UI drains scrollback replay, prompt frames, and any workflow-switch
-  replay through this channel.
+The tool executor and context lifetime are separate from the agent loop so an
+MCP inventory can join native tools later. Context replacement belongs between
+settled batches: preserve session transcript and the shared anchor engine, create
+a fresh model conversation and editor read cache, and freeze the selected tool
+set. No placeholder MCP transport or hook framework is implemented.
 
-The desktop always starts the sibling `frances-worker serve --stdio` binary.
-Milestone one hardcodes this local startup sequence, but the protocol only
-assumes an async byte stream; SSH and WSL launchers can provide the same stdio
-shape later. There is deliberately no in-process production filesystem
-fallback. Workflow file reads, writes, metadata, directory creation,
-canonicalization, and editable-root marker discovery all cross the worker.
-
-Worker messages use `Content-Length` framed JSON. Byte content is carried in
-preceding `application/octet-stream` frames and represented in Rust as a
-single-use `Content`; serde registers and claims attachment IDs internally.
-Received content is staged and deleted when `Content` or its reader is dropped,
-so filesystem handlers do not know about framing or transport tempfiles.
-
-The worker advertises `filesystem` and `shell` capabilities. The protocol has a
-permanent reader dispatcher, a serialized bounded writer, concurrent request
-matching, and transferable bounded `Feed<T>` endpoints. A shell is a
-connection-scoped resource with a command feed in one direction and an event
-feed in the other; multiple shells have independent worker tasks, process
-state, and output. Each run/wait observation ends with `Done`, `Quiet`, or
-`Dead`, which the local proxy consumes behind its ordinary async methods.
-
-`Feed<T>` is intentionally one-way. Passing one feed in a request and another
-in its response composes a bidirectional session without a separate channel
-abstraction. A future one-result `Observation<T>` can reuse the same routing
-machinery without changing shell resource or framing semantics.
-
-`OPENROUTER_API_KEY` and any other secrets come from the process environment
-at startup; the runtime carries an `InvocationContext` snapshot of env + cwd
-that workflows read via `current_env` / `current_cwd`.
-
-There is no listening socket, socket-pairing race, or re-attach. The UI/runtime
-model intentionally drops the "session
-outlives the UI" property — quitting the app cancels any in-flight turn.
-Persisted state (scrollback rows, history rows, workflow metadata) is
-written eagerly during the turn so a partial turn survives the restart.
-
-## Per-session database
-
-Each session has its own `frances.db` inside its session dir. The schema
-(chat history, scrollback, anchor, and entity tables) has **no
-`session_id` columns** — sessions are isolated at the file level, not by
-row. Don't reintroduce a global db at `state_root/frances.db`: turso uses
-exclusive file locks and that caused cross-process contention back when
-sessions were owned by separate daemons. `Session::database_path()` is
-the source of truth.
-
-## Entities
-
-Sections are one-shot: a workflow pushes a fully-formed `SectionKind`
-and the driver emits + persists it in the same step. Nothing in the
-transcript is opened, appended to, or sealed. Anything that streams is
-an entity, referenced from the transcript by an `EntityRef` section.
-
-UI state that outlives a transcript position is an **entity**: a typed
-envelope (`entity_id`, `kind` string, `lifecycle: Live | Settled`) plus
-opaque-JSON facets — a small latest-wins **snapshot**, an optional
-append-only **stream** (seq assigned by the hub; frontend subscriptions
-get a gap-free catch-up + live tail), and **settle artifacts** (bounded
-derived blobs written once at settle, point-read by tag). The
-`EntityHub` (`frances-session/src/entities`) persists all three in the
-per-session db and is a policy-free pipe: kind-specific decisions live
-in producers (workflow JS via `frances:v1/entities`, or the runtime for
-the workspace/session singletons) and in the frontend's per-kind
-`{ Inline, Opened }` component pairs.
-
-Lifecycle is the envelope's only non-identity field because core
-machinery reads it: entities found Live at db open are **force-settled**
-(their producer died with the previous process), and workflow
-finish/dehydrate force-settles whatever the workflow left Live. The
-transcript references entities via one-shot `SectionKind::EntityRef`
-sections; the hub's attach snapshot is queued into the events channel
-ahead of the scrollback replay, so snapshots always arrive before the
-refs that need them.
-
-In the replacement, the Rust protocol adapter becomes the producer of MCP UI
-entities. Its local rendering lifecycle must not resolve a server-owned pending
-interaction. Force-settling a local entity after a crash is not approval or
-cancellation: reconnect using the persisted MCP session ID, reconcile the server's
-UI snapshots and action receipts, and restore unresolved interactions. See the
-[UI lifecycle](../model-content-hooks-ui.md#reconnection-and-removal).
+The [main workflow record](main-workflow.md) preserves the removed planning
+workflow for its later server port. That server will own planning state; the
+host will own MCP identities, accepted transitions, receipts, and generic UI.
+Fresh launch today is not durable MCP reconnection or session restoration.

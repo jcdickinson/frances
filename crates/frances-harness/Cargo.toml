@@ -1,0 +1,33 @@
+[package]
+name = "frances-harness"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+chrono.workspace = true
+jaq-core.workspace = true
+jaq-json.workspace = true
+jaq-std.workspace = true
+frances-core.workspace = true
+frances-edit.workspace = true
+frances-models-llm.workspace = true
+frances-models-ui.workspace = true
+frances-shell.workspace = true
+frances-worker.workspace = true
+frances-worker-protocol.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+twox-hash = { workspace = true, features = ["std"] }
+uuid.workspace = true
+xdg.workspace = true
+
+[dev-dependencies]
+frances-edit = { workspace = true, features = ["test-utils"] }
+tempfile.workspace = true

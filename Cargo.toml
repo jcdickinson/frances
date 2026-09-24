@@ -20,7 +20,7 @@ frances-models-llm = { path = "crates/frances-models-llm" }
 frances-models-ui = { path = "crates/frances-models-ui" }
 frances-shell = { path = "crates/frances-shell" }
 frances-storage = { path = "crates/frances-storage" }
-frances-workflow = { path = "crates/frances-workflow" }
+frances-harness = { path = "crates/frances-harness" }
 frances-worker = { path = "crates/frances-worker" }
 frances-worker-protocol = { path = "crates/frances-worker-protocol" }
 
@@ -31,7 +31,6 @@ base64 = "0.22"
 bincode = { version = "2", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 dashmap = "6"
-deno_ast = { version = "0.53", features = ["transpiling"] }
 flate2 = "1"
 futures = "0.3"
 futures-util = "0.3"
@@ -52,11 +51,8 @@ gtk = "0.18"
 parking_lot = "0.12"
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 regex = "1"
-rquickjs = { version = "0.11", features = ["futures", "loader", "macro"] }
-rust-embed = "8.12.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-shell-words = "1"
 shellexpand = "3"
 similar = { version = "3.1", default-features = false }
 slotmap = "1"

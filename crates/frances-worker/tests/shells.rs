@@ -243,3 +243,64 @@ async fn request(
     assert_eq!(response.id, id);
     response.result.unwrap()
 }
+
+#[tokio::test]
+async fn client_streams_before_exit_and_retains_output_across_waits() {
+    use frances_shell::{ReadEvent, RunOpts, RunOutcome, WaitOpts};
+    let (client_io, worker_io) = tokio::io::duplex(16 * 1024);
+    let worker = tokio::spawn(frances_worker::serve(worker_io));
+    let client = frances_worker::Client::connect(client_io).await.unwrap();
+    let mut shell = client.open_shell(ShellOptions::default()).await.unwrap();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    shell.set_output_sink(Some(tx));
+    let run = shell.run_with_opts(
+        "printf 'ready%.0s' {1..1000}; sleep 0.2; printf done",
+        RunOpts::default(),
+        WaitOpts {
+            quiet: Some(Duration::from_secs(1)),
+            max: Some(Duration::from_secs(2)),
+        },
+    );
+    let result;
+    {
+        tokio::pin!(run);
+        tokio::select! {
+            event = rx.recv() => assert!(matches!(event, Some(ReadEvent::Output(bytes)) if String::from_utf8_lossy(&bytes).contains("ready"))),
+            result = &mut run => panic!("command ended before streaming: {result:?}"),
+            () = tokio::time::sleep(Duration::from_secs(3)) => panic!("shell output did not stream"),
+        }
+        result = run.await.unwrap();
+    }
+    assert!(matches!(result, RunOutcome::Done { exit_code:0, output } if output.ends_with("done")));
+    let result = shell
+        .run_with_opts(
+            "printf first; sleep 0.1; printf second",
+            RunOpts::default(),
+            WaitOpts {
+                quiet: Some(Duration::from_millis(10)),
+                max: Some(Duration::from_secs(1)),
+            },
+        )
+        .await
+        .unwrap();
+    let RunOutcome::Quiet { output: first, .. } = result else {
+        panic!("expected quiet");
+    };
+    let result = shell
+        .keep_waiting(WaitOpts {
+            quiet: Some(Duration::from_secs(1)),
+            max: Some(Duration::from_secs(2)),
+        })
+        .await
+        .unwrap();
+    let RunOutcome::Done {
+        output: second,
+        exit_code: 0,
+    } = result
+    else {
+        panic!("expected completion");
+    };
+    assert_eq!(first + &second, "firstsecond");
+    client.shutdown().await.unwrap();
+    worker.await.unwrap().unwrap();
+}

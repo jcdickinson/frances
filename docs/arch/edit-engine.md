@@ -1,7 +1,6 @@
 # Edit engine
 
-Status: current engine design. JS tool bindings described below are being replaced
-by Rust platform tools under the
+Status: current engine design with native Rust tool bindings. Future MCP integration follows the
 [Model Content + Hooks Protocol](../model-content-hooks-protocol.md). The anchor
 algorithms and filesystem-independent engine remain; no JS runtime is required
 by this design.
@@ -12,9 +11,8 @@ The full anchor design is in [`anchors.md`](anchors.md) — read it before chang
 
 - **`frances-anchors`** — anchor word dictionary (`words.txt`, ~8200 BPE-friendly words), FNV/xxhash line hashing, and the word↔index encoding used to serialize anchors. No I/O.
 - **`frances-edit`** — `EditEngine`, `WorkingFile`, patch parser, reconciler, renderer, anchor pool. Filesystem-agnostic: callers supply file content; the engine never reads disk itself. `test-utils` feature exposes `FakeStore`.
-- **`frances-workflow` file module and JS tool wrappers** — current adapter from
-  tools to `EditSession`, worker-backed filesystem I/O, and UI output. This adapter
-  is replaced by native Rust tools, not retained as a QuickJS compatibility layer.
+- **`frances-harness` file tools** — native adapter to `EditSession`, worker-backed
+  filesystem I/O, and file/diff UI output.
 - **`frances-session::runtime::SessionEditorFactory`** — creates per-context
   `EditSession` instances over the shared engine.
 - **`frances-session::anchor_store`** — `AnchorStore` implementation backed by the
@@ -25,8 +23,7 @@ Public surface of `frances-edit` is re-exported from `lib.rs`; check there befor
 ## Context and authorization boundaries
 
 The Rust host owns tool dispatch, file I/O, edit reconciliation, and publishing
-file/diff views. These responsibilities must move out of the workflow wrappers
-when the embedded JS runtime is deleted. The worker remains the filesystem
+file/diff views. These responsibilities live in `frances-harness`; the embedded JS runtime is removed. The worker remains the filesystem
 boundary; MCP does not replace its internal transport.
 
 Each model context receives a fresh editor read cache and loop guard. Context
@@ -34,7 +31,7 @@ replacement retains the shared anchor engine and persisted anchors, but the mode
 must read files again before editing through the new context. Pending calls settle
 or cancel before replacement; the host owns the edit reconciliation boundary.
 
-Platform file tools expose authorization descriptions with the requested `uri`
+The future authorization extension will make platform file tools expose authorization descriptions with the requested `uri`
 and resolved `canonicalUri`. Both filesystem schemes are hostless; resolved paths
 inside the canonical workspace use `workspace-file:///`. A requested workspace
 symlink can resolve outside it without an automatic denial solely for that reason.

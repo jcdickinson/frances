@@ -24,8 +24,7 @@ fn into_erased(e: ChatError) -> ErasedError {
 }
 
 /// Concrete chat session. Clone-by-value handle; complex state in
-/// `Arc<Inner>`. Generic over the manager's deps `D` so the JS class
-/// and tests can pin different impls.
+/// `Arc<Inner>`. Generic over the manager's deps `D` so hosts and tests can use different stores.
 pub struct ChatSession<D: ChatManagerDeps> {
     inner: Arc<ChatSessionInner<D>>,
 }
@@ -42,7 +41,7 @@ struct ChatSessionInner<D: ChatManagerDeps> {
     /// Set on first `run` via `ensure_row` (or up-front for `load`).
     /// Stays `None` forever for `ephemeral` sessions.
     id: Mutex<Option<ChatSessionId>>,
-    /// Mutable workflow preference. `None` uses the selected model's default.
+    /// Mutable context preference. `None` uses the selected model's default.
     effort: Mutex<Option<NormalizedEffort>>,
     /// Opaque per-session UUID; threaded into provider requests for
     /// token-cache scoping.
@@ -56,7 +55,13 @@ struct ChatSessionInner<D: ChatManagerDeps> {
     ephemeral: bool,
     manager: ChatSessionManager<D>,
     /// Inputs queued via `push` since the last `run`. Drained by `run`.
-    pending: Mutex<Vec<OwnedHistoryInput>>,
+    pending: Mutex<Vec<PendingInput>>,
+}
+
+#[derive(Clone)]
+struct PendingInput {
+    value: OwnedHistoryInput,
+    persisted: bool,
 }
 
 impl<D: ChatManagerDeps> ChatSession<D> {
@@ -104,6 +109,32 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         self.inner.ephemeral
     }
 
+    /// Persist queued inputs without making a model request. The host calls
+    /// this at tool-batch and interruption boundaries. They remain queued for
+    /// the provider until a successful response forges their wire history.
+    pub async fn persist_pending(&self) -> Result<(), ChatError> {
+        let Some(id) = self.ensure_row().await? else {
+            return Ok(());
+        };
+        let pending = self.inner.pending.lock().clone();
+        let mut batch = HistoryBatch::default();
+        for input in &pending {
+            if !input.persisted && !matches!(input.value, OwnedHistoryInput::System { .. }) {
+                batch.primitive(&input.value)?;
+            }
+        }
+        self.inner
+            .manager
+            .deps()
+            .history_store()
+            .flush(id, batch)
+            .await?;
+        for input in self.inner.pending.lock().iter_mut().take(pending.len()) {
+            input.persisted = true;
+        }
+        Ok(())
+    }
+
     /// Enqueue a user input for the next `run`.
     pub async fn submit_user(&self, text: &str) -> Result<(), ChatError> {
         self.push_internal(OwnedHistoryInput::User {
@@ -129,7 +160,10 @@ impl<D: ChatManagerDeps> ChatSession<D> {
 
     fn push_internal(&self, mut input: OwnedHistoryInput) {
         input.truncate_tool_result();
-        self.inner.pending.lock().push(input);
+        self.inner.pending.lock().push(PendingInput {
+            value: input,
+            persisted: false,
+        });
     }
 
     fn push_system_internal(&self, input: OwnedHistoryInput) {
@@ -139,9 +173,15 @@ impl<D: ChatManagerDeps> ChatSession<D> {
         // inputs the host already queued.
         let pos = pending
             .iter()
-            .rposition(|m| matches!(m, OwnedHistoryInput::System { .. }))
+            .rposition(|m| matches!(m.value, OwnedHistoryInput::System { .. }))
             .map_or(0, |i| i + 1);
-        pending.insert(pos, input);
+        pending.insert(
+            pos,
+            PendingInput {
+                value: input,
+                persisted: false,
+            },
+        );
     }
 
     /// Ensure the `chat_sessions` row exists. Idempotent. Used by
@@ -207,96 +247,95 @@ impl<D: ChatManagerDeps> ChatSessionTrait for ChatSession<D> {
         let id = self.ensure_row().await?;
         let store = self.inner.manager.deps().history_store().clone();
 
-        // Drain pending under the lock, then release it before any await.
-        let drained: Vec<OwnedHistoryInput> = std::mem::take(&mut *self.inner.pending.lock());
+        self.persist_pending().await?;
+        let drained = std::mem::take(&mut *self.inner.pending.lock());
+        let result = async {
+            let model_name = self.inner.manager.resolve_name(&self.inner.model_intents);
+            let model = self.inner.manager.model_for(&model_name);
+            let provider_id = model.model_provider.clone();
+            let provider = self
+                .inner
+                .manager
+                .cache()
+                .get(&provider_id)
+                .ok_or_else(|| ChatError::ProviderUnavailable(provider_id.clone()))?;
+            let provider_kind = provider.kind();
 
-        // Write primitives for drained entries first so the history
-        // store is consistent before the network call. Skipped for
-        // ephemeral sessions.
-        if let Some(id) = id {
-            let mut batch = HistoryBatch::default();
-            for input in &drained {
-                // System inputs are the per-turn prompt, re-pushed every
-                // run by the host. Persisting them would pile up one stale
-                // copy per turn (and a model-swap reforge would replay the
-                // pile), so they live only in this run's `new_inputs`.
-                if matches!(input, OwnedHistoryInput::System { .. }) {
-                    continue;
+            let new_inputs: Vec<_> = drained
+                .iter()
+                .map(|input| input.value.as_borrowed())
+                .collect();
+            // Ephemeral sessions have no persisted history — the provider
+            // sees only `new_inputs` (the in-memory drain).
+            let history = match id {
+                Some(id) => store.loaded_history(id).await?,
+                None => Vec::new(),
+            };
+
+            let req = ProviderRequest {
+                session_id: &self.inner.session_id,
+                model_name: &model_name,
+                model: &model,
+                history: &history,
+                new_inputs: &new_inputs,
+                tools: &tools,
+                tool_choice: tool_choice.as_ref(),
+                env: env.as_ref(),
+                effort: self.effort(),
+                max_tool_calls,
+            };
+
+            let mut emitted_payloads: Vec<Value> = Vec::new();
+            let mut wrapped = |ev: StreamEvent| match ev {
+                StreamEvent::History(payload) => {
+                    emitted_payloads.push(payload);
+                    Ok(())
                 }
-                batch.primitive(input)?;
+                other => on_event(other).map_err(into_erased),
+            };
+
+            let mut completion = match provider.stream(req, cancel.clone(), &mut wrapped).await {
+                Ok(c) => c,
+                Err(_) if cancel.is_cancelled() => return Err(ChatError::Cancelled),
+                Err(source) => return Err(log_and_typed(&provider_id, source)),
+            };
+            frances_models_llm::tool_args::annotate(&mut completion.tool_calls, &tools);
+
+            if let Some(id) = id {
+                let mut batch = HistoryBatch::default();
+                for payload in &emitted_payloads {
+                    batch.history(payload, provider_kind, &provider_id)?;
+                }
+                if !completion.text.is_empty() {
+                    batch.primitive(&OwnedHistoryInput::Assistant {
+                        text: completion.text.clone(),
+                    })?;
+                }
+                for call in &completion.tool_calls {
+                    batch.primitive(&OwnedHistoryInput::ToolCall {
+                        id: call.id.clone(),
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                    })?;
+                }
+                store.flush(id, batch).await?;
             }
-            store.flush(id, batch).await?;
+
+            Ok(completion)
         }
-
-        let model_name = self.inner.manager.resolve_name(&self.inner.model_intents);
-        let model = self.inner.manager.model_for(&model_name);
-        let provider_id = model.model_provider.clone();
-        let provider = self
-            .inner
-            .manager
-            .cache()
-            .get(&provider_id)
-            .ok_or_else(|| ChatError::ProviderUnavailable(provider_id.clone()))?;
-        let provider_kind = provider.kind();
-
-        let new_inputs: Vec<_> = drained.iter().map(OwnedHistoryInput::as_borrowed).collect();
-        // Ephemeral sessions have no persisted history — the provider
-        // sees only `new_inputs` (the in-memory drain).
-        let history = match id {
-            Some(id) => store.loaded_history(id).await?,
-            None => Vec::new(),
-        };
-
-        let req = ProviderRequest {
-            session_id: &self.inner.session_id,
-            model_name: &model_name,
-            model: &model,
-            history: &history,
-            new_inputs: &new_inputs,
-            tools: &tools,
-            tool_choice: tool_choice.as_ref(),
-            env: env.as_ref(),
-            effort: self.effort(),
-            max_tool_calls,
-        };
-
-        let mut emitted_payloads: Vec<Value> = Vec::new();
-        let mut wrapped = |ev: StreamEvent| match ev {
-            StreamEvent::History(payload) => {
-                emitted_payloads.push(payload);
-                Ok(())
-            }
-            other => on_event(other).map_err(into_erased),
-        };
-
-        let mut completion = match provider.stream(req, cancel.clone(), &mut wrapped).await {
-            Ok(c) => c,
-            Err(_) if cancel.is_cancelled() => return Err(ChatError::Cancelled),
-            Err(source) => return Err(log_and_typed(&provider_id, source)),
-        };
-        frances_models_llm::tool_args::annotate(&mut completion.tool_calls, &tools);
-
-        if let Some(id) = id {
-            let mut batch = HistoryBatch::default();
-            for payload in &emitted_payloads {
-                batch.history(payload, provider_kind, &provider_id)?;
-            }
-            if !completion.text.is_empty() {
-                batch.primitive(&OwnedHistoryInput::Assistant {
-                    text: completion.text.clone(),
-                })?;
-            }
-            for call in &completion.tool_calls {
-                batch.primitive(&OwnedHistoryInput::ToolCall {
-                    id: call.id.clone(),
-                    name: call.name.clone(),
-                    arguments: call.arguments.clone(),
-                })?;
-            }
-            store.flush(id, batch).await?;
+        .await;
+        if result.is_err() {
+            // A failed/cancelled provider call did not forge durable wire
+            // history. Retry its inputs, without duplicating primitive rows.
+            let mut pending = self.inner.pending.lock();
+            let mut retry: Vec<_> = drained
+                .into_iter()
+                .filter(|input| !matches!(input.value, OwnedHistoryInput::System { .. }))
+                .collect();
+            retry.append(&mut pending);
+            *pending = retry;
         }
-
-        Ok(completion)
+        result
     }
 }
 
@@ -524,7 +563,7 @@ mod tests {
         let session = manager.create(ChatSessionBuilder::new().with_ephemeral(true));
 
         // Production order: the host queues the user message first, then the
-        // workflow renders and pushes its system prompt sections.
+        // host renders and pushes its system prompt sections.
         session.push(OwnedHistoryInput::User {
             text: "hi".to_owned(),
         });
@@ -538,7 +577,7 @@ mod tests {
         let pending = session.inner.pending.lock();
         let roles: Vec<&str> = pending
             .iter()
-            .map(|m| match m {
+            .map(|m| match &m.value {
                 OwnedHistoryInput::System { .. } => "system",
                 OwnedHistoryInput::User { .. } => "user",
                 _ => "other",
@@ -547,7 +586,7 @@ mod tests {
         // Both system messages cluster at the front in push order, ahead of
         // the user message — so the leading-system hoist fills `instructions`.
         assert_eq!(roles, vec!["system", "system", "user"]);
-        assert!(matches!(&pending[0], OwnedHistoryInput::System { text } if text == "sys"));
+        assert!(matches!(&pending[0].value, OwnedHistoryInput::System { text } if text == "sys"));
     }
 
     #[tokio::test]
@@ -561,7 +600,7 @@ mod tests {
         });
 
         let pending = session.inner.pending.lock();
-        let OwnedHistoryInput::ToolResult { content, .. } = &pending[0] else {
+        let OwnedHistoryInput::ToolResult { content, .. } = &pending[0].value else {
             panic!("expected tool result");
         };
         assert!(content.len() <= frances_models_llm::history::TOOL_RESULT_BYTE_CAP);
@@ -584,7 +623,7 @@ mod tests {
         });
         run_once(&session).await;
 
-        // Round 2: workflow would push the tool result, then user keeps going.
+        // Round 2: host pushes the tool result, then user keeps going.
         session.push(OwnedHistoryInput::ToolResult {
             call_id: "call-1".to_owned(),
             content: "the-answer".to_owned(),
@@ -797,6 +836,46 @@ mod tests {
             .await
             .expect("run should succeed");
         assert_eq!(outcome.tool_calls.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn persisted_pending_inputs_survive_cancellation_without_duplicate_rows() {
+        use frances_models_llm::chat::ChatError;
+        use std::collections::HashMap;
+        use tokio_util::sync::CancellationToken;
+        let (manager, store, stub) = build_manager().await;
+        let session = manager.create(ChatSessionBuilder::new());
+        session.push(OwnedHistoryInput::ToolResult {
+            call_id: "call-1".into(),
+            content: "interrupted".into(),
+            is_error: true,
+        });
+        session.persist_pending().await.unwrap();
+        session.persist_pending().await.unwrap();
+        assert_eq!(
+            store.append_primitive_tool_result.load(Ordering::Relaxed),
+            1
+        );
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let result = session
+            .run(
+                Arc::new(HashMap::new()),
+                vec![],
+                None,
+                cancel,
+                None,
+                Box::new(|_| Ok(())),
+            )
+            .await;
+        assert!(matches!(result, Err(ChatError::Cancelled)));
+        stub.push_script(assistant_script("resumed"));
+        run_once(&session).await;
+        assert_eq!(
+            store.append_primitive_tool_result.load(Ordering::Relaxed),
+            1
+        );
+        assert!(stub.captured()[0].new_inputs.iter().any(|input| matches!(input, OwnedHistoryInput::ToolResult { call_id, .. } if call_id == "call-1")));
     }
 
     #[tokio::test]

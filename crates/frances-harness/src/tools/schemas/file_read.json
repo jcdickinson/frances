@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "ranges": {
+      "type": "array",
+      "description": "Optional list of 1-indexed, inclusive [start, end] pairs. Returned output concatenates the requested ranges with separator `\u2026\u00a7`. Muxually exclusive with `into`.",
+      "items": {
+        "type": "array",
+        "items": {
+          "type": "integer"
+        },
+        "minItems": 2,
+        "maxItems": 2
+      }
+    },
+    "into": {
+      "type": "string",
+      "description": "Optional Frances variable name to store the file's raw bytes into. Bypasses anchors and does NOT count as a read for editing \u2014 I MUST call file_read without `into` if I intend to edit the file afterwards. Mutually exclusive with `ranges`."
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "additionalProperties": false
+}

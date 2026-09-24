@@ -1,6 +1,6 @@
 # Agentic loop
 
-Status: replacement architecture, not yet implemented. This overview replaces the
+Status: native Rust harness implemented; MCP and planning server remain future work. This overview replaces the
 earlier proposal to embed planning, gates, and plan storage in Frances's session
 runtime.
 
@@ -15,16 +15,16 @@ contracts for that later integration, not prerequisites for the initial harness.
 Where older documents differ, follow those specifications. They are
 drafts; their explicitly open questions remain open.
 
-## Current implementation
+## Recorded workflow
 
 The [main workflow behavioral record](main-workflow.md) captures the implementation
 in `assets/workflows/main.ts`: a
 planning interview, structured plan updates, sequential step execution, referee
 review, transcript summaries, and fresh chats after progression or rejection.
-It persists workflow state through the JS storage API. It does not yet implement
+It persisted workflow state through the JS storage API. It does not yet implement
 the explicit revision-bound plan approval UI in the new UI specification.
 
-The embedded workflow runtime and JS chat/tool wrappers currently own substantial
+The removed workflow runtime and JS chat/tool wrappers owned substantial
 coordination: prompt construction, tool dispatch, streaming, interruptions,
 continuation, and UI output. Removing JS means moving necessary host behavior
 into Rust, not deleting only the main workflow script.

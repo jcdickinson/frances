@@ -1,41 +1,17 @@
-//! `frances install` — write a starter config and drop the `main` workflow
-//! into the user's config dir.
-//!
-//! The workflow script is always (re)installed; the questionnaire only runs
-//! when `config.toml` doesn't already exist, so re-running `install` refreshes
-//! `main.ts` without clobbering a config the user has since edited.
+//! Write a starter model/provider configuration.
 
 use std::fs;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{Context, Result};
 
-/// Stable id for the `main` workflow. It namespaces this workflow's rows in the
-/// per-session DB. Frances has never shipped, so a fixed constant is fine.
-const MAIN_WORKFLOW_ID: &str = "e3c5d9f6-141b-4cf8-b6ad-41e5a9cdee43";
-
-/// The workflow script shipped with the binary, embedded at compile time.
-const EMBEDDED_MAIN_TS: &str = include_str!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/workflows/main.ts"
-));
-
-/// Absolute path to the in-repo workflow script, baked in at compile time.
-/// `--local` points the generated config at this instead of copying.
-const LOCAL_MAIN_TS: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/../../assets/workflows/main.ts"
-);
-
-pub fn run(local: bool) -> Result<()> {
+pub fn run() -> Result<()> {
     let config_home = xdg::BaseDirectories::with_prefix("frances")
         .get_config_home()
         .context("could not determine the XDG config home (is HOME set?)")?;
     fs::create_dir_all(&config_home)
         .with_context(|| format!("create config dir {}", config_home.display()))?;
-
-    let workflow_file = install_workflow(&config_home, local)?;
 
     let config_path = config_home.join("config.toml");
     if config_path.exists() {
@@ -46,7 +22,7 @@ pub fn run(local: bool) -> Result<()> {
         return Ok(());
     }
 
-    let config = prompt_config(&config_home, &workflow_file)?;
+    let config = prompt_config(&config_home)?;
     fs::write(&config_path, config)
         .with_context(|| format!("write config to {}", config_path.display()))?;
     println!("Wrote config: {}", config_path.display());
@@ -54,29 +30,9 @@ pub fn run(local: bool) -> Result<()> {
     Ok(())
 }
 
-/// Resolve the path the config's `[workflows.main]` should point at. With
-/// `--local` that's the in-repo script (no copy); otherwise the embedded
-/// script is copied into the config dir and that copy's path is returned.
-fn install_workflow(config_home: &Path, local: bool) -> Result<PathBuf> {
-    if local {
-        let path = fs::canonicalize(LOCAL_MAIN_TS)
-            .with_context(|| format!("locate in-repo workflow at {LOCAL_MAIN_TS}"))?;
-        println!("Using in-repo workflow: {}", path.display());
-        return Ok(path);
-    }
-
-    let dest = config_home.join("workflows/main/main.ts");
-    let dir = dest.parent().expect("workflow dest always has a parent");
-    fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
-    fs::write(&dest, EMBEDDED_MAIN_TS)
-        .with_context(|| format!("write workflow to {}", dest.display()))?;
-    println!("Wrote workflow: {}", dest.display());
-    Ok(dest)
-}
-
 /// Ask the provider questions and render a starter `config.toml`. Values are
 /// emitted as single-quoted TOML literals, so no escaping is needed.
-fn prompt_config(config_home: &Path, workflow_file: &Path) -> Result<String> {
+fn prompt_config(config_home: &Path) -> Result<String> {
     let provider_id;
     let model_id;
     let provider_block;
@@ -117,14 +73,7 @@ fn prompt_config(config_home: &Path, workflow_file: &Path) -> Result<String> {
          [models.default]\n\
          model_provider = '{provider_id}'\n\
          id = '{model_id}'\n\
-         {effort_config}\
-         \n\
-         default_workflow = 'main'\n\
-         \n\
-         [workflows.main]\n\
-         id = '{MAIN_WORKFLOW_ID}'\n\
-         file = '{}'\n",
-        workflow_file.display()
+         {effort_config}"
     ))
 }
 
@@ -142,7 +91,7 @@ originator = 'codex_cli_rs'
 
 fn prompt_line(question: &str) -> Result<String> {
     print!("{question} ");
-    io::stdout().flush().ok();
+    io::stdout().flush().context("flush prompt")?;
     let mut line = String::new();
     io::stdin().read_line(&mut line).context("read stdin")?;
     Ok(line.trim().to_string())

@@ -1,25 +1,4 @@
-//! Per-workflow scrollback persistence.
-//!
-//! ## Writes
-//!
-//! [`persist_section`] writes one row per section the workflow pushes,
-//! called from the emit path in `workflows::emit`. Sections are
-//! one-shot, so a row is complete the moment it's written — there is no
-//! open/close bookkeeping and nothing to reconcile if a workflow is
-//! dehydrated mid-flight.
-//!
-//! ## Reads
-//!
-//! [`replay_to_channel`] queries every row for the given workflow
-//! instance in `id` order and emits a [`ScrollbackFrame`] burst (each
-//! wrapped in [`StreamFrame::Scrollback`]) on the supplied channel:
-//!
-//! 1. [`ScrollbackFrame::Reset`] — UI clears its in-memory
-//!    scrollback and begins the burst.
-//! 2. One [`ScrollbackFrame::Section`] per row, except error rows,
-//!    which replay as [`ScrollbackFrame::Error`] to match how they
-//!    were emitted live.
-//! 3. [`ScrollbackFrame::End`] — UI returns to live mode.
+//! Per-session transcript persistence and replay.
 
 use std::borrow::Cow;
 
@@ -61,17 +40,15 @@ pub enum ScrollbackError {
 /// Insert one section row.
 pub async fn persist_section(
     db: &Database,
-    instance: Uuid,
     kind: &SectionKind,
 ) -> std::result::Result<(), ScrollbackError> {
     let payload_json = serde_json::to_string(kind).map_err(ScrollbackError::Encode)?;
-    let instance_bytes = instance.as_bytes().to_vec();
     let now = now_ns();
     let conn = db.connect().await;
     conn.execute(
-        "INSERT INTO scrollback_sections (instance_id, payload, created_at) \
-         VALUES (?1, jsonb(?2), ?3)",
-        (instance_bytes, payload_json, now),
+        "INSERT INTO scrollback_sections (payload, created_at) \
+         VALUES (jsonb(?1), ?2)",
+        (payload_json, now),
     )
     .await?;
     Ok(())
@@ -79,16 +56,13 @@ pub async fn persist_section(
 
 /// Load every row for an instance in insertion order. The list maps
 /// 1:1 onto the replay frame burst.
-pub async fn load_for_instance(
-    db: &Database,
-    instance: Uuid,
-) -> std::result::Result<Vec<SectionKind>, ScrollbackError> {
+pub async fn load(db: &Database) -> std::result::Result<Vec<SectionKind>, ScrollbackError> {
     let conn = db.connect().await;
     let mut rows = conn
         .query(
             "SELECT json(payload) FROM scrollback_sections \
-             WHERE instance_id = ?1 ORDER BY id ASC",
-            (instance.as_bytes().to_vec(),),
+             ORDER BY id ASC",
+            (),
         )
         .await?;
     let mut out = Vec::new();
@@ -114,9 +88,7 @@ pub async fn replay_to_channel(
     db: &Database,
     instance: Uuid,
 ) -> Result<()> {
-    let rows = load_for_instance(db, instance)
-        .await
-        .map_err(crate::Error::Scrollback)?;
+    let rows = load(db).await.map_err(crate::Error::Scrollback)?;
 
     events.send(StreamFrame::Scrollback(ScrollbackFrame::Reset {
         instance_id: instance,
@@ -163,7 +135,6 @@ mod tests {
         let instance = Uuid::new_v4();
         persist_section(
             &db,
-            instance,
             &SectionKind::Json {
                 tag: "plan".into(),
                 value: serde_json::json!({ "step": 1 }),
@@ -199,7 +170,7 @@ mod tests {
         let db = fresh_db().await;
         let instance = Uuid::new_v4();
         let entity_id = Uuid::new_v4();
-        persist_section(&db, instance, &SectionKind::EntityRef { entity_id })
+        persist_section(&db, &SectionKind::EntityRef { entity_id })
             .await
             .unwrap();
 
@@ -221,7 +192,6 @@ mod tests {
         let instance = Uuid::new_v4();
         persist_section(
             &db,
-            instance,
             &SectionKind::Json {
                 tag: "plan".into(),
                 value: serde_json::json!({ "step": 1 }),
@@ -231,14 +201,13 @@ mod tests {
         .unwrap();
         persist_section(
             &db,
-            instance,
             &SectionKind::Error {
                 text: "boom".into(),
             },
         )
         .await
         .unwrap();
-        persist_section(&db, instance, &SectionKind::Diff { lines: Vec::new() })
+        persist_section(&db, &SectionKind::Diff { lines: Vec::new() })
             .await
             .unwrap();
 

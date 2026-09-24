@@ -1,8 +1,6 @@
 import type { JsonValue } from '../../bindings';
 
-// Hand-written: the chat producer is JS (frances:v1/messages), so this
-// shape has no Rust source for specta to export. Keep in sync with
-// crates/frances-workflow/assets/frances/v1/messages.js.
+// Keep this snapshot shape in sync with crates/frances-session/src/runtime/driver.rs.
 export type ChatSnapshot = {
   source: 'user' | 'assistant' | 'reasoning' | 'internal';
   text: string;

@@ -1,7 +1,7 @@
 //! Session-runtime wiring around the workspace-shared [`Database`].
 //!
 //! [`Database`] itself lives in `frances-storage` so that crates
-//! outside the session runtime (the workflow runtime, in particular) hold the
+//! outside the session runtime can hold the
 //! same lock when they touch the per-session turso connection. This
 //! module just exposes the runtime's open-and-migrate flow plus an
 //! in-memory variant for tests.

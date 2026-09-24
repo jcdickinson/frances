@@ -1,10 +1,7 @@
 import type { JsonValue } from '../../bindings';
 import type { CodeRow } from '../../components/CodeView.svelte';
 
-// Hand-written: the file producer is JS (workflow-side file.js), so this
-// shape has no Rust source for specta to export. Keep in sync with
-// `_pushReadEntity` in
-// crates/frances-workflow/assets/frances/v1/tools/file.js.
+// Keep this snapshot shape in sync with crates/frances-harness/src/tools/mod.rs.
 export type FileSnapshot = {
   /** Path exactly as the model asked for it. */
   path: string;

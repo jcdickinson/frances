@@ -1,4 +1,4 @@
-//! Stream-event surface shared by producers (workflows, scrollback
+//! Stream-event surface shared by producers (agents, scrollback
 //! replay) and the UI consumer.
 //!
 //! These types travel through an in-process `tokio::sync::mpsc` from
@@ -13,7 +13,7 @@ use uuid::Uuid;
 
 pub use frances_models_ui::{EntityEnvelope, Lifecycle, SectionKind};
 
-pub use frances_workflow::permission::{
+pub use frances_harness::permission::{
     PermissionRequest, PermissionResponse, PermissionResponseWire,
 };
 

@@ -2,7 +2,7 @@
 
 Status: record of `assets/workflows/main.ts` before removal, captured on
 2026-09-23. This document is self-contained so the script and its JS runtime can
-be deleted. It describes existing behavior, including limitations, rather than
+be deleted. They have now been removed. It describes their behavior, including limitations, rather than
 specifying the ordinary harness that replaces it.
 
 The immediate implementation is a regular Rust coding harness without MCP or
@@ -275,8 +275,8 @@ context seeds. Ordinary harness responsibilities—streaming, dispatch, tool I/O
 interruptions, history and editor lifecycle—belong in Rust independently of that
 port. See the [staged replacement](agentic-loop.md#remove-the-js-workflow-layer).
 
-The old tests in `crates/frances-workflow/src/runtime/tests/main_workflow.rs`
-cover restart hydration without a ready banner, effort commands and persistence,
+The removed tests in `crates/frances-workflow/src/runtime/tests/main_workflow.rs`
+covered restart hydration without a ready banner, effort commands and persistence,
 variable-store round trips, and source-level assertions about plan/finish tool
 contracts. They are not end-to-end proof of the whole planning loop.
 

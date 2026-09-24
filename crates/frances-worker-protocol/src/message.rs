@@ -253,6 +253,7 @@ pub enum ErrorCode {
     InvalidRequest,
     Io,
     AlreadyExists,
+    NotFound,
     UnsupportedVersion,
     Internal,
 }

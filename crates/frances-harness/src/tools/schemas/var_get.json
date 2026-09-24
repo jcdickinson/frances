@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "filter": {
+      "type": "string",
+      "description": "Optional jq filter. The stored value is bound as `.`; the filter's single output is returned instead of the whole value. No `$name` bindings \u2014 use var_edit to combine variables."
+    }
+  },
+  "required": [
+    "name"
+  ],
+  "additionalProperties": false
+}

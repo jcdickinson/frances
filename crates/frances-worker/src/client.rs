@@ -391,19 +391,64 @@ impl WorkerShell {
     }
 
     async fn wait(&mut self, wait: WaitOpts) -> Result<RunOutcome, ClientError> {
+        let client = self.client.clone();
+        let id = self.id;
         let quiet = wait.quiet.unwrap_or(frances_shell::DEFAULT_QUIET);
-        let waiting = self.wait_quiet(quiet);
-        if let Some(max) = wait.max {
-            match tokio::time::timeout(max, waiting).await {
-                Ok(result) => self.read_until(result?).await,
-                Err(_) => Ok(RunOutcome::Quiet {
-                    output: String::new(),
-                    reason: QuietReason::MaxElapsed,
-                }),
+        let waiting = async move {
+            match client
+                .call(RequestKind::ShellWaitQuiet {
+                    shell: id,
+                    quiet_ms: duration_millis(quiet),
+                })
+                .await?
+            {
+                ResponseKind::ShellWaitQuiet(wait) => Ok(wait),
+                _ => Err(ClientError::WrongResponseKind),
             }
-        } else {
-            self.read_until(waiting.await?).await
+        };
+        tokio::pin!(waiting);
+        let deadline = async {
+            match wait.max {
+                Some(max) => tokio::time::sleep(max).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(deadline);
+        let mut output = Vec::new();
+        let reason = loop {
+            tokio::select! {
+                biased;
+                () = &mut deadline => break QuietReason::MaxElapsed,
+                item = self.output.next() => {
+                    if let Some(outcome) = self.collect_output(item?.ok_or(ClientError::Closed)?, &mut output).await? {
+                        return Ok(outcome);
+                    }
+                }
+                status = &mut waiting => {
+                    match status? {
+                        ShellWaitQuiet::Quiet => break QuietReason::NoOutput,
+                        ShellWaitQuiet::Exit => {
+                            // The matching exit marker follows the command's
+                            // bytes on the feed. Drain through that marker.
+                            loop {
+                                let item = self.output.next().await?.ok_or(ClientError::Closed)?;
+                                if let Some(outcome) = self.collect_output(item, &mut output).await? { return Ok(outcome); }
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        while let Some(item) = self.output.try_next()? {
+            if let Some(outcome) = self.collect_output(item, &mut output).await? {
+                return Ok(outcome);
+            }
         }
+        self.send_read_event(ReadEvent::Quiet { reason });
+        Ok(RunOutcome::Quiet {
+            output: String::from_utf8_lossy(&output).into_owned(),
+            reason,
+        })
     }
 
     /// Wait for the shell to become quiet or exit.
@@ -429,49 +474,33 @@ impl WorkerShell {
         Ok(wait)
     }
 
-    async fn read_until(&mut self, wait: ShellWaitQuiet) -> Result<RunOutcome, ClientError> {
-        let mut output = Vec::new();
-        if matches!(wait, ShellWaitQuiet::Quiet) {
-            while let Some(item) = self.output.try_next()? {
-                let ShellOutput::Output { content } = item else {
-                    return Err(ClientError::WrongResponseKind);
-                };
+    async fn collect_output(
+        &self,
+        item: ShellOutput,
+        output: &mut Vec<u8>,
+    ) -> Result<Option<RunOutcome>, ClientError> {
+        match item {
+            ShellOutput::Output { content } => {
                 let bytes = read_content(content).await?;
                 output.extend_from_slice(&bytes);
-                if let Some(sink) = &self.output_sink {
-                    let _ = sink.send(ReadEvent::Output(bytes));
-                }
+                self.send_read_event(ReadEvent::Output(bytes));
+                Ok(None)
             }
-            let reason = QuietReason::NoOutput;
-            self.send_read_event(ReadEvent::Quiet { reason });
-            return Ok(RunOutcome::Quiet {
-                output: String::from_utf8_lossy(&output).into_owned(),
-                reason,
-            });
-        }
-        loop {
-            match self.output.next().await?.ok_or(ClientError::Closed)? {
-                ShellOutput::Output { content } => {
-                    let bytes = read_content(content).await?;
-                    output.extend_from_slice(&bytes);
-                    if let Some(sink) = &self.output_sink {
-                        let _ = sink.send(ReadEvent::Output(bytes));
-                    }
-                }
-                ShellOutput::Exit { exit_code } => {
-                    self.send_read_event(ReadEvent::Done { exit_code });
-                    return Ok(RunOutcome::Done {
-                        exit_code,
-                        output: String::from_utf8_lossy(&output).into_owned(),
-                    });
-                }
+            ShellOutput::Exit { exit_code } => {
+                self.send_read_event(ReadEvent::Done { exit_code });
+                Ok(Some(RunOutcome::Done {
+                    exit_code,
+                    output: String::from_utf8_lossy(output).into_owned(),
+                }))
             }
         }
     }
 
     fn send_read_event(&self, event: ReadEvent) {
-        if let Some(sink) = &self.output_sink {
-            let _ = sink.send(event);
+        if let Some(sink) = &self.output_sink
+            && let Err(error) = sink.send(event)
+        {
+            tracing::debug!(%error, "shell output receiver closed");
         }
     }
 }

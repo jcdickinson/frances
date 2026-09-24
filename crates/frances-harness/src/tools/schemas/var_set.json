@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string"
+    },
+    "value": {
+      "description": "JSON value to store (object, array, string, number, boolean, or null)."
+    }
+  },
+  "required": [
+    "name",
+    "value"
+  ],
+  "additionalProperties": false
+}

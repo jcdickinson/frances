@@ -1,9 +1,6 @@
 import type { JsonValue } from '../../bindings';
 
-// Hand-written: the shell producer is JS (workflow-side shell.js), so
-// these shapes have no Rust source for specta to export. Keep in sync
-// with `_openShellEntity` / `_settleShellEntity` in
-// crates/frances-workflow/assets/frances/v1/tools/shell.js.
+// Keep this snapshot shape in sync with crates/frances-harness/src/tools/shell.rs.
 export type ShellState =
   | { type: 'running' }
   | { type: 'success' }
@@ -32,7 +29,7 @@ export function asShellStreamItem(value: JsonValue): ShellStreamItem {
 /**
  * Display label + tone for a shell's state. "Interrupted" is derived,
  * not stored: a settled entity whose state still reads `running` was
- * force-settled (crash, workflow teardown) mid-run.
+ * force-settled (crash, agent shutdown) mid-run.
  */
 export function shellStateView(
   state: ShellState,

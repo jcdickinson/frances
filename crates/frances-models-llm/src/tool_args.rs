@@ -94,10 +94,14 @@ pub fn validate(args: &Value, schema: &Value) -> Result<(), ValidationMessage> {
 /// property in `required` (recursively, through nested objects and array `items`).
 pub fn is_strict_compatible(schema: &Value) -> bool {
     let Value::Object(map) = schema else {
-        return true;
+        return false;
     };
-    let ty = map.get("type").and_then(Value::as_str);
-    if ty == Some("object") || map.contains_key("properties") {
+    // An unconstrained JSON value is valid in ordinary tool schemas, but
+    // cannot be advertised as a strict structured-output schema.
+    let Some(ty) = map.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    if ty == "object" || map.contains_key("properties") {
         if map.get("additionalProperties") != Some(&Value::Bool(false)) {
             return false;
         }
@@ -112,8 +116,8 @@ pub fn is_strict_compatible(schema: &Value) -> bool {
         props
             .iter()
             .all(|(k, sub)| required.contains(k.as_str()) && is_strict_compatible(sub))
-    } else if ty == Some("array") {
-        map.get("items").is_none_or(is_strict_compatible)
+    } else if ty == "array" {
+        map.get("items").is_some_and(is_strict_compatible)
     } else {
         true
     }
@@ -304,6 +308,26 @@ mod tests {
         };
         repair_qwen_quirks(&mut call, &tools);
         assert_eq!(call.arguments, before);
+    }
+
+    #[test]
+    fn unconstrained_values_do_not_enable_strict_mode() {
+        for value in [
+            json!({}),
+            json!({"description": "Any JSON value"}),
+            json!(true),
+        ] {
+            assert!(!is_strict_compatible(&json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {"value": value},
+                "required": ["value"],
+            })));
+        }
+        assert!(!is_strict_compatible(&json!({"type": "array"})));
+        assert!(!is_strict_compatible(
+            &json!({"type": "array", "items": {}})
+        ));
     }
 
     #[test]

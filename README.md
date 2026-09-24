@@ -6,8 +6,8 @@ Frances is an agentic coding tool with a Tauri desktop app, and a worker.
   several challenging UI problems; I always point at font-size as one example - too many things aren't important enough
   to justify font size equality.
 - Worker: I work around the lack of a TUI by using a remote worker, vscode-style.
-- MCP++: Frances substantially improves the MCP protocol to add support for hooks, context management, and more.
-  - And bundles an experimental workflow that uses it.
+- Native Rust harness: ordinary chat with filesystem, editing, search, shell, and variable tools.
+- Planned MCP extensions: [Model Content + Hooks Protocol](docs/model-content-hooks-protocol.md) describes future hooks and context management. MCP is not implemented yet.
 
 ## The name
 
@@ -29,12 +29,6 @@ auth = { file = "/home/you/.config/frances/ds.txt" }
 model_provider = "deepseek"
 id = "deepseek-chat"
 
-# A workflow to drive the session. Point `file` at the one shipped in this repo.
-default_workflow = "main"
-
-[workflows.main]
-id = "e3c5d9f6-141b-4cf8-b6ad-41e5a9cdee43"
-file = "/home/you/Code/frances/assets/workflows/main.ts"
 ```
 
 ## Building
@@ -62,8 +56,9 @@ A `nix develop` dev shell provides the toolchain plus `rust-analyzer`, `jq`,
 frances                 # open the current directory; launch in the background
 frances path/to/repo    # open a directory as a workspace
 frances ws.toml         # open a workspace file: dirs = ["a", "b"]
-frances --workflow review  # start with the `review` workflow
+frances install         # write starter model/provider configuration
 frances --foreground    # run attached (useful for development)
+frances --export-tool-schemas > tool-schemas.json # export tools without starting a session
 ```
 
 Every launch starts a fresh session.
@@ -115,9 +110,6 @@ effort_tiers = "openai"
 model_provider = "codex"
 id = "gpt-5.4-mini"
 
-[workflows.main]
-id = "e3c5d9f6-141b-4cf8-b6ad-41e5a9cdee43"
-file = "/home/jono/Code/frances/assets/workflows/main.ts"
 ```
 
 ### Providers (`[model_providers.<id>]`)
@@ -203,29 +195,19 @@ labels and accepts either the `"openai"` preset or an explicit ascending array,
 for example `["off", "low", "high"]`. A chat-session override takes precedence
 over the model default; without either value no effort is sent.
 
-### Workflows (`[workflows.<name>]`)
+### Native harness
 
-A workflow is the JS/TS script that drives a chat session and its tool calls.
-The table key (`main`, `plan`) is the name the rest of the config refers to.
+The Rust host runs ordinary chat and tools directly. No workflow script or
+workflow selection is required. Shell commands use the existing permission UI;
+file edits use the anchor engine and worker filesystem. See the
+[session runtime](docs/arch/session-runtime.md) for loop and persistence details.
 
-| Field        | Required | Notes                                                                              |
-| ------------ | -------- | ---------------------------------------------------------------------------------- |
-| `id`         | yes      | Stable UUID. The workflow owns a chunk of the per-session DB schema under this id. |
-| `file`       | yes      | Absolute path to the workflow script that gets loaded and run.                     |
-| `migrations` | no       | SQL migration files in apply order, resolved **relative to `file`'s directory**.   |
+Run `just check-tool-schemas` to export all built-in tools (including the permission
+judge) and check their schemas using the pinned npm `tool-schema` package. The
+script installs its locked dependency and checks each tool in the strict or
+non-strict mode selected by the provider. It also checks for missing strict-mode
+types and array items, which the package currently misses. This is a local lint,
+not a guarantee that every provider will accept a schema.
 
-So in the example above, `file = ".../assets/workflows/main.ts"` is the script
-the `main` workflow executes, and its `id` is the entity that namespaces any DB
-rows that workflow persists. If `main.ts` needed schema, you would co-locate
-`0001_init.sql` next to it and list `migrations = ["0001_init.sql"]`.
-
-Which workflow runs at boot is chosen by the top-level `default_workflow` key,
-which names one of the `[workflows.*]` entries:
-
-```toml
-default_workflow = "main"
-```
-
-On a fresh session the runtime seats `default_workflow`, defaulting to `main`
-when unset. On an existing session it restores that session's persisted workflow
-selection instead.
+To check an existing export, run `node opt/check-tool-schemas.mjs tool-schemas.json`.
+The Nix development shell includes Node.js and npm.

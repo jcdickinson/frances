@@ -1,7 +1,7 @@
-//! Workflow-facing traits for chat sessions.
+//! Host-facing traits for chat sessions.
 //!
 //! The concrete `ChatSession` / `ChatSessionManager` structs live in
-//! `frances-llm`. Workflow code uses these traits exclusively, so it can
+//! `frances-llm`. Host code uses these traits exclusively, so it can
 //! depend only on `frances-models-llm` (no `Provider` trait, no HTTP).
 
 use std::collections::HashMap;
@@ -44,7 +44,7 @@ pub trait ChatSession: Clone + Send + Sync + 'static {
     /// Insert a system input directly after the last system input already
     /// pending (or at the front if there are none yet), ahead of the
     /// user/tool inputs the host queued first. The host pushes the user
-    /// message before the workflow renders its prompt sections, so the
+    /// message before the host renders its prompt sections, so the
     /// system prompt must jump ahead to lead the request — a leading
     /// system message is what becomes the Responses API `instructions`
     /// field downstream. Multiple sections stay in push order.

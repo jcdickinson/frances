@@ -111,27 +111,27 @@ export type JsonValue = null | boolean | number | string | JsonValue[] | Partial
 export type Lifecycle = "live" | "settled"
 /**
  * What kind of section, and the data that rides with it. Every
- * section is one-shot: the workflow pushes it fully formed and the
+ * section is one-shot: the host pushes it fully formed and the
  * frontend matches on this to pick a rendering.
  */
 export type SectionKind = 
 /**
- * `ErrorSection` — one-shot error message. Side-channel: the
+ * one-shot error message. Side-channel: the
  * session driver turns it into an error frame rather than a
  * rendered section.
  */
 { type: "error"; text: string } | 
 /**
- * `JsonSection` — single tagged JSON value.
+ * single tagged JSON value.
  */
 { type: "json"; tag: string; value: JsonValue } | 
 /**
- * `DiffSection` — one-shot structured diff produced by a file-
+ * one-shot structured diff produced by a file-
  * edit tool.
  */
 { type: "diff"; lines: DiffOp[] } | 
 /**
- * `EntityRefSection` — one-shot pointer at an entity. The
+ * one-shot pointer at an entity. The
  * transcript carries only the reference; the entity's snapshot
  * (and, on demand, its stream) render it. Dumb by design: the
  * entity exists independently via the registry/hub, refs are
@@ -143,7 +143,7 @@ export type SectionKind =
  */
 export type SessionSnapshot = { title: string | null; usage: Usage | null; 
 /**
- * Footer busy-indicator text (the workflow's `setStatus`). Not
+ * Footer busy-indicator text (the agent's `setStatus`). Not
  * meaningful after settle; a fresh session starts with `None`.
  */
 busy: string | null }

@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "find": {
+      "type": "string"
+    },
+    "replacement": {
+      "type": "string"
+    },
+    "count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Optional maximum match count. If the regex matches more than this, the edit fails without writing."
+    }
+  },
+  "required": [
+    "path",
+    "find",
+    "replacement"
+  ],
+  "additionalProperties": false
+}

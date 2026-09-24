@@ -1,0 +1,19 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "from": {
+      "type": "string",
+      "description": "Frances variable name to pull the file content from. Provide exactly one of `text` or `from`."
+    }
+  },
+  "required": [
+    "path"
+  ],
+  "additionalProperties": false
+}

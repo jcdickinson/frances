@@ -1,0 +1,95 @@
+use frances_models_llm::{ToolDef, ToolFunction};
+
+pub fn definitions() -> Vec<ToolDef> {
+    [
+        (
+            "file_read",
+            include_str!("prompts/file_read.md"),
+            include_str!("schemas/file_read.json"),
+        ),
+        (
+            "file_replace_lines",
+            include_str!("prompts/file_replace_lines.md"),
+            include_str!("schemas/file_replace_lines.json"),
+        ),
+        (
+            "file_replace_all",
+            include_str!("prompts/file_replace_all.md"),
+            include_str!("schemas/file_replace_all.json"),
+        ),
+        (
+            "file_insert_before",
+            include_str!("prompts/file_insert_before.md"),
+            include_str!("schemas/file_insert_before.json"),
+        ),
+        (
+            "file_insert_after",
+            include_str!("prompts/file_insert_after.md"),
+            include_str!("schemas/file_insert_after.json"),
+        ),
+        (
+            "file_new",
+            include_str!("prompts/file_new.md"),
+            include_str!("schemas/file_new.json"),
+        ),
+        (
+            "file_overwrite",
+            include_str!("prompts/file_overwrite.md"),
+            include_str!("schemas/file_overwrite.json"),
+        ),
+        (
+            "file_find_or_grep",
+            include_str!("prompts/file_find_or_grep.md"),
+            include_str!("schemas/file_find_or_grep.json"),
+        ),
+        (
+            "shell_run",
+            include_str!("prompts/shell_run.md"),
+            include_str!("schemas/shell_run.json"),
+        ),
+        (
+            "shell_wait",
+            include_str!("prompts/shell_wait.md"),
+            include_str!("schemas/shell_wait.json"),
+        ),
+        (
+            "shell_kill",
+            include_str!("prompts/shell_kill.md"),
+            include_str!("schemas/shell_kill.json"),
+        ),
+        (
+            "shell_set",
+            include_str!("prompts/shell_set.md"),
+            include_str!("schemas/shell_set.json"),
+        ),
+        (
+            "shell_get",
+            include_str!("prompts/shell_get.md"),
+            include_str!("schemas/shell_get.json"),
+        ),
+        (
+            "var_set",
+            include_str!("prompts/var_set.md"),
+            include_str!("schemas/var_set.json"),
+        ),
+        (
+            "var_get",
+            include_str!("prompts/var_get.md"),
+            include_str!("schemas/var_get.json"),
+        ),
+        (
+            "var_edit",
+            include_str!("prompts/var_edit.md"),
+            include_str!("schemas/var_edit.json"),
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, parameters)| {
+        ToolDef::Function(ToolFunction {
+            name: name.into(),
+            description: description.into(),
+            parameters: serde_json::from_str(parameters).expect("embedded tool schema is valid"),
+        })
+    })
+    .collect()
+}

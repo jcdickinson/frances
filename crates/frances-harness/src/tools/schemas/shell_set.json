@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Bash variable name to assign and export. Persists: subsequent shell_run calls and their subprocesses see it."
+    },
+    "from": {
+      "type": "string",
+      "description": "Frances variable name to pull the value from. Strings pass through verbatim; non-strings are JSON-encoded."
+    }
+  },
+  "required": [
+    "name",
+    "from"
+  ],
+  "additionalProperties": false
+}

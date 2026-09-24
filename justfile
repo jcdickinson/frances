@@ -100,3 +100,7 @@ lint:
 # Find unused crate dependencies
 machete:
     cargo machete
+
+# Export and validate every built-in tool schema against provider rules.
+check-tool-schemas:
+    node opt/check-tool-schemas.mjs

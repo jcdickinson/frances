@@ -16,14 +16,14 @@
 //! LLM-visible output digest.
 //!
 //! The [`EntityHub`] is the single publish point. Producers (the
-//! workflow driver, the runtime's singleton writers) call its verbs;
+//! agent driver, the runtime's singleton writers) call its verbs;
 //! frames flow out the events channel latest-wins for snapshots and
 //! append-ordered for stream items. Kind-specific policy (caps,
 //! teasers, compaction shape) lives entirely in producers — the hub is
 //! a policy-free pipe.
 //!
 //! Appends for one entity must come from a single task (today: the
-//! workflow driver), which makes seq order and persist order agree
+//! agent driver), which makes seq order and persist order agree
 //! without hub-side coordination.
 
 use std::borrow::Cow;
@@ -76,7 +76,7 @@ pub struct WorkspaceSnapshot {
 pub struct SessionSnapshot {
     pub title: Option<String>,
     pub usage: Option<frances_models_llm::Usage>,
-    /// Footer busy-indicator text (the workflow's `setStatus`). Not
+    /// Footer busy-indicator text (the agent's `setStatus`). Not
     /// meaningful after settle; a fresh session starts with `None`.
     pub busy: Option<String>,
 }
@@ -229,7 +229,7 @@ impl EntityHub {
 
     /// Append one item to an entity's stream. Fire-and-forget from the
     /// producer's perspective: unknown or settled entities trace and
-    /// drop (the workflow may race teardown), only storage errors
+    /// drop (the agent may race teardown), only storage errors
     /// surface.
     pub async fn append(&self, entity_id: Uuid, payload: serde_json::Value) -> Result<()> {
         let Some(record) = self.records.get(&entity_id).map(|r| r.clone()) else {
@@ -436,9 +436,9 @@ impl EntityHub {
         }
     }
 
-    /// Generic repair for workflow teardown: flip every Live entity to
+    /// Generic repair for agent teardown: flip every Live entity to
     /// Settled (snapshot stays as last persisted), except the
-    /// runtime-owned singletons — the workflow producer going away says
+    /// runtime-owned singletons — the agent producer going away says
     /// nothing about the session itself. Rows only on disk (a previous
     /// process's) are handled by [`EntityHub::open`], so in-memory
     /// records are the complete live set here.
@@ -512,7 +512,7 @@ impl EntityHub {
             .await;
     }
 
-    /// Seeds a booting workflow's `getTitle` (via `WorkflowDeps`).
+    /// Current session title, used when naming a new conversation.
     pub fn session_title(&self) -> Option<String> {
         let session: SessionSnapshot = self
             .snapshot(SESSION_ENTITY_ID)

@@ -1,7 +1,7 @@
 //! LLM-backed auto-approver for permission gates flagged with
 //! `allow_auto = true`.
 //!
-//! When a workflow opts a gate into auto, the runtime's emit loop
+//! When a agent opts a gate into auto, the runtime's emit loop
 //! calls [`judge`] before forwarding the request to the UI. The
 //! judge walks the model-intent fallback `["auto", "referee", "cheap"]`
 //! and forces a single `decide` tool whose `verdict` is the decision.
@@ -36,7 +36,7 @@ const SYSTEM_PROMPT: &str = include_str!("auto_judge/system_prompt.md");
 
 /// The single forced tool. Schema is strict-compatible; host-side validation
 /// backs it up where the provider ignores OpenAI strict mode.
-static DECIDE_TOOLS: LazyLock<[ToolDef; 1]> = LazyLock::new(|| {
+pub(super) static DECIDE_TOOLS: LazyLock<[ToolDef; 1]> = LazyLock::new(|| {
     [ToolDef::Function(ToolFunction {
         name: "decide".into(),
         description: "Decide whether to auto-approve the proposed action. Call this exactly once."
@@ -78,9 +78,10 @@ pub(crate) enum JudgeOutcome {
 const DEFAULT_REASON: &str = "(no reason given)";
 
 /// Ask the configured judge model whether to auto-approve `request`.
-pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
+pub(crate) async fn judge<Io: frances_harness::HarnessIo>(
     runtime: &Arc<SessionRuntime<Io>>,
     request: &PermissionRequest,
+    cancel: CancellationToken,
 ) -> JudgeOutcome {
     let env = runtime.invocation.lock().process.env.clone();
     let session_id = format!("auto-judge:{}", uuid::Uuid::new_v4());
@@ -101,7 +102,7 @@ pub(crate) async fn judge<Io: frances_workflow::WorkflowIo>(
         new_inputs: &inputs,
         tools: &*DECIDE_TOOLS,
         tool_choice: None,
-        cancel: CancellationToken::new(),
+        cancel,
         max_tool_calls: Some(1),
     };
 

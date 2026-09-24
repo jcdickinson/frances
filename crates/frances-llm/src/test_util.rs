@@ -49,6 +49,7 @@ pub struct CapturedRequest {
     pub session_id: String,
     pub effort: Option<NormalizedEffort>,
     pub history: Vec<Value>,
+    pub tools: Vec<String>,
     pub new_inputs: Vec<OwnedHistoryInput>,
 }
 
@@ -147,6 +148,11 @@ impl Provider for StubProvider {
             session_id: req.session_id.to_owned(),
             effort: req.effort,
             history: req.history.to_vec(),
+            tools: req
+                .tools
+                .iter()
+                .map(|frances_models_llm::ToolDef::Function(f)| f.name.clone())
+                .collect(),
             new_inputs: req
                 .new_inputs
                 .iter()

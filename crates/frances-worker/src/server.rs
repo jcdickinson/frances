@@ -659,6 +659,7 @@ fn content_error(error: io::Error) -> ResponseError {
 fn io_error(path: &std::path::Path, error: io::Error) -> ResponseError {
     let code = match error.kind() {
         io::ErrorKind::AlreadyExists => ErrorCode::AlreadyExists,
+        io::ErrorKind::NotFound => ErrorCode::NotFound,
         _ => ErrorCode::Io,
     };
     ResponseError::new(code, format!("{}: {error}", path.display()))

@@ -1,0 +1,44 @@
+{
+  "type": "object",
+  "properties": {
+    "cmd": {
+      "type": "string",
+      "description": "Bash code to run. Multi-line, pipelines, heredocs, etc. all work."
+    },
+    "quiet": {
+      "type": "number",
+      "description": "Seconds of output silence before control returns to me (default 10). The command keeps running \u2014 I MUST call shell_wait to resume. I lower it when I expect a quick command; raise it for ones with long silent phases.",
+      "minimum": 0
+    },
+    "max": {
+      "type": "number",
+      "description": "Wall-clock seconds before returning control; the command keeps running. Default 120.",
+      "minimum": 0
+    },
+    "head": {
+      "type": "number",
+      "description": "I receive only the first N lines of output (the user keeps their own view of it). Combine with `tail` to see both ends.",
+      "minimum": 0
+    },
+    "tail": {
+      "type": "number",
+      "description": "I receive only the last N lines of output (the user keeps their own view of it). Combine with `head`. When neither is set, the last ~200 lines are returned by default. Prefer this over piping to `tail` in bash.",
+      "minimum": 0
+    },
+    "stdin": {
+      "type": "string",
+      "description": "Optional bytes/text delivered to bash on fd 0 for this invocation. The wrapper/user script is passed separately, not through stdin. When omitted, fd 0 is EOF/null so commands waiting for input do not accidentally hang on Frances' own stdin."
+    },
+    "persist": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Exported environment variable names to capture after this command finishes. Cwd always persists; persist applies only to this run, is not a durable watch list, and tracks exported env vars only. Names must be plain bash identifiers. FRANCES_ROOT is reserved and Frances-managed; persisting it is ignored."
+    }
+  },
+  "required": [
+    "cmd"
+  ],
+  "additionalProperties": false
+}

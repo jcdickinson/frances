@@ -1,0 +1,27 @@
+{
+  "type": "object",
+  "properties": {
+    "path": {
+      "type": "string"
+    },
+    "anchor": {
+      "type": "string"
+    },
+    "end_anchor": {
+      "type": "string"
+    },
+    "text": {
+      "type": "string"
+    },
+    "from": {
+      "type": "string",
+      "description": "Frances variable name to pull replacement text from. Provide exactly one of `text` or `from`."
+    }
+  },
+  "required": [
+    "path",
+    "anchor",
+    "end_anchor"
+  ],
+  "additionalProperties": false
+}

@@ -1,6 +1,7 @@
 # Model Content + Hooks Protocol
 
-Status: draft proposal, not implemented. Extension version: 1.
+Status: draft protocol, not implemented. Extension version: 1. The prerequisite
+native Rust harness is implemented without MCP or the planning workflow.
 
 This document specifies a family of MCP extensions for hosts that run coding
 agents. The working name is Model Content + Hooks Protocol. All extension

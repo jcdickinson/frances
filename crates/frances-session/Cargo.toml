@@ -31,13 +31,12 @@ frances-llm.workspace = true
 frances-models-llm.workspace = true
 frances-models-ui.workspace = true
 frances-storage.workspace = true
-frances-workflow.workspace = true
+frances-harness.workspace = true
 
 [dev-dependencies]
 frances-edit = { workspace = true, features = ["test-utils"] }
 frances-config = { workspace = true, features = ["test-util"] }
 frances-llm = { workspace = true, features = ["test-util"] }
-frances-workflow = { workspace = true, features = ["test-utils"] }
 frances-models-llm = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

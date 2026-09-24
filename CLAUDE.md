@@ -21,8 +21,8 @@ The interesting components:
 
 - **`frances`** — the Tauri binary, detached launcher, and event bridge.
 - **`frontend`** — the Svelte + SCSS interface, developed and built with Deno.
-- **`frances-session`** — session runtime: per-session DB handle, workflow selection, history, scrollback persistence, anchor store, llm session provider, and UI event channel.
-- **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat sessions and tool calls.
+- **`frances-session`** — session runtime: per-session DB handle, native agent loop, history, scrollback persistence, anchor store, llm session provider, and UI event channel.
+- **`frances-harness`** — native filesystem, editing, search, shell, and variable tools.
 - **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
 - **`frances-anchors`** — anchor word dictionary plus line hashing and word↔index encoding.
 
@@ -72,9 +72,8 @@ The user runs the dev shell via `nix develop` (provides toolchain + `rust-analyz
 `frances` CLI:
 
 - `frances [path]` — open a directory or workspace file (defaults to `.`) in a fresh session and return immediately. Every launch is a new session.
-- `frances --workflow <name>` — start the session with a specific workflow.
 - `frances --foreground` — run the desktop app attached to the launcher process.
-- `frances install [--local]` — write a starter config and install the `main` workflow.
+- `frances install` — write a starter model/provider config.
 
 ## Code style and conventions
 

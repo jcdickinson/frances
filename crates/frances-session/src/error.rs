@@ -6,7 +6,6 @@ use crate::runtime::RuntimeError;
 use crate::scrollback::ScrollbackError;
 use crate::session::SessionError;
 use crate::store::DatabaseError;
-use crate::workflows::WorkflowError;
 use frances_edit::EditError;
 use frances_llm::ProviderCacheError;
 use frances_models_llm::chat::{ChatError, HistoryError};
@@ -39,7 +38,7 @@ pub enum Error {
     Session(#[from] SessionError),
 
     #[error(transparent)]
-    Workflow(#[from] WorkflowError),
+    Tool(#[from] frances_harness::ToolError),
 
     #[error(transparent)]
     ProviderCache(#[from] ProviderCacheError),

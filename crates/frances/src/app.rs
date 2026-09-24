@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use frances_harness::WorkerIo;
 use frances_models_ui::{Lifecycle, SectionKind};
 use frances_session::context::InvocationContext;
 use frances_session::entities::{SESSION_KIND, SessionSnapshot};
@@ -12,7 +13,6 @@ use frances_session::session::{Paths, Session};
 use frances_session::store;
 use frances_session::workspace::Workspace;
 use frances_worker::Client as WorkerClient;
-use frances_workflow::WorkerIo;
 #[cfg(target_os = "linux")]
 use gdk::prelude::*;
 use parking_lot::Mutex;
@@ -66,7 +66,7 @@ enum UiEvent {
     },
 }
 
-pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
+pub fn run(workspace: Workspace) -> Result<()> {
     let paths = Paths::discover()?;
     let session = paths.create_session(&workspace)?;
     let invocation = InvocationContext::capture(workspace);
@@ -90,13 +90,7 @@ pub fn run(workspace: Workspace, workflow: Option<String>) -> Result<()> {
                 #[cfg(not(target_os = "linux"))]
                 let worker_image = None;
 
-                start_runtime(
-                    session_for_setup.clone(),
-                    invocation,
-                    workflow,
-                    worker_image,
-                )
-                .await
+                start_runtime(session_for_setup.clone(), invocation, worker_image).await
             })?;
 
             if let Some(title) = &session_for_setup.meta.title
@@ -195,7 +189,6 @@ fn export_bindings(specta: &tauri_specta::Builder) -> Result<()> {
 async fn start_runtime(
     session: Session,
     invocation: InvocationContext,
-    workflow: Option<String>,
     worker_image: Option<std::path::PathBuf>,
 ) -> Result<(
     Arc<SessionRuntime<WorkerIo>>,
@@ -206,10 +199,7 @@ async fn start_runtime(
         Some(path) => WorkerClient::spawn(path).await?,
         None => WorkerClient::spawn_local().await?,
     };
-    let overrides = StartOverrides {
-        default_workflow: workflow,
-        ..StartOverrides::default()
-    };
+    let overrides = StartOverrides::default();
     Ok(
         SessionRuntime::start_with_io(session, db, invocation, overrides, WorkerIo::new(worker))
             .await?,
