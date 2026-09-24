@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    // Start with `just dev-mcp`.
+    "dev-http": {
+      "url": "http://127.0.0.1:3001/mcp"
+    },
+    // Build with `just build-dev-mcp`; open the repository root as the workspace.
+    "dev-stdio": {
+      "command": "./target/frances-dev-mcp.js",
+      "args": ["--state", "./target/frances-dev-mcp-stdio-state.json"],
+      "frances/place": "remote"
+    }
+  }
+}

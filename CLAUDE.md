@@ -46,6 +46,25 @@ changes shape. (Same scratch convention `docs/newui/` used.)
 
 ## Common commands
 
+Run `./opt/bin/dev-app` from the dev shell for Tauri MCP development. It starts
+the HTTP dev MCP in Deno watch mode and `just app` in debug mode, opens the
+repository workspace, and selects `dev-http` using the absolute path to
+`packages/frances-dev-mcp/mcp.jsonc`. A transient systemd user service owns the
+processes. The command returns only after HTTP port 3001 and Tauri debug port
+9223 accept connections (startup timeout: 180 seconds), leaving the app running
+in the background. Port readiness does not guarantee the webview has loaded;
+connect with `driver_session` before inspecting it.
+Use `./opt/bin/dev-app stop` to stop the entire process tree, `status` to inspect
+the service, `logs` for the last 100 journal entries from the most recent
+execution, or `logs -f` to follow that execution. Its systemd invocation ID is
+saved in `target/dev-app.invocation`, so logs remain available after stopping;
+retention follows the shared user journal policy. Starting an active service is a no-op;
+an occupied port without our service is an error. Each checkout has its own
+service name, but the fixed ports permit only one running checkout at a time.
+The debug app exposes the Tauri MCP bridge on loopback (port 9223 by default).
+Codex's project MCP configuration is in `.codex/config.toml`; restart Codex after
+changing it, then use the Tauri MCP `driver_session` tool to connect to the app.
+
 ```bash
 cargo build                       # build everything
 cargo build -p frances            # just the binary (matches Nix flake)

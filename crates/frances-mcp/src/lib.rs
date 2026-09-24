@@ -2,8 +2,10 @@
 //! context lifetime, and any future Frances extension authority.
 mod config;
 mod connection;
+mod json_config;
 pub use config::{Config, Lifecycle, Preset, Selection, ServerConfig, Transport};
 pub use connection::{Connection, Environment};
+pub use json_config::McpJsonProvider;
 pub use rmcp::model::{
     CallToolResult, ContentBlock, GetPromptResult, Prompt, ReadResourceResult, Resource,
     ResourceContents, ResourceTemplate, Tool,

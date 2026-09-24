@@ -211,3 +211,6 @@ not a guarantee that every provider will accept a schema.
 
 To check an existing export, run `node opt/check-tool-schemas.mjs tool-schemas.json`.
 The Nix development shell includes Node.js and npm.
+
+Load additional MCP definitions explicitly with `frances --mcp mcp.jsonc`; use `--mcp-server NAME`
+to select one. See [MCP configuration](docs/arch/mcp.md) for JSONC fields and execution placement.

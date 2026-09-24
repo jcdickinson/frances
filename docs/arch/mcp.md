@@ -28,6 +28,62 @@ servers = ["docs"]
 servers = ["docs", "issues"]
 ```
 
+### Explicit JSON/JSONC source
+
+`frances --mcp /path/to/mcp.json` loads a separate configuration source. The file can use
+JSONC comments and trailing commas regardless of its extension. No `mcp.json` files are discovered
+automatically. This source adapts the common `mcpServers` shape into the ordinary `mcp.servers`
+configuration layer, after the other sources. It follows the existing per-field layering rules;
+other configured servers and presets remain available.
+
+```jsonc
+{
+  "mcpServers": {
+    "worker-tool": {
+      "command": "./target/frances-dev-mcp.js",
+      "args": ["--state", "./target/dev-stdio-state.json"],
+      "frances/place": "remote", // Run through the workspace worker.
+    },
+    "host-tool": {
+      "type": "stdio",
+      "command": "my-host-tool",
+      "frances/place": "local",
+      "env": { "TOKEN": "${TOKEN}" }
+    },
+    "dev-http": {
+      "type": "http",
+      "url": "http://127.0.0.1:3001/mcp"
+    }
+  }
+}
+```
+
+`type` is optional when exactly one of `command` or `url` identifies the transport. For stdio,
+`frances/place` defaults to `local` (native `local-stdio`); `remote` maps to native `stdio`.
+The unprefixed `place` field belongs to other tools and has no effect in Frances. HTTP always
+connects from the host: `frances/place` on an HTTP entry logs an error and is ignored, regardless
+of its value.
+
+Supported stdio fields are `command`, `args`, `env`, and `cwd`; HTTP supports `url` and `headers`.
+Environment/header templates retain the native expansion behavior. Command, argument, and cwd
+paths retain their execution-environment meaning; they are not rebased against the JSON file.
+The `--mcp` file path itself is resolved relative to the launch directory and forwarded as an
+absolute path when the app detaches.
+
+This filename/schema convention is host-specific, not part of MCP itself. Shared files may contain
+other tools' fields: Frances warns and ignores unknown fields (and accepts `$schema` without a
+warning). Malformed or unsupported server entries log errors and are skipped independently. An
+unreadable or malformed file logs an error and contributes no configuration; it does not stop the
+app from starting. Diagnostics appear in the session log. Explicitly selecting a skipped server
+still follows the ordinary unknown-server selection rules.
+
+Loading definitions does not activate servers. Select them with the MCP panel, `--mcp-server`, or a
+configured preset:
+
+```sh
+frances --mcp mcp.jsonc --mcp-server dev-http
+```
+
 `type = "stdio"` starts the process through the workspace worker. It inherits the
 worker environment; environment templates are expanded there, and `which` runs
 there using the resulting `PATH`. The host does not send its captured environment
@@ -133,3 +189,9 @@ The session adapter owns tool selection, permission decisions, model projection,
 and context replacement. Full tool declarations remain host-side with each call.
 Future Frances extensions belong across that boundary; they do not require
 putting session IDs, controller state, or authorization metadata in model arguments.
+
+## Development server
+
+[`packages/frances-dev-mcp`](../../packages/frances-dev-mcp/README.md) supplies a local test server.
+`just dev-mcp` runs HTTP with source watching and persisted test state. `just build-dev-mcp` produces
+an executable stdio script with absolute Nix runtime paths for worker-side testing.

@@ -1,6 +1,7 @@
 # Run the desktop app with frontend HMR (starts Vite, then tauri dev)
-app:
-    deno task --config packages/frontend/deno.json app
+[positional-arguments]
+app *args:
+    deno task --config packages/frontend/deno.json app "$@"
 
 # Build everything
 build:
@@ -104,3 +105,16 @@ machete:
 # Export and validate every built-in tool schema against provider rules.
 check-tool-schemas:
     node opt/check-tool-schemas.mjs
+
+# Build a standalone MCP test script pinned to this machine's Deno runtime.
+build-dev-mcp:
+    deno run -A packages/frances-dev-mcp/build.ts "$(command -v env)"
+
+# Restart the HTTP MCP test server whenever its source changes.
+dev-mcp *args:
+    deno task --config packages/frances-dev-mcp/deno.json dev {{ args }}
+
+check-dev-mcp:
+    deno task --config packages/frances-dev-mcp/deno.json check
+    deno task --config packages/frances-dev-mcp/deno.json lint
+    deno task --config packages/frances-dev-mcp/deno.json test

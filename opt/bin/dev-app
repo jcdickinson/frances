@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+cd -- "$repo_dir"
+unit="frances-dev-$(systemd-escape --path "$repo_dir").service"
+invocation_file="$repo_dir/target/dev-app.invocation"
+
+show_logs() {
+    if [[ ! -f "$invocation_file" ]]; then
+        echo 'No recorded development app execution.' >&2
+        return 1
+    fi
+    journalctl --user -u "$unit" "_SYSTEMD_INVOCATION_ID=$(<"$invocation_file")" \
+        -n 100 --no-pager -o cat "$@"
+}
+
+port_open() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+case "${1:-start}" in
+    start)
+        if systemctl --user is-active --quiet "$unit"; then
+            echo "Already running. Use $0 status or $0 logs."
+            exit 0
+        fi
+        for port in 3001 9223; do
+            if port_open "$port"; then
+                echo "Port $port is already occupied; stop its owner before starting." >&2
+                exit 1
+            fi
+        done
+
+        # Preserve the dev shell and desktop environment, including Nix build flags.
+        environment=()
+        while IFS= read -r -d '' entry; do
+            name=${entry%%=*}
+            case "$name" in
+                NOTIFY_SOCKET|WATCHDOG_*|INVOCATION_ID|JOURNAL_STREAM|SYSTEMD_EXEC_PID) continue ;;
+            esac
+            environment+=("--setenv=$name")
+        done < <(env -0)
+
+        # Type=notify makes this command wait until __run signals readiness.
+        if ! systemd-run --user --quiet --collect --unit="$unit" \
+            --service-type=notify --property=NotifyAccess=all \
+            --property=TimeoutStartSec=180 --property=TimeoutStopSec=15 \
+            --property=KillMode=control-group --expand-environment=no \
+            --working-directory="$repo_dir" "${environment[@]}" \
+            "$(command -v bash)" "$repo_dir/opt/bin/dev-app" __run; then
+            show_logs
+            exit 1
+        fi
+        echo "Ready: Tauri MCP at 127.0.0.1:9223; HTTP MCP at http://127.0.0.1:3001/mcp"
+        echo "Background service: $unit"
+        echo "Logs: $0 logs    Stop: $0 stop"
+        ;;
+    stop)
+        systemctl --user stop "$unit"
+        ;;
+    status)
+        systemctl --user status "$unit" --no-pager
+        ;;
+    logs)
+        shift
+        show_logs "$@"
+        ;;
+    __run)
+        # systemd owns cleanup of both commands and all their descendants.
+        [[ -n "${NOTIFY_SOCKET:-}" ]] || { echo 'Use dev-app start.' >&2; exit 1; }
+        mkdir -p "$repo_dir/target"
+        printf '%s\n' "$INVOCATION_ID" > "$invocation_file"
+        just dev-mcp &
+        mcp_pid=$!
+        just app --mcp "$repo_dir/packages/frances-dev-mcp/mcp.jsonc" \
+            --mcp-server dev-http "$repo_dir" &
+        app_pid=$!
+
+        until port_open 3001 && port_open 9223; do
+            if ! kill -0 "$mcp_pid" "$app_pid" 2>/dev/null; then
+                echo 'A development process exited before readiness.' >&2
+                exit 1
+            fi
+            sleep 1
+        done
+        systemd-notify --ready --status='HTTP MCP :3001 and Tauri MCP :9223 are listening'
+        wait -n "$mcp_pid" "$app_pid"
+        ;;
+    *)
+        echo "Usage: $0 [start|stop|status|logs [-f]]" >&2
+        exit 2
+        ;;
+esac

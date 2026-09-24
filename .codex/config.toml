@@ -1,0 +1,4 @@
+[mcp_servers.tauri]
+command = "deno"
+args = ["run", "-A", "npm:@hypothesi/tauri-mcp-server"]
+startup_timeout_sec = 60

@@ -14,7 +14,7 @@
     "vite": "npm:vite@^7.0.0"
   },
   "tasks": {
-    "app": "cd ../../crates/frances && deno run -A npm:@tauri-apps/cli@^2.0.0 dev -- -- --foreground",
+    "app": "cd ../../crates/frances && deno run -A npm:@tauri-apps/cli@^2.0.0 dev -- --quiet -- --foreground",
     "dev": "deno run -A npm:vite@^7.0.0",
     "build": "deno run -A npm:vite@^7.0.0 build",
     "check": "deno check src/main.ts && deno run -A npm:svelte-check@^4.0.0 --tsconfig ./tsconfig.json",

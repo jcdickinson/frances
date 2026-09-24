@@ -30,6 +30,7 @@ specta.workspace = true
 specta-typescript.workspace = true
 tauri.workspace = true
 tauri-plugin-dialog.workspace = true
+tauri-plugin-mcp-bridge.workspace = true
 tauri-specta.workspace = true
 xdg.workspace = true
 

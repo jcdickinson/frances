@@ -6,10 +6,12 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+async-trait.workspace = true
 frances-config.workspace = true
 frances-core.workspace = true
 frances-worker.workspace = true
 frances-worker-protocol.workspace = true
+jsonc-parser = { version = "0.33.2", features = ["serde"] }
 jsonschema = { version = "0.46.5", default-features = false }
 rmcp.workspace = true
 reqwest.workspace = true

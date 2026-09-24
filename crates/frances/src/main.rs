@@ -22,7 +22,7 @@ struct Cli {
     foreground: bool,
 
     /// Print all built-in tool definitions and their strict mode flags as JSON.
-    #[arg(long, conflicts_with_all = ["path", "foreground", "presets", "mcp_servers"])]
+    #[arg(long, conflicts_with_all = ["path", "foreground", "presets", "mcp_servers", "mcp"])]
     export_tool_schemas: bool,
 
     /// Compose MCP presets for this session (repeat, or separate with +).
@@ -32,6 +32,10 @@ struct Cli {
     /// Enable an additional configured MCP server.
     #[arg(long = "mcp-server")]
     mcp_servers: Vec<String>,
+
+    /// Load MCP server definitions from an explicit mcp.json file.
+    #[arg(long, value_name = "PATH")]
+    mcp: Option<PathBuf>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -75,14 +79,30 @@ fn real_main() -> Result<()> {
         presets: cli.presets,
         servers: cli.mcp_servers,
     };
+    let mcp_path = cli
+        .mcp
+        .map(|path| frances_core::env::invocation_dir().join(path));
     if !cli.foreground {
-        return launch_detached(&workspace, &selection);
+        return launch_detached(&workspace, &selection, mcp_path.as_deref());
     }
 
-    app::run(workspace, selection)
+    let mut overrides = frances_session::runtime::StartOverrides {
+        mcp_selection: selection,
+        ..Default::default()
+    };
+    if let Some(path) = mcp_path {
+        overrides
+            .extra_config_providers
+            .push(std::sync::Arc::new(frances_mcp::McpJsonProvider::new(path)));
+    }
+    app::run(workspace, overrides)
 }
 
-fn launch_detached(workspace: &Workspace, selection: &frances_mcp::Selection) -> Result<()> {
+fn launch_detached(
+    workspace: &Workspace,
+    selection: &frances_mcp::Selection,
+    mcp_path: Option<&std::path::Path>,
+) -> Result<()> {
     let current_executable = std::env::current_exe().context("resolve frances executable")?;
     #[cfg(target_os = "linux")]
     let executable = appimage::launcher_executable(&current_executable);
@@ -91,6 +111,9 @@ fn launch_detached(workspace: &Workspace, selection: &frances_mcp::Selection) ->
 
     let mut command = ProcessCommand::new(executable);
     command.arg("--foreground");
+    if let Some(path) = mcp_path {
+        command.arg("--mcp").arg(path);
+    }
     for preset in &selection.presets {
         command.arg("--preset").arg(preset);
     }
@@ -153,6 +176,7 @@ mod tests {
         assert!(cli.path.is_none());
         assert!(cli.presets.is_empty());
         assert!(cli.mcp_servers.is_empty());
+        assert!(cli.mcp.is_none());
     }
 
     #[test]
@@ -169,6 +193,17 @@ mod tests {
         .unwrap();
         assert_eq!(cli.presets, ["frances", "rust", "project"]);
         assert_eq!(cli.mcp_servers, ["docs"]);
+    }
+
+    #[test]
+    fn explicit_mcp_source_does_not_select_servers() {
+        let cli = Cli::try_parse_from(["frances", "--mcp", "config/mcp.jsonc"]).unwrap();
+        assert_eq!(cli.mcp.unwrap(), std::path::Path::new("config/mcp.jsonc"));
+        assert!(cli.mcp_servers.is_empty());
+        assert!(
+            Cli::try_parse_from(["frances", "--export-tool-schemas", "--mcp", "mcp.json"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["frances", "--mcp"]).is_err());
     }
 
     #[test]

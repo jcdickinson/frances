@@ -63,6 +63,7 @@ specta = { version = "2.0.0-rc.22", features = ["derive", "serde", "serde_json",
 specta-typescript = "0.0.9"
 tauri = { version = "2", features = ["devtools"] }
 tauri-plugin-dialog = "2"
+tauri-plugin-mcp-bridge = "0.13"
 tauri-specta = { version = "2.0.0-rc.21", features = ["derive", "typescript"] }
 tempfile = "3"
 thiserror = "2"

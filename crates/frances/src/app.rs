@@ -66,7 +66,7 @@ enum UiEvent {
     },
 }
 
-pub fn run(workspace: Workspace, mcp_selection: frances_mcp::Selection) -> Result<()> {
+pub fn run(workspace: Workspace, overrides: StartOverrides) -> Result<()> {
     let paths = Paths::discover()?;
     let session = paths.create_session(&workspace)?;
     let invocation = InvocationContext::capture(workspace);
@@ -78,7 +78,14 @@ pub fn run(workspace: Workspace, mcp_selection: frances_mcp::Selection) -> Resul
     export_bindings(&specta)?;
 
     let session_for_setup = session.clone();
-    let app = tauri::Builder::default()
+    let builder = tauri::Builder::default();
+    #[cfg(debug_assertions)]
+    let builder = builder.plugin(
+        tauri_plugin_mcp_bridge::Builder::new()
+            .bind_address("127.0.0.1")
+            .build(),
+    );
+    let app = builder
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(specta.invoke_handler())
         .setup(move |app| {
@@ -94,7 +101,7 @@ pub fn run(workspace: Workspace, mcp_selection: frances_mcp::Selection) -> Resul
                     session_for_setup.clone(),
                     invocation,
                     worker_image,
-                    mcp_selection,
+                    overrides,
                 )
                 .await
             })?;
@@ -199,7 +206,7 @@ async fn start_runtime(
     session: Session,
     invocation: InvocationContext,
     worker_image: Option<std::path::PathBuf>,
-    mcp_selection: frances_mcp::Selection,
+    overrides: StartOverrides,
 ) -> Result<(
     Arc<SessionRuntime<WorkerIo>>,
     mpsc::UnboundedReceiver<StreamFrame>,
@@ -208,10 +215,6 @@ async fn start_runtime(
     let worker = match worker_image {
         Some(path) => WorkerClient::spawn(path).await?,
         None => WorkerClient::spawn_local().await?,
-    };
-    let overrides = StartOverrides {
-        mcp_selection,
-        ..StartOverrides::default()
     };
     Ok(
         SessionRuntime::start_with_io(session, db, invocation, overrides, WorkerIo::new(worker))

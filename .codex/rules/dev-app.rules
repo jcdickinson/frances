@@ -1,0 +1,13 @@
+prefix_rule(
+    pattern = ["./opt/bin/dev-app"],
+    decision = "allow",
+    justification = "Manage the project's local debug app and development MCP service.",
+    match = [
+        "./opt/bin/dev-app",
+        "./opt/bin/dev-app start",
+        "./opt/bin/dev-app stop",
+        "./opt/bin/dev-app status",
+        "./opt/bin/dev-app logs -f",
+    ],
+    not_match = ["systemctl --user stop unrelated.service"],
+)
