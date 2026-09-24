@@ -94,7 +94,7 @@ mkdir -p "$bundle_dir"
 find "$bundle_dir" -maxdepth 1 -type f -name '*.AppImage' -delete
 rm -rf "$package_dir"
 
-deno task --config frontend/deno.json tauri build \
+deno task --config packages/frontend/deno.json tauri build \
     --verbose \
     --target "$target" \
     --bundles appimage \

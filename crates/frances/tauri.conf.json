@@ -4,10 +4,10 @@
   "version": "0.1.0",
   "identifier": "dev.frances",
   "build": {
-    "beforeDevCommand": "deno task --config ../frontend/deno.json dev",
-    "beforeBuildCommand": "deno task --config ../frontend/deno.json build",
+    "beforeDevCommand": "deno task --config ../packages/frontend/deno.json dev",
+    "beforeBuildCommand": "deno task --config ../packages/frontend/deno.json build",
     "devUrl": "http://localhost:5173",
-    "frontendDist": "../../frontend/dist"
+    "frontendDist": "../../packages/frontend/dist"
   },
   "app": {
     "windows": [

@@ -1,6 +1,6 @@
 # Run the desktop app with frontend HMR (starts Vite, then tauri dev)
 app:
-    deno task --config frontend/deno.json app
+    deno task --config packages/frontend/deno.json app
 
 # Build everything
 build:
@@ -9,12 +9,12 @@ build:
 # Build the standalone debug application and its sibling worker.
 build-app:
     cargo build -p frances-worker
-    deno task --config frontend/deno.json tauri build --debug --no-bundle
+    deno task --config packages/frontend/deno.json tauri build --debug --no-bundle
 
 # Build the standalone release application and its sibling worker.
 bundle:
     cargo build --release -p frances-worker
-    deno task --config frontend/deno.json tauri build --no-bundle
+    deno task --config packages/frontend/deno.json tauri build --no-bundle
 
 # Run the already-built standalone release binary.
 bundle-run *args:
@@ -83,7 +83,7 @@ appimage-run:
 
 # Type-check the frontend
 check:
-    cd frontend && deno task check
+    cd packages/frontend && deno task check
 
 # Run all tests, or one crate: just test -p frances-edit
 test *args:
@@ -91,11 +91,11 @@ test *args:
 
 fmt:
     cargo fmt --all
-    cd frontend && deno task fmt
+    cd packages/frontend && deno task fmt
 
 lint:
     cargo clippy --all-targets
-    cd frontend && deno task lint
+    cd packages/frontend && deno task lint
 
 # Find unused crate dependencies
 machete:

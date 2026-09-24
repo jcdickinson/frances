@@ -21,7 +21,7 @@ worth the duplication.
 
 ## Hand-mirrored TypeScript types
 
-`frontend/src/types.ts` mirrors the Rust serde shapes by eye:
+`packages/frontend/src/types.ts` mirrors the Rust serde shapes by eye:
 `SectionKind`, `DiffLine` (= `frances_edit::DiffOp`), `SurfaceCommand`,
 `UiEvent`, `Usage`, `AppInfo`. Nothing checks they stay in lockstep — a
 Rust enum change silently breaks rendering.

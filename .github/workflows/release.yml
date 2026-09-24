@@ -117,7 +117,7 @@ jobs:
         id: archive
         shell: bash
         run: |
-          deno task --config frontend/deno.json build
+          deno task --config packages/frontend/deno.json build
           cargo build --release --locked -p frances --target '${{ matrix.target }}'
           name="frances-${{ matrix.target }}"
           mkdir "$name"

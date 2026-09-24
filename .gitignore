@@ -1,7 +1,7 @@
 target/
-frontend/node_modules/
-frontend/dist/
-frontend/.vite/
+packages/frontend/node_modules/
+packages/frontend/dist/
+packages/frontend/.vite/
 crates/frances/gen/
 /result
 .claude/settings.local.json

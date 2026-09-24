@@ -20,7 +20,7 @@ Frances is an agentic coding tool with a Tauri desktop app. The launcher opens a
 The interesting components:
 
 - **`frances`** — the Tauri binary, detached launcher, and event bridge.
-- **`frontend`** — the Svelte + SCSS interface, developed and built with Deno.
+- **`packages/frontend`** — the Svelte + SCSS interface, developed and built with Deno.
 - **`frances-session`** — session runtime: per-session DB handle, native agent loop, history, scrollback persistence, anchor store, llm session provider, and UI event channel.
 - **`frances-harness`** — native filesystem, editing, search, shell, and variable tools.
 - **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
@@ -49,9 +49,9 @@ changes shape. (Same scratch convention `docs/newui/` used.)
 ```bash
 cargo build                       # build everything
 cargo build -p frances            # just the binary (matches Nix flake)
-cd frontend && deno task build    # build the Svelte frontend
-cd frontend && deno task check    # type-check the frontend
-deno task --config frontend/deno.json app # run with frontend HMR
+cd packages/frontend && deno task build    # build the Svelte frontend
+cd packages/frontend && deno task check    # type-check the frontend
+deno task --config packages/frontend/deno.json app # run with frontend HMR
 cargo nextest                        # all tests
 cargo nextest -p frances-edit        # one crate
 cargo nextest -p frances-edit reconcile::tests::name_of_test  # one test

@@ -39,8 +39,8 @@ The workspace pins a single Rust toolchain in `rust-toolchain.toml`
 ```bash
 cargo build                  # build everything
 cargo build -p frances       # just the binary
-cd frontend && deno task build
-deno task --config frontend/deno.json app
+cd packages/frontend && deno task build
+deno task --config packages/frontend/deno.json app
 cargo nextest                # run all tests
 cargo fmt --all
 cargo clippy --all-targets

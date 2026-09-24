@@ -189,7 +189,7 @@ fn export_bindings(specta: &tauri_specta::Builder) -> Result<()> {
             .bigint(specta_typescript::BigIntExportBehavior::Number),
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../frontend/src/bindings.ts"
+            "/../../packages/frontend/src/bindings.ts"
         ),
     )?;
     Ok(())
@@ -448,7 +448,7 @@ fn store_permission(app: &tauri::AppHandle, request: PermissionRequest) -> Optio
 mod tests {
     use super::*;
 
-    /// Regenerates `frontend/src/bindings.ts`. The debug desktop launch
+    /// Regenerates `packages/frontend/src/bindings.ts`. The debug desktop launch
     /// does the same; this keeps the bindings reproducible headlessly.
     #[test]
     fn export_typescript_bindings() {
