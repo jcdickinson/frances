@@ -1,5 +1,22 @@
 # Project DB
 
+Status: historical optional cross-session knowledge proposal. The
+[agent-loop architecture](../agentic-loop.md) and
+[core protocol](../../model-content-hooks-protocol.md) supersede its host ownership,
+storage locations, and staged rollout.
+
+A knowledge MCP server chooses whether and how to maintain a project database.
+Frances retains its own host history, MCP session IDs, and protocol receipts; it
+does not prescribe server tables, a workdir-local database, or a promotion policy.
+Durable server session IDs and required workflow state cannot expire implicitly.
+
+The local-database and external-harness comparisons below record the earlier
+proposal, not current Frances capabilities or dependencies. Cross-project
+isolation and stale-evidence handling remain concerns for any server implementing
+the feature.
+
+## Historical proposal
+
 The project DB is a per-workdir database that accumulates knowledge across sessions. It is the answer to "what did I learn about this codebase last week?" — a question that the per-session DB cannot answer because each session starts empty.
 
 This is layer 3 in the staged rollout (see [agentic-loop.md](../agentic-loop.md)). Foundation (layer 1) and per-file summaries (layer 2) ship first. Layer 3 should not be designed in detail until 1 and 2 are in use; treat what follows as architectural intent, not a detailed spec.

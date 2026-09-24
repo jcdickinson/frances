@@ -1,5 +1,12 @@
 # Line Anchor Design Notes
 
+Status: algorithm design notes. The notation and historical implementation
+references below do not prescribe a JavaScript runtime. The planned
+[Rust host and MCP extension architecture](agentic-loop.md) removes embedded JS
+workflows while retaining the Rust anchor/edit engine. See
+[edit-engine.md](edit-engine.md) for its current wiring and context-reset boundary;
+the [protocol](../model-content-hooks-protocol.md) governs tool authorization.
+
 Working notes from designing a line-anchor system for LLM file edits, informed by reading dirac's existing implementation and discussion.
 
 ## Goal

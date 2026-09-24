@@ -2,6 +2,15 @@
 
 Forward-looking design — not yet implemented. Captures the conclusions of a design discussion about how search/list/read tools should hand results to the model without dumping them into context.
 
+This is an optional tool-provider design, not a requirement for the host loop or
+the [Model Content + Hooks Protocol](../model-content-hooks-protocol.md). Any future
+handle store belongs to the provider that creates the handles. Server-owned
+handles must not rely on Frances's JS variables or embedded runtime: those are
+being removed. MCP resources and tools can expose retained results without
+requiring the host to adopt this particular handle schema or query language.
+Handles do not add tools dynamically; their reader/query tools must already be
+selected in the model context's fixed tool set.
+
 ## Problem
 
 The default tool shape is "run, return everything to the model." For small results that's fine. For anything larger — file listings, grep hits, file contents in bulk — it has two failure modes:
@@ -67,12 +76,18 @@ These cover the common path with discoverable, single-purpose tools and no langu
 
 ### Why not a Turing-complete interpreter
 
-Embedding Lua / QuickJS / Starlark / Python was considered and rejected. The real surface area is filter-shape-project on structured data, which is exactly jq's job. A general interpreter buys:
+Embedding Lua / QuickJS / Starlark / Python for handle queries was considered and
+rejected. The separate QuickJS workflow runtime currently exists but is being
+removed under the new host architecture. A general interpreter for queries adds:
 
 - **Costs.** Sandboxing review, embedding maintenance, error-surface translation, another language for users to learn.
-- **Negligible benefit for this workload.** Control flow and branching are the model's job, not a script's. The cases where "I need to make a decision based on this result and call a different tool" are precisely the cases where keeping the decision in the model — not in embedded code — is the right call.
+- **Additional execution authority.** Querying retained data should not implicitly
+  execute more tools. The Rust host controls execution; server hooks and the
+  selected controller influence it through explicit protocol operations.
 
-Non-Turing is a feature: jq queries are pure functions, terminate by construction, can't escape the sandbox, and have no side-channel state. Start here. Add an interpreter only if concrete cases pile up that jq genuinely cannot express.
+Any query implementation needs explicit resource and execution limits; choosing
+jaq does not by itself guarantee termination or isolation. The optional query
+surface is not a reason to preserve the embedded JS workflow runtime.
 
 ## Open questions
 

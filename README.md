@@ -1,46 +1,23 @@
 # Frances
 
-Frances is an agentic coding tool with a Tauri desktop app. The launcher
-opens a workspace (a directory, or a workspace file listing several), creates
-a fresh session for it, and starts the app in the background. The Rust backend owns the in-process
-`SessionRuntime`; a Svelte frontend renders its event stream. LLM completions
-stream through a configurable set of model providers.
+Frances is an agentic coding tool with a Tauri desktop app, and a worker.
+
+- No TUI: The main advantage of a TUI is that it's trivial to get working remotely (just run it in SSH), but it causes
+  several challenging UI problems; I always point at font-size as one example - too many things aren't important enough
+  to justify font size equality.
+- Worker: I work around the lack of a TUI by using a remote worker, vscode-style.
+- MCP++: Frances substantially improves the MCP protocol to add support for hooks, context management, and more.
+  - And bundles an experimental workflow that uses it.
+
+## The name
+
+Frances is named for two early UNIVAC programmers:
+
+- **Frances E. Holberton** (1917–2001) — one of the six original ENIAC programmers, who went on to work on UNIVAC.
+- **Frances ("Betty") Morello** — a UNIVAC programmer of the same era.
 
 > [!WARNING]
-> **This project is almost entirely coded by an LLM.** Treat the code, comments,
-> and this README accordingly: assume nothing has been hand-audited unless you
-> verify it yourself. Frances has also never shipped — there is no released
-> version and no backward-compatibility burden, so schemas, formats, and APIs
-> change freely.
-
-## TL;DR — get up and running
-
-```bash
-# 1. Get the toolchain: either the dev shell (adds rust-analyzer, jq, cargo machete, ...)
-nix develop                    # or: rustup install 1.95.0
-
-# 2. Build, then run the installer. It asks a few questions, writes a starter
-#    config.toml, and drops the `main` workflow into ~/.config/frances.
-cargo run -p frances -- install            # copies the workflow into the config dir
-cargo run -p frances -- install --local    # instead points the config at the in-repo workflow
-
-# 3. Build the Svelte frontend, then run it.
-cd frontend && deno task build && cd ..
-./target/debug/frances        # launches the app and returns immediately
-./target/debug/frances --foreground # keep the launcher attached
-```
-
-`install` always (re)installs the `main` workflow; it only runs the
-questionnaire when `config.toml` doesn't already exist, so re-running it
-refreshes the workflow without clobbering a config you've since edited. The
-questionnaire offers your Codex (ChatGPT) login, or any other provider — for
-which it writes the token you paste to `~/.config/frances/<provider>.txt`.
-
-Once the app is up, type `/main` to kick off the `main` workflow.
-Within that workflow, `/effort`, `/effort 0` through `/effort 100`, and
-`/effort default` inspect, set, and clear the persistent session override.
-
-If you'd rather write the config by hand, a minimum viable `config.toml`:
+> **This project is almost entirely coded by an LLM.**
 
 ```toml
 [model_providers.deepseek]
@@ -59,40 +36,6 @@ default_workflow = "main"
 id = "e3c5d9f6-141b-4cf8-b6ad-41e5a9cdee43"
 file = "/home/you/Code/frances/assets/workflows/main.ts"
 ```
-
-
-## The name
-
-Frances is named for two early UNIVAC programmers:
-
-- **Frances E. Holberton** (1917–2001) — one of the six original ENIAC
-  programmers, who went on to work on UNIVAC. She wrote the C-10 instruction set
-  and the *Sort-Merge Generator*, an early example of a program that writes
-  programs — a fitting namesake for an agentic coding tool.
-- **Frances ("Betty") Morello** — a UNIVAC programmer of the same era.
-
-## Workspace layout
-
-The interesting crates live under `crates/`:
-
-- **`frances`** — the Tauri binary, launcher, and Rust-to-webview event bridge.
-- **`frances-worker`** / **`frances-worker-protocol`** — the mandatory local
-  workspace worker and its framed stdio protocol. The transport is remote-ready;
-  milestone one exposes only local sibling-process startup; filesystem IO and
-  independent multi-shell execution already cross the worker boundary.
-- **`frontend`** — the Svelte, TypeScript, and SCSS interface, built with Deno.
-- **`frances-session`** — session runtime: per-session DB handle, workflow
-  selection, history, scrollback persistence, anchor store, the LLM session
-  provider, and the events channel into the desktop app.
-- **`frances-workflow`** — JS-driven workflow runtime (rquickjs) that drives chat
-  sessions and tool calls.
-- **`frances-llm`** / **`frances-models-llm`** — provider configuration, auth
-  resolution, and the genai-backed request plan.
-- **`frances-edit`** — anchor-based file edit engine. Filesystem-agnostic.
-- **`frances-anchors`** — anchor word dictionary plus line hashing and
-  word↔index encoding.
-
-Architecture docs live in [`docs/arch/`](docs/arch/).
 
 ## Building
 
@@ -182,18 +125,18 @@ file = "/home/jono/Code/frances/assets/workflows/main.ts"
 The table key (`codex`, `zai`, `deepseek`) is the provider id referenced by
 `[models.*].model_provider`. Each provider supports:
 
-| Field                    | Required | Notes                                                          |
-| ------------------------ | -------- | -------------------------------------------------------------- |
-| `kind`                   | yes      | Adapter selector — see below.                                  |
-| `base_url`               | yes      | Provider API base URL.                                         |
-| `auth`                   | yes      | Auth method — see below.                                       |
-| `name`                   | no       | Human-facing display name.                                     |
-| `http_headers`           | no       | Extra request headers (values support env-var expansion).      |
-| `query_params`           | no       | Extra query params (values support env-var expansion).         |
-| `supports_websockets`    | no       | Default `false`.                                               |
-| `request_max_retries`    | no       | Default `4`.                                                   |
-| `stream_max_retries`     | no       | Default `5`.                                                   |
-| `stream_idle_timeout_ms` | no       | Default `300000`.                                              |
+| Field                    | Required | Notes                                                     |
+| ------------------------ | -------- | --------------------------------------------------------- |
+| `kind`                   | yes      | Adapter selector — see below.                             |
+| `base_url`               | yes      | Provider API base URL.                                    |
+| `auth`                   | yes      | Auth method — see below.                                  |
+| `name`                   | no       | Human-facing display name.                                |
+| `http_headers`           | no       | Extra request headers (values support env-var expansion). |
+| `query_params`           | no       | Extra query params (values support env-var expansion).    |
+| `supports_websockets`    | no       | Default `false`.                                          |
+| `request_max_retries`    | no       | Default `4`.                                              |
+| `stream_max_retries`     | no       | Default `5`.                                              |
+| `stream_idle_timeout_ms` | no       | Default `300000`.                                         |
 
 `kind` is validated at provider-build time (`parse_kind` in
 `crates/frances-llm/src/providers/genai/kinds.rs`). Accepted values:
@@ -239,13 +182,13 @@ Auth resolution happens in exactly one place: `resolve_auth` in
 [`crates/frances-llm/src/providers/genai/request_plan.rs`](crates/frances-llm/src/providers/genai/request_plan.rs).
 It is called from `RequestPlan::build` and exhaustively matches every variant:
 
-| Variant        | Behaviour                                                                                   |
-| -------------- | ------------------------------------------------------------------------------------------- |
-| `EnvKey`       | Reads the named env var; errors `MissingEnvVar` (surfacing `env_key_instructions`) if unset. |
-| `Token`        | Uses the literal token as-is.                                                                |
-| `File`         | Reads and trims the file; errors `ReadAuthFile` on IO failure.                               |
-| `Codex`        | Resolves via `codex_auth`, returning an access token plus a `ChatGPT-Account-ID` header.     |
-| `Command`      | Returns `AuthCommandUnimplemented` — defined but not yet wired up.                           |
+| Variant   | Behaviour                                                                                    |
+| --------- | -------------------------------------------------------------------------------------------- |
+| `EnvKey`  | Reads the named env var; errors `MissingEnvVar` (surfacing `env_key_instructions`) if unset. |
+| `Token`   | Uses the literal token as-is.                                                                |
+| `File`    | Reads and trims the file; errors `ReadAuthFile` on IO failure.                               |
+| `Codex`   | Resolves via `codex_auth`, returning an access token plus a `ChatGPT-Account-ID` header.     |
+| `Command` | Returns `AuthCommandUnimplemented` — defined but not yet wired up.                           |
 
 `AuthMethod` is defined in `frances-models-llm` and re-exported from
 `frances-models-llm` and `frances-llm`. Outside of tests, `resolve_auth` is its
@@ -267,7 +210,7 @@ The table key (`main`, `plan`) is the name the rest of the config refers to.
 
 | Field        | Required | Notes                                                                              |
 | ------------ | -------- | ---------------------------------------------------------------------------------- |
-| `id`         | yes      | Stable UUID. The workflow owns a chunk of the per-session DB schema under this id.  |
+| `id`         | yes      | Stable UUID. The workflow owns a chunk of the per-session DB schema under this id. |
 | `file`       | yes      | Absolute path to the workflow script that gets loaded and run.                     |
 | `migrations` | no       | SQL migration files in apply order, resolved **relative to `file`'s directory**.   |
 

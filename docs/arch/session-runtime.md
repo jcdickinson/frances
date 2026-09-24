@@ -1,5 +1,50 @@
 # Session runtime
 
+Status: current implementation, with the replacement target below. References to
+JS workflows describe code being removed, not an extension API to build upon.
+
+## Replacement target
+
+First implement an ordinary Rust harness without MCP or the structured planning
+workflow. The [main workflow record](main-workflow.md) preserves the behavior for
+a later server port; MCP is not a prerequisite for removing JS.
+
+The [Model Content + Hooks Protocol](../model-content-hooks-protocol.md) and its
+[UI extension](../model-content-hooks-ui.md) define the later host/server boundary.
+The [agentic-loop overview](agentic-loop.md) maps that boundary to Frances.
+
+- A Rust-owned agent loop replaces the JS workflow driver, QuickJS runtime,
+  TypeScript transpilation, and embedded `frances:v1/*` module surface. Move
+  required dispatch, streaming, tool, permission, and interruption behavior into
+  Rust before deleting those bindings. Do not preserve a parallel JS workflow API.
+- Existing provider, worker, editor, anchor, history, and UI infrastructure remains
+  available to the Rust host. Removing workflow JS does not remove Svelte or the
+  frontend's JavaScript runtime.
+- MCP servers own planning state and its persistence. The host does not add plan
+  tables to its session DB; it persists MCP session IDs, conversation history,
+  context identities, and protocol receipts. Durable controller session IDs survive
+  server restart and do not expire while their state is needed.
+- Later port the recorded main workflow behavior into a supplied planning MCP
+  server, with server configuration and behavioral coverage. The initial harness
+  can ship without this workflow or MCP support; see the
+  [port requirements](agentic-loop.md#remove-the-js-workflow-layer).
+- One host session can contain successive model contexts. Replacement preserves
+  workspace files and UI history while rebuilding model context and the editor's
+  per-context read state. Tool selection is fixed for each context.
+- The selected controller requests transitions through `frances/context`. Other
+  servers can supply tools, authorization descriptions, hooks, and UI without
+  owning the conversation. Generic MCP sampling supports server-owned referee and
+  summarizer logic; the host does not implement those planning roles itself.
+- Native semantic UI replaces workflow-specific rendering code: plan approval is
+  an explicit review of a revision, and discussion leaves it unresolved. This is
+  separate from host tool permissions.
+
+The existing fresh-launch behavior below does not implement durable MCP
+reconnection yet. Host session restoration and protocol receipts must be wired
+up when implementing the new design; deleting JS alone does not provide them.
+
+## Current session layout
+
 The unit of state is a **session**, identified by a random ID. A session owns:
 
 - `state_root/sessions/<id>/` — durable: `metadata.bin`, `frances.db` (turso), anchor state, `frances.log`.
@@ -123,3 +168,10 @@ transcript references entities via one-shot `SectionKind::EntityRef`
 sections; the hub's attach snapshot is queued into the events channel
 ahead of the scrollback replay, so snapshots always arrive before the
 refs that need them.
+
+In the replacement, the Rust protocol adapter becomes the producer of MCP UI
+entities. Its local rendering lifecycle must not resolve a server-owned pending
+interaction. Force-settling a local entity after a crash is not approval or
+cancellation: reconnect using the persisted MCP session ID, reconcile the server's
+UI snapshots and action receipts, and restore unresolved interactions. See the
+[UI lifecycle](../model-content-hooks-ui.md#reconnection-and-removal).

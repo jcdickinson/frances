@@ -1,5 +1,22 @@
 # Plan and step schema
 
+Status: historical planning-server schema proposal, not the current host schema
+or the protocol's wire format. Follow the [agent-loop architecture](../agentic-loop.md),
+[core protocol](../../model-content-hooks-protocol.md), and
+[UI specification](../../model-content-hooks-ui.md) when implementing the replacement.
+
+The planning MCP server owns typed plans, validation, revisions, and persistence.
+The table sketches below are possible server internals; they MUST NOT be copied
+into Frances's session database as a protocol requirement. The server chooses
+its storage. The current JS workflow already has a smaller structured plan model;
+the replacement preserves its required behavior without retaining its JS runtime.
+
+Fields, split/replan policies, and the hot-context selection below are historical
+proposals, not additional obligations. Plan approval binds to an artifact revision
+through `frances/ui`; the host does not interpret these tables.
+
+## Historical proposal
+
 A plan is a typed structure, not a markdown file. The agent reads and writes it through structured tool calls; the UI renders it natively at gates; the source of truth is rows in the per-session turso DB.
 
 ## Plan

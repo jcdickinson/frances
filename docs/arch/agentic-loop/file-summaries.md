@@ -1,5 +1,21 @@
 # Per-file summaries
 
+Status: historical optional server-feature proposal. The
+[agent-loop architecture](../agentic-loop.md) and
+[core protocol](../../model-content-hooks-protocol.md) supersede the staged rollout
+and host-storage assumptions below.
+
+A planning/knowledge MCP server would own these summaries, indexes, and evidence
+references. It can request generic sampling and retain evidence collected through
+hooks. The host does not add file-summary tables, a mandatory per-step summarizer,
+or a plan-patching pass. The existing workflow's per-step transcript summary is
+not this proposed per-file index.
+
+The following schema and pipeline are design notes for such a server, not
+requirements for removing the JS runtime or implementing the protocol.
+
+## Historical proposal
+
 Per-file summaries are a *lateral* view of plan progress: cross-step, per-file. They complement the longitudinal view (the plan as a sequence of steps) and answer queries like "what's been changed in `src/daemon/server.rs` so far?" cheaply, without forcing the agent to recall multiple step transcripts and reconstruct the file's evolution by hand.
 
 This is layer 2 in the staged rollout (see [agentic-loop.md](../agentic-loop.md)). Foundation layer 1 ships without it.

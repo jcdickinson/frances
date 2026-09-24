@@ -1,5 +1,23 @@
 # Recall surface
 
+Status: historical optional recall/search proposal. The
+[core protocol](../../model-content-hooks-protocol.md) and
+[agent-loop architecture](../agentic-loop.md) supersede its host-storage and gate
+assumptions.
+
+Recall tools, if implemented, belong to an MCP server and use server-owned state.
+Frances's private session database is not a remote recall API. A server collects
+needed evidence through tool/batch hooks or explicitly exposed resources; it
+cannot assume access to host-local transcript files, reasoning traces, or row IDs.
+These tools must be selected when a context is created, not injected on demand.
+
+The current JS workflow already saves step summaries and reseeds fresh chats.
+That is distinct from implementing the richer recall interface below. Removing
+the JS runtime does not require adopting this interface, its FTS schema, unbounded
+result policy, or historical storage layout.
+
+## Historical proposal
+
 Frances's per-session turso DB already persists every turn — the cold storage substrate exists. The recall surface is the agent-facing API for pulling cold content back into hot context on demand.
 
 ## Hot vs cold

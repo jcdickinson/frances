@@ -1,5 +1,29 @@
 # Open questions
 
+Status: questions from the historical host-owned planning proposal. They are not
+the open-question list for implementing the new harness. Use the
+[core protocol](../../model-content-hooks-protocol.md#draft-decisions-still-to-resolve)
+and [UI specification](../../model-content-hooks-ui.md#remaining-schema-decisions)
+for the current unresolved contracts.
+
+The following architecture decisions are already settled:
+
+- Remove the embedded JS/QuickJS workflow runtime and TypeScript transpilation;
+  the ordinary agent loop runs in Rust.
+- MCP servers own plans, derived knowledge, and their persistence. The host does
+  not adopt the plan/recall/project database schemas in these older notes.
+- Discussion is an explicit unresolved UI interaction. Plan approval binds to an
+  exact revision; dismissal and conversational assent do not approve it.
+- Referee and summarizer logic lives in servers using generic MCP sampling.
+- Tool definitions remain fixed for a model context. Changes require replacement.
+- Required server session IDs and state persist until explicit deletion.
+
+Remaining questions about findings, project identity, summary policies, and
+promotion may inform an optional server implementation. They do not reopen these
+host/protocol decisions or mandate the old staged rollout.
+
+## Historical proposal
+
 Things this design did not resolve. Recorded so they're not lost — to be answered when implementation makes the right answer obvious, or when real usage forces a decision.
 
 ## Investigation steps: same schema or distinct?
